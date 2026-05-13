@@ -82,11 +82,42 @@ struct Args {
     #[arg(long)]
     skip_auth: bool,
 
+    /// Read the password from the macOS Keychain instead of prompting.
+    /// Expects a generic-password entry: service `macrdp`, account = the
+    /// resolved username. Create it once with:
+    ///   security add-generic-password -s macrdp -a $USER -w
+    /// Lets launchd start macrdp without an interactive terminal.
+    #[arg(long)]
+    keychain: bool,
+
     /// Directory holding cert.pem / key.pem. Generated on first run and
     /// reused thereafter so clients see a stable fingerprint across restarts.
     /// Defaults to ~/Library/Application Support/macrdp.
     #[arg(long)]
     cert_dir: Option<PathBuf>,
+}
+
+/// Shell out to `security find-generic-password -s macrdp -a <user> -w`,
+/// which prints the password on stdout. The Keychain entry has to be
+/// created out-of-band; this never prompts the user interactively.
+fn read_password_from_keychain(username: &str) -> Result<String> {
+    let out = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", "macrdp", "-a", username, "-w"])
+        .output()
+        .context("invoke security(1)")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "keychain entry not found (run: security add-generic-password -s macrdp -a {username} -w)"
+        ));
+    }
+    let s = String::from_utf8(out.stdout)
+        .map_err(|_| anyhow!("keychain returned non-UTF8 bytes"))?
+        .trim_end_matches('\n')
+        .to_string();
+    if s.is_empty() {
+        return Err(anyhow!("keychain entry for macrdp is empty"));
+    }
+    Ok(s)
 }
 
 fn default_cert_dir() -> Result<PathBuf> {
@@ -240,10 +271,14 @@ async fn main() -> Result<()> {
         .clone()
         .or_else(|| std::env::var("USER").ok())
         .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
-    let password = match args.password.clone() {
-        Some(p) => p,
-        None => rpassword::prompt_password(format!("Password for {username}: "))
-            .context("read password from terminal")?,
+    let password = if args.keychain {
+        read_password_from_keychain(&username)?
+    } else {
+        match args.password.clone() {
+            Some(p) => p,
+            None => rpassword::prompt_password(format!("Password for {username}: "))
+                .context("read password from terminal")?,
+        }
     };
     if !args.skip_auth {
         auth::authenticate(&username, &password)

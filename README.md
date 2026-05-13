@@ -23,6 +23,20 @@ First run will prompt for:
 
 Then connect from a client to `<your-mac-ip>:3390` with your Mac username and password. `mstsc` will prompt for credentials in its own NLA dialog — no need to pre-type the username.
 
+## Auto-start at login (launchd)
+
+```bash
+dist/install.sh
+```
+
+Builds + signs + installs to `~/.local/bin/macrdp`, stores your Mac password in the macOS Keychain under service `macrdp`, drops a launchd plist at `~/Library/LaunchAgents/com.user.macrdp.plist`, and loads it. macrdp will start on every login and restart if it crashes. Re-run the script after `cargo build --release` to refresh the installed binary.
+
+```bash
+launchctl print gui/$UID/com.user.macrdp | head    # status
+launchctl kickstart -k gui/$UID/com.user.macrdp    # restart
+launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
+```
+
 ## CLI
 
 ```
@@ -30,6 +44,7 @@ Then connect from a client to `<your-mac-ip>:3390` with your Mac username and pa
 --username NAME           Defaults to $USER
 --password PASS           Skip the interactive prompt
 --skip-auth               Bypass PAM (testing only)
+--keychain                Read password from macOS Keychain (service=macrdp)
 --width / --height        Override autodetected display size
 --fps N                   Frame rate cap (default 15)
 --cert-dir PATH           Persisted TLS cert (default ~/Library/Application Support/macrdp)

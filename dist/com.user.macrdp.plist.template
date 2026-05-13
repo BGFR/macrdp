@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.macrdp</string>
+
+    <!-- Replace BINARY_PATH with the absolute path to the signed release
+         binary you installed (e.g. /usr/local/bin/macrdp). Stay on a
+         stable path so TCC grants don't churn. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>BINARY_PATH</string>
+        <string>--keychain</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- launchd starts the agent without a terminal; --keychain pulls
+         the password from `security find-generic-password -s macrdp`. -->
+
+    <key>StandardOutPath</key>
+    <string>/tmp/macrdp.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/macrdp.err.log</string>
+
+    <!-- ProcessType=Interactive so it stays high-priority and isn't
+         throttled like a background daemon. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

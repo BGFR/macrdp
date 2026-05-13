@@ -24,6 +24,11 @@ use tracing::{debug, warn};
 
 type Sender = Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>;
 
+/// Maximum FormatDataResponse payload we'll accept from the client. An
+/// authenticated peer that paste-pumped a multi-gig DIB at us could
+/// otherwise exhaust memory before any other check kicks in.
+const MAX_INCOMING_PAYLOAD: usize = 50 * 1024 * 1024;
+
 /// Convert PNG/TIFF bytes from NSPasteboard into a CF_DIB payload: a
 /// `BITMAPINFOHEADER` (40 bytes) followed by 32bpp BGRA pixels in
 /// top-down order (negative `biHeight`). 32bpp is the most widely
@@ -341,6 +346,14 @@ impl CliprdrBackend for MacCliprdrBackend {
             return;
         }
         let data = response.data();
+        if data.len() > MAX_INCOMING_PAYLOAD {
+            warn!(
+                len = data.len(),
+                cap = MAX_INCOMING_PAYLOAD,
+                "clipboard payload exceeds cap; dropping"
+            );
+            return;
+        }
         match requested {
             Some(ClipboardFormatId::CF_UNICODETEXT) | None => {
                 // Default to text if we don't know what we asked for —

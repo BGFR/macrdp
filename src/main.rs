@@ -50,8 +50,10 @@ fn ensure_screen_recording_access() {
 #[derive(Parser, Debug)]
 #[command(name = "macrdp", about = "Native RDP server for macOS")]
 struct Args {
-    /// Address to bind. Default is unprivileged 3390; real RDP is 3389.
-    #[arg(long, default_value = "0.0.0.0:3390")]
+    /// Address to bind. Defaults to loopback only — pass `0.0.0.0:3390`
+    /// explicitly to accept LAN connections. Port 3389 (the standard RDP
+    /// port) is privileged; 3390 is the unprivileged dev default.
+    #[arg(long, default_value = "127.0.0.1:3390")]
     bind: SocketAddr,
 
     /// Desktop width in pixels. Defaults to the primary display's native width
@@ -143,11 +145,13 @@ fn load_pem_cert_and_key(
         .with_context(|| format!("stat key {}", key_path.display()))?;
     let mode = key_meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
-        warn!(
-            path = %key_path.display(),
-            mode = format!("{:o}", mode),
-            "private key is group/world-accessible; chmod 600 it"
-        );
+        return Err(anyhow!(
+            "private key {} is group/world-accessible (mode {:o}); refusing to use it. \
+             Fix with: chmod 600 {}",
+            key_path.display(),
+            mode,
+            key_path.display(),
+        ));
     }
 
     let key_file = fs::File::open(key_path)
@@ -285,7 +289,17 @@ async fn main() -> Result<()> {
             .with_context(|| format!("PAM auth failed for {username}"))?;
         info!(user = %username, "PAM auth ok");
     } else {
-        warn!("--skip-auth set; using --password verbatim without PAM check");
+        // --skip-auth is a dev-only escape hatch. Refuse it whenever the
+        // listener is reachable beyond loopback so a fat-fingered config
+        // can't accidentally expose an unauth'd RDP server to the LAN.
+        if !args.bind.ip().is_loopback() {
+            return Err(anyhow!(
+                "--skip-auth refused on non-loopback bind {} — \
+                 remove --skip-auth or rebind to 127.0.0.1",
+                args.bind,
+            ));
+        }
+        warn!("--skip-auth set; using --password verbatim without PAM check (loopback only)");
     }
 
     let cert_dir = match args.cert_dir.clone() {

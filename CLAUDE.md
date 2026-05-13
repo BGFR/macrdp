@@ -11,8 +11,9 @@ Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
 - See the real macOS cursor shape (I-beam, hand, etc.) overlaid by the client.
 - Copy/paste UTF-8 text and images (CF_DIB ↔ PNG) between Mac and remote.
 - Forward macOS system audio to the remote (RDPSND, 44.1 kHz stereo 16-bit PCM).
+- NLA / CredSSP authentication — no more "type username before Connect" mstsc workaround.
 
-Not yet implemented: NLA/CredSSP, multi-monitor, codec negotiation (NSCodec / RemoteFx), non-US keyboard layouts, file clipboard, drive/printer redirection.
+Not yet implemented: multi-monitor, codec negotiation (NSCodec / RemoteFx), non-US keyboard layouts, file clipboard, drive/printer redirection.
 
 ## Project goal
 
@@ -34,7 +35,7 @@ build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 ```
 
 Cross-cutting:
-- **TLS** terminates inside the acceptor; `rustls` with a self-signed cert at `~/Library/Application Support/macrdp/{cert,key}.pem` (generated on first run, persisted thereafter for stable client TOFU).
+- **TLS** terminates inside the acceptor; `rustls` with a self-signed cert at `~/Library/Application Support/macrdp/{cert,key}.pem` (generated on first run, persisted thereafter for stable client TOFU). `RdpServerSecurity::Hybrid` is used so the negotiation response advertises CredSSP — the public-key bytes handed to ironrdp are the raw `subjectPublicKey` BIT STRING from the X.509 cert (not the SPKI sequence, not the keypair-derived bytes), since that's what sspi hashes client-side.
 - **Auth** at startup: `--username` (defaults to `$USER`) + interactive password prompt → PAM `checkpw` service → set as the static credential ironrdp_server checks per-connection. `--skip-auth` bypasses for dev.
 - **Session model** — v0 attaches to the console session of the logged-in user (single session). Multi-session / headless virtual displays would need a private framebuffer and are out of scope.
 
@@ -85,10 +86,11 @@ Testing against the server:
 xfreerdp /v:127.0.0.1:3390 /u:$USER /cert:ignore /log-level:DEBUG
 
 # Microsoft Remote Desktop / Windows App.app — closest to real-user UX.
-# Windows mstsc: expand "Show Options" and put $USER in the User name
-# field BEFORE clicking Connect, otherwise mstsc sends an empty username
-# in ClientInfoPdu (mstsc tries NLA first, fails since we only do plain
-# SSL, and doesn't reuse the NLA-collected creds on fallback).
+# Windows mstsc: just enter the computer and click Connect — NLA/CredSSP
+# is enabled, mstsc will prompt for credentials in its own dialog.
+# Expect one "Broken pipe" error in the log on the first attempt: that's
+# mstsc's cert-trust prompt closing and reopening the socket. The next
+# attempt succeeds.
 ```
 
 When iterating on the capture/encode path, prefer FreeRDP with `/log-level:DEBUG` — its PDU traces are far more useful than mstsc's silent failures.

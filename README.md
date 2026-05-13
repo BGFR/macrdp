@@ -1,6 +1,6 @@
 # macrdp
 
-A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, and system audio forwarding. Authenticates against your local Mac account via PAM.
+A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, and system audio forwarding. NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
 
 This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
@@ -20,7 +20,7 @@ First run will prompt for:
 2. **Accessibility permission** (same path, "Accessibility" — required to forward keyboard and mouse).
 3. Your Mac password at the terminal — validated against your local account via PAM `checkpw`, then used as the RDP credential.
 
-Then connect from a client to `<your-mac-ip>:3390` with your Mac username and password. From Windows `mstsc`: expand **Show Options**, put your username in the **User name** field *before* clicking Connect (otherwise mstsc sends an empty username over plain-SSL fallback).
+Then connect from a client to `<your-mac-ip>:3390` with your Mac username and password. `mstsc` will prompt for credentials in its own NLA dialog — no need to pre-type the username.
 
 ## CLI
 

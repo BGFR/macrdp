@@ -45,7 +45,7 @@ When adding a feature, locate it in one of those modules first; if it spans them
 
 - **Screen Recording permission** (TCC) is required for ScreenCaptureKit. Granted in System Settings → Privacy & Security → Screen Recording.
 - **Accessibility permission** is required to post synthetic keyboard/mouse events via `CGEventPost`. Granted in System Settings → Privacy & Security → Accessibility. Without it, posted events are silently dropped.
-- **TCC grants are path-keyed.** `target/debug/macrdp` and `target/release/macrdp` are tracked separately by TCC, so each binary gets its own prompt the first time. Move the binary and you re-prompt. Stay on a stable install path for daily use.
+- **TCC grants are path-keyed AND signature-keyed.** `target/debug/macrdp` and `target/release/macrdp` are tracked separately. An *unsigned* rebuild at the same path also invalidates the grant — every fresh link gets a different identity. Ad-hoc sign the release binary (`codesign -s - --force target/release/macrdp`) to get a stable code-signature identity so the grant survives rebuilds. Cargo doesn't have a post-link hook, so do it manually or via a wrapper script.
 - **Posting events to the login window or secure-input contexts** (password fields, lock screen) is blocked by the OS and cannot be worked around — document the limitation rather than fighting it.
 - **Default RDP port 3389 is privileged**; bind 3389 only with elevated rights, otherwise default to 3390 in dev.
 - **OpenPAM, not Linux-PAM.** `checkpw` uses `use_first_pass`, so `pam_opendirectory` reads the password from `pam_set_item(PAM_AUTHTOK, ...)` and never invokes the conv callback. See `src/auth.rs`.

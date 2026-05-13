@@ -12,6 +12,7 @@ v0 — daily-driver usable on a trusted LAN. See [CLAUDE.md](CLAUDE.md) for what
 
 ```bash
 cargo build --release
+codesign -s - --force target/release/macrdp   # ad-hoc sign so TCC grants persist
 ./target/release/macrdp
 ```
 

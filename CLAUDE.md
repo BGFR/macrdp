@@ -9,9 +9,10 @@ Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
 - See the primary display at native resolution with incremental damage-region updates.
 - Drive keyboard and mouse, including modifier keys, mouse buttons, and wheel.
 - See the real macOS cursor shape (I-beam, hand, etc.) overlaid by the client.
-- Copy/paste UTF-8 text between Mac and remote.
+- Copy/paste UTF-8 text and images (CF_DIB ↔ PNG) between Mac and remote.
+- Forward macOS system audio to the remote (RDPSND, 44.1 kHz stereo 16-bit PCM).
 
-Not yet implemented: NLA/CredSSP, multi-monitor, audio (`rdpsnd`), non-text clipboard, codec negotiation (NSCodec / RemoteFx), non-US keyboard layouts, drive/printer redirection.
+Not yet implemented: NLA/CredSSP, multi-monitor, codec negotiation (NSCodec / RemoteFx), non-US keyboard layouts, file clipboard, drive/printer redirection.
 
 ## Project goal
 
@@ -27,7 +28,8 @@ src/auth.rs       Startup PAM auth against the macOS account (libpam FFI)
 src/capture.rs    ScreenCaptureKit → BgrA32 BitmapUpdate, dirty-rect driven
 src/cursor.rs     NSCursor → RGBAPointer, hashed for change detection
 src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI)
-src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT only)
+src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB)
+src/audio.rs      RDPSND ← second SCK stream with system-audio capture
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 ```
 

@@ -45,6 +45,7 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
 --password PASS           Skip the interactive prompt
 --skip-auth               Bypass PAM (testing only)
 --keychain                Read password from macOS Keychain (service=macrdp)
+-v, --verbose             Show all the noisy logs the default filter hides
 --width / --height        Override autodetected display size
 --fps N                   Frame rate cap (default 15)
 --cert-dir PATH           Persisted TLS cert (default ~/Library/Application Support/macrdp)

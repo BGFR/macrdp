@@ -97,6 +97,13 @@ struct Args {
     /// Defaults to ~/Library/Application Support/macrdp.
     #[arg(long)]
     cert_dir: Option<PathBuf>,
+
+    /// Show debug-level logs from macrdp and the underlying ironrdp / rustls
+    /// crates. Without this, known-noisy lines (TLS SNI warnings, the
+    /// "Encoding bitmap took N ms" timer, the cert-acceptance "Broken pipe"
+    /// from ironrdp_server) are suppressed.
+    #[arg(long, short = 'v')]
+    verbose: bool,
 }
 
 /// Shell out to `security find-generic-password -s macrdp -a <user> -w`,
@@ -244,14 +251,26 @@ fn make_tls_acceptor(cert_dir: &Path) -> Result<(TlsAcceptor, Vec<u8>)> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let args = Args::parse();
+
+    // RUST_LOG (if set) always wins. Otherwise: --verbose turns on debug
+    // everywhere; without it we apply a targeted filter that quiets known
+    // noisy modules:
+    //   - rustls SNI warnings (clients legally put IPs there)
+    //   - the ironrdp_server::encoder "took N ms" timer (fires above 10ms)
+    //   - ironrdp_server::server WARN ("Unexpected share data pdu"); ERRORs
+    //     are still shown — that's where the cert-acceptance "Broken pipe"
+    //     comes from, which we can't suppress without losing real errors.
+    let filter = if let Ok(env) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        env
+    } else if args.verbose {
+        tracing_subscriber::EnvFilter::new("debug")
+    } else {
+        tracing_subscriber::EnvFilter::new(
+            "info,rustls=error,ironrdp_server::encoder=error,ironrdp_server::server=error",
+        )
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     #[cfg(target_os = "macos")]
     {

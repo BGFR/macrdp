@@ -14,12 +14,14 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use der::Decode;
 use ironrdp_server::{Credentials, RdpServer};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
+use x509_cert::Certificate;
 
 use crate::capture::{primary_display_size, CaptureDisplay};
 use crate::input::{ensure_accessibility_access, MacInputHandler};
@@ -168,7 +170,7 @@ fn generate_and_persist(
     Ok((vec![cert_der], key_der))
 }
 
-fn make_tls_acceptor(cert_dir: &Path) -> Result<TlsAcceptor> {
+fn make_tls_acceptor(cert_dir: &Path) -> Result<(TlsAcceptor, Vec<u8>)> {
     let cert_path = cert_dir.join("cert.pem");
     let key_path = cert_dir.join("key.pem");
 
@@ -180,11 +182,29 @@ fn make_tls_acceptor(cert_dir: &Path) -> Result<TlsAcceptor> {
         generate_and_persist(cert_dir, &cert_path, &key_path)?
     };
 
+    // CredSSP's public-key channel-binding hashes the raw `subjectPublicKey`
+    // BIT STRING contents from the X.509 cert — i.e. the DER-encoded
+    // RSAPublicKey itself, NOT the full SubjectPublicKeyInfo wrapper. See
+    // sspi's `raw_peer_public_key()`. Re-deriving from a keypair, or
+    // passing the SPKI sequence, both produce different bytes and the
+    // server/client hashes disagree.
+    let cert_der_bytes = certs
+        .first()
+        .ok_or_else(|| anyhow!("empty cert chain"))?
+        .as_ref();
+    let parsed = Certificate::from_der(cert_der_bytes).context("parse cert DER for SPKI")?;
+    let spki_der = parsed
+        .tbs_certificate
+        .subject_public_key_info
+        .subject_public_key
+        .raw_bytes()
+        .to_vec();
+
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("build rustls ServerConfig")?;
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    Ok((TlsAcceptor::from(Arc::new(config)), spki_der))
 }
 
 #[tokio::main]
@@ -237,7 +257,7 @@ async fn main() -> Result<()> {
         Some(p) => p,
         None => default_cert_dir()?,
     };
-    let tls = make_tls_acceptor(&cert_dir)?;
+    let (tls, spki_der) = make_tls_acceptor(&cert_dir)?;
 
     let detected = primary_display_size().await?;
     let width = args
@@ -266,9 +286,12 @@ async fn main() -> Result<()> {
     let sound: Box<dyn ironrdp_server::SoundServerFactory> =
         Box::new(audio::MacRdpsnd::new());
 
+    // with_hybrid advertises HYBRID | HYBRID_EX so clients run CredSSP/NLA
+    // over TLS. ironrdp_acceptor's accept_credssp reads our set_credentials
+    // and validates the client's NTLM response against it.
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
-        .with_tls(tls)
+        .with_hybrid(tls, spki_der)
         .with_input_handler(input_handler)
         .with_display_handler(display)
         .with_cliprdr_factory(Some(cliprdr))

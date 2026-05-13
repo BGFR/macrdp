@@ -1931,6 +1931,7 @@ dependencies = [
  "clap",
  "core-foundation 0.10.1",
  "core-graphics",
+ "der 0.7.10",
  "image",
  "ironrdp",
  "ironrdp-acceptor",
@@ -1953,6 +1954,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "x509-cert",
 ]
 
 [[package]]

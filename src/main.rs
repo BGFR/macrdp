@@ -1,3 +1,4 @@
+mod audio;
 mod auth;
 mod capture;
 mod clipboard;
@@ -262,6 +263,8 @@ async fn main() -> Result<()> {
     let input_handler = MacInputHandler::new(width, height)?;
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> =
         Box::new(clipboard::MacCliprdr::new());
+    let sound: Box<dyn ironrdp_server::SoundServerFactory> =
+        Box::new(audio::MacRdpsnd::new());
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
@@ -269,6 +272,7 @@ async fn main() -> Result<()> {
         .with_input_handler(input_handler)
         .with_display_handler(display)
         .with_cliprdr_factory(Some(cliprdr))
+        .with_sound_factory(Some(sound))
         .build();
 
     server.set_credentials(Some(Credentials {

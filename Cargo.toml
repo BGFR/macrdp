@@ -39,6 +39,7 @@ ironrdp-acceptor = "0.8"
 ironrdp-pdu = "0.7"
 ironrdp-cliprdr = "0.5"
 ironrdp-core = "0.1"
+ironrdp-rdpsnd = "0.7"
 
 # macOS-only: screen capture + input synthesis
 [target.'cfg(target_os = "macos")'.dependencies]

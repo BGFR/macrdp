@@ -1937,6 +1937,7 @@ dependencies = [
  "ironrdp-cliprdr",
  "ironrdp-core",
  "ironrdp-pdu",
+ "ironrdp-rdpsnd",
  "ironrdp-server",
  "libc",
  "objc2",

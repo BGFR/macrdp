@@ -1,3 +1,4 @@
+mod auth;
 mod capture;
 mod cursor;
 mod input;
@@ -61,15 +62,21 @@ struct Args {
     #[arg(long, default_value_t = 15)]
     fps: u32,
 
-    /// Username the client must present. Plain-TLS RDP compares creds against
-    /// what's set here; NLA/CredSSP would validate them differently.
-    #[arg(long, default_value = "user")]
-    username: String,
+    /// Mac account the client authenticates as. Defaults to $USER. The
+    /// password is validated against the local account via PAM (checkpw
+    /// service) at startup, so this must be a real Mac user.
+    #[arg(long)]
+    username: Option<String>,
 
-    /// Password the client must present. Dev-only — do not use a real password
-    /// here; the demo is not hardened.
-    #[arg(long, default_value = "password")]
-    password: String,
+    /// Password to use without an interactive prompt. Discouraged — leaving
+    /// this unset and entering at the prompt avoids shell-history leakage.
+    #[arg(long)]
+    password: Option<String>,
+
+    /// Skip the PAM check and use the supplied --password verbatim. Useful
+    /// for non-macOS dev or scripted tests; never use on a shared network.
+    #[arg(long)]
+    skip_auth: bool,
 
     /// Directory holding cert.pem / key.pem. Generated on first run and
     /// reused thereafter so clients see a stable fingerprint across restarts.
@@ -209,6 +216,24 @@ async fn main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     tracing::warn!("Built for a non-macOS target — capture is a static-rectangle stub.");
 
+    let username = args
+        .username
+        .clone()
+        .or_else(|| std::env::var("USER").ok())
+        .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
+    let password = match args.password.clone() {
+        Some(p) => p,
+        None => rpassword::prompt_password(format!("Password for {username}: "))
+            .context("read password from terminal")?,
+    };
+    if !args.skip_auth {
+        auth::authenticate(&username, &password)
+            .with_context(|| format!("PAM auth failed for {username}"))?;
+        info!(user = %username, "PAM auth ok");
+    } else {
+        warn!("--skip-auth set; using --password verbatim without PAM check");
+    }
+
     let cert_dir = match args.cert_dir.clone() {
         Some(p) => p,
         None => default_cert_dir()?,
@@ -246,18 +271,17 @@ async fn main() -> Result<()> {
         .build();
 
     server.set_credentials(Some(Credentials {
-        username: args.username.clone(),
-        password: args.password.clone(),
+        username: username.clone(),
+        password,
         domain: None,
     }));
 
     info!(
         addr = %args.bind,
-        user = %args.username,
-        "macrdp listening — try: xfreerdp /v:127.0.0.1:{} /cert:ignore /u:{} /p:{}",
+        user = %username,
+        "macrdp listening — connect with: mstsc / xfreerdp at port {} as {}",
         args.bind.port(),
-        args.username,
-        args.password,
+        username,
     );
     server.run().await
 }

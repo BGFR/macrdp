@@ -1,4 +1,5 @@
 mod capture;
+mod cursor;
 mod input;
 
 use std::fs;

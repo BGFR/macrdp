@@ -13,6 +13,8 @@ use ironrdp_server::{
     RdpServerDisplayUpdates,
 };
 
+use crate::cursor::CursorState;
+
 pub struct CaptureDisplay {
     pub width: u16,
     pub height: u16,
@@ -87,6 +89,7 @@ mod macos {
         // bitmap cache starts in a known-good state; SCK's dirty rects
         // for frame 0 may not cover everything.
         seeded: bool,
+        cursor: CursorState,
     }
 
     impl ScreenCaptureUpdates {
@@ -107,7 +110,11 @@ mod macos {
                 .with_width(u32::from(width))
                 .with_height(u32::from(height))
                 .with_pixel_format(SckPixelFormat::BGRA)
-                .with_fps(fps);
+                .with_fps(fps)
+                // Hide the macOS cursor in the captured framebuffer; we forward
+                // it separately as RGBAPointer so the client renders its own
+                // (real-shape) cursor without doubling up.
+                .with_shows_cursor(false);
 
             let stream =
                 AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
@@ -115,10 +122,12 @@ mod macos {
                 .start_capture()
                 .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
 
+            let cursor = CursorState::new(width, height)?;
             Ok(Self {
                 stream,
                 pending: std::collections::VecDeque::new(),
                 seeded: false,
+                cursor,
             })
         }
     }
@@ -164,6 +173,18 @@ mod macos {
     impl RdpServerDisplayUpdates for ScreenCaptureUpdates {
         async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
             loop {
+                // Poll cursor on every call — preempts queued bitmap rects so
+                // pointer position keeps up with mouse movement instead of
+                // batching behind the bitmap drain of the previous SCK sample.
+                let mut cursor_updates = self.cursor.poll();
+                if !cursor_updates.is_empty() {
+                    let first = cursor_updates.remove(0);
+                    for u in cursor_updates.into_iter().rev() {
+                        self.pending.push_front(u);
+                    }
+                    return Ok(Some(first));
+                }
+
                 if let Some(update) = self.pending.pop_front() {
                     return Ok(Some(update));
                 }

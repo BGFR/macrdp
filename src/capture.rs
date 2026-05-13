@@ -82,6 +82,11 @@ mod macos {
 
     pub struct ScreenCaptureUpdates {
         stream: AsyncSCStream,
+        pending: std::collections::VecDeque<DisplayUpdate>,
+        // Force a full-frame seed on the first sample so the client's
+        // bitmap cache starts in a known-good state; SCK's dirty rects
+        // for frame 0 may not cover everything.
+        seeded: bool,
     }
 
     impl ScreenCaptureUpdates {
@@ -110,8 +115,43 @@ mod macos {
                 .start_capture()
                 .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
 
-            Ok(Self { stream })
+            Ok(Self {
+                stream,
+                pending: std::collections::VecDeque::new(),
+                seeded: false,
+            })
         }
+    }
+
+    /// Build a `BitmapUpdate` for a sub-rectangle of the captured frame by
+    /// copying the rect's pixels into a tightly-packed buffer.
+    fn rect_update(
+        src: &[u8],
+        src_stride: usize,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+    ) -> Option<DisplayUpdate> {
+        let (Some(width), Some(height)) = (NonZeroU16::new(w), NonZeroU16::new(h)) else {
+            return None;
+        };
+        let row_bytes = usize::from(w) * 4;
+        let stride = NonZeroUsize::new(row_bytes)?;
+        let mut data = Vec::with_capacity(row_bytes * usize::from(h));
+        for row in 0..usize::from(h) {
+            let src_off = (usize::from(y) + row) * src_stride + usize::from(x) * 4;
+            data.extend_from_slice(&src[src_off..src_off + row_bytes]);
+        }
+        Some(DisplayUpdate::Bitmap(BitmapUpdate {
+            x,
+            y,
+            width,
+            height,
+            format: PixelFormat::BgrA32,
+            data: Bytes::from(data),
+            stride,
+        }))
     }
 
     impl Drop for ScreenCaptureUpdates {
@@ -124,12 +164,15 @@ mod macos {
     impl RdpServerDisplayUpdates for ScreenCaptureUpdates {
         async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
             loop {
+                if let Some(update) = self.pending.pop_front() {
+                    return Ok(Some(update));
+                }
+
                 let Some(sample) = self.stream.next().await else {
                     return Ok(None);
                 };
 
                 // Skip non-renderable frames (Idle, Blank, Suspended, Stopped).
-                // If status is missing, fall through and let image_buffer() decide.
                 if let Some(status) = sample.frame_status() {
                     if !status.has_content() {
                         continue;
@@ -148,26 +191,51 @@ mod macos {
                 let pb_height =
                     u16::try_from(guard.height()).context("pixel buffer height > u16")?;
                 let stride_bytes = guard.bytes_per_row();
-                let payload = Bytes::copy_from_slice(guard.as_slice());
+                let src = guard.as_slice();
 
-                let (Some(width), Some(height), Some(stride)) = (
-                    NonZeroU16::new(pb_width),
-                    NonZeroU16::new(pb_height),
-                    NonZeroUsize::new(stride_bytes),
-                ) else {
-                    continue;
+                // Decide the rect set to emit. On the first frame we always
+                // send the full frame so the client's bitmap cache is seeded.
+                // After that, SCK's dirty_rects tells us what changed; if the
+                // attachment is missing (older macOS, no key), fall back to
+                // the full frame.
+                let dirty = if !self.seeded {
+                    None
+                } else {
+                    sample.dirty_rects()
                 };
 
-                return Ok(Some(DisplayUpdate::Bitmap(BitmapUpdate {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                    // SCK BGRA in memory = B,G,R,A bytes per pixel = ironrdp BgrA32.
-                    format: PixelFormat::BgrA32,
-                    data: payload,
-                    stride,
-                })));
+                let rects: Vec<(u16, u16, u16, u16)> = match dirty {
+                    Some(list) if !list.is_empty() => list
+                        .into_iter()
+                        .filter_map(|r| {
+                            let origin = r.origin();
+                            let size = r.size();
+                            let x = origin.x.max(0.0).round() as u32;
+                            let y = origin.y.max(0.0).round() as u32;
+                            let w = size.width.max(0.0).round() as u32;
+                            let h = size.height.max(0.0).round() as u32;
+                            let x = u16::try_from(x.min(u32::from(pb_width))).ok()?;
+                            let y = u16::try_from(y.min(u32::from(pb_height))).ok()?;
+                            let w = u16::try_from(w.min(u32::from(pb_width.saturating_sub(x))))
+                                .ok()?;
+                            let h = u16::try_from(h.min(u32::from(pb_height.saturating_sub(y))))
+                                .ok()?;
+                            if w == 0 || h == 0 {
+                                None
+                            } else {
+                                Some((x, y, w, h))
+                            }
+                        })
+                        .collect(),
+                    _ => vec![(0, 0, pb_width, pb_height)],
+                };
+
+                for (x, y, w, h) in rects {
+                    if let Some(update) = rect_update(src, stride_bytes, x, y, w, h) {
+                        self.pending.push_back(update);
+                    }
+                }
+                self.seeded = true;
             }
         }
     }

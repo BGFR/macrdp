@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use ironrdp_server::{
-    BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServer, RdpServerDisplay,
-    RdpServerDisplayUpdates,
+    BitmapUpdate, Credentials, DesktopSize, DisplayUpdate, PixelFormat, RdpServer,
+    RdpServerDisplay, RdpServerDisplayUpdates,
 };
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -27,6 +27,16 @@ struct Args {
 
     #[arg(long, default_value_t = 720)]
     height: u16,
+
+    /// Username the client must present. Plain-TLS RDP compares creds against
+    /// what's set here; NLA/CredSSP would validate them differently.
+    #[arg(long, default_value = "user")]
+    username: String,
+
+    /// Password the client must present. Dev-only — do not use a real password
+    /// here; the demo is not hardened.
+    #[arg(long, default_value = "password")]
+    password: String,
 }
 
 struct StaticDisplay {
@@ -130,10 +140,19 @@ async fn main() -> Result<()> {
         .with_display_handler(display)
         .build();
 
+    server.set_credentials(Some(Credentials {
+        username: args.username.clone(),
+        password: args.password.clone(),
+        domain: None,
+    }));
+
     info!(
         addr = %args.bind,
-        "macrdp listening — try: xfreerdp /v:127.0.0.1:{}/cert:ignore /u:any /p:any",
-        args.bind.port()
+        user = %args.username,
+        "macrdp listening — try: xfreerdp /v:127.0.0.1:{} /cert:ignore /u:{} /p:{}",
+        args.bind.port(),
+        args.username,
+        args.password,
     );
     server.run().await
 }

@@ -53,6 +53,11 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
 
 `RUST_LOG=debug` for verbose logging.
 
+## Reason why this was made
+This was done to scratch an itch.  There are practically no active open source RDP servers for MacOS.  The closest project that does this functionality is xrdp; however this program only runs on Linux/Unix machines, and has no homebrew equivalent on Macs. Done in a few hours with the help of Claude and runs pretty well.
+
+I intend to add file copy and paste functionality and multi-monitor support maybe later (however the current implementation is so functional enough for my use that I might do this when I'm bored or need a distraction from real life); however this requires forking out the original IronRDP implementation of the clipboard functionality and extending it.
+
 ## License
 
 MIT OR Apache-2.0.

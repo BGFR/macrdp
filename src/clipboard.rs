@@ -133,7 +133,15 @@ fn dib_to_png(dib: &[u8]) -> anyhow::Result<Vec<u8>> {
         bail!("DIB payload truncated: have {}, need {need}", dib.len());
     }
 
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    // Capacity arithmetic must match the byte-bounds checked_mul above —
+    // otherwise an attacker could craft a DIB whose dimensions overflow u32
+    // and silently allocate a too-small buffer. Vec would still grow on
+    // push, so no UB, but be consistent.
+    let cap = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| anyhow!("RGBA buffer size overflow"))?;
+    let mut rgba: Vec<u8> = Vec::with_capacity(cap);
     for row in 0..h {
         let src_row = if top_down { row } else { h - 1 - row };
         let row_off = pixel_start + (src_row as usize) * stride;

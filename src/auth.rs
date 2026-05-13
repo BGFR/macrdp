@@ -130,6 +130,8 @@ mod pam_impl {
     }
 
     pub fn authenticate(service: &str, username: &str, password: &str) -> Result<()> {
+        use zeroize::Zeroizing;
+
         let service_c = CString::new(service).map_err(|_| anyhow!("service contains NUL"))?;
         let user_c = CString::new(username).map_err(|_| anyhow!("username contains NUL"))?;
         let pw_c = CString::new(password).map_err(|_| anyhow!("password contains NUL"))?;
@@ -181,6 +183,13 @@ mod pam_impl {
         };
 
         unsafe { pam_end(handle, acct_rc) };
+
+        // Overwrite the password buffer before drop. CString's Drop frees
+        // but doesn't zero; converting into its underlying Vec<u8> and
+        // wrapping with Zeroizing lets the bytes be wiped at scope exit.
+        // Safe ordering: pam_end has already returned, so libpam no longer
+        // holds the pointer set via pam_set_item.
+        let _wiped_pw = Zeroizing::new(pw_c.into_bytes_with_nul());
 
         if let Some(msg) = err {
             bail!("authentication failed: {msg}");

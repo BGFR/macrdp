@@ -22,6 +22,7 @@ use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 use x509_cert::Certificate;
+use zeroize::Zeroizing;
 
 use crate::capture::{primary_display_size, CaptureDisplay};
 use crate::input::{ensure_accessibility_access, MacInputHandler};
@@ -109,7 +110,7 @@ struct Args {
 /// Shell out to `security find-generic-password -s macrdp -a <user> -w`,
 /// which prints the password on stdout. The Keychain entry has to be
 /// created out-of-band; this never prompts the user interactively.
-fn read_password_from_keychain(username: &str) -> Result<String> {
+fn read_password_from_keychain(username: &str) -> Result<Zeroizing<String>> {
     let out = std::process::Command::new("security")
         .args(["find-generic-password", "-s", "macrdp", "-a", username, "-w"])
         .output()
@@ -119,10 +120,15 @@ fn read_password_from_keychain(username: &str) -> Result<String> {
             "keychain entry not found (run: security add-generic-password -s macrdp -a {username} -w)"
         ));
     }
-    let s = String::from_utf8(out.stdout)
-        .map_err(|_| anyhow!("keychain returned non-UTF8 bytes"))?
-        .trim_end_matches('\n')
-        .to_string();
+    // Wrap as soon as we touch the bytes so the underlying allocation is
+    // zeroed when this scope drops. `security` appends a single \n.
+    let mut s = Zeroizing::new(
+        String::from_utf8(out.stdout)
+            .map_err(|_| anyhow!("keychain returned non-UTF8 bytes"))?,
+    );
+    if s.ends_with('\n') {
+        s.pop();
+    }
     if s.is_empty() {
         return Err(anyhow!("keychain entry for macrdp is empty"));
     }
@@ -251,7 +257,7 @@ fn make_tls_acceptor(cert_dir: &Path) -> Result<(TlsAcceptor, Vec<u8>)> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     // RUST_LOG (if set) always wins. Otherwise: --verbose turns on debug
     // everywhere; without it we apply a targeted filter that quiets known
@@ -294,17 +300,18 @@ async fn main() -> Result<()> {
         .clone()
         .or_else(|| std::env::var("USER").ok())
         .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
-    let password = if args.keychain {
+    let password: Zeroizing<String> = if args.keychain {
         read_password_from_keychain(&username)?
+    } else if let Some(p) = args.password.take() {
+        Zeroizing::new(p)
     } else {
-        match args.password.clone() {
-            Some(p) => p,
-            None => rpassword::prompt_password(format!("Password for {username}: "))
+        Zeroizing::new(
+            rpassword::prompt_password(format!("Password for {username}: "))
                 .context("read password from terminal")?,
-        }
+        )
     };
     if !args.skip_auth {
-        auth::authenticate(&username, &password)
+        auth::authenticate(&username, password.as_str())
             .with_context(|| format!("PAM auth failed for {username}"))?;
         info!(user = %username, "PAM auth ok");
     } else {
@@ -366,9 +373,12 @@ async fn main() -> Result<()> {
         .with_sound_factory(Some(sound))
         .build();
 
+    // ironrdp_server::Credentials holds a plain String, so this copy is
+    // outside our control and won't be zeroed when the server shuts down.
+    // Our Zeroizing<String> still wipes its own allocation at scope exit.
     server.set_credentials(Some(Credentials {
         username: username.clone(),
-        password,
+        password: (*password).clone(),
         domain: None,
     }));
 

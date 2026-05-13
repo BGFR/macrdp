@@ -26,13 +26,11 @@ rustls = "0.23"
 tokio-rustls = "0.26"
 rcgen = "0.13"  # self-signed cert for first-run / dev
 
-# RDP protocol — pin to latest minor once you've run `cargo update`.
-# ironrdp is split into many sub-crates; add only what you actually use.
-# See https://crates.io/crates/ironrdp-server for the current version.
-ironrdp = "0"
-ironrdp-server = "0"
-ironrdp-acceptor = "0"
-ironrdp-pdu = "0"
+# RDP protocol — ironrdp is split into many sub-crates; add only what you use.
+ironrdp = "0.14"
+ironrdp-server = "0.10"
+ironrdp-acceptor = "0.8"
+ironrdp-pdu = "0.7"
 
 # macOS-only: screen capture + input synthesis
 [target.'cfg(target_os = "macos")'.dependencies]

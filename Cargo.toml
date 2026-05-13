@@ -36,6 +36,8 @@ ironrdp = "0.14"
 ironrdp-server = "0.10"
 ironrdp-acceptor = "0.8"
 ironrdp-pdu = "0.7"
+ironrdp-cliprdr = "0.5"
+ironrdp-core = "0.1"
 
 # macOS-only: screen capture + input synthesis
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -45,7 +47,7 @@ core-foundation = "0.10"
 # alternatives: `screencapturekit`, or direct `objc2`/`objc2-screen-capture-kit`.
 objc2 = "0.5"
 objc2-foundation = "0.2"
-objc2-app-kit = { version = "0.2", features = ["NSCursor", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics", "NSGraphicsContext"] }
+objc2-app-kit = { version = "0.2", features = ["NSCursor", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics", "NSGraphicsContext", "NSPasteboard"] }
 screencapturekit = { version = "2.1", features = ["async"] }
 
 [profile.release]

@@ -1,5 +1,6 @@
 mod auth;
 mod capture;
+mod clipboard;
 mod cursor;
 mod input;
 
@@ -259,12 +260,15 @@ async fn main() -> Result<()> {
     };
 
     let input_handler = MacInputHandler::new(width, height)?;
+    let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> =
+        Box::new(clipboard::MacCliprdr::new());
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
         .with_tls(tls)
         .with_input_handler(input_handler)
         .with_display_handler(display)
+        .with_cliprdr_factory(Some(cliprdr))
         .build();
 
     server.set_credentials(Some(Credentials {

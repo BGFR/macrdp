@@ -1905,6 +1905,8 @@ dependencies = [
  "core-graphics",
  "ironrdp",
  "ironrdp-acceptor",
+ "ironrdp-cliprdr",
+ "ironrdp-core",
  "ironrdp-pdu",
  "ironrdp-server",
  "libc",

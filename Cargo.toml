@@ -1,0 +1,49 @@
+[package]
+name = "macrdp"
+version = "0.0.1"
+edition = "2021"
+description = "Native RDP server for macOS"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "macrdp"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
+
+# Logging / errors / config
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+
+# TLS for RDP security layer
+rustls = "0.23"
+tokio-rustls = "0.26"
+rcgen = "0.13"  # self-signed cert for first-run / dev
+
+# RDP protocol — pin to latest minor once you've run `cargo update`.
+# ironrdp is split into many sub-crates; add only what you actually use.
+# See https://crates.io/crates/ironrdp-server for the current version.
+ironrdp = "0"
+ironrdp-server = "0"
+ironrdp-acceptor = "0"
+ironrdp-pdu = "0"
+
+# macOS-only: screen capture + input synthesis
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+core-foundation = "0.10"
+# ScreenCaptureKit bindings — verify the crate name/version against crates.io;
+# alternatives: `screencapturekit`, or direct `objc2`/`objc2-screen-capture-kit`.
+objc2 = "0.5"
+objc2-foundation = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Self-signed dev certs that the server generates on first run
+/dev-certs/
+*.pem
+*.key
+
+# macOS
+.DS_Store

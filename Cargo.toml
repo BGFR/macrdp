@@ -20,6 +20,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
+async-trait = "0.1"
+bytes = "1"
 
 # TLS for RDP security layer
 rustls = "0.23"

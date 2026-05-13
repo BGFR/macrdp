@@ -189,11 +189,8 @@ fn make_tls_acceptor(cert_dir: &Path) -> Result<TlsAcceptor> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(
-                    "info,macrdp=debug,ironrdp_server=debug,ironrdp_acceptor=debug",
-                )
-            }),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 

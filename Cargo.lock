@@ -1911,6 +1911,8 @@ dependencies = [
  "objc2-foundation",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
+ "screencapturekit",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
@@ -2818,6 +2820,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2864,6 +2875,12 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "screencapturekit"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c26aa93dbf2f4edfc3646a9b9c4ab0d7acfb1b0e5938fe2d8d1d9a4e66b3502"
 
 [[package]]
 name = "sec1"

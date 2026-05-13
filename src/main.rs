@@ -1,19 +1,43 @@
+mod capture;
+
+use std::fs;
+use std::io::BufReader;
 use std::net::SocketAddr;
-use std::num::{NonZeroU16, NonZeroUsize};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use bytes::Bytes;
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use ironrdp_server::{
-    BitmapUpdate, Credentials, DesktopSize, DisplayUpdate, PixelFormat, RdpServer,
-    RdpServerDisplay, RdpServerDisplayUpdates,
-};
+use ironrdp_server::{Credentials, RdpServer};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
-use tracing::info;
+use tracing::{info, warn};
+
+use crate::capture::{primary_display_size, CaptureDisplay};
+
+const FALLBACK_WIDTH: u16 = 1280;
+const FALLBACK_HEIGHT: u16 = 720;
+
+#[cfg(target_os = "macos")]
+fn ensure_screen_recording_access() {
+    use core_graphics::access::ScreenCaptureAccess;
+    let tcc = ScreenCaptureAccess;
+    if tcc.preflight() {
+        info!("Screen Recording permission already granted");
+        return;
+    }
+    warn!(
+        "Screen Recording permission NOT granted. macrdp will appear in \
+         System Settings → Privacy & Security → Screen Recording. Enable it, \
+         then RESTART macrdp (TCC grants only take effect on next launch)."
+    );
+    // request() registers the binary with TCC and opens the prompt; the
+    // returned bool reflects current state, which is still false on first run.
+    let _ = tcc.request();
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "macrdp", about = "Native RDP server for macOS")]
@@ -22,11 +46,17 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:3390")]
     bind: SocketAddr,
 
-    #[arg(long, default_value_t = 1280)]
-    width: u16,
+    /// Desktop width in pixels. Defaults to the primary display's native width
+    /// (queried via ScreenCaptureKit). Set to override scaling.
+    #[arg(long)]
+    width: Option<u16>,
 
-    #[arg(long, default_value_t = 720)]
-    height: u16,
+    /// Desktop height in pixels. Defaults to the primary display's native height.
+    #[arg(long)]
+    height: Option<u16>,
+
+    #[arg(long, default_value_t = 15)]
+    fps: u32,
 
     /// Username the client must present. Plain-TLS RDP compares creds against
     /// what's set here; NLA/CredSSP would validate them differently.
@@ -37,75 +67,110 @@ struct Args {
     /// here; the demo is not hardened.
     #[arg(long, default_value = "password")]
     password: String,
+
+    /// Directory holding cert.pem / key.pem. Generated on first run and
+    /// reused thereafter so clients see a stable fingerprint across restarts.
+    /// Defaults to ~/Library/Application Support/macrdp.
+    #[arg(long)]
+    cert_dir: Option<PathBuf>,
 }
 
-struct StaticDisplay {
-    width: u16,
-    height: u16,
+fn default_cert_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME not set")?;
+    Ok(PathBuf::from(home).join("Library/Application Support/macrdp"))
 }
 
-struct StaticUpdates {
-    pending: Option<DisplayUpdate>,
-}
-
-#[async_trait::async_trait]
-impl RdpServerDisplayUpdates for StaticUpdates {
-    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
-        if let Some(update) = self.pending.take() {
-            return Ok(Some(update));
-        }
-        // After the first frame, park forever so the server keeps the session open.
-        // Replacing this with a real frame source is the next step.
-        std::future::pending::<()>().await;
-        Ok(None)
-    }
-}
-
-#[async_trait::async_trait]
-impl RdpServerDisplay for StaticDisplay {
-    async fn size(&mut self) -> DesktopSize {
-        DesktopSize {
-            width: self.width,
-            height: self.height,
-        }
+fn load_pem_cert_and_key(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let cert_file = fs::File::open(cert_path)
+        .with_context(|| format!("open cert {}", cert_path.display()))?;
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(cert_file))
+            .collect::<std::io::Result<_>>()
+            .with_context(|| format!("parse cert {}", cert_path.display()))?;
+    if certs.is_empty() {
+        return Err(anyhow!("no certificates in {}", cert_path.display()));
     }
 
-    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-        let width = NonZeroU16::new(self.width).context("width must be > 0")?;
-        let height = NonZeroU16::new(self.height).context("height must be > 0")?;
-        let stride =
-            NonZeroUsize::new(usize::from(self.width) * 4).context("stride must be > 0")?;
-        let pixel_count = usize::from(self.width) * usize::from(self.height);
-
-        // ARgb32 = bytes are A, R, G, B per pixel. Solid muted teal.
-        let mut data = Vec::with_capacity(pixel_count * 4);
-        for _ in 0..pixel_count {
-            data.extend_from_slice(&[0xFF, 0x10, 0x80, 0x90]);
-        }
-
-        Ok(Box::new(StaticUpdates {
-            pending: Some(DisplayUpdate::Bitmap(BitmapUpdate {
-                x: 0,
-                y: 0,
-                width,
-                height,
-                format: PixelFormat::ARgb32,
-                data: Bytes::from(data),
-                stride,
-            })),
-        }))
+    let key_meta = fs::metadata(key_path)
+        .with_context(|| format!("stat key {}", key_path.display()))?;
+    let mode = key_meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        warn!(
+            path = %key_path.display(),
+            mode = format!("{:o}", mode),
+            "private key is group/world-accessible; chmod 600 it"
+        );
     }
+
+    let key_file = fs::File::open(key_path)
+        .with_context(|| format!("open key {}", key_path.display()))?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+        .with_context(|| format!("parse key {}", key_path.display()))?
+        .ok_or_else(|| anyhow!("no private key in {}", key_path.display()))?;
+
+    Ok((certs, key))
 }
 
-fn make_tls_acceptor() -> Result<TlsAcceptor> {
+fn generate_and_persist(
+    cert_dir: &Path,
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    fs::create_dir_all(cert_dir)
+        .with_context(|| format!("create cert dir {}", cert_dir.display()))?;
+
     let CertifiedKey { cert, key_pair } =
         generate_simple_self_signed(vec!["localhost".to_string()])
             .context("generate self-signed cert")?;
+
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
+
+    fs::write(cert_path, &cert_pem)
+        .with_context(|| format!("write cert {}", cert_path.display()))?;
+
+    // Create key with 0600 from the start — never let it briefly exist 0644.
+    {
+        use std::io::Write as _;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(key_path)
+            .with_context(|| format!("create key {}", key_path.display()))?;
+        f.write_all(key_pem.as_bytes())
+            .with_context(|| format!("write key {}", key_path.display()))?;
+    }
+    // If the file pre-existed with looser perms, OpenOptions::mode is a no-op
+    // on truncate — re-assert 0600 explicitly.
+    fs::set_permissions(key_path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod key {}", key_path.display()))?;
+
     let cert_der = CertificateDer::from(cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+    let key_der = PrivateKeyDer::try_from(key_pair.serialize_der())
+        .map_err(|e| anyhow!("convert key DER: {e}"))?;
+    Ok((vec![cert_der], key_der))
+}
+
+fn make_tls_acceptor(cert_dir: &Path) -> Result<TlsAcceptor> {
+    let cert_path = cert_dir.join("cert.pem");
+    let key_path = cert_dir.join("key.pem");
+
+    let (certs, key) = if cert_path.exists() && key_path.exists() {
+        info!(dir = %cert_dir.display(), "loading persisted TLS cert");
+        load_pem_cert_and_key(&cert_path, &key_path)?
+    } else {
+        info!(dir = %cert_dir.display(), "generating new self-signed TLS cert");
+        generate_and_persist(cert_dir, &cert_path, &key_path)?
+    };
+
     let config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
+        .with_single_cert(certs, key)
         .context("build rustls ServerConfig")?;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
@@ -124,13 +189,36 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    #[cfg(target_os = "macos")]
+    ensure_screen_recording_access();
     #[cfg(not(target_os = "macos"))]
-    tracing::warn!("Built for a non-macOS target — capture and input layers are stubs.");
+    tracing::warn!("Built for a non-macOS target — capture is a static-rectangle stub.");
 
-    let tls = make_tls_acceptor()?;
-    let display = StaticDisplay {
-        width: args.width,
-        height: args.height,
+    let cert_dir = match args.cert_dir.clone() {
+        Some(p) => p,
+        None => default_cert_dir()?,
+    };
+    let tls = make_tls_acceptor(&cert_dir)?;
+
+    let detected = primary_display_size().await?;
+    let width = args
+        .width
+        .or(detected.map(|(w, _)| w))
+        .unwrap_or(FALLBACK_WIDTH);
+    let height = args
+        .height
+        .or(detected.map(|(_, h)| h))
+        .unwrap_or(FALLBACK_HEIGHT);
+    if let Some((dw, dh)) = detected {
+        info!(width, height, detected_w = dw, detected_h = dh, "desktop size");
+    } else {
+        info!(width, height, "desktop size (no display detected)");
+    }
+
+    let display = CaptureDisplay {
+        width,
+        height,
+        fps: args.fps,
     };
 
     let mut server = RdpServer::builder()

@@ -27,6 +27,7 @@ bytes = "1"
 rustls = "0.23"
 tokio-rustls = "0.26"
 rcgen = "0.13"  # self-signed cert for first-run / dev
+rustls-pemfile = "2"  # read persisted cert.pem / key.pem on subsequent runs
 
 # RDP protocol — ironrdp is split into many sub-crates; add only what you use.
 ironrdp = "0.14"
@@ -42,6 +43,7 @@ core-foundation = "0.10"
 # alternatives: `screencapturekit`, or direct `objc2`/`objc2-screen-capture-kit`.
 objc2 = "0.5"
 objc2-foundation = "0.2"
+screencapturekit = { version = "2.1", features = ["async"] }
 
 [profile.release]
 lto = "thin"

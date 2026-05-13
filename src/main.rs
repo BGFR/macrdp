@@ -1,4 +1,5 @@
 mod capture;
+mod input;
 
 use std::fs;
 use std::io::BufReader;
@@ -17,6 +18,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 use crate::capture::{primary_display_size, CaptureDisplay};
+use crate::input::{ensure_accessibility_access, MacInputHandler};
 
 const FALLBACK_WIDTH: u16 = 1280;
 const FALLBACK_HEIGHT: u16 = 720;
@@ -190,7 +192,19 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     #[cfg(target_os = "macos")]
-    ensure_screen_recording_access();
+    {
+        ensure_screen_recording_access();
+        if !ensure_accessibility_access() {
+            warn!(
+                "Accessibility permission NOT granted. macrdp will appear in \
+                 System Settings → Privacy & Security → Accessibility. Enable \
+                 it, then RESTART macrdp. Without it, keyboard/mouse input \
+                 from RDP clients is silently dropped."
+            );
+        } else {
+            info!("Accessibility permission already granted");
+        }
+    }
     #[cfg(not(target_os = "macos"))]
     tracing::warn!("Built for a non-macOS target — capture is a static-rectangle stub.");
 
@@ -221,10 +235,12 @@ async fn main() -> Result<()> {
         fps: args.fps,
     };
 
+    let input_handler = MacInputHandler::new(width, height)?;
+
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
         .with_tls(tls)
-        .with_no_input()
+        .with_input_handler(input_handler)
         .with_display_handler(display)
         .build();
 

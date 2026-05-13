@@ -37,7 +37,7 @@ ironrdp-pdu = "0.7"
 
 # macOS-only: screen capture + input synthesis
 [target.'cfg(target_os = "macos")'.dependencies]
-core-graphics = "0.24"
+core-graphics = { version = "0.24", features = ["highsierra"] }
 core-foundation = "0.10"
 # ScreenCaptureKit bindings — verify the crate name/version against crates.io;
 # alternatives: `screencapturekit`, or direct `objc2`/`objc2-screen-capture-kit`.

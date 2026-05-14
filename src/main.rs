@@ -283,6 +283,17 @@ async fn main() -> Result<()> {
     };
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // Install signal handling before anything touches ScreenCaptureKit. Once an
+    // SCK capture stream is live, macOS framework threads can leave the process
+    // unkillable by Ctrl-C; a forced exit on SIGINT/SIGTERM sidesteps that — and
+    // any other non-cooperative native threads — instead of relying on the
+    // tokio runtime to unwind cleanly.
+    tokio::spawn(async {
+        shutdown_signal().await;
+        info!("shutdown signal received — exiting");
+        std::process::exit(0);
+    });
+
     #[cfg(target_os = "macos")]
     {
         ensure_screen_recording_access();
@@ -400,4 +411,28 @@ async fn main() -> Result<()> {
         username,
     );
     server.run().await
+}
+
+/// Resolves when the process receives SIGINT (Ctrl-C) or, on Unix, SIGTERM.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(e) => {
+                warn!("could not install SIGTERM handler: {e}");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

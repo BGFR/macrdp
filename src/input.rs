@@ -40,7 +40,8 @@ impl RdpServerInputHandler for MacInputHandler {
 
     fn mouse(&mut self, event: MouseEvent) {
         #[cfg(target_os = "macos")]
-        self.inner.mouse(event, self.desktop_width, self.desktop_height);
+        self.inner
+            .mouse(event, self.desktop_width, self.desktop_height);
         #[cfg(not(target_os = "macos"))]
         trace!(?event, "mouse event (stub)");
     }

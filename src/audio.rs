@@ -80,15 +80,12 @@ impl RdpsndServerHandler for MacRdpsndBackend {
     fn start(&mut self, client_format: &ClientAudioFormatPdu) -> Option<u16> {
         // Find our PCM format in the client's accepted list and use its index.
         let target = pcm_format();
-        let index = client_format
-            .formats
-            .iter()
-            .position(|f| {
-                f.format == target.format
-                    && f.n_channels == target.n_channels
-                    && f.n_samples_per_sec == target.n_samples_per_sec
-                    && f.bits_per_sample == target.bits_per_sample
-            })?;
+        let index = client_format.formats.iter().position(|f| {
+            f.format == target.format
+                && f.n_channels == target.n_channels
+                && f.n_samples_per_sec == target.n_samples_per_sec
+                && f.bits_per_sample == target.bits_per_sample
+        })?;
 
         if self.running.swap(true, Ordering::SeqCst) {
             // Already running; reuse the existing capture task.
@@ -112,15 +109,10 @@ impl RdpsndServerHandler for MacRdpsndBackend {
 }
 
 #[cfg(target_os = "macos")]
-async fn capture_loop(
-    sender: Sender,
-    running: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
+async fn capture_loop(sender: Sender, running: Arc<AtomicBool>) -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
     use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
-    use screencapturekit::prelude::{
-        SCContentFilter, SCStreamConfiguration, SCStreamOutputType,
-    };
+    use screencapturekit::prelude::{SCContentFilter, SCStreamConfiguration, SCStreamOutputType};
 
     let content = AsyncSCShareableContent::get()
         .await
@@ -170,8 +162,7 @@ async fn capture_loop(
             guard.clone()
         };
         let Some(s) = s else { break };
-        if s
-            .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(pcm, ts_ms)))
+        if s.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(pcm, ts_ms)))
             .is_err()
         {
             break;
@@ -184,17 +175,12 @@ async fn capture_loop(
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn capture_loop(
-    _sender: Sender,
-    _running: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
+async fn capture_loop(_sender: Sender, _running: Arc<AtomicBool>) -> anyhow::Result<()> {
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn float_list_to_pcm16_interleaved(
-    list: &screencapturekit::cm::AudioBufferList,
-) -> Vec<u8> {
+fn float_list_to_pcm16_interleaved(list: &screencapturekit::cm::AudioBufferList) -> Vec<u8> {
     let num_buffers = list.num_buffers();
     if num_buffers == 0 {
         return Vec::new();

@@ -60,8 +60,8 @@ impl RdpServerDisplay for CaptureDisplay {
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
         #[cfg(target_os = "macos")]
         {
-            let updates = macos::ScreenCaptureUpdates::start(self.width, self.height, self.fps)
-                .await?;
+            let updates =
+                macos::ScreenCaptureUpdates::start(self.width, self.height, self.fps).await?;
             Ok(Box::new(updates))
         }
         #[cfg(not(target_os = "macos"))]
@@ -116,8 +116,7 @@ mod macos {
                 // (real-shape) cursor without doubling up.
                 .with_shows_cursor(false);
 
-            let stream =
-                AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
+            let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
             stream
                 .start_capture()
                 .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
@@ -237,8 +236,8 @@ mod macos {
                             let h = size.height.max(0.0).round() as u32;
                             let x = u16::try_from(x.min(u32::from(pb_width))).ok()?;
                             let y = u16::try_from(y.min(u32::from(pb_height))).ok()?;
-                            let w = u16::try_from(w.min(u32::from(pb_width.saturating_sub(x))))
-                                .ok()?;
+                            let w =
+                                u16::try_from(w.min(u32::from(pb_width.saturating_sub(x)))).ok()?;
                             let h = u16::try_from(h.min(u32::from(pb_height.saturating_sub(y))))
                                 .ok()?;
                             if w == 0 || h == 0 {
@@ -275,8 +274,7 @@ mod stub {
         pub fn new(width: u16, height: u16) -> Result<Self> {
             let w = NonZeroU16::new(width).context("width must be > 0")?;
             let h = NonZeroU16::new(height).context("height must be > 0")?;
-            let stride =
-                NonZeroUsize::new(usize::from(width) * 4).context("stride must be > 0")?;
+            let stride = NonZeroUsize::new(usize::from(width) * 4).context("stride must be > 0")?;
             let pixel_count = usize::from(width) * usize::from(height);
             let mut data = Vec::with_capacity(pixel_count * 4);
             for _ in 0..pixel_count {

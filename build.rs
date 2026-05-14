@@ -20,9 +20,7 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
 
     let xcode_dev_dir = match Command::new("xcode-select").arg("-p").output() {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => {
             println!(
                 "cargo:warning=xcode-select -p failed; macrdp may not load at runtime. \
@@ -36,9 +34,8 @@ fn main() {
     // versions differ on which exists. Adding both rpaths is harmless if one
     // is absent; the dynamic linker just skips missing entries.
     for slice in ["swift-5.5", "swift"] {
-        let path = format!(
-            "{xcode_dev_dir}/Toolchains/XcodeDefault.xctoolchain/usr/lib/{slice}/macosx"
-        );
+        let path =
+            format!("{xcode_dev_dir}/Toolchains/XcodeDefault.xctoolchain/usr/lib/{slice}/macosx");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{path}");
     }
 }

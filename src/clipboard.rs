@@ -10,9 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::io::Cursor;
 
 use image::{ImageEncoder, ImageReader};
-use ironrdp_cliprdr::backend::{
-    CliprdrBackend, CliprdrBackendFactory, ClipboardMessage,
-};
+use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::{
     ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
     FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
@@ -127,7 +125,11 @@ fn dib_to_png(dib: &[u8]) -> anyhow::Result<Vec<u8>> {
     };
     let pixel_start = bi_size + mask_bytes;
     let need = pixel_start
-        .checked_add(stride.checked_mul(h as usize).ok_or_else(|| anyhow!("overflow"))?)
+        .checked_add(
+            stride
+                .checked_mul(h as usize)
+                .ok_or_else(|| anyhow!("overflow"))?,
+        )
         .ok_or_else(|| anyhow!("overflow"))?;
     if dib.len() < need {
         bail!("DIB payload truncated: have {}, need {need}", dib.len());
@@ -203,11 +205,10 @@ impl ServerEventSender for MacCliprdr {
                 let Some(s) = guard.as_ref() else {
                     break; // sender dropped, server is shutting down
                 };
-                if s
-                    .send(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(
-                        formats,
-                    )))
-                    .is_err()
+                if s.send(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(
+                    formats,
+                )))
+                .is_err()
                 {
                     break;
                 }
@@ -379,7 +380,10 @@ impl CliprdrBackend for MacCliprdrBackend {
                 }
                 match String::from_utf16(&units) {
                     Ok(s) => {
-                        debug!(len = s.len(), "writing remote clipboard text to NSPasteboard");
+                        debug!(
+                            len = s.len(),
+                            "writing remote clipboard text to NSPasteboard"
+                        );
                         pb::write_string(&s);
                     }
                     Err(e) => warn!("UTF-16 decode failed: {e}"),
@@ -388,7 +392,10 @@ impl CliprdrBackend for MacCliprdrBackend {
             Some(ClipboardFormatId::CF_DIB) | Some(ClipboardFormatId::CF_DIBV5) => {
                 match dib_to_png(data) {
                     Ok(png) => {
-                        debug!(len = png.len(), "writing remote clipboard image to NSPasteboard");
+                        debug!(
+                            len = png.len(),
+                            "writing remote clipboard image to NSPasteboard"
+                        );
                         pb::write_png(&png);
                     }
                     Err(e) => warn!("DIB decode failed: {e}"),
@@ -432,7 +439,9 @@ mod pb {
     fn has_type(target: &objc2_app_kit::NSPasteboardType) -> bool {
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
-            let Some(types) = pb.types() else { return false };
+            let Some(types) = pb.types() else {
+                return false;
+            };
             for i in 0..types.count() {
                 let t = types.objectAtIndex(i);
                 if (&*t).isEqualToString(target) {
@@ -446,7 +455,8 @@ mod pb {
     pub fn read_string() -> Option<String> {
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
-            pb.stringForType(NSPasteboardTypeString).map(|s| s.to_string())
+            pb.stringForType(NSPasteboardTypeString)
+                .map(|s| s.to_string())
         })
     }
 

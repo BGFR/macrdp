@@ -112,7 +112,14 @@ struct Args {
 /// created out-of-band; this never prompts the user interactively.
 fn read_password_from_keychain(username: &str) -> Result<Zeroizing<String>> {
     let out = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", "macrdp", "-a", username, "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "macrdp",
+            "-a",
+            username,
+            "-w",
+        ])
         .output()
         .context("invoke security(1)")?;
     if !out.status.success() {
@@ -123,8 +130,7 @@ fn read_password_from_keychain(username: &str) -> Result<Zeroizing<String>> {
     // Wrap as soon as we touch the bytes so the underlying allocation is
     // zeroed when this scope drops. `security` appends a single \n.
     let mut s = Zeroizing::new(
-        String::from_utf8(out.stdout)
-            .map_err(|_| anyhow!("keychain returned non-UTF8 bytes"))?,
+        String::from_utf8(out.stdout).map_err(|_| anyhow!("keychain returned non-UTF8 bytes"))?,
     );
     if s.ends_with('\n') {
         s.pop();
@@ -144,18 +150,17 @@ fn load_pem_cert_and_key(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let cert_file = fs::File::open(cert_path)
-        .with_context(|| format!("open cert {}", cert_path.display()))?;
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(cert_file))
-            .collect::<std::io::Result<_>>()
-            .with_context(|| format!("parse cert {}", cert_path.display()))?;
+    let cert_file =
+        fs::File::open(cert_path).with_context(|| format!("open cert {}", cert_path.display()))?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<std::io::Result<_>>()
+        .with_context(|| format!("parse cert {}", cert_path.display()))?;
     if certs.is_empty() {
         return Err(anyhow!("no certificates in {}", cert_path.display()));
     }
 
-    let key_meta = fs::metadata(key_path)
-        .with_context(|| format!("stat key {}", key_path.display()))?;
+    let key_meta =
+        fs::metadata(key_path).with_context(|| format!("stat key {}", key_path.display()))?;
     let mode = key_meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         return Err(anyhow!(
@@ -167,8 +172,8 @@ fn load_pem_cert_and_key(
         ));
     }
 
-    let key_file = fs::File::open(key_path)
-        .with_context(|| format!("open key {}", key_path.display()))?;
+    let key_file =
+        fs::File::open(key_path).with_context(|| format!("open key {}", key_path.display()))?;
     let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
         .with_context(|| format!("parse key {}", key_path.display()))?
         .ok_or_else(|| anyhow!("no private key in {}", key_path.display()))?;
@@ -344,7 +349,13 @@ async fn main() -> Result<()> {
         .or(detected.map(|(_, h)| h))
         .unwrap_or(FALLBACK_HEIGHT);
     if let Some((dw, dh)) = detected {
-        info!(width, height, detected_w = dw, detected_h = dh, "desktop size");
+        info!(
+            width,
+            height,
+            detected_w = dw,
+            detected_h = dh,
+            "desktop size"
+        );
     } else {
         info!(width, height, "desktop size (no display detected)");
     }
@@ -358,8 +369,7 @@ async fn main() -> Result<()> {
     let input_handler = MacInputHandler::new(width, height)?;
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> =
         Box::new(clipboard::MacCliprdr::new());
-    let sound: Box<dyn ironrdp_server::SoundServerFactory> =
-        Box::new(audio::MacRdpsnd::new());
+    let sound: Box<dyn ironrdp_server::SoundServerFactory> = Box::new(audio::MacRdpsnd::new());
 
     // with_hybrid advertises HYBRID | HYBRID_EX so clients run CredSSP/NLA
     // over TLS. ironrdp_acceptor's accept_credssp reads our set_credentials

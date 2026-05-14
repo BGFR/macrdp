@@ -52,8 +52,8 @@ mod macos {
     use objc2::rc::Retained;
     use objc2::ClassType;
     use objc2_app_kit::{
-        NSBitmapFormat, NSBitmapImageRep, NSCompositingOperation, NSCursor,
-        NSDeviceRGBColorSpace, NSGraphicsContext,
+        NSBitmapFormat, NSBitmapImageRep, NSCompositingOperation, NSCursor, NSDeviceRGBColorSpace,
+        NSGraphicsContext,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use tracing::trace;

@@ -68,11 +68,7 @@ mod pam_impl {
             conv: *const PamConv,
             handle: *mut *mut c_void,
         ) -> c_int;
-        fn pam_set_item(
-            handle: *mut c_void,
-            item_type: c_int,
-            item: *const c_void,
-        ) -> c_int;
+        fn pam_set_item(handle: *mut c_void, item_type: c_int, item: *const c_void) -> c_int;
         fn pam_authenticate(handle: *mut c_void, flags: c_int) -> c_int;
         fn pam_acct_mgmt(handle: *mut c_void, flags: c_int) -> c_int;
         fn pam_end(handle: *mut c_void, status: c_int) -> c_int;
@@ -154,8 +150,7 @@ mod pam_impl {
             return Err(anyhow!("pam_start failed: rc={rc}"));
         }
 
-        let set_rc =
-            unsafe { pam_set_item(handle, PAM_AUTHTOK, pw_c.as_ptr() as *const c_void) };
+        let set_rc = unsafe { pam_set_item(handle, PAM_AUTHTOK, pw_c.as_ptr() as *const c_void) };
         if set_rc != PAM_SUCCESS {
             unsafe { pam_end(handle, set_rc) };
             return Err(anyhow!("pam_set_item(AUTHTOK) failed: rc={set_rc}"));

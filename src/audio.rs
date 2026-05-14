@@ -133,9 +133,11 @@ async fn capture_loop(sender: Sender, running: Arc<AtomicBool>) -> anyhow::Resul
         .with_sample_rate(SAMPLE_RATE as i32)
         .with_channel_count(CHANNELS as i32);
 
-    // Shallow queue: SCK buffers at most this many audio sample-buffers before
-    // we drain them. Lower = less latency, at the cost of dropouts under load.
-    let stream = AsyncSCStream::new(&filter, &config, 3, SCStreamOutputType::Audio);
+    // Shallow queue: SCK's async buffer is a drop-oldest ring of this depth.
+    // Each slot is ~20 ms of audio, so 2 caps capture-side staleness at ~40 ms
+    // while leaving one slot of headroom against scheduler jitter. Lower would
+    // trade dropouts for marginal latency; the real backlog is downstream.
+    let stream = AsyncSCStream::new(&filter, &config, 2, SCStreamOutputType::Audio);
     stream
         .start_capture()
         .map_err(|e| anyhow!("audio start_capture: {e:?}"))?;

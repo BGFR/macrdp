@@ -444,7 +444,7 @@ mod pb {
             };
             for i in 0..types.count() {
                 let t = types.objectAtIndex(i);
-                if (&*t).isEqualToString(target) {
+                if t.isEqualToString(target) {
                     return true;
                 }
             }
@@ -497,7 +497,7 @@ mod pb {
     fn nsdata_to_vec(d: &NSData) -> Vec<u8> {
         unsafe {
             let len = d.length();
-            let ptr = d.bytes().as_ptr() as *const u8;
+            let ptr = d.bytes().as_ptr();
             std::slice::from_raw_parts(ptr, len).to_vec()
         }
     }

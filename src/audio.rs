@@ -7,7 +7,7 @@
 //! ship via `RdpsndServerMessage::Wave`.
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -15,7 +15,7 @@ use ironrdp_rdpsnd::pdu::{AudioFormat, ClientAudioFormatPdu, WaveFormat};
 use ironrdp_rdpsnd::server::{RdpsndServerHandler, RdpsndServerMessage};
 use ironrdp_server::{ServerEvent, ServerEventSender, SoundServerFactory};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // ScreenCaptureKit only honors 8000/16000/24000/48000 Hz; asking for 44100
 // is silently served as 48000, so the advertised RDPSND format must match or
@@ -29,12 +29,20 @@ type Sender = Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>;
 #[derive(Debug)]
 pub struct MacRdpsnd {
     sender: Sender,
+    // Monotonic capture-loop generation, shared with every backend this
+    // factory builds. mstsc's cert-prompt reconnect makes ironrdp build a
+    // second backend (and thus a second capture loop) while the first may
+    // still be alive; both would feed the shared `sender` and the client
+    // would receive ~2x the audio. Each `start()` claims a new generation;
+    // older capture loops observe the bump and exit, so at most one runs.
+    generation: Arc<AtomicU64>,
 }
 
 impl MacRdpsnd {
     pub fn new() -> Self {
         Self {
             sender: Arc::new(Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -49,7 +57,8 @@ impl SoundServerFactory for MacRdpsnd {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
         Box::new(MacRdpsndBackend {
             sender: self.sender.clone(),
-            running: Arc::new(AtomicBool::new(false)),
+            generation: self.generation.clone(),
+            my_gen: 0,
             formats: vec![pcm_format()],
         })
     }
@@ -71,7 +80,9 @@ fn pcm_format() -> AudioFormat {
 #[derive(Debug)]
 struct MacRdpsndBackend {
     sender: Sender,
-    running: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    // Generation claimed by this backend's capture loop, 0 until `start()`.
+    my_gen: u64,
     formats: Vec<AudioFormat>,
 }
 
@@ -81,38 +92,69 @@ impl RdpsndServerHandler for MacRdpsndBackend {
     }
 
     fn start(&mut self, client_format: &ClientAudioFormatPdu) -> Option<u16> {
-        // Find our PCM format in the client's accepted list and use its index.
-        let target = pcm_format();
-        let index = client_format.formats.iter().position(|f| {
-            f.format == target.format
-                && f.n_channels == target.n_channels
-                && f.n_samples_per_sec == target.n_samples_per_sec
-                && f.bits_per_sample == target.bits_per_sample
-        })?;
+        // wFormatNo in the Wave/Wave2 PDU indexes the *server's* format list
+        // (what we sent in the Server Audio Formats PDU), not the client's
+        // reply list. Returning a client-list index here makes the client
+        // decode our audio with whatever format sits at that index in the
+        // server list — audible as wrong pitch and progressive drift when the
+        // two lists don't line up. So find the first server format the client
+        // echoed back as accepted and return *its* index into our list.
+        let format_no = self.formats.iter().position(|server_fmt| {
+            client_format.formats.iter().any(|client_fmt| {
+                client_fmt.format == server_fmt.format
+                    && client_fmt.n_channels == server_fmt.n_channels
+                    && client_fmt.n_samples_per_sec == server_fmt.n_samples_per_sec
+                    && client_fmt.bits_per_sample == server_fmt.bits_per_sample
+            })
+        });
+        let Some(format_no) = format_no else {
+            warn!(
+                client_formats = client_format.formats.len(),
+                "client accepted none of the server audio formats; no audio"
+            );
+            return None;
+        };
+        debug!(
+            format_no,
+            client_formats = client_format.formats.len(),
+            version = ?client_format.version,
+            "rdpsnd audio format negotiated"
+        );
 
-        if self.running.swap(true, Ordering::SeqCst) {
-            // Already running; reuse the existing capture task.
-            return Some(index as u16);
-        }
+        // Claim a fresh generation. Any capture loop from a previous
+        // connection sees the bump on its next iteration and exits, so it
+        // never feeds the shared event channel alongside this one.
+        self.my_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
 
         let sender = self.sender.clone();
-        let running = self.running.clone();
+        let generation = self.generation.clone();
+        let my_gen = self.my_gen;
         tokio::spawn(async move {
-            if let Err(e) = capture_loop(sender, running.clone()).await {
+            if let Err(e) = capture_loop(sender, generation, my_gen).await {
                 warn!("audio capture loop ended: {e}");
             }
-            running.store(false, Ordering::SeqCst);
         });
-        Some(index as u16)
+        Some(format_no as u16)
     }
 
     fn stop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
+        // Retire our capture loop, but only if it is still the active one — a
+        // newer connection may have already superseded us.
+        let _ = self.generation.compare_exchange(
+            self.my_gen,
+            self.my_gen + 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 }
 
 #[cfg(target_os = "macos")]
-async fn capture_loop(sender: Sender, running: Arc<AtomicBool>) -> anyhow::Result<()> {
+async fn capture_loop(
+    sender: Sender,
+    generation: Arc<AtomicU64>,
+    my_gen: u64,
+) -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
     use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
     use screencapturekit::prelude::{SCContentFilter, SCStreamConfiguration, SCStreamOutputType};
@@ -144,23 +186,63 @@ async fn capture_loop(sender: Sender, running: Arc<AtomicBool>) -> anyhow::Resul
     debug!("audio capture started");
 
     let start_instant = std::time::Instant::now();
+    let mut format_logged = false;
+    // Diagnostic: measure how many stereo frames we actually hand off per
+    // wall-clock second. If this isn't ~SAMPLE_RATE, we're over/under-feeding
+    // the client and that is the drift (and, if over, the lowered pitch).
+    let mut frames_sent: u64 = 0;
+    let mut last_rate_log = start_instant;
 
     loop {
-        if !running.load(Ordering::SeqCst) {
+        if generation.load(Ordering::SeqCst) != my_gen {
+            debug!(my_gen, "audio capture loop superseded; exiting");
             break;
         }
         let Some(sample) = stream.next().await else {
             break;
         };
+
+        // Log the format SCK actually delivers, once per session. SCK does not
+        // always honor the requested rate/channels; a mismatch against the
+        // advertised RDPSND format makes the client play at the wrong frame
+        // rate — audible as drift and lowered pitch.
+        if !format_logged {
+            format_logged = true;
+            if let Some(fd) = sample.format_description() {
+                let rate = fd.audio_sample_rate().unwrap_or(0.0);
+                let channels = fd.audio_channel_count().unwrap_or(0);
+                info!(rate, channels, "SCK audio format");
+                if rate != 0.0 && (rate - f64::from(SAMPLE_RATE)).abs() > 1.0 {
+                    warn!(
+                        delivered = rate,
+                        advertised = SAMPLE_RATE,
+                        "SCK audio rate differs from advertised RDPSND rate; \
+                         playback will drift (resampling not implemented)"
+                    );
+                }
+            }
+        }
+
         let Some(list) = sample.audio_buffer_list() else {
             continue;
         };
 
-        // SCK delivers float32 PCM, normally one buffer per channel (planar)
-        // OR one interleaved buffer. Normalize both to interleaved i16le.
-        let pcm = float_list_to_pcm16_interleaved(&list);
+        // SCK delivers float32 PCM as planar (one buffer per channel) or a
+        // single interleaved buffer. Normalize to interleaved 16-bit stereo so
+        // the payload always matches the advertised RDPSND format.
+        let pcm = float_list_to_pcm16_stereo(&list);
         if pcm.is_empty() {
             continue;
+        }
+
+        // 4 bytes per stereo i16 frame.
+        frames_sent += (pcm.len() / 4) as u64;
+        let now = std::time::Instant::now();
+        if now.duration_since(last_rate_log).as_secs() >= 2 {
+            let elapsed = now.duration_since(start_instant).as_secs_f64();
+            let effective_hz = frames_sent as f64 / elapsed;
+            debug!(effective_hz, frames_sent, elapsed, "audio production rate");
+            last_rate_log = now;
         }
 
         let ts_ms = start_instant.elapsed().as_millis() as u32;
@@ -182,59 +264,89 @@ async fn capture_loop(sender: Sender, running: Arc<AtomicBool>) -> anyhow::Resul
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn capture_loop(_sender: Sender, _running: Arc<AtomicBool>) -> anyhow::Result<()> {
+async fn capture_loop(
+    _sender: Sender,
+    _generation: Arc<AtomicU64>,
+    _my_gen: u64,
+) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Normalize an SCK audio buffer list to interleaved 16-bit little-endian
+/// stereo, regardless of whether SCK delivered planar or interleaved float32
+/// data and regardless of its channel count. A mono source is duplicated into
+/// both channels. The output must always be stereo: that is what the RDPSND
+/// `AudioFormat` advertises, and a channel-count mismatch makes the client
+/// play back at the wrong frame rate (audible as drift and lowered pitch).
 #[cfg(target_os = "macos")]
-fn float_list_to_pcm16_interleaved(list: &screencapturekit::cm::AudioBufferList) -> Vec<u8> {
-    let num_buffers = list.num_buffers();
-    if num_buffers == 0 {
+fn float_list_to_pcm16_stereo(list: &screencapturekit::cm::AudioBufferList) -> Vec<u8> {
+    let Some(first) = list.get(0) else {
         return Vec::new();
-    }
-    // Planar case: num_buffers == channels, each buffer one channel of floats.
-    // Interleaved case: num_buffers == 1, that buffer has channels*frames floats.
-    let mut planar: Vec<&[u8]> = Vec::with_capacity(num_buffers);
-    for i in 0..num_buffers {
-        if let Some(b) = list.get(i) {
-            planar.push(b.data());
-        }
-    }
-    if planar.is_empty() {
-        return Vec::new();
+    };
+
+    if list.num_buffers() >= 2 {
+        // Planar: one mono buffer per channel. Channel 0 -> L, channel 1 -> R.
+        let left = first.data();
+        let right = list.get(1).map(|b| b.data()).unwrap_or(left);
+        return planar_pair_to_stereo_i16(left, right);
     }
 
-    let bytes_per_sample = 4; // float32
-    if num_buffers == 1 {
-        // Already interleaved (or mono). Convert in order.
-        return floats_to_pcm16(planar[0]);
+    // Single buffer: interleaved across `number_channels`, or mono.
+    match first.number_channels {
+        0 | 1 => mono_to_stereo_i16(first.data()),
+        n => interleaved_to_stereo_i16(first.data(), n as usize),
     }
+}
 
-    // Planar: zip channels frame-by-frame.
-    let frames = planar[0].len() / bytes_per_sample;
-    let mut out = Vec::with_capacity(frames * num_buffers * 2);
-    for f in 0..frames {
-        for ch in &planar {
-            let off = f * bytes_per_sample;
-            if off + bytes_per_sample > ch.len() {
-                continue;
-            }
-            let bits = u32::from_le_bytes([ch[off], ch[off + 1], ch[off + 2], ch[off + 3]]);
-            let v = f32::from_bits(bits);
-            out.extend_from_slice(&float_to_i16(v).to_le_bytes());
-        }
+#[cfg(target_os = "macos")]
+fn read_f32_le(b: &[u8]) -> f32 {
+    f32::from_bits(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Duplicate each mono float32 sample into both stereo channels.
+#[cfg(target_os = "macos")]
+fn mono_to_stereo_i16(bytes: &[u8]) -> Vec<u8> {
+    // frames*4 bytes in (mono f32) -> frames*4 bytes out (stereo i16).
+    let mut out = Vec::with_capacity(bytes.len());
+    for chunk in bytes.chunks_exact(4) {
+        let s = float_to_i16(read_f32_le(chunk)).to_le_bytes();
+        out.extend_from_slice(&s);
+        out.extend_from_slice(&s);
     }
     out
 }
 
+/// Zip two planar float32 channels into interleaved stereo i16.
 #[cfg(target_os = "macos")]
-fn floats_to_pcm16(bytes: &[u8]) -> Vec<u8> {
-    let n = bytes.len() / 4;
-    let mut out = Vec::with_capacity(n * 2);
-    for chunk in bytes.chunks_exact(4) {
-        let bits = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let v = f32::from_bits(bits);
-        out.extend_from_slice(&float_to_i16(v).to_le_bytes());
+fn planar_pair_to_stereo_i16(left: &[u8], right: &[u8]) -> Vec<u8> {
+    let frames = left.len().min(right.len()) / 4;
+    let mut out = Vec::with_capacity(frames * 4);
+    for f in 0..frames {
+        let off = f * 4;
+        let l = float_to_i16(read_f32_le(&left[off..off + 4]));
+        let r = float_to_i16(read_f32_le(&right[off..off + 4]));
+        out.extend_from_slice(&l.to_le_bytes());
+        out.extend_from_slice(&r.to_le_bytes());
+    }
+    out
+}
+
+/// Take the first two channels of an interleaved float32 buffer as stereo i16.
+/// Only called with `channels >= 2`.
+#[cfg(target_os = "macos")]
+fn interleaved_to_stereo_i16(bytes: &[u8], channels: usize) -> Vec<u8> {
+    let frame_bytes = channels * 4;
+    if frame_bytes == 0 {
+        return Vec::new();
+    }
+    let frames = bytes.len() / frame_bytes;
+    let mut out = Vec::with_capacity(frames * 4);
+    for f in 0..frames {
+        let base = f * frame_bytes;
+        let l = float_to_i16(read_f32_le(&bytes[base..base + 4]));
+        let r = float_to_i16(read_f32_le(&bytes[base + 4..base + 8]));
+        out.extend_from_slice(&l.to_le_bytes());
+        out.extend_from_slice(&r.to_le_bytes());
     }
     out
 }

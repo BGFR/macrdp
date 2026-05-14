@@ -498,18 +498,24 @@ impl RdpServer {
         writer: &mut impl FramedWrite,
         user_channel_id: u16,
     ) -> Result<RunState> {
-        // Avoid wave messages queuing up and causing extra delay. When a batch
-        // carries more audio than we want buffered, drop the OLDEST waves and
-        // keep the most recent ones — playing stale audio just bakes the
-        // latency in permanently. ~4 frames is roughly low-hundreds of ms in
-        // regular setups. (Upstream 0.10.0 kept the oldest 4 instead, which
-        // turns any dispatch stall into a permanent audio offset.)
-        const WAVE_KEEP: usize = 4;
-        let mut wave_skip = events
+        // Cap a runaway audio backlog without dropping audio during normal
+        // operation. A dispatch stall (a video encode holding the server lock)
+        // only bunches a handful of waves per batch; dropping those starves
+        // the client's jitter buffer and makes it slow playback down (audible
+        // as drift + lowered pitch). 64 waves is ~1.3s of audio — far above
+        // normal bunching — so this only fires on a genuine multi-second
+        // backlog, and when it does it keeps the NEWEST waves, not the oldest.
+        // (Upstream 0.10.0 kept the oldest 4, turning any stall into permanent
+        // latency; 4 was also low enough to drop audio in normal operation.)
+        const WAVE_KEEP: usize = 64;
+        let wave_total = events
             .iter()
             .filter(|e| matches!(e, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(..))))
-            .count()
-            .saturating_sub(WAVE_KEEP);
+            .count();
+        let mut wave_skip = wave_total.saturating_sub(WAVE_KEEP);
+        if wave_skip > 0 {
+            debug!(wave_total, dropped = wave_skip, "audio backlog: dropping oldest waves");
+        }
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
             match event {
@@ -532,7 +538,6 @@ impl RdpServer {
                         RdpsndServerMessage::Wave(data, ts) => {
                             if wave_skip > 0 {
                                 wave_skip -= 1;
-                                debug!("Dropping stale wave");
                                 continue;
                             }
                             rdpsnd.wave(data, ts)

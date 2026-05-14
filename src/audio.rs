@@ -17,7 +17,10 @@ use ironrdp_server::{ServerEvent, ServerEventSender, SoundServerFactory};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-const SAMPLE_RATE: u32 = 44100;
+// ScreenCaptureKit only honors 8000/16000/24000/48000 Hz; asking for 44100
+// is silently served as 48000, so the advertised RDPSND format must match or
+// the client plays back slow/low-pitched and the buffer drifts unboundedly.
+const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: u16 = 2;
 const BITS_PER_SAMPLE: u16 = 16;
 
@@ -130,7 +133,9 @@ async fn capture_loop(sender: Sender, running: Arc<AtomicBool>) -> anyhow::Resul
         .with_sample_rate(SAMPLE_RATE as i32)
         .with_channel_count(CHANNELS as i32);
 
-    let stream = AsyncSCStream::new(&filter, &config, 8, SCStreamOutputType::Audio);
+    // Shallow queue: SCK buffers at most this many audio sample-buffers before
+    // we drain them. Lower = less latency, at the cost of dropouts under load.
+    let stream = AsyncSCStream::new(&filter, &config, 3, SCStreamOutputType::Audio);
     stream
         .start_capture()
         .map_err(|e| anyhow!("audio start_capture: {e:?}"))?;

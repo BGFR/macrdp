@@ -10,7 +10,7 @@ Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
 - Drive keyboard and mouse, including modifier keys, mouse buttons, and wheel.
 - See the real macOS cursor shape (I-beam, hand, etc.) overlaid by the client.
 - Copy/paste UTF-8 text and images (CF_DIB ↔ PNG) between Mac and remote.
-- Forward macOS system audio to the remote (RDPSND, 44.1 kHz stereo 16-bit PCM).
+- Forward macOS system audio to the remote (RDPSND, 48 kHz stereo 16-bit PCM).
 - NLA / CredSSP authentication — no more "type username before Connect" mstsc workaround.
 
 Not yet implemented: multi-monitor, codec negotiation (NSCodec / RemoteFx), non-US keyboard layouts, file clipboard, drive/printer redirection.

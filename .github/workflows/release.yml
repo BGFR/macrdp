@@ -78,8 +78,6 @@ jobs:
         include:
           - runner: macos-14   # Apple Silicon
             target: aarch64-apple-darwin
-          - runner: macos-13   # Intel
-            target: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -167,79 +165,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  universal:
-    name: universal binary
-    needs: build
-    runs-on: macos-14
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    steps:
-      - name: Harden runner
-        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
-        with:
-          egress-policy: audit
-
-      - name: Checkout (for LICENSE/README only)
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Download per-arch artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          pattern: macrdp-*
-
-      - name: Build universal binary
-        id: stage
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${{ inputs.tag || github.ref_name }}"
-          mkdir -p work
-          for arch in aarch64-apple-darwin x86_64-apple-darwin; do
-            NAME="macrdp-${VERSION}-${arch}"
-            tar -xzf "artifacts/${NAME}/${NAME}.tar.gz" -C work
-            # Verify the per-arch checksum before consuming the binary
-            (cd "artifacts/${NAME}" && shasum -a 256 -c "${NAME}.tar.gz.sha256")
-          done
-          NAME="macrdp-${VERSION}-universal-apple-darwin"
-          mkdir -p "dist/${NAME}"
-          lipo -create \
-            "work/macrdp-${VERSION}-aarch64-apple-darwin/macrdp" \
-            "work/macrdp-${VERSION}-x86_64-apple-darwin/macrdp" \
-            -output "dist/${NAME}/macrdp"
-          lipo -info "dist/${NAME}/macrdp"
-          codesign -s - --force --options runtime --timestamp=none "dist/${NAME}/macrdp"
-          cp LICENSE* README.md "dist/${NAME}/" 2>/dev/null || true
-          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
-          (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
-          echo "archive=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "checksum=dist/${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
-          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Attest build provenance (universal)
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
-        with:
-          subject-path: ${{ steps.stage.outputs.archive }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.stage.outputs.name }}
-          path: |
-            ${{ steps.stage.outputs.archive }}
-            ${{ steps.stage.outputs.checksum }}
-          if-no-files-found: error
-          retention-days: 7
-
   release:
     name: publish release
-    needs: [build, universal]
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

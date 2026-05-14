@@ -1,0 +1,265 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build, e.g. v0.5.1'
+        required: true
+
+# Default to read-only. Each job opts in to the writes it actually needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_RETRY: '10'
+  RUSTFLAGS: '-D warnings'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  # Cross-compile sanity check: the protocol layer is meant to stay buildable
+  # on Linux (stubs for the macOS-only modules). If this breaks, we'd rather
+  # fail fast before burning macOS runner minutes.
+  lint:
+    name: lint (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          toolchain: '1.84.0'
+          components: clippy,rustfmt
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (protocol layer compiles on Linux via stubs)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: lint
+    permissions:
+      contents: read
+      id-token: write       # for build provenance OIDC
+      attestations: write   # for actions/attest-build-provenance
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14   # Apple Silicon
+            target: aarch64-apple-darwin
+          - runner: macos-13   # Intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
+        with:
+          egress-policy: audit # macOS runners only support audit mode
+
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Verify Cargo.lock is committed
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f Cargo.lock || { echo "Cargo.lock missing — commit it for reproducible release builds"; exit 1; }
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          toolchain: '1.84.0'
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Ad-hoc codesign
+        # Without any signature the OS treats every rebuilt binary as a new
+        # identity and the user has to re-grant Screen Recording / Accessibility
+        # on every download. Ad-hoc (-s -) at least gives it a stable hash.
+        # For production: replace with Developer ID + notarytool.
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/macrdp"
+          codesign -s - --force --options runtime --timestamp=none "$BIN"
+          codesign -dv "$BIN"
+
+      - name: Stage artifact
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.tag || github.ref_name }}"
+          NAME="macrdp-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${{ matrix.target }}/release/macrdp" "dist/${NAME}/"
+          cp LICENSE* README.md "dist/${NAME}/" 2>/dev/null || true
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          echo "archive=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ steps.stage.outputs.archive }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.name }}
+          path: |
+            ${{ steps.stage.outputs.archive }}
+            ${{ steps.stage.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  universal:
+    name: universal binary
+    needs: build
+    runs-on: macos-14
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
+        with:
+          egress-policy: audit
+
+      - name: Checkout (for LICENSE/README only)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Download per-arch artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: macrdp-*
+
+      - name: Build universal binary
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.tag || github.ref_name }}"
+          mkdir -p work
+          for arch in aarch64-apple-darwin x86_64-apple-darwin; do
+            NAME="macrdp-${VERSION}-${arch}"
+            tar -xzf "artifacts/${NAME}/${NAME}.tar.gz" -C work
+            # Verify the per-arch checksum before consuming the binary
+            (cd "artifacts/${NAME}" && shasum -a 256 -c "${NAME}.tar.gz.sha256")
+          done
+          NAME="macrdp-${VERSION}-universal-apple-darwin"
+          mkdir -p "dist/${NAME}"
+          lipo -create \
+            "work/macrdp-${VERSION}-aarch64-apple-darwin/macrdp" \
+            "work/macrdp-${VERSION}-x86_64-apple-darwin/macrdp" \
+            -output "dist/${NAME}/macrdp"
+          lipo -info "dist/${NAME}/macrdp"
+          codesign -s - --force --options runtime --timestamp=none "dist/${NAME}/macrdp"
+          cp LICENSE* README.md "dist/${NAME}/" 2>/dev/null || true
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          echo "archive=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance (universal)
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ steps.stage.outputs.archive }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.name }}
+          path: |
+            ${{ steps.stage.outputs.archive }}
+            ${{ steps.stage.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish release
+    needs: [build, universal]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # only this job writes to the repo (creates a Release)
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9ca718d3bf646d6534007c269a635b3e54cadf99 # v2.19.2
+        with:
+          egress-policy: audit
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: macrdp-*
+
+      - name: Aggregate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find artifacts -type f -name '*.tar.gz' -exec cp {} out/ \;
+          find artifacts -type f -name '*.tar.gz.sha256' -exec cp {} out/ \;
+          (cd out && cat *.tar.gz.sha256 > SHA256SUMS && rm *.tar.gz.sha256)
+          cat out/SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@aec2ec56f94eb8180ceec724245f64ef008b89f5 # v2.4.0
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          draft: true                 # human reviews before publishing
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            out/*.tar.gz
+            out/SHA256SUMS

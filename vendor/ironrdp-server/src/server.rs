@@ -290,7 +290,7 @@ impl RdpServer {
             local_addr: None,
             audio_waves_sent: 0,
             audio_waves_confirmed: 0,
-            audio_blind_drop_active: false,
+            audio_blind_drop_active: true,
             audio_blind_drop_counter: 0,
         }
     }
@@ -324,7 +324,7 @@ impl RdpServer {
             // do because the deficit was from a closed socket.
             self.audio_waves_sent = 0;
             self.audio_waves_confirmed = 0;
-            self.audio_blind_drop_active = false;
+            self.audio_blind_drop_active = true;
             self.audio_blind_drop_counter = 0;
         }
 
@@ -542,17 +542,12 @@ impl RdpServer {
         // drop new waves once the client is more than this many waves behind.
         // ~32 waves is roughly half a second of audio.
         const MAX_OUTSTANDING_WAVES: u64 = 32;
-        // Fallback heuristic for clients whose WaveConfirm count over-counts
-        // our sends (e.g. mstsc emits two confirm sequences per send). When
-        // detected, the send/confirm cap can't bound latency, so instead drop
-        // a fixed fraction of waves to compensate for the empirical over-feed.
-        // 5 = drop 1 in 5 = 20%, matching the ~20% backlog growth measured on
-        // mstsc.
+        // Unconditional blind drop to compensate for the ~20% over-feed
+        // observed across clients (mstsc, Microsoft Remote Desktop on Mac).
+        // 5 = drop 1 in 5 = 20%. Coarser than the precise send/confirm cap
+        // but doesn't depend on WaveConfirm counts being honest, which they
+        // aren't on at least one client we care about.
         const BLIND_DROP_MODULO: u64 = 5;
-        // Trigger threshold for the blind-drop fallback: confirms exceeding
-        // sends by more than this is impossible if counting is honest, so
-        // treat it as evidence the counter can't be trusted.
-        const OVER_COUNT_THRESHOLD: u64 = 8;
         let wave_total = events
             .iter()
             .filter(|e| matches!(e, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(..))))
@@ -565,24 +560,9 @@ impl RdpServer {
         // can't run concurrently, both run under the same server lock.
         let waves_confirmed = self.audio_waves_confirmed;
         let mut waves_sent = self.audio_waves_sent;
-        let mut blind_drop_active = self.audio_blind_drop_active;
+        let blind_drop_active = self.audio_blind_drop_active;
         let mut blind_drop_counter = self.audio_blind_drop_counter;
         let mut waves_dropped_behind = 0u64;
-
-        // One-time latch: if the client has over-confirmed by a meaningful
-        // amount, the precise cap is broken on this client — switch to the
-        // blind-drop fallback for the rest of the session.
-        if !blind_drop_active
-            && waves_confirmed > waves_sent.saturating_add(OVER_COUNT_THRESHOLD)
-        {
-            blind_drop_active = true;
-            debug!(
-                waves_sent,
-                waves_confirmed,
-                "audio: client confirm count exceeds send count — \
-                 enabling blind-drop fallback to bound latency"
-            );
-        }
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
             match event {

@@ -53,6 +53,10 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
 
 `RUST_LOG=debug` for verbose logging.
 
+## Audio
+
+System audio rides over the RDPSND virtual channel as 16-bit stereo PCM at **44.1 kHz**. ScreenCaptureKit only supports 8 / 16 / 24 / 48 kHz, so the capture loop captures at 48 kHz and resamples to 44.1 with [`rubato`](https://github.com/HEnquist/rubato) before sending. 44.1 matches the native rate of most Windows audio endpoints, which avoids the client-side resampling drift that otherwise accumulates into multi-second audio backlogs. A send-vs-`WaveConfirm` sliding-window cap in the vendored `ironrdp-server` bounds end-to-end latency as a safety net, and a generation counter on the audio factory makes sure a client reconnect can't leave a second capture loop feeding the channel.
+
 ## Reason why this was made
 This was done to scratch an itch.  There are practically no active open source RDP servers for MacOS.  The closest project that does this functionality is xrdp; however this program only runs on Linux/Unix machines, and has no homebrew equivalent on Macs. Done in a few hours with the help of Claude and runs pretty well.
 

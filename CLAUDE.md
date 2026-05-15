@@ -34,15 +34,14 @@ src/audio.rs      RDPSND ← second SCK stream with system-audio capture,
                   rubato 48→44.1 kHz resample, latency-bounded
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
-vendor/ironrdp-server/    Local fork of ironrdp-server, pulled in via
-                          [patch.crates-io] in Cargo.toml. Patches
-                          dispatch_server_events to: (a) keep the NEWEST
-                          queued waves on a per-batch overflow instead of
-                          the oldest (upstream 0.10.0 keeps oldest, which
-                          bakes any dispatch stall into permanent audio
-                          latency), and (b) bound end-to-end audio latency
-                          via a send-vs-WaveConfirm sliding window. Drop
-                          when upstream lands an equivalent fix.
+vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in
+                          via [patch.crates-io] in Cargo.toml. Single
+                          targeted fix in dispatch_server_events: keep the
+                          NEWEST queued waves on per-batch overflow instead
+                          of the oldest (upstream 0.10.0 keeps oldest, which
+                          bakes any dispatch stall into a permanent audio
+                          offset). Submitted upstream — delete this vendor
+                          dir once it lands in a released version.
 ```
 
 Cross-cutting:

@@ -221,19 +221,6 @@ pub struct RdpServer {
     ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
     creds: Option<Credentials>,
     local_addr: Option<SocketAddr>,
-    // RDPSND latency cap: count of wave PDUs sent vs WaveConfirms received from
-    // the client. When (sent - confirmed) grows past a bound the client has
-    // fallen behind, so new waves are dropped to keep audio latency bounded
-    // instead of letting a backlog accumulate.
-    audio_waves_sent: u64,
-    audio_waves_confirmed: u64,
-    // Some clients (notably mstsc) emit more WaveConfirms than the server
-    // issued waves — i.e. `confirmed > sent`, which is otherwise impossible.
-    // When we detect that, the precise send/confirm cap above is unusable
-    // (saturating_sub makes it inactive), and we fall back to dropping a
-    // fixed fraction of waves to compensate for an empirically ~20% over-feed.
-    audio_blind_drop_active: bool,
-    audio_blind_drop_counter: u64,
 }
 
 #[derive(Debug)]
@@ -288,10 +275,6 @@ impl RdpServer {
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
             creds: None,
             local_addr: None,
-            audio_waves_sent: 0,
-            audio_waves_confirmed: 0,
-            audio_blind_drop_active: false,
-            audio_blind_drop_counter: 0,
         }
     }
 
@@ -316,15 +299,6 @@ impl RdpServer {
             let backend = factory.build_backend();
 
             acceptor.attach_static_channel(RdpsndServer::new(backend));
-            // Reset the latency-cap counters per connection. Without this, a
-            // previous session that ended with sent > confirmed leaves the
-            // next connection starting "in debt", and the cap drops audio
-            // from the first wave until confirms catch up — which they never
-            // do because the deficit was from a closed socket.
-            self.audio_waves_sent = 0;
-            self.audio_waves_confirmed = 0;
-            self.audio_blind_drop_active = false;
-            self.audio_blind_drop_counter = 0;
         }
 
         let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
@@ -534,20 +508,6 @@ impl RdpServer {
         // (Upstream 0.10.0 kept the oldest 4, turning any stall into permanent
         // latency; 4 was also low enough to drop audio in normal operation.)
         const WAVE_KEEP: usize = 64;
-        // End-to-end audio latency cap. The per-batch WAVE_KEEP above only
-        // bounds the backlog inside our event channel; it can't see a backlog
-        // that builds up downstream (the client consuming/playing slower than
-        // we feed it). So also track waves sent vs WaveConfirms received and
-        // drop new waves once the client is more than this many waves behind.
-        // ~32 waves is roughly half a second of audio.
-        const MAX_OUTSTANDING_WAVES: u64 = 32;
-        // Optional blind-drop fallback (1 in N) for clients whose WaveConfirm
-        // counts can't be trusted. Disabled by default — capture-side
-        // resampling to 44.1 kHz already prevents over-feed on the clients
-        // we've tested, so dropping any audio is pure quality loss. Kept as a
-        // knob via `audio_blind_drop_active` if a future client genuinely
-        // needs it.
-        const BLIND_DROP_MODULO: u64 = 5;
         let wave_total = events
             .iter()
             .filter(|e| matches!(e, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(..))))
@@ -556,13 +516,6 @@ impl RdpServer {
         if wave_skip > 0 {
             debug!(wave_total, dropped = wave_skip, "audio backlog: dropping oldest waves");
         }
-        // Snapshot the confirm count once — handle_x224 (which updates it)
-        // can't run concurrently, both run under the same server lock.
-        let waves_confirmed = self.audio_waves_confirmed;
-        let mut waves_sent = self.audio_waves_sent;
-        let blind_drop_active = self.audio_blind_drop_active;
-        let mut blind_drop_counter = self.audio_blind_drop_counter;
-        let mut waves_dropped_behind = 0u64;
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
             match event {
@@ -587,34 +540,6 @@ impl RdpServer {
                                 wave_skip -= 1;
                                 continue;
                             }
-                            // Two complementary drop policies:
-                            // * Blind-drop mode (mstsc-style clients that
-                            //   over-count confirms): drop 1 in
-                            //   BLIND_DROP_MODULO unconditionally to
-                            //   compensate for ~20% over-feed.
-                            // * Precise mode: drop only when (sent - confirmed)
-                            //   exceeds MAX_OUTSTANDING_WAVES. Gated on
-                            //   `waves_confirmed > 0` so audio still plays if
-                            //   the client never confirms; `saturating_sub`
-                            //   keeps an over-count from wrapping the gap and
-                            //   silencing audio forever.
-                            if blind_drop_active {
-                                blind_drop_counter = blind_drop_counter.wrapping_add(1);
-                                if blind_drop_counter % BLIND_DROP_MODULO == 0 {
-                                    waves_dropped_behind += 1;
-                                    continue;
-                                }
-                            } else {
-                                let outstanding =
-                                    waves_sent.saturating_sub(waves_confirmed);
-                                if waves_confirmed > 0
-                                    && outstanding >= MAX_OUTSTANDING_WAVES
-                                {
-                                    waves_dropped_behind += 1;
-                                    continue;
-                                }
-                            }
-                            waves_sent = waves_sent.wrapping_add(1);
                             rdpsnd.wave(data, ts)
                         }
                         RdpsndServerMessage::SetVolume { left, right } => rdpsnd.set_volume(left, right),
@@ -653,18 +578,6 @@ impl RdpServer {
                     writer.write_all(&data).await?;
                 }
             }
-        }
-
-        self.audio_waves_sent = waves_sent;
-        self.audio_blind_drop_active = blind_drop_active;
-        self.audio_blind_drop_counter = blind_drop_counter;
-        if waves_dropped_behind > 0 {
-            debug!(
-                dropped = waves_dropped_behind,
-                outstanding = waves_sent.saturating_sub(waves_confirmed),
-                blind_drop = blind_drop_active,
-                "audio latency cap: dropped waves"
-            );
         }
 
         Ok(RunState::Continue)
@@ -1001,16 +914,6 @@ impl RdpServer {
                 debug!(?data, "McsMessage::SendDataRequest");
                 if data.channel_id == io_channel_id {
                     return self.handle_io_channel_data(data).await;
-                }
-
-                // Count RDPSND WaveConfirms (SNDC_WAVECONFIRM, msgType 0x05) so
-                // dispatch_server_events can bound audio latency. user_data is
-                // CHANNEL_PDU_HEADER (8 bytes) followed by the rdpsnd PDU, whose
-                // first byte is the message type.
-                if self.get_channel_id_by_type::<RdpsndServer>() == Some(data.channel_id)
-                    && data.user_data.get(8) == Some(&0x05)
-                {
-                    self.audio_waves_confirmed = self.audio_waves_confirmed.wrapping_add(1);
                 }
 
                 if let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) {

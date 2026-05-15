@@ -308,6 +308,13 @@ impl RdpServer {
 
             debug!("rdpsnd lifecycle: attach_channels (attaching RdpsndServer)");
             acceptor.attach_static_channel(RdpsndServer::new(backend));
+            // Reset the latency-cap counters per connection. Without this, a
+            // previous session that ended with sent > confirmed leaves the
+            // next connection starting "in debt", and the cap drops audio
+            // from the first wave until confirms catch up — which they never
+            // do because the deficit was from a closed socket.
+            self.audio_waves_sent = 0;
+            self.audio_waves_confirmed = 0;
         }
 
         let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
@@ -564,7 +571,20 @@ impl RdpServer {
                             // Drop if the client has fallen too far behind —
                             // keeps audio latency bounded instead of letting a
                             // downstream backlog grow without limit.
-                            if waves_sent.wrapping_sub(waves_confirmed) >= MAX_OUTSTANDING_WAVES {
+                            //
+                            // Safety properties:
+                            // * `waves_confirmed > 0`: if no confirms ever
+                            //   arrive (counter wired wrong, or client doesn't
+                            //   send them), don't silence audio — fall back to
+                            //   the WAVE_KEEP per-batch cap.
+                            // * `saturating_sub`: if the confirm count gets
+                            //   *ahead* of the send count (e.g. mstsc emits
+                            //   more confirms than we issued waves, which we
+                            //   actually observe), the gap reads as 0 rather
+                            //   than wrapping to ~u64::MAX and dropping every
+                            //   subsequent wave forever.
+                            let outstanding = waves_sent.saturating_sub(waves_confirmed);
+                            if waves_confirmed > 0 && outstanding >= MAX_OUTSTANDING_WAVES {
                                 waves_dropped_behind += 1;
                                 continue;
                             }
@@ -613,7 +633,7 @@ impl RdpServer {
         if waves_dropped_behind > 0 {
             debug!(
                 dropped = waves_dropped_behind,
-                outstanding = waves_sent.wrapping_sub(waves_confirmed),
+                outstanding = waves_sent.saturating_sub(waves_confirmed),
                 "audio latency cap: dropped waves, client behind"
             );
         }
@@ -961,6 +981,9 @@ impl RdpServer {
                 if self.get_channel_id_by_type::<RdpsndServer>() == Some(data.channel_id)
                     && data.user_data.get(8) == Some(&0x05)
                 {
+                    if self.audio_waves_confirmed == 0 {
+                        debug!(channel_id = data.channel_id, "audio latency cap: first WaveConfirm seen");
+                    }
                     self.audio_waves_confirmed = self.audio_waves_confirmed.wrapping_add(1);
                 }
 

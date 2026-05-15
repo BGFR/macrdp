@@ -20,6 +20,7 @@ use crate::{ColorPointer, DisplayUpdate, Framebuffer, RGBAPointer};
 
 mod bitmap;
 mod fast_path;
+mod nscodec;
 pub(crate) mod rfx;
 
 pub(crate) use fast_path::*;
@@ -147,7 +148,7 @@ impl UpdateEncoder {
                 BitmapUpdater::None(_) => "none (raw surface bits)",
                 BitmapUpdater::Bitmap(_) => "legacy bitmap (no SurfaceCommands)",
                 BitmapUpdater::RemoteFx(_) => "RemoteFx",
-                BitmapUpdater::NsCodec(_) => "NSCodec (stub — encoder not yet implemented)",
+                BitmapUpdater::NsCodec(_) => "NSCodec",
                 #[cfg(feature = "qoi")]
                 BitmapUpdater::Qoi(_) => "QOI",
                 #[cfg(feature = "qoiz")]
@@ -523,18 +524,18 @@ impl BitmapUpdateHandler for RemoteFxHandler {
     }
 }
 
-/// NSCodec encoder stub (Phase 1 of MS-RDPNSC implementation).
+/// MS-RDPNSC encoder handler. The actual codec lives in
+/// `encoder/nscodec.rs`; this struct just plumbs encoded bytes through
+/// `set_surface` as a `SurfaceBitsPdu`.
 ///
-/// The real encoder lands in Phase 2. For now, this exists only to confirm
-/// negotiation works: clients (notably Microsoft Remote Desktop on macOS) that
-/// only advertise NSCodec will land on this handler, see the diagnostic
-/// `"video encoder negotiated"` info log, and then the connection will error
-/// on the first frame because `handle()` is intentionally unimplemented.
+/// Color-loss-level (CLL) **must match** what was advertised to the client in
+/// the `NsCodec` capability (currently 3, set in `src/main.rs::bitmap_codecs`).
 #[derive(Clone, Debug)]
 struct NsCodecHandler {
-    #[allow(dead_code)] // wired up in Phase 2
     codec_id: u8,
 }
+
+const NSCODEC_COLOR_LOSS_LEVEL: u8 = 3;
 
 impl NsCodecHandler {
     fn new(codec_id: u8) -> Self {
@@ -543,11 +544,9 @@ impl NsCodecHandler {
 }
 
 impl BitmapUpdateHandler for NsCodecHandler {
-    fn handle(&mut self, _bitmap: &BitmapUpdate) -> Result<UpdateFragmenter> {
-        anyhow::bail!(
-            "NSCodec encoder not yet implemented (Phase 1 stub); \
-             negotiation confirmed but no frames will encode"
-        );
+    fn handle(&mut self, bitmap: &BitmapUpdate) -> Result<UpdateFragmenter> {
+        let encoded = nscodec::encode(bitmap, NSCODEC_COLOR_LOSS_LEVEL);
+        set_surface(bitmap, self.codec_id, &encoded)
     }
 }
 

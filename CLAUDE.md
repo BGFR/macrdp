@@ -30,14 +30,28 @@ src/capture.rs    ScreenCaptureKit → BgrA32 BitmapUpdate, dirty-rect driven
 src/cursor.rs     NSCursor → RGBAPointer, hashed for change detection
 src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI)
 src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB)
-src/audio.rs      RDPSND ← second SCK stream with system-audio capture
+src/audio.rs      RDPSND ← second SCK stream with system-audio capture,
+                  rubato 48→44.1 kHz resample, latency-bounded
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
+
+vendor/ironrdp-server/    Local fork of ironrdp-server, pulled in via
+                          [patch.crates-io] in Cargo.toml. Patches
+                          dispatch_server_events to: (a) keep the NEWEST
+                          queued waves on a per-batch overflow instead of
+                          the oldest (upstream 0.10.0 keeps oldest, which
+                          bakes any dispatch stall into permanent audio
+                          latency), and (b) bound end-to-end audio latency
+                          via a send-vs-WaveConfirm sliding window. Drop
+                          when upstream lands an equivalent fix.
 ```
 
 Cross-cutting:
 - **TLS** terminates inside the acceptor; `rustls` with a self-signed cert at `~/Library/Application Support/macrdp/{cert,key}.pem` (generated on first run, persisted thereafter for stable client TOFU). `RdpServerSecurity::Hybrid` is used so the negotiation response advertises CredSSP — the public-key bytes handed to ironrdp are the raw `subjectPublicKey` BIT STRING from the X.509 cert (not the SPKI sequence, not the keypair-derived bytes), since that's what sspi hashes client-side.
 - **Auth** at startup: `--username` (defaults to `$USER`) + interactive password prompt → PAM `checkpw` service → set as the static credential ironrdp_server checks per-connection. `--skip-auth` bypasses for dev.
 - **Session model** — v0 attaches to the console session of the logged-in user (single session). Multi-session / headless virtual displays would need a private framebuffer and are out of scope.
+- **Signal handling** — `main.rs` spawns a task that awaits SIGINT/SIGTERM and `std::process::exit(0)`s. Without it, ScreenCaptureKit's framework threads can leave the process unkillable by Ctrl-C once an SCStream is active.
+- **Audio rate** — SCK only supports 8/16/24/48 kHz, so capture is at 48 kHz, but `src/audio.rs` resamples to 44.1 kHz via `rubato` before sending. 44.1 matches the native rate of most Windows audio endpoints, so the client plays directly without internal resampling — which used to cause a ~20% sustained over-feed and multi-second audio backlogs on mstsc. The advertised RDPSND `AudioFormat` is therefore 44.1 kHz / 2 ch / 16-bit.
+- **Single capture loop** — `MacRdpsnd` (the audio factory) holds an `Arc<AtomicU64>` generation counter shared with every backend it builds. Each `start()` claims a fresh generation; older capture loops observe the bump on their next iteration and exit. Without this, an mstsc cert-prompt reconnect leaves the first capture loop running while the second starts, both feeding the shared event channel → ~2× audio reaching the client.
 
 When adding a feature, locate it in one of those modules first; if it spans them (e.g., a new virtual channel), it belongs in a dedicated module alongside `clipboard.rs`, driven by `ironrdp_server`'s factory traits.
 

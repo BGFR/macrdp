@@ -53,14 +53,12 @@ impl MacRdpsnd {
 
 impl ServerEventSender for MacRdpsnd {
     fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
-        debug!("rdpsnd lifecycle: set_sender (event channel (re)wired)");
         *self.sender.lock().unwrap() = Some(sender);
     }
 }
 
 impl SoundServerFactory for MacRdpsnd {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
-        debug!("rdpsnd lifecycle: build_backend (new audio backend)");
         Box::new(MacRdpsndBackend {
             sender: self.sender.clone(),
             generation: self.generation.clone(),
@@ -131,10 +129,6 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         // connection sees the bump on its next iteration and exits, so it
         // never feeds the shared event channel alongside this one.
         self.my_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        debug!(
-            my_gen = self.my_gen,
-            "rdpsnd lifecycle: start (spawning capture loop)"
-        );
 
         let sender = self.sender.clone();
         let generation = self.generation.clone();
@@ -148,28 +142,14 @@ impl RdpsndServerHandler for MacRdpsndBackend {
     }
 
     fn stop(&mut self) {
-        let superseded = self
-            .generation
-            .compare_exchange(
-                self.my_gen,
-                self.my_gen + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_err();
         // Retire our capture loop, but only if it is still the active one — a
         // newer connection may have already superseded us.
-        debug!(
-            my_gen = self.my_gen,
-            already_superseded = superseded,
-            "rdpsnd lifecycle: stop (retiring capture loop)"
+        let _ = self.generation.compare_exchange(
+            self.my_gen,
+            self.my_gen + 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
         );
-    }
-}
-
-impl Drop for MacRdpsndBackend {
-    fn drop(&mut self) {
-        debug!(my_gen = self.my_gen, "rdpsnd lifecycle: backend dropped");
     }
 }
 
@@ -231,11 +211,6 @@ async fn capture_loop(
 
     let start_instant = std::time::Instant::now();
     let mut format_logged = false;
-    // Diagnostic: measure how many stereo frames we actually hand off per
-    // wall-clock second. If this isn't ~SAMPLE_RATE, we're over/under-feeding
-    // the client and that is the drift (and, if over, the lowered pitch).
-    let mut frames_sent: u64 = 0;
-    let mut last_rate_log = start_instant;
 
     loop {
         if generation.load(Ordering::SeqCst) != my_gen {
@@ -293,16 +268,6 @@ async fn capture_loop(
             let pcm = planar_f32_to_interleaved_i16(&resampled);
             if pcm.is_empty() {
                 continue;
-            }
-
-            // 4 bytes per stereo i16 frame.
-            frames_sent += (pcm.len() / 4) as u64;
-            let now = std::time::Instant::now();
-            if now.duration_since(last_rate_log).as_secs() >= 2 {
-                let elapsed = now.duration_since(start_instant).as_secs_f64();
-                let effective_hz = frames_sent as f64 / elapsed;
-                debug!(effective_hz, frames_sent, elapsed, "audio production rate");
-                last_rate_log = now;
             }
 
             let ts_ms = start_instant.elapsed().as_millis() as u32;

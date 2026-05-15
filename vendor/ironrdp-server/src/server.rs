@@ -315,7 +315,6 @@ impl RdpServer {
         if let Some(factory) = self.sound_factory.as_deref() {
             let backend = factory.build_backend();
 
-            debug!("rdpsnd lifecycle: attach_channels (attaching RdpsndServer)");
             acceptor.attach_static_channel(RdpsndServer::new(backend));
             // Reset the latency-cap counters per connection. Without this, a
             // previous session that ended with sent > confirmed leaves the
@@ -1011,9 +1010,6 @@ impl RdpServer {
                 if self.get_channel_id_by_type::<RdpsndServer>() == Some(data.channel_id)
                     && data.user_data.get(8) == Some(&0x05)
                 {
-                    if self.audio_waves_confirmed == 0 {
-                        debug!(channel_id = data.channel_id, "audio latency cap: first WaveConfirm seen");
-                    }
                     self.audio_waves_confirmed = self.audio_waves_confirmed.wrapping_add(1);
                 }
 

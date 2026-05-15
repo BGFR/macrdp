@@ -221,6 +221,12 @@ pub struct RdpServer {
     ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
     creds: Option<Credentials>,
     local_addr: Option<SocketAddr>,
+    // RDPSND latency cap: count of wave PDUs sent vs WaveConfirms received from
+    // the client. When (sent - confirmed) grows past a bound the client has
+    // fallen behind, so new waves are dropped to keep audio latency bounded
+    // instead of letting a backlog accumulate.
+    audio_waves_sent: u64,
+    audio_waves_confirmed: u64,
 }
 
 #[derive(Debug)]
@@ -275,6 +281,8 @@ impl RdpServer {
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
             creds: None,
             local_addr: None,
+            audio_waves_sent: 0,
+            audio_waves_confirmed: 0,
         }
     }
 
@@ -298,6 +306,7 @@ impl RdpServer {
         if let Some(factory) = self.sound_factory.as_deref() {
             let backend = factory.build_backend();
 
+            debug!("rdpsnd lifecycle: attach_channels (attaching RdpsndServer)");
             acceptor.attach_static_channel(RdpsndServer::new(backend));
         }
 
@@ -508,6 +517,13 @@ impl RdpServer {
         // (Upstream 0.10.0 kept the oldest 4, turning any stall into permanent
         // latency; 4 was also low enough to drop audio in normal operation.)
         const WAVE_KEEP: usize = 64;
+        // End-to-end audio latency cap. The per-batch WAVE_KEEP above only
+        // bounds the backlog inside our event channel; it can't see a backlog
+        // that builds up downstream (the client consuming/playing slower than
+        // we feed it). So also track waves sent vs WaveConfirms received and
+        // drop new waves once the client is more than this many waves behind.
+        // ~32 waves is roughly half a second of audio.
+        const MAX_OUTSTANDING_WAVES: u64 = 32;
         let wave_total = events
             .iter()
             .filter(|e| matches!(e, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(..))))
@@ -516,6 +532,11 @@ impl RdpServer {
         if wave_skip > 0 {
             debug!(wave_total, dropped = wave_skip, "audio backlog: dropping oldest waves");
         }
+        // Snapshot the confirm count once — handle_x224 (which updates it)
+        // can't run concurrently, both run under the same server lock.
+        let waves_confirmed = self.audio_waves_confirmed;
+        let mut waves_sent = self.audio_waves_sent;
+        let mut waves_dropped_behind = 0u64;
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
             match event {
@@ -540,6 +561,14 @@ impl RdpServer {
                                 wave_skip -= 1;
                                 continue;
                             }
+                            // Drop if the client has fallen too far behind —
+                            // keeps audio latency bounded instead of letting a
+                            // downstream backlog grow without limit.
+                            if waves_sent.wrapping_sub(waves_confirmed) >= MAX_OUTSTANDING_WAVES {
+                                waves_dropped_behind += 1;
+                                continue;
+                            }
+                            waves_sent = waves_sent.wrapping_add(1);
                             rdpsnd.wave(data, ts)
                         }
                         RdpsndServerMessage::SetVolume { left, right } => rdpsnd.set_volume(left, right),
@@ -578,6 +607,15 @@ impl RdpServer {
                     writer.write_all(&data).await?;
                 }
             }
+        }
+
+        self.audio_waves_sent = waves_sent;
+        if waves_dropped_behind > 0 {
+            debug!(
+                dropped = waves_dropped_behind,
+                outstanding = waves_sent.wrapping_sub(waves_confirmed),
+                "audio latency cap: dropped waves, client behind"
+            );
         }
 
         Ok(RunState::Continue)
@@ -914,6 +952,16 @@ impl RdpServer {
                 debug!(?data, "McsMessage::SendDataRequest");
                 if data.channel_id == io_channel_id {
                     return self.handle_io_channel_data(data).await;
+                }
+
+                // Count RDPSND WaveConfirms (SNDC_WAVECONFIRM, msgType 0x05) so
+                // dispatch_server_events can bound audio latency. user_data is
+                // CHANNEL_PDU_HEADER (8 bytes) followed by the rdpsnd PDU, whose
+                // first byte is the message type.
+                if self.get_channel_id_by_type::<RdpsndServer>() == Some(data.channel_id)
+                    && data.user_data.get(8) == Some(&0x05)
+                {
+                    self.audio_waves_confirmed = self.audio_waves_confirmed.wrapping_add(1);
                 }
 
                 if let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) {

@@ -49,12 +49,14 @@ impl MacRdpsnd {
 
 impl ServerEventSender for MacRdpsnd {
     fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
+        debug!("rdpsnd lifecycle: set_sender (event channel (re)wired)");
         *self.sender.lock().unwrap() = Some(sender);
     }
 }
 
 impl SoundServerFactory for MacRdpsnd {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
+        debug!("rdpsnd lifecycle: build_backend (new audio backend)");
         Box::new(MacRdpsndBackend {
             sender: self.sender.clone(),
             generation: self.generation.clone(),
@@ -125,6 +127,10 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         // connection sees the bump on its next iteration and exits, so it
         // never feeds the shared event channel alongside this one.
         self.my_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        debug!(
+            my_gen = self.my_gen,
+            "rdpsnd lifecycle: start (spawning capture loop)"
+        );
 
         let sender = self.sender.clone();
         let generation = self.generation.clone();
@@ -138,14 +144,28 @@ impl RdpsndServerHandler for MacRdpsndBackend {
     }
 
     fn stop(&mut self) {
+        let superseded = self
+            .generation
+            .compare_exchange(
+                self.my_gen,
+                self.my_gen + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err();
         // Retire our capture loop, but only if it is still the active one — a
         // newer connection may have already superseded us.
-        let _ = self.generation.compare_exchange(
-            self.my_gen,
-            self.my_gen + 1,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+        debug!(
+            my_gen = self.my_gen,
+            already_superseded = superseded,
+            "rdpsnd lifecycle: stop (retiring capture loop)"
         );
+    }
+}
+
+impl Drop for MacRdpsndBackend {
+    fn drop(&mut self) {
+        debug!(my_gen = self.my_gen, "rdpsnd lifecycle: backend dropped");
     }
 }
 

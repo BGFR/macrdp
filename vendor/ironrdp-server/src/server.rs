@@ -227,6 +227,13 @@ pub struct RdpServer {
     // instead of letting a backlog accumulate.
     audio_waves_sent: u64,
     audio_waves_confirmed: u64,
+    // Some clients (notably mstsc) emit more WaveConfirms than the server
+    // issued waves — i.e. `confirmed > sent`, which is otherwise impossible.
+    // When we detect that, the precise send/confirm cap above is unusable
+    // (saturating_sub makes it inactive), and we fall back to dropping a
+    // fixed fraction of waves to compensate for an empirically ~20% over-feed.
+    audio_blind_drop_active: bool,
+    audio_blind_drop_counter: u64,
 }
 
 #[derive(Debug)]
@@ -283,6 +290,8 @@ impl RdpServer {
             local_addr: None,
             audio_waves_sent: 0,
             audio_waves_confirmed: 0,
+            audio_blind_drop_active: false,
+            audio_blind_drop_counter: 0,
         }
     }
 
@@ -315,6 +324,8 @@ impl RdpServer {
             // do because the deficit was from a closed socket.
             self.audio_waves_sent = 0;
             self.audio_waves_confirmed = 0;
+            self.audio_blind_drop_active = false;
+            self.audio_blind_drop_counter = 0;
         }
 
         let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
@@ -531,6 +542,17 @@ impl RdpServer {
         // drop new waves once the client is more than this many waves behind.
         // ~32 waves is roughly half a second of audio.
         const MAX_OUTSTANDING_WAVES: u64 = 32;
+        // Fallback heuristic for clients whose WaveConfirm count over-counts
+        // our sends (e.g. mstsc emits two confirm sequences per send). When
+        // detected, the send/confirm cap can't bound latency, so instead drop
+        // a fixed fraction of waves to compensate for the empirical over-feed.
+        // 5 = drop 1 in 5 = 20%, matching the ~20% backlog growth measured on
+        // mstsc.
+        const BLIND_DROP_MODULO: u64 = 5;
+        // Trigger threshold for the blind-drop fallback: confirms exceeding
+        // sends by more than this is impossible if counting is honest, so
+        // treat it as evidence the counter can't be trusted.
+        const OVER_COUNT_THRESHOLD: u64 = 8;
         let wave_total = events
             .iter()
             .filter(|e| matches!(e, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(..))))
@@ -543,7 +565,24 @@ impl RdpServer {
         // can't run concurrently, both run under the same server lock.
         let waves_confirmed = self.audio_waves_confirmed;
         let mut waves_sent = self.audio_waves_sent;
+        let mut blind_drop_active = self.audio_blind_drop_active;
+        let mut blind_drop_counter = self.audio_blind_drop_counter;
         let mut waves_dropped_behind = 0u64;
+
+        // One-time latch: if the client has over-confirmed by a meaningful
+        // amount, the precise cap is broken on this client — switch to the
+        // blind-drop fallback for the rest of the session.
+        if !blind_drop_active
+            && waves_confirmed > waves_sent.saturating_add(OVER_COUNT_THRESHOLD)
+        {
+            blind_drop_active = true;
+            debug!(
+                waves_sent,
+                waves_confirmed,
+                "audio: client confirm count exceeds send count — \
+                 enabling blind-drop fallback to bound latency"
+            );
+        }
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
             match event {
@@ -568,25 +607,32 @@ impl RdpServer {
                                 wave_skip -= 1;
                                 continue;
                             }
-                            // Drop if the client has fallen too far behind —
-                            // keeps audio latency bounded instead of letting a
-                            // downstream backlog grow without limit.
-                            //
-                            // Safety properties:
-                            // * `waves_confirmed > 0`: if no confirms ever
-                            //   arrive (counter wired wrong, or client doesn't
-                            //   send them), don't silence audio — fall back to
-                            //   the WAVE_KEEP per-batch cap.
-                            // * `saturating_sub`: if the confirm count gets
-                            //   *ahead* of the send count (e.g. mstsc emits
-                            //   more confirms than we issued waves, which we
-                            //   actually observe), the gap reads as 0 rather
-                            //   than wrapping to ~u64::MAX and dropping every
-                            //   subsequent wave forever.
-                            let outstanding = waves_sent.saturating_sub(waves_confirmed);
-                            if waves_confirmed > 0 && outstanding >= MAX_OUTSTANDING_WAVES {
-                                waves_dropped_behind += 1;
-                                continue;
+                            // Two complementary drop policies:
+                            // * Blind-drop mode (mstsc-style clients that
+                            //   over-count confirms): drop 1 in
+                            //   BLIND_DROP_MODULO unconditionally to
+                            //   compensate for ~20% over-feed.
+                            // * Precise mode: drop only when (sent - confirmed)
+                            //   exceeds MAX_OUTSTANDING_WAVES. Gated on
+                            //   `waves_confirmed > 0` so audio still plays if
+                            //   the client never confirms; `saturating_sub`
+                            //   keeps an over-count from wrapping the gap and
+                            //   silencing audio forever.
+                            if blind_drop_active {
+                                blind_drop_counter = blind_drop_counter.wrapping_add(1);
+                                if blind_drop_counter % BLIND_DROP_MODULO == 0 {
+                                    waves_dropped_behind += 1;
+                                    continue;
+                                }
+                            } else {
+                                let outstanding =
+                                    waves_sent.saturating_sub(waves_confirmed);
+                                if waves_confirmed > 0
+                                    && outstanding >= MAX_OUTSTANDING_WAVES
+                                {
+                                    waves_dropped_behind += 1;
+                                    continue;
+                                }
                             }
                             waves_sent = waves_sent.wrapping_add(1);
                             rdpsnd.wave(data, ts)
@@ -630,11 +676,14 @@ impl RdpServer {
         }
 
         self.audio_waves_sent = waves_sent;
+        self.audio_blind_drop_active = blind_drop_active;
+        self.audio_blind_drop_counter = blind_drop_counter;
         if waves_dropped_behind > 0 {
             debug!(
                 dropped = waves_dropped_behind,
                 outstanding = waves_sent.saturating_sub(waves_confirmed),
-                "audio latency cap: dropped waves, client behind"
+                blind_drop = blind_drop_active,
+                "audio latency cap: dropped waves"
             );
         }
 

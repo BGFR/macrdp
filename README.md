@@ -46,6 +46,9 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
 --skip-auth               Bypass PAM (testing only)
 --keychain                Read password from macOS Keychain (service=macrdp)
 -v, --verbose             Show all the noisy logs the default filter hides
+--allow-sleep             Let the Mac sleep / auto-lock normally (default
+                          is to spawn `caffeinate` so an idle Mac doesn't
+                          drop the connection mid-session)
 --width / --height        Override autodetected display size
 --fps N                   Frame rate cap (default 15)
 --cert-dir PATH           Persisted TLS cert (default ~/Library/Application Support/macrdp)

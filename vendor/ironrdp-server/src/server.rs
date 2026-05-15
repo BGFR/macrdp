@@ -290,7 +290,7 @@ impl RdpServer {
             local_addr: None,
             audio_waves_sent: 0,
             audio_waves_confirmed: 0,
-            audio_blind_drop_active: true,
+            audio_blind_drop_active: false,
             audio_blind_drop_counter: 0,
         }
     }
@@ -324,7 +324,7 @@ impl RdpServer {
             // do because the deficit was from a closed socket.
             self.audio_waves_sent = 0;
             self.audio_waves_confirmed = 0;
-            self.audio_blind_drop_active = true;
+            self.audio_blind_drop_active = false;
             self.audio_blind_drop_counter = 0;
         }
 
@@ -542,11 +542,12 @@ impl RdpServer {
         // drop new waves once the client is more than this many waves behind.
         // ~32 waves is roughly half a second of audio.
         const MAX_OUTSTANDING_WAVES: u64 = 32;
-        // Unconditional blind drop to compensate for the ~20% over-feed
-        // observed across clients (mstsc, Microsoft Remote Desktop on Mac).
-        // 5 = drop 1 in 5 = 20%. Coarser than the precise send/confirm cap
-        // but doesn't depend on WaveConfirm counts being honest, which they
-        // aren't on at least one client we care about.
+        // Optional blind-drop fallback (1 in N) for clients whose WaveConfirm
+        // counts can't be trusted. Disabled by default — capture-side
+        // resampling to 44.1 kHz already prevents over-feed on the clients
+        // we've tested, so dropping any audio is pure quality loss. Kept as a
+        // knob via `audio_blind_drop_active` if a future client genuinely
+        // needs it.
         const BLIND_DROP_MODULO: u64 = 5;
         let wave_total = events
             .iter()

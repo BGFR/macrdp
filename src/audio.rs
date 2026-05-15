@@ -17,10 +17,14 @@ use ironrdp_server::{ServerEvent, ServerEventSender, SoundServerFactory};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-// ScreenCaptureKit only honors 8000/16000/24000/48000 Hz; asking for 44100
-// is silently served as 48000, so the advertised RDPSND format must match or
-// the client plays back slow/low-pitched and the buffer drifts unboundedly.
-const SAMPLE_RATE: u32 = 48000;
+// ScreenCaptureKit only honors 8000/16000/24000/48000 Hz, so we capture at
+// 48 kHz. The advertised RDPSND format, however, is 44.1 kHz: Windows audio
+// endpoints are commonly 44.1 native, and feeding clients at that rate lets
+// them play directly without internal resampling, which is what was causing
+// the ~20% over-feed / drift on mstsc. The capture loop resamples 48 -> 44.1
+// before handing PCM to the client.
+const SCK_SAMPLE_RATE: u32 = 48000;
+const SAMPLE_RATE: u32 = 44100;
 const CHANNELS: u16 = 2;
 const BITS_PER_SAMPLE: u16 = 16;
 
@@ -176,6 +180,7 @@ async fn capture_loop(
     my_gen: u64,
 ) -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
+    use rubato::Resampler;
     use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
     use screencapturekit::prelude::{SCContentFilter, SCStreamConfiguration, SCStreamOutputType};
 
@@ -192,8 +197,27 @@ async fn capture_loop(
 
     let config = SCStreamConfiguration::new()
         .with_captures_audio(true)
-        .with_sample_rate(SAMPLE_RATE as i32)
+        .with_sample_rate(SCK_SAMPLE_RATE as i32)
         .with_channel_count(CHANNELS as i32);
+
+    // SCK only delivers 8/16/24/48 kHz. We capture at 48 and resample to the
+    // advertised SAMPLE_RATE (44.1 kHz) so the client plays at its native rate
+    // without internal resampling. Chunk size matches a typical SCK audio
+    // buffer (~21 ms at 48 kHz) — input is buffered until we have a full
+    // chunk, then fed to the resampler.
+    const RESAMPLE_CHUNK: usize = 1024;
+    let mut resampler = rubato::FftFixedIn::<f32>::new(
+        SCK_SAMPLE_RATE as usize,
+        SAMPLE_RATE as usize,
+        RESAMPLE_CHUNK,
+        1,
+        CHANNELS as usize,
+    )
+    .map_err(|e| anyhow!("rubato resampler init: {e}"))?;
+    let mut input_buf: [Vec<f32>; 2] = [
+        Vec::with_capacity(RESAMPLE_CHUNK * 2),
+        Vec::with_capacity(RESAMPLE_CHUNK * 2),
+    ];
 
     // Shallow queue: SCK's async buffer is a drop-oldest ring of this depth.
     // Each slot is ~20 ms of audio, so 2 caps capture-side staleness at ~40 ms
@@ -232,12 +256,12 @@ async fn capture_loop(
                 let rate = fd.audio_sample_rate().unwrap_or(0.0);
                 let channels = fd.audio_channel_count().unwrap_or(0);
                 info!(rate, channels, "SCK audio format");
-                if rate != 0.0 && (rate - f64::from(SAMPLE_RATE)).abs() > 1.0 {
+                if rate != 0.0 && (rate - f64::from(SCK_SAMPLE_RATE)).abs() > 1.0 {
                     warn!(
                         delivered = rate,
-                        advertised = SAMPLE_RATE,
-                        "SCK audio rate differs from advertised RDPSND rate; \
-                         playback will drift (resampling not implemented)"
+                        requested = SCK_SAMPLE_RATE,
+                        "SCK audio rate differs from what we requested; \
+                         the 48->44.1 resampler assumes 48 kHz input"
                     );
                 }
             }
@@ -248,33 +272,50 @@ async fn capture_loop(
         };
 
         // SCK delivers float32 PCM as planar (one buffer per channel) or a
-        // single interleaved buffer. Normalize to interleaved 16-bit stereo so
-        // the payload always matches the advertised RDPSND format.
-        let pcm = float_list_to_pcm16_stereo(&list);
-        if pcm.is_empty() {
+        // single interleaved buffer. Normalize to planar stereo f32 at the
+        // SCK rate, accumulate into the resampler input buffer, then emit
+        // resampled chunks as interleaved 16-bit stereo at SAMPLE_RATE.
+        let (in_left, in_right) = float_list_to_planar_f32_stereo(&list);
+        if in_left.is_empty() {
             continue;
         }
+        input_buf[0].extend_from_slice(&in_left);
+        input_buf[1].extend_from_slice(&in_right);
 
-        // 4 bytes per stereo i16 frame.
-        frames_sent += (pcm.len() / 4) as u64;
-        let now = std::time::Instant::now();
-        if now.duration_since(last_rate_log).as_secs() >= 2 {
-            let elapsed = now.duration_since(start_instant).as_secs_f64();
-            let effective_hz = frames_sent as f64 / elapsed;
-            debug!(effective_hz, frames_sent, elapsed, "audio production rate");
-            last_rate_log = now;
-        }
+        while input_buf[0].len() >= RESAMPLE_CHUNK && input_buf[1].len() >= RESAMPLE_CHUNK {
+            let chunk: [Vec<f32>; 2] = [
+                input_buf[0].drain(..RESAMPLE_CHUNK).collect(),
+                input_buf[1].drain(..RESAMPLE_CHUNK).collect(),
+            ];
+            let resampled = resampler
+                .process(&chunk, None)
+                .map_err(|e| anyhow!("rubato resample: {e}"))?;
+            let pcm = planar_f32_to_interleaved_i16(&resampled);
+            if pcm.is_empty() {
+                continue;
+            }
 
-        let ts_ms = start_instant.elapsed().as_millis() as u32;
-        let s = {
-            let guard = sender.lock().unwrap();
-            guard.clone()
-        };
-        let Some(s) = s else { break };
-        if s.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(pcm, ts_ms)))
-            .is_err()
-        {
-            break;
+            // 4 bytes per stereo i16 frame.
+            frames_sent += (pcm.len() / 4) as u64;
+            let now = std::time::Instant::now();
+            if now.duration_since(last_rate_log).as_secs() >= 2 {
+                let elapsed = now.duration_since(start_instant).as_secs_f64();
+                let effective_hz = frames_sent as f64 / elapsed;
+                debug!(effective_hz, frames_sent, elapsed, "audio production rate");
+                last_rate_log = now;
+            }
+
+            let ts_ms = start_instant.elapsed().as_millis() as u32;
+            let s = {
+                let guard = sender.lock().unwrap();
+                guard.clone()
+            };
+            let Some(s) = s else { return Ok(()) };
+            if s.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(pcm, ts_ms)))
+                .is_err()
+            {
+                return Ok(());
+            }
         }
     }
 
@@ -292,30 +333,60 @@ async fn capture_loop(
     Ok(())
 }
 
-/// Normalize an SCK audio buffer list to interleaved 16-bit little-endian
-/// stereo, regardless of whether SCK delivered planar or interleaved float32
-/// data and regardless of its channel count. A mono source is duplicated into
-/// both channels. The output must always be stereo: that is what the RDPSND
-/// `AudioFormat` advertises, and a channel-count mismatch makes the client
-/// play back at the wrong frame rate (audible as drift and lowered pitch).
+/// Normalize an SCK audio buffer list to planar stereo `f32` at the SCK rate.
+/// Handles both planar (one buffer per channel) and interleaved (single buffer
+/// with `number_channels` channels) layouts; a mono source is duplicated. The
+/// result feeds the rubato resampler.
 #[cfg(target_os = "macos")]
-fn float_list_to_pcm16_stereo(list: &screencapturekit::cm::AudioBufferList) -> Vec<u8> {
+fn float_list_to_planar_f32_stereo(
+    list: &screencapturekit::cm::AudioBufferList,
+) -> (Vec<f32>, Vec<f32>) {
     let Some(first) = list.get(0) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
 
     if list.num_buffers() >= 2 {
         // Planar: one mono buffer per channel. Channel 0 -> L, channel 1 -> R.
-        let left = first.data();
-        let right = list.get(1).map(|b| b.data()).unwrap_or(left);
-        return planar_pair_to_stereo_i16(left, right);
+        let left = bytes_to_f32(first.data());
+        let right = list
+            .get(1)
+            .map(|b| bytes_to_f32(b.data()))
+            .unwrap_or_else(|| left.clone());
+        let n = left.len().min(right.len());
+        return (left[..n].to_vec(), right[..n].to_vec());
     }
 
     // Single buffer: interleaved across `number_channels`, or mono.
     match first.number_channels {
-        0 | 1 => mono_to_stereo_i16(first.data()),
-        n => interleaved_to_stereo_i16(first.data(), n as usize),
+        0 | 1 => {
+            let mono = bytes_to_f32(first.data());
+            (mono.clone(), mono)
+        }
+        n => deinterleave_first_two_channels(first.data(), n as usize),
     }
+}
+
+/// Pull the first two channels out of an interleaved float32 buffer.
+#[cfg(target_os = "macos")]
+fn deinterleave_first_two_channels(bytes: &[u8], channels: usize) -> (Vec<f32>, Vec<f32>) {
+    let frame_bytes = channels * 4;
+    if frame_bytes == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let frames = bytes.len() / frame_bytes;
+    let mut left = Vec::with_capacity(frames);
+    let mut right = Vec::with_capacity(frames);
+    for f in 0..frames {
+        let base = f * frame_bytes;
+        left.push(read_f32_le(&bytes[base..base + 4]));
+        right.push(read_f32_le(&bytes[base + 4..base + 8]));
+    }
+    (left, right)
+}
+
+#[cfg(target_os = "macos")]
+fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4).map(read_f32_le).collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -323,50 +394,17 @@ fn read_f32_le(b: &[u8]) -> f32 {
     f32::from_bits(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-/// Duplicate each mono float32 sample into both stereo channels.
+/// Interleave two planar float32 channels into a 16-bit LE stereo PCM payload.
 #[cfg(target_os = "macos")]
-fn mono_to_stereo_i16(bytes: &[u8]) -> Vec<u8> {
-    // frames*4 bytes in (mono f32) -> frames*4 bytes out (stereo i16).
-    let mut out = Vec::with_capacity(bytes.len());
-    for chunk in bytes.chunks_exact(4) {
-        let s = float_to_i16(read_f32_le(chunk)).to_le_bytes();
-        out.extend_from_slice(&s);
-        out.extend_from_slice(&s);
-    }
-    out
-}
-
-/// Zip two planar float32 channels into interleaved stereo i16.
-#[cfg(target_os = "macos")]
-fn planar_pair_to_stereo_i16(left: &[u8], right: &[u8]) -> Vec<u8> {
-    let frames = left.len().min(right.len()) / 4;
-    let mut out = Vec::with_capacity(frames * 4);
-    for f in 0..frames {
-        let off = f * 4;
-        let l = float_to_i16(read_f32_le(&left[off..off + 4]));
-        let r = float_to_i16(read_f32_le(&right[off..off + 4]));
-        out.extend_from_slice(&l.to_le_bytes());
-        out.extend_from_slice(&r.to_le_bytes());
-    }
-    out
-}
-
-/// Take the first two channels of an interleaved float32 buffer as stereo i16.
-/// Only called with `channels >= 2`.
-#[cfg(target_os = "macos")]
-fn interleaved_to_stereo_i16(bytes: &[u8], channels: usize) -> Vec<u8> {
-    let frame_bytes = channels * 4;
-    if frame_bytes == 0 {
+fn planar_f32_to_interleaved_i16(planar: &[Vec<f32>]) -> Vec<u8> {
+    if planar.len() < 2 {
         return Vec::new();
     }
-    let frames = bytes.len() / frame_bytes;
+    let frames = planar[0].len().min(planar[1].len());
     let mut out = Vec::with_capacity(frames * 4);
-    for f in 0..frames {
-        let base = f * frame_bytes;
-        let l = float_to_i16(read_f32_le(&bytes[base..base + 4]));
-        let r = float_to_i16(read_f32_le(&bytes[base + 4..base + 8]));
-        out.extend_from_slice(&l.to_le_bytes());
-        out.extend_from_slice(&r.to_le_bytes());
+    for (lf, rf) in planar[0].iter().zip(planar[1].iter()).take(frames) {
+        out.extend_from_slice(&float_to_i16(*lf).to_le_bytes());
+        out.extend_from_slice(&float_to_i16(*rf).to_le_bytes());
     }
     out
 }

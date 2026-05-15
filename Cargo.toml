@@ -26,6 +26,7 @@ rpassword = "7"
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 zeroize = "1"
+rubato = "0.16"  # 48 kHz SCK capture -> 44.1 kHz output, advertised to client
 
 # TLS for RDP security layer
 rustls = "0.23"

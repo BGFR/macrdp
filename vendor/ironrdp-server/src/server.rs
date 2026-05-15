@@ -57,6 +57,13 @@ impl RdpServerOptions {
             .any(|codec| matches!(codec.property, CodecProperty::RemoteFx(_)))
     }
 
+    fn has_nscodec(&self) -> bool {
+        self.codecs
+            .0
+            .iter()
+            .any(|codec| matches!(codec.property, CodecProperty::NsCodec(_)))
+    }
+
     #[cfg(feature = "qoi")]
     fn has_qoi(&self) -> bool {
         self.codecs
@@ -783,6 +790,9 @@ impl RdpServer {
                                 for caps in c.caps_data.0 .0 {
                                     update_codecs.set_remotefx(Some((caps.entropy_bits, codec.id)));
                                 }
+                            }
+                            CodecProperty::NsCodec(_) if self.opts.has_nscodec() => {
+                                update_codecs.set_nscodec(Some(codec.id));
                             }
                             CodecProperty::NsCodec(_) => (),
                             #[cfg(feature = "qoi")]

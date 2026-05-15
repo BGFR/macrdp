@@ -10,7 +10,7 @@ use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_pdu::pointer::{ColorPointerAttribute, Point16, PointerAttribute, PointerPositionAttribute};
 use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits};
 use ironrdp_pdu::surface_commands::{ExtendedBitmapDataPdu, SurfaceBitsPdu, SurfaceCommand};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use self::bitmap::BitmapEncoder;
 use self::rfx::RfxEncoder;
@@ -45,6 +45,7 @@ impl CodecId {
 #[derive(Debug)]
 pub(crate) struct UpdateEncoderCodecs {
     remotefx: Option<(EntropyBits, u8)>,
+    nscodec: Option<u8>,
     #[cfg(feature = "qoi")]
     qoi: Option<u8>,
     #[cfg(feature = "qoiz")]
@@ -56,6 +57,7 @@ impl UpdateEncoderCodecs {
     pub(crate) fn new() -> Self {
         Self {
             remotefx: None,
+            nscodec: None,
             #[cfg(feature = "qoi")]
             qoi: None,
             #[cfg(feature = "qoiz")]
@@ -66,6 +68,11 @@ impl UpdateEncoderCodecs {
     #[cfg_attr(feature = "__bench", visibility::make(pub))]
     pub(crate) fn set_remotefx(&mut self, remotefx: Option<(EntropyBits, u8)>) {
         self.remotefx = remotefx
+    }
+
+    #[cfg_attr(feature = "__bench", visibility::make(pub))]
+    pub(crate) fn set_nscodec(&mut self, nscodec: Option<u8>) {
+        self.nscodec = nscodec
     }
 
     #[cfg(feature = "qoi")]
@@ -108,6 +115,15 @@ impl UpdateEncoder {
         let bitmap_updater = if surface_flags.contains(CmdFlags::SET_SURFACE_BITS) {
             let mut bitmap = BitmapUpdater::None(NoneHandler);
 
+            // NSCodec is the lowest-priority real codec — clients that ALSO
+            // speak RemoteFx/QOI/QOIZ get the better codec via the overrides
+            // below. Microsoft Remote Desktop on macOS only speaks NSCodec,
+            // so this is the only path it can land on (apart from legacy
+            // bitmap when SurfaceCommands aren't supported).
+            if let Some(id) = codecs.nscodec {
+                bitmap = BitmapUpdater::NsCodec(NsCodecHandler::new(id));
+            }
+
             if let Some((algo, id)) = codecs.remotefx {
                 bitmap = BitmapUpdater::RemoteFx(RemoteFxHandler::new(algo, id, desktop_size));
             }
@@ -125,6 +141,21 @@ impl UpdateEncoder {
         } else {
             BitmapUpdater::Bitmap(BitmapHandler::new())
         };
+
+        info!(
+            codec = match &bitmap_updater {
+                BitmapUpdater::None(_) => "none (raw surface bits)",
+                BitmapUpdater::Bitmap(_) => "legacy bitmap (no SurfaceCommands)",
+                BitmapUpdater::RemoteFx(_) => "RemoteFx",
+                BitmapUpdater::NsCodec(_) => "NSCodec (stub — encoder not yet implemented)",
+                #[cfg(feature = "qoi")]
+                BitmapUpdater::Qoi(_) => "QOI",
+                #[cfg(feature = "qoiz")]
+                BitmapUpdater::Qoiz(_) => "QOIZ",
+            },
+            surface_bits = surface_flags.contains(CmdFlags::SET_SURFACE_BITS),
+            "video encoder negotiated"
+        );
 
         Ok(Self {
             desktop_size,
@@ -359,6 +390,7 @@ enum BitmapUpdater {
     None(NoneHandler),
     Bitmap(BitmapHandler),
     RemoteFx(RemoteFxHandler),
+    NsCodec(NsCodecHandler),
     #[cfg(feature = "qoi")]
     Qoi(QoiHandler),
     #[cfg(feature = "qoiz")]
@@ -371,6 +403,7 @@ impl BitmapUpdater {
             Self::None(up) => up.handle(bitmap),
             Self::Bitmap(up) => up.handle(bitmap),
             Self::RemoteFx(up) => up.handle(bitmap),
+            Self::NsCodec(up) => up.handle(bitmap),
             #[cfg(feature = "qoi")]
             Self::Qoi(up) => up.handle(bitmap),
             #[cfg(feature = "qoiz")]
@@ -487,6 +520,34 @@ impl BitmapUpdateHandler for RemoteFxHandler {
         };
 
         set_surface(bitmap, self.codec_id, &buffer[..len])
+    }
+}
+
+/// NSCodec encoder stub (Phase 1 of MS-RDPNSC implementation).
+///
+/// The real encoder lands in Phase 2. For now, this exists only to confirm
+/// negotiation works: clients (notably Microsoft Remote Desktop on macOS) that
+/// only advertise NSCodec will land on this handler, see the diagnostic
+/// `"video encoder negotiated"` info log, and then the connection will error
+/// on the first frame because `handle()` is intentionally unimplemented.
+#[derive(Clone, Debug)]
+struct NsCodecHandler {
+    #[allow(dead_code)] // wired up in Phase 2
+    codec_id: u8,
+}
+
+impl NsCodecHandler {
+    fn new(codec_id: u8) -> Self {
+        Self { codec_id }
+    }
+}
+
+impl BitmapUpdateHandler for NsCodecHandler {
+    fn handle(&mut self, _bitmap: &BitmapUpdate) -> Result<UpdateFragmenter> {
+        anyhow::bail!(
+            "NSCodec encoder not yet implemented (Phase 1 stub); \
+             negotiation confirmed but no frames will encode"
+        );
     }
 }
 

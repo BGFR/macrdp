@@ -15,6 +15,9 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use der::Decode;
+use ironrdp_pdu::rdp::capability_sets::{
+    BitmapCodecs, Codec, CodecProperty, NsCodec, RemoteFxContainer,
+};
 use ironrdp_server::{Credentials, RdpServer};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -29,6 +32,44 @@ use crate::input::{ensure_accessibility_access, MacInputHandler};
 
 const FALLBACK_WIDTH: u16 = 1280;
 const FALLBACK_HEIGHT: u16 = 720;
+
+/// Codecs advertised to the client. The actual encoder picks the one the
+/// client also speaks; on conflict, the negotiation prefers (in order)
+/// QOIZ > QOI > RemoteFx > NSCodec.
+///
+/// NSCodec is here for Microsoft Remote Desktop on macOS, which speaks only
+/// NSCodec. The encoder is a Phase-1 stub right now — see CLAUDE.md.
+fn bitmap_codecs() -> BitmapCodecs {
+    BitmapCodecs(vec![
+        // NSCodec — for Microsoft Remote Desktop on macOS.
+        Codec {
+            id: 0,
+            property: CodecProperty::NsCodec(NsCodec {
+                is_dynamic_fidelity_allowed: false,
+                is_subsampling_allowed: false, // Phase 3 will flip this on.
+                color_loss_level: 3,
+            }),
+        },
+        // RemoteFx — what mstsc actually uses.
+        Codec {
+            id: 0,
+            property: CodecProperty::RemoteFx(RemoteFxContainer::ServerContainer(1)),
+        },
+        Codec {
+            id: 0,
+            property: CodecProperty::ImageRemoteFx(RemoteFxContainer::ServerContainer(1)),
+        },
+        // QOI/QOIZ — for FreeRDP and any other client that picks them up.
+        Codec {
+            id: 0,
+            property: CodecProperty::Qoi,
+        },
+        Codec {
+            id: 0,
+            property: CodecProperty::QoiZ,
+        },
+    ])
+}
 
 #[cfg(target_os = "macos")]
 fn ensure_screen_recording_access() {
@@ -392,6 +433,7 @@ async fn main() -> Result<()> {
         .with_display_handler(display)
         .with_cliprdr_factory(Some(cliprdr))
         .with_sound_factory(Some(sound))
+        .with_bitmap_codecs(bitmap_codecs())
         .build();
 
     // ironrdp_server::Credentials holds a plain String, so this copy is

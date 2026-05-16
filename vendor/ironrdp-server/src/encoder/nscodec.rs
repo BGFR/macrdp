@@ -37,7 +37,10 @@ pub(crate) fn encode(bitmap: &BitmapUpdate, color_loss_level: u8) -> Vec<u8> {
     let mut cg_plane = Vec::with_capacity(pixels);
     let mut a_plane = Vec::with_capacity(pixels);
 
-    for row in 0..h {
+    // Surface-bits PDU clients expect rows bottom-up — `BitmapUpdate.data`
+    // arrives top-down from SCK, so we iterate in reverse. Without this each
+    // dirty rect is rendered upside-down inside its own bounding box.
+    for row in (0..h).rev() {
         let row_off = row * stride;
         for col in 0..w {
             let off = row_off + col * bpp;

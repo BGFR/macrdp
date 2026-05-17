@@ -25,7 +25,7 @@
 #![cfg(target_os = "macos")]
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,6 +44,12 @@ use tracing::{debug, info, warn};
 /// Per-RANGE request size. 1 MiB matches what mstsc itself asks for when
 /// fetching files from us in the Mac→Windows direction.
 const CHUNK_SIZE: u32 = 1024 * 1024;
+
+/// Maximum number of in-flight `FileContentsRequest` PDUs for a single
+/// file. Higher cuts wall-clock download time on high-latency links;
+/// lower keeps us off mstsc's nerves. 8 covers a typical LAN's
+/// bandwidth-delay product comfortably without flooding the channel.
+const MAX_PARALLEL_CHUNKS: usize = 8;
 
 /// Shared event sender used by both the cliprdr backend (for ack PDUs) and
 /// any eager-download task.
@@ -205,8 +211,17 @@ fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount)
     self_change_count.store(new_change_count, Ordering::Relaxed);
 }
 
-/// SIZE-then-RANGE loop for one file. Writes `dst` and returns
-/// `Ok(())` on full success.
+/// Download a single file as a fan-out of RANGE chunks. Up to
+/// `MAX_PARALLEL_CHUNKS` requests are in flight at once; each completes
+/// independently and writes its slice into the pre-allocated destination
+/// at the matching offset. Returns `Ok(())` once every chunk has been
+/// written.
+///
+/// Each chunk task opens its own `File` handle and `seek`s to its
+/// position before writing. On Unix that's race-free: each open fd has
+/// its own offset, and `pwrite`-like behavior via `seek+write` works as
+/// long as no two tasks write the same byte range (which by construction
+/// they don't — chunks are disjoint by `position`).
 async fn fetch_file(
     file: &RemoteFile,
     dst: &Path,
@@ -217,22 +232,103 @@ async fn fetch_file(
         Some(s) => s,
         None => fetch_size(file.index, router, sender).await?,
     };
-    let mut out = std::fs::File::create(dst).map_err(|e| format!("create {dst:?}: {e}"))?;
-    let mut position: u64 = 0;
-    while position < total {
-        let remaining = total - position;
-        let req_size = remaining.min(u64::from(CHUNK_SIZE)) as u32;
-        let chunk = fetch_range(file.index, position, req_size, router, sender).await?;
-        if chunk.is_empty() {
-            return Err(format!(
-                "short read at {position}; expected {req_size} bytes, got 0"
-            ));
-        }
-        out.write_all(&chunk)
-            .map_err(|e| format!("write {dst:?}: {e}"))?;
-        position += chunk.len() as u64;
+
+    // Pre-allocate the file to its final size so concurrent writers don't
+    // race on extending it. `set_len` writes a sparse hole on APFS; the
+    // actual blocks materialize as chunks land.
+    {
+        let f = std::fs::File::create(dst).map_err(|e| format!("create {dst:?}: {e}"))?;
+        f.set_len(total)
+            .map_err(|e| format!("set_len {dst:?}: {e}"))?;
     }
-    out.flush().map_err(|e| format!("flush {dst:?}: {e}"))?;
+
+    if total == 0 {
+        return Ok(());
+    }
+
+    // Build the chunk plan upfront so we know how many tasks to spawn.
+    let mut plan: Vec<(u64, u32)> = Vec::new();
+    let mut pos = 0u64;
+    while pos < total {
+        let req = (total - pos).min(u64::from(CHUNK_SIZE)) as u32;
+        plan.push((pos, req));
+        pos += u64::from(req);
+    }
+
+    let mut set: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
+    let mut next = 0usize;
+    let dst_owned = dst.to_path_buf();
+    let index = file.index;
+
+    // Prime the in-flight window.
+    while next < plan.len() && set.len() < MAX_PARALLEL_CHUNKS {
+        let (p, sz) = plan[next];
+        set.spawn(chunk_task(
+            index,
+            p,
+            sz,
+            router.clone(),
+            sender.clone(),
+            dst_owned.clone(),
+        ));
+        next += 1;
+    }
+
+    // As each chunk completes, refill the window until the plan is
+    // exhausted; collect any error and abort the rest.
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                set.abort_all();
+                return Err(e);
+            }
+            Err(join_err) => {
+                set.abort_all();
+                return Err(format!("chunk task panicked: {join_err}"));
+            }
+        }
+        if next < plan.len() {
+            let (p, sz) = plan[next];
+            set.spawn(chunk_task(
+                index,
+                p,
+                sz,
+                router.clone(),
+                sender.clone(),
+                dst_owned.clone(),
+            ));
+            next += 1;
+        }
+    }
+    Ok(())
+}
+
+async fn chunk_task(
+    index: i32,
+    position: u64,
+    requested_size: u32,
+    router: DownloadRouter,
+    sender: EventSender,
+    dst: PathBuf,
+) -> Result<(), String> {
+    let bytes = fetch_range(index, position, requested_size, &router, &sender).await?;
+    if bytes.is_empty() {
+        return Err(format!(
+            "short read at {position}; expected {requested_size} bytes, got 0"
+        ));
+    }
+    // std::fs is fine here; writes are small, infrequent per task, and
+    // tokio's blocking-thread pool absorbs the cost. Wrapping in
+    // spawn_blocking would add more overhead than the save.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&dst)
+        .map_err(|e| format!("open {dst:?}: {e}"))?;
+    f.seek(SeekFrom::Start(position))
+        .map_err(|e| format!("seek {dst:?} @ {position}: {e}"))?;
+    f.write_all(&bytes)
+        .map_err(|e| format!("write {dst:?} @ {position}: {e}"))?;
     Ok(())
 }
 

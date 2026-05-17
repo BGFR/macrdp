@@ -184,18 +184,38 @@ pub fn spawn_remote_paste(
 /// Editor" in Notification Center settings — minor cosmetic quirk we
 /// accept in exchange for not having to ship a `.app` bundle.
 ///
-/// Failure is silent: if `osascript` is missing or the spawn fails we
-/// still have the `published remote paste` log line and the pasteboard
-/// content, so the worst case is the user has to glance at the terminal
-/// instead of the desktop banner.
+/// We log osascript's exit status + stderr so a silent failure (e.g.
+/// Script Editor doesn't have notification permission yet, Do Not
+/// Disturb is on, osascript missing from PATH) shows up at debug
+/// level. The pasteboard content + the `published remote paste`
+/// info log are still the source of truth for "paste is ready."
 fn notify_user(message: &str) {
     // AppleScript string literals — escape `\` and `"`.
     let escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!("display notification \"{escaped}\" with title \"macrdp\"");
-    let _ = std::process::Command::new("osascript")
+    let output = match std::process::Command::new("osascript")
         .arg("-e")
         .arg(&script)
-        .spawn();
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("osascript spawn failed: {e}");
+            return;
+        }
+    };
+    if output.status.success() {
+        debug!(message, "fired desktop notification");
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(
+            status = ?output.status,
+            stderr = %stderr.trim(),
+            "osascript notification failed; grant Script Editor \
+             permission in System Settings → Notifications, or check \
+             Do Not Disturb"
+        );
+    }
 }
 
 fn make_temp_dir() -> std::io::Result<PathBuf> {

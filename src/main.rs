@@ -350,16 +350,7 @@ async fn main() -> Result<()> {
             "info,rustls=error,ironrdp_server::encoder=error,ironrdp_server::server=error",
         )
     };
-    // Non-blocking stderr writer: a dedicated background thread drains the
-    // tracing channel and writes to stderr, so a slow TTY can't backpressure
-    // the tokio runtime when verbose logging is enabled. `_guard` must live
-    // for the lifetime of `main` — dropping it flushes and shuts the writer
-    // thread down.
-    let (nb_writer, _guard) = tracing_appender::non_blocking(std::io::stderr());
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(nb_writer)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     // Install signal handling before anything touches ScreenCaptureKit. Once an
     // SCK capture stream is live, macOS framework threads can leave the process

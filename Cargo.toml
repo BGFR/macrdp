@@ -17,7 +17,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 # Logging / errors / config
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
 anyhow = "1"
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }

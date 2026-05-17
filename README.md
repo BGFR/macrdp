@@ -63,7 +63,13 @@ System audio rides over the RDPSND virtual channel as 16-bit stereo PCM at **44.
 ## Reason why this was made
 This was done to scratch an itch.  There are practically no active open source RDP servers for MacOS.  The closest project that does this functionality is xrdp; however this program only runs on Linux/Unix machines, and has no homebrew equivalent on Macs. Done in a few hours with the help of Claude and runs pretty well.
 
-Multi-monitor support is on the list when I'm bored or need a distraction from real life. File copy is now bidirectional: Mac→Windows streams real bytes via the standard MS-RDPECLIP path; Windows→Mac eagerly downloads to `/tmp` the moment Windows announces a copy, publishes the file URLs to NSPasteboard, plays a Glass chime when ready, and automatically fires `Cmd-V` if Finder is the frontmost app so the paste completes without a second keystroke. Recursive directory copy works Mac→Windows but not yet Windows→Mac.
+Multi-monitor support is on the list when I'm bored or need a distraction from real life. File copy is now bidirectional: Mac→Windows streams real bytes via the standard MS-RDPECLIP path; Windows→Mac eagerly downloads to `/tmp` the moment Windows announces a copy, publishes the file URLs to NSPasteboard, plays a Glass chime when ready, and automatically fires `Cmd-V` if Finder is the frontmost app so the paste completes without a second keystroke.
+
+### Windows → Mac file copy: known limitation
+
+`Ctrl-C` on a *folder* in Windows Explorer doesn't reach the Mac side. Explorer puts only the Shell IDList format on the clipboard and delay-renders `FileGroupDescriptorW`, which `mstsc` doesn't request — so nothing is forwarded over the RDP clipboard channel and you'll hear a beep on `Cmd-V`. This is a Windows + mstsc behavior we can't work around server-side.
+
+**Workaround:** open the folder in Explorer, `Ctrl-A` to select its contents (files and any subfolders), `Ctrl-C`, then `Cmd-V` in Finder. That path produces a real file group descriptor and folder structure is preserved via `relative_path`. For copying entire arbitrary folder trees rooted at a folder you don't want to enter, RDP drive redirection is a more appropriate feature (not currently implemented).
 
 ## License
 

@@ -572,6 +572,8 @@ impl RdpServer {
                         ClipboardMessage::SendInitiateCopy(formats) => cliprdr.initiate_copy(&formats),
                         ClipboardMessage::SendFormatData(data) => cliprdr.submit_format_data(data),
                         ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
+                        ClipboardMessage::SendFileContentsRequest(req) => cliprdr.request_file_contents(req),
+                        ClipboardMessage::SendFileContentsResponse(resp) => cliprdr.submit_file_contents(resp),
                         ClipboardMessage::Error(error) => {
                             error!(?error, "Handling clipboard event");
                             continue;

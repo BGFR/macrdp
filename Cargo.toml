@@ -56,12 +56,35 @@ objc2-foundation = "0.2"
 objc2-app-kit = { version = "0.2", features = ["NSCursor", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics", "NSGraphicsContext", "NSPasteboard"] }
 screencapturekit = { version = "2.1", features = ["async"] }
 
-# Vendored fork of ironrdp-server 0.10.0 with one fix: dispatch_server_events
-# drops the OLDEST queued wave PDUs instead of the newest, so a dispatch stall
-# no longer turns into a permanent audio-latency offset. See
-# vendor/ironrdp-server/src/server.rs. Drop this patch once the fix is upstream.
+# All ironrdp-* crates pinned to a specific upstream commit. The published
+# 0.x crates lag main by enough that several features we need (file
+# clipboard via SendFileContents{Request,Response}, the EGFX virtual channel
+# for AVC/H.264, etc.) only exist on `master`. The pinned commit is bumped
+# manually so the build is reproducible.
+#
+# `ironrdp-server` is the one exception — it stays vendored locally because
+# our wave-drop fix isn't merged upstream yet (PR
+# https://github.com/Devolutions/IronRDP/pull/1276). Our vendored 0.10.0
+# compiles against the patched (master) sibling crates because upstream hasn't
+# bumped the inter-crate version numbers since 0.10.0 was released. Once the
+# wave-drop PR merges, drop the vendor block and add `ironrdp-server` to the
+# git pin list below.
 [patch.crates-io]
 ironrdp-server = { path = "vendor/ironrdp-server" }
+ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-acceptor         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-dvc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-graphics         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-pdu              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-rdpsnd           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-svc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-tokio            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
 
 [profile.release]
 lto = "thin"

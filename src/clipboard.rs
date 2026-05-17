@@ -1,9 +1,15 @@
-//! Bidirectional text clipboard sync between the Mac and the RDP client.
+//! Bidirectional clipboard sync between the Mac and the RDP client.
 //!
-//! Only `CF_UNICODETEXT` ↔ `NSPasteboardTypeString` is wired today; images,
-//! RTF, and file lists are stubbed out. The factory owns the event sender
-//! and spawns a poller that detects Mac-side clipboard changes via
-//! `NSPasteboard.changeCount` and signals the protocol layer.
+//! Text (CF_UNICODETEXT ↔ NSPasteboardTypeString) and images
+//! (CF_DIB ↔ PNG/TIFF) flow both directions. File copy is **Mac → Windows
+//! only and metadata only** today: the file *names* and sizes are advertised
+//! as a FileGroupDescriptorW; any FileContentsRequest from the client is
+//! answered with CB_RESPONSE_FAIL so the paste shows the list but no bytes
+//! transfer. Streaming actual file bytes is Phase 2.
+//!
+//! The factory owns the event sender and spawns a poller that detects
+//! Mac-side clipboard changes via `NSPasteboard.changeCount` and signals
+//! the protocol layer.
 
 use std::sync::{Arc, Mutex};
 
@@ -12,13 +18,22 @@ use std::io::Cursor;
 use image::{ImageEncoder, ImageReader};
 use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
-    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
-    OwnedFormatDataResponse,
+    ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId, ClipboardFormatName,
+    ClipboardGeneralCapabilityFlags, FileContentsRequest, FileContentsResponse, FileDescriptor,
+    FormatDataRequest, FormatDataResponse, LockDataId, OwnedFormatDataResponse, PackedFileList,
 };
+use ironrdp_core::{Encode, WriteCursor};
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+
+/// Format ID we use locally to identify FileGroupDescriptorW in the format
+/// list we advertise. The Windows side identifies the format by *name*, not
+/// id, so this value is arbitrary — it just has to be in the
+/// `0xC000..=0xFFFF` registered-format range. `0xC0FE` matches what upstream
+/// IronRDP's `initiate_file_copy` uses, making the wire trace consistent
+/// across implementations.
+const FILE_LIST_FORMAT_ID: u32 = 0xC0FE;
 
 type Sender = Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>;
 
@@ -259,6 +274,15 @@ impl MacCliprdrBackend {
 /// can handle.
 fn advertised_formats() -> Vec<ClipboardFormat> {
     let mut out = Vec::new();
+    // Files are checked before image/text because in macOS multi-selection
+    // a Finder copy can briefly look like "string + url" before the file URLs
+    // settle, and we want the file flavor to win when present.
+    if pb::has_files() {
+        out.push(
+            ClipboardFormat::new(ClipboardFormatId::new(FILE_LIST_FORMAT_ID))
+                .with_name(ClipboardFormatName::FILE_LIST),
+        );
+    }
     if pb::has_image() {
         out.push(ClipboardFormat::new(ClipboardFormatId::CF_DIB));
     }
@@ -268,13 +292,49 @@ fn advertised_formats() -> Vec<ClipboardFormat> {
     out
 }
 
+/// Serialize the current Mac file-pasteboard contents as a
+/// FILEGROUPDESCRIPTORW (`PackedFileList`) wire payload. Returns None if
+/// nothing on the pasteboard maps to a regular file/dir we can describe.
+fn encode_file_list() -> Option<Vec<u8>> {
+    let entries = pb::read_files();
+    if entries.is_empty() {
+        return None;
+    }
+    let files: Vec<FileDescriptor> = entries
+        .into_iter()
+        .map(|e| {
+            let mut fd = FileDescriptor::new(e.name);
+            if e.is_dir {
+                fd = fd.with_attributes(ClipboardFileAttributes::DIRECTORY);
+            } else {
+                fd = fd.with_attributes(ClipboardFileAttributes::NORMAL);
+                if let Some(sz) = e.size {
+                    fd = fd.with_file_size(sz);
+                }
+            }
+            fd
+        })
+        .collect();
+    let pdu = PackedFileList { files };
+    let mut buf = vec![0u8; pdu.size()];
+    let mut cur = WriteCursor::new(&mut buf);
+    if let Err(e) = pdu.encode(&mut cur) {
+        warn!("PackedFileList encode failed: {e}");
+        return None;
+    }
+    Some(buf)
+}
+
 impl CliprdrBackend for MacCliprdrBackend {
     fn temporary_directory(&self) -> &str {
         "/tmp"
     }
 
     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
-        ClipboardGeneralCapabilityFlags::empty()
+        // STREAM_FILECLIP_ENABLED is the gate that lets either side use
+        // FileGroupDescriptorW + FileContents{Request,Response}. Without
+        // it, clients won't advertise file paste at all.
+        ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
     }
 
     fn on_ready(&mut self) {
@@ -317,6 +377,16 @@ impl CliprdrBackend for MacCliprdrBackend {
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
+        // FileGroupDescriptorW is identified by id (the one we advertised),
+        // not by a CF_* constant.
+        if request.format == ClipboardFormatId::new(FILE_LIST_FORMAT_ID) {
+            let response = match encode_file_list() {
+                Some(bytes) => OwnedFormatDataResponse::new_data(bytes),
+                None => OwnedFormatDataResponse::new_error(),
+            };
+            self.push(ClipboardMessage::SendFormatData(response));
+            return;
+        }
         let response = match request.format {
             ClipboardFormatId::CF_UNICODETEXT => match pb::read_string() {
                 Some(s) => {
@@ -407,7 +477,19 @@ impl CliprdrBackend for MacCliprdrBackend {
         }
     }
 
-    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
+    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+        // Phase 1: we advertise the file list (names + sizes) but don't
+        // stream contents. Reply with CB_RESPONSE_FAIL so the client knows
+        // the paste failed instead of hanging on a missing response.
+        debug!(
+            stream_id = request.stream_id,
+            index = request.index,
+            "file contents requested; replying with error (Phase 1 metadata-only)"
+        );
+        self.push(ClipboardMessage::SendFileContentsResponse(
+            FileContentsResponse::new_error(request.stream_id),
+        ));
+    }
     fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
     fn on_lock(&mut self, _data_id: LockDataId) {}
     fn on_unlock(&mut self, _data_id: LockDataId) {}
@@ -417,7 +499,8 @@ impl CliprdrBackend for MacCliprdrBackend {
 mod pb {
     use objc2::rc::autoreleasepool;
     use objc2_app_kit::{
-        NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString, NSPasteboardTypeTIFF,
+        NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeString,
+        NSPasteboardTypeTIFF,
     };
     use objc2_foundation::{NSData, NSString};
 
@@ -434,6 +517,84 @@ mod pb {
 
     pub fn has_image() -> bool {
         unsafe { has_type(NSPasteboardTypePNG) || has_type(NSPasteboardTypeTIFF) }
+    }
+
+    pub fn has_files() -> bool {
+        unsafe { has_type(NSPasteboardTypeFileURL) }
+    }
+
+    pub struct FileEntry {
+        pub name: String,
+        pub size: Option<u64>,
+        pub is_dir: bool,
+    }
+
+    /// Return one entry per file URL item on the general pasteboard.
+    /// Cocoa stores multi-file selections as one pasteboard item per file,
+    /// each with its own `NSPasteboardTypeFileURL` string. We resolve names
+    /// and sizes via `std::fs::metadata`; unreadable paths are skipped so
+    /// the rest of a selection still pastes.
+    pub fn read_files() -> Vec<FileEntry> {
+        autoreleasepool(|_| unsafe {
+            let pb = NSPasteboard::generalPasteboard();
+            let Some(items) = pb.pasteboardItems() else {
+                return Vec::new();
+            };
+            let mut out = Vec::with_capacity(items.count());
+            for i in 0..items.count() {
+                let item = items.objectAtIndex(i);
+                let Some(url_str) = item.stringForType(NSPasteboardTypeFileURL) else {
+                    continue;
+                };
+                let url = url_str.to_string();
+                let Some(path) = file_url_to_path(&url) else {
+                    continue;
+                };
+                let Some(name) = std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                let meta = std::fs::metadata(&path).ok();
+                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                // For directories, the wire `file_size` field is unused
+                // (Windows queries it per-file when recursing).
+                let size = if is_dir { None } else { meta.map(|m| m.len()) };
+                out.push(FileEntry { name, size, is_dir });
+            }
+            out
+        })
+    }
+
+    /// Convert a `file://` URL to a filesystem path. NSPasteboard hands us
+    /// percent-encoded URLs (spaces -> `%20`, etc.) — strip the scheme and
+    /// decode. Anything else (http://, raw paths) is rejected.
+    fn file_url_to_path(url: &str) -> Option<String> {
+        let rest = url.strip_prefix("file://")?;
+        // RFC 3986 file URLs can have an empty authority (`file:///path`)
+        // or a `localhost` authority (`file://localhost/path`). Strip both.
+        let path = rest.strip_prefix("localhost").unwrap_or(rest);
+        percent_decode(path)
+    }
+
+    fn percent_decode(s: &str) -> Option<String> {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hi = (bytes[i + 1] as char).to_digit(16)?;
+                let lo = (bytes[i + 2] as char).to_digit(16)?;
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).ok()
     }
 
     fn has_type(target: &objc2_app_kit::NSPasteboardType) -> bool {
@@ -514,6 +675,11 @@ mod pb {
         Png,
         Tiff,
     }
+    pub struct FileEntry {
+        pub name: String,
+        pub size: Option<u64>,
+        pub is_dir: bool,
+    }
     pub fn change_count() -> i64 {
         0
     }
@@ -521,6 +687,9 @@ mod pb {
         false
     }
     pub fn has_image() -> bool {
+        false
+    }
+    pub fn has_files() -> bool {
         false
     }
     pub fn read_string() -> Option<String> {
@@ -531,4 +700,7 @@ mod pb {
         None
     }
     pub fn write_png(_: &[u8]) {}
+    pub fn read_files() -> Vec<FileEntry> {
+        Vec::new()
+    }
 }

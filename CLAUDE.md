@@ -10,11 +10,11 @@ Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
 - Drive keyboard and mouse, including modifier keys, mouse buttons, and wheel.
 - See the real macOS cursor shape (I-beam, hand, etc.) overlaid by the client.
 - Copy/paste UTF-8 text and images (CF_DIB ↔ PNG) between Mac and remote.
-- Mac→Windows file-name clipboard (FileGroupDescriptorW): copying a file in Finder lets Windows see the file name on paste. The actual byte stream isn't wired (FileContentsRequest is answered CB_RESPONSE_FAIL), so Explorer's "paste file" fails cleanly while text-paste targets get the name. Phase 2 will stream the bytes.
+- Mac→Windows file copy: copying a file in Finder and pasting on Windows produces a real file in Explorer. Files are streamed via MS-RDPECLIP `FileContentsRequest` SIZE + RANGE chunks (4 MiB per chunk). Reaches upstream `Cliprdr::initiate_file_copy` via the vendored `ServerEvent::ClipboardFileCopy(Vec<FileDescriptor>)` variant — that's the only API that populates `local_file_list`, without which upstream short-circuits every byte fetch with CB_RESPONSE_FAIL. Finder hands out *file-reference* URLs (`/.file/id=...`); we resolve them through `NSURL::URLByResolvingSymlinksInPath` because `std::fs::metadata` can't stat them directly.
 - Forward macOS system audio to the remote (RDPSND, 44.1 kHz stereo 16-bit PCM; SCK captures at 48 kHz and the capture loop resamples via `rubato`).
 - NLA / CredSSP authentication — no more "type username before Connect" mstsc workaround.
 
-Not yet implemented: multi-monitor, file-content streaming (the second half of the file clipboard), non-US keyboard layouts, drive/printer redirection.
+Not yet implemented: multi-monitor, Windows→Mac file clipboard direction, recursive directory copy for file clipboard, non-US keyboard layouts, drive/printer redirection.
 
 ## Project goal
 
@@ -31,7 +31,8 @@ src/capture.rs    ScreenCaptureKit → BgrA32 BitmapUpdate, dirty-rect driven
 src/cursor.rs     NSCursor → RGBAPointer, hashed for change detection
 src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI)
 src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB
-                  + FileGroupDescriptorW Mac→Windows, names only)
+                  + Mac→Windows file copy via FileGroupDescriptorW
+                  and FileContentsRequest streaming)
 src/audio.rs      RDPSND ← second SCK stream with system-audio capture,
                   rubato 48→44.1 kHz resample, latency-bounded
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary

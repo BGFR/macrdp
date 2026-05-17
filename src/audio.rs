@@ -202,17 +202,14 @@ async fn capture_loop(
     // Vecs per chunk (`drain(..N).collect()` did at ~46 chunks/sec).
     let mut chunk: [Vec<f32>; 2] = [vec![0.0; RESAMPLE_CHUNK], vec![0.0; RESAMPLE_CHUNK]];
 
-    // Resolve the sender once. The Mutex-guarded clone was happening on every
-    // emitted wave (~46/sec); the sender only changes between connections, so
-    // grabbing it here is sufficient — if it isn't set yet, the capture loop
-    // shouldn't be running anyway.
-    let s = {
-        let guard = sender.lock().unwrap();
-        let Some(s) = guard.clone() else {
-            return Ok(());
-        };
-        s
-    };
+    // Sender is lazily resolved on first emit, then cached. Resolving at the
+    // top of capture_loop instead breaks Microsoft Remote Desktop for Mac:
+    // that client appears to call `set_sender` *after* `start()`, so an
+    // up-front grab returns None and exits silently. The old per-emit lock
+    // worked because SCK's first sample takes ~21 ms to arrive, leaving a
+    // window for set_sender to populate the Mutex. Lazy-resolve here gives
+    // the same robustness without paying for a lock on every wave.
+    let mut s: Option<mpsc::UnboundedSender<ServerEvent>> = None;
 
     // Shallow queue: SCK's async buffer is a drop-oldest ring of this depth.
     // Each slot is ~20 ms of audio, so 2 caps capture-side staleness at ~40 ms
@@ -286,7 +283,16 @@ async fn capture_loop(
             }
 
             let ts_ms = start_instant.elapsed().as_millis() as u32;
-            if s.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(pcm, ts_ms)))
+
+            // Lazy resolve the sender on first need. If set_sender hasn't
+            // populated the Mutex yet, retry next iteration — at 48 kHz / 1024
+            // samples this is ~21 ms later.
+            if s.is_none() {
+                s = sender.lock().unwrap().clone();
+            }
+            let Some(s_ref) = s.as_ref() else { continue };
+            if s_ref
+                .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(pcm, ts_ms)))
                 .is_err()
             {
                 return Ok(());

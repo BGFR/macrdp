@@ -193,17 +193,21 @@ pub struct MacCliprdr {
     file_paths: Paths,
     /// Windows→Mac file paste routing. Backend's
     /// `on_file_contents_response` dispatches incoming bytes through this;
-    /// each in-flight promise delegate holds the matching receiver. See
+    /// each in-flight download task holds the matching receiver. See
     /// `src/file_promise.rs`.
     #[cfg(target_os = "macos")]
     download_router: crate::file_promise::DownloadRouter,
-    /// Keeps `NSFilePromiseProvider` instances alive across the
-    /// `on_remote_file_list` -> Cocoa-callback gap. NSPasteboard doesn't
-    /// retain promise writers; without our own stash they'd be freed
-    /// before Finder ever called `writePromiseToURL` and the paste would
-    /// silently beep with no log line on our side.
+    /// Most recently-allocated temp directory holding downloaded remote
+    /// files. The download task swaps it on each new remote copy and
+    /// removes the previous tree to keep /tmp tidy.
     #[cfg(target_os = "macos")]
-    provider_stash: crate::file_promise::ProviderStash,
+    paste_temp_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
+    /// The `NSPasteboard.changeCount` value we set the last time we
+    /// published remote files. The poller compares this against the
+    /// current changeCount and skips its tick if equal, so we don't see
+    /// our own write and bounce it back to Windows.
+    #[cfg(target_os = "macos")]
+    self_change_count: crate::file_promise::SelfChangeCount,
 }
 
 impl MacCliprdr {
@@ -214,7 +218,9 @@ impl MacCliprdr {
             #[cfg(target_os = "macos")]
             download_router: crate::file_promise::DownloadRouter::default(),
             #[cfg(target_os = "macos")]
-            provider_stash: crate::file_promise::new_provider_stash(),
+            paste_temp_dir: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            self_change_count: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
         }
     }
 }
@@ -227,6 +233,8 @@ impl ServerEventSender for MacCliprdr {
         // server to advertise the new content to the remote.
         let sender_arc = self.sender.clone();
         let paths_arc = self.file_paths.clone();
+        #[cfg(target_os = "macos")]
+        let self_cc = self.self_change_count.clone();
         tokio::spawn(async move {
             // NSPasteboard.changeCount is monotonic; record the starting
             // value so we don't fire an event for whatever was already on
@@ -239,6 +247,14 @@ impl ServerEventSender for MacCliprdr {
                     continue;
                 }
                 last_seen = current;
+                // If the latest bump is from OUR remote-paste publish,
+                // skip — otherwise we'd advertise the just-pasted Windows
+                // files back to Windows as a fresh Mac→Windows copy.
+                #[cfg(target_os = "macos")]
+                if current == self_cc.load(std::sync::atomic::Ordering::Relaxed) {
+                    debug!(current, "skipping pasteboard tick (self-write)");
+                    continue;
+                }
                 if !advertise_pasteboard(&sender_arc, &paths_arc) {
                     break;
                 }
@@ -256,7 +272,9 @@ impl CliprdrBackendFactory for MacCliprdr {
             #[cfg(target_os = "macos")]
             download_router: self.download_router.clone(),
             #[cfg(target_os = "macos")]
-            provider_stash: self.provider_stash.clone(),
+            paste_temp_dir: self.paste_temp_dir.clone(),
+            #[cfg(target_os = "macos")]
+            self_change_count: self.self_change_count.clone(),
         })
     }
 }
@@ -273,14 +291,18 @@ struct MacCliprdrBackend {
     // Shared with `MacCliprdr` so the poller and the backend agree on which
     // paths back the currently-advertised FILEGROUPDESCRIPTORW.
     file_paths: Paths,
-    // Windows→Mac side: route FileContentsResponses to whichever delegate
+    // Windows→Mac side: route FileContentsResponses to whichever download
     // task is awaiting the matching stream_id.
     #[cfg(target_os = "macos")]
     download_router: crate::file_promise::DownloadRouter,
-    // Keeps NSFilePromiseProvider instances alive across the pasteboard-
-    // write -> Finder-callback gap. See `MacCliprdr::provider_stash`.
+    // Latest paste temp dir (cleaned + recreated per remote copy). See
+    // `MacCliprdr::paste_temp_dir`.
     #[cfg(target_os = "macos")]
-    provider_stash: crate::file_promise::ProviderStash,
+    paste_temp_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
+    // Set by the download task after writing remote files to NSPasteboard
+    // so the poller can skip its own write. See `MacCliprdr::self_change_count`.
+    #[cfg(target_os = "macos")]
+    self_change_count: crate::file_promise::SelfChangeCount,
 }
 
 impl ironrdp_core::AsAny for MacCliprdrBackend {
@@ -531,39 +553,41 @@ impl CliprdrBackend for MacCliprdrBackend {
     fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
         debug!(
             file_count = files.len(),
-            clip_data_id, "remote file list received; placing on NSPasteboard"
+            clip_data_id, "remote file list received; eagerly downloading"
         );
         #[cfg(target_os = "macos")]
         {
-            let delegates: Vec<_> = files
+            let remote_files: Vec<crate::file_promise::RemoteFile> = files
                 .iter()
                 .enumerate()
                 .filter_map(|(i, f)| {
-                    // Phase 2a: directories aren't byte-fetchable; skip
-                    // them. Recursive folder fetch needs the Phase 2b
-                    // streaming machinery + relative_path-aware
-                    // descriptor walk.
+                    // Directories aren't byte-fetchable. Recursive folder
+                    // copy in this direction would need the remote to
+                    // send descriptors with `relative_path` set; for now
+                    // we drop them and warn.
                     let is_dir = f
                         .attributes
                         .map(|a| a.contains(ClipboardFileAttributes::DIRECTORY))
                         .unwrap_or(false);
                     if is_dir {
-                        debug!(name = %f.name, "skipping directory in Phase 2a");
+                        debug!(name = %f.name, "skipping directory in Win->Mac paste");
                         return None;
                     }
-                    Some(crate::file_promise::PromiseDelegate::new(
-                        crate::file_promise::PromiseIvars {
-                            file_name: f.name.clone(),
-                            file_index: i as i32,
-                            file_size: f.file_size,
-                            router: self.download_router.clone(),
-                            sender: self.sender.clone(),
-                            rt_handle: tokio::runtime::Handle::current(),
-                        },
-                    ))
+                    Some(crate::file_promise::RemoteFile {
+                        index: i as i32,
+                        name: f.name.clone(),
+                        size: f.file_size,
+                    })
                 })
                 .collect();
-            crate::file_promise::write_promises_to_pasteboard(&delegates, &self.provider_stash);
+            crate::file_promise::spawn_remote_paste(
+                remote_files,
+                self.download_router.clone(),
+                self.sender.clone(),
+                self.paste_temp_dir.clone(),
+                self.self_change_count.clone(),
+                tokio::runtime::Handle::current(),
+            );
         }
         #[cfg(not(target_os = "macos"))]
         let _ = (files, clip_data_id);

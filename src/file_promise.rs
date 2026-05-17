@@ -41,15 +41,18 @@ use objc2_foundation::{NSArray, NSString, NSURL};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-/// Per-RANGE request size. 1 MiB matches what mstsc itself asks for when
-/// fetching files from us in the Mac→Windows direction.
-const CHUNK_SIZE: u32 = 1024 * 1024;
+/// Per-RANGE request size. 4 MiB matches the cap we honour ourselves on
+/// the Mac→Windows side and is well within what mstsc serves in one
+/// response; pushing larger doesn't help because mstsc's
+/// FileContentsResponse PDU lengths top out around there anyway.
+const CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 
 /// Maximum number of in-flight `FileContentsRequest` PDUs for a single
 /// file. Higher cuts wall-clock download time on high-latency links;
-/// lower keeps us off mstsc's nerves. 8 covers a typical LAN's
-/// bandwidth-delay product comfortably without flooding the channel.
-const MAX_PARALLEL_CHUNKS: usize = 8;
+/// lower keeps us off mstsc's nerves. 16 saturates a gigabit LAN
+/// comfortably (16 × 4 MiB = 64 MiB in flight) without flooding the
+/// channel.
+const MAX_PARALLEL_CHUNKS: usize = 16;
 
 /// Shared event sender used by both the cliprdr backend (for ack PDUs) and
 /// any eager-download task.
@@ -162,7 +165,37 @@ pub fn spawn_remote_paste(
             count = written.len(),
             "published remote paste to NSPasteboard"
         );
+        let summary = match written.as_slice() {
+            [single] => single
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| format!("{n} ready to paste"))
+                .unwrap_or_else(|| "File ready to paste".into()),
+            many => format!("{} files ready to paste", many.len()),
+        };
+        notify_user(&summary);
     });
+}
+
+/// Fire a macOS desktop notification. Uses `osascript` because (a) it
+/// avoids the entitlements / app-bundle dance that
+/// `UNUserNotificationCenter` requires for an unbundled CLI and (b) it's
+/// already on the system. Notifications appear attributed to "Script
+/// Editor" in Notification Center settings — minor cosmetic quirk we
+/// accept in exchange for not having to ship a `.app` bundle.
+///
+/// Failure is silent: if `osascript` is missing or the spawn fails we
+/// still have the `published remote paste` log line and the pasteboard
+/// content, so the worst case is the user has to glance at the terminal
+/// instead of the desktop banner.
+fn notify_user(message: &str) {
+    // AppleScript string literals — escape `\` and `"`.
+    let escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!("display notification \"{escaped}\" with title \"macrdp\"");
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .spawn();
 }
 
 fn make_temp_dir() -> std::io::Result<PathBuf> {

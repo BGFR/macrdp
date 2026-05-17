@@ -10,10 +10,11 @@ Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
 - Drive keyboard and mouse, including modifier keys, mouse buttons, and wheel.
 - See the real macOS cursor shape (I-beam, hand, etc.) overlaid by the client.
 - Copy/paste UTF-8 text and images (CF_DIB ↔ PNG) between Mac and remote.
+- Mac→Windows file-name clipboard (FileGroupDescriptorW): copying a file in Finder lets Windows see the file name on paste. The actual byte stream isn't wired (FileContentsRequest is answered CB_RESPONSE_FAIL), so Explorer's "paste file" fails cleanly while text-paste targets get the name. Phase 2 will stream the bytes.
 - Forward macOS system audio to the remote (RDPSND, 44.1 kHz stereo 16-bit PCM; SCK captures at 48 kHz and the capture loop resamples via `rubato`).
 - NLA / CredSSP authentication — no more "type username before Connect" mstsc workaround.
 
-Not yet implemented: multi-monitor, codec negotiation (NSCodec / RemoteFx), non-US keyboard layouts, file clipboard, drive/printer redirection.
+Not yet implemented: multi-monitor, file-content streaming (the second half of the file clipboard), non-US keyboard layouts, drive/printer redirection.
 
 ## Project goal
 
@@ -29,7 +30,8 @@ src/auth.rs       Startup PAM auth against the macOS account (libpam FFI)
 src/capture.rs    ScreenCaptureKit → BgrA32 BitmapUpdate, dirty-rect driven
 src/cursor.rs     NSCursor → RGBAPointer, hashed for change detection
 src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI)
-src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB)
+src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB
+                  + FileGroupDescriptorW Mac→Windows, names only)
 src/audio.rs      RDPSND ← second SCK stream with system-audio capture,
                   rubato 48→44.1 kHz resample, latency-bounded
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary

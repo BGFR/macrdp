@@ -1,6 +1,6 @@
 # macrdp
 
-A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, and system audio forwarding. NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
+A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, Mac→Windows file-name clipboard, and system audio forwarding. NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
 
 This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
@@ -63,7 +63,7 @@ System audio rides over the RDPSND virtual channel as 16-bit stereo PCM at **44.
 ## Reason why this was made
 This was done to scratch an itch.  There are practically no active open source RDP servers for MacOS.  The closest project that does this functionality is xrdp; however this program only runs on Linux/Unix machines, and has no homebrew equivalent on Macs. Done in a few hours with the help of Claude and runs pretty well.
 
-I intend to add file copy and paste functionality and multi-monitor support maybe later (however the current implementation is so functional enough for my use that I might do this when I'm bored or need a distraction from real life); however this requires forking out the original IronRDP implementation of the clipboard functionality and extending it.
+Multi-monitor and full file-content streaming (Phase 2 of the file clipboard) are on the list when I'm bored or need a distraction from real life. As of v0.5.14, copying a file in Finder and pasting on the Windows side surfaces the file *name* (e.g. into Explorer's address bar or any text field) — the byte transfer itself fails cleanly because the streaming half of MS-RDPECLIP isn't wired yet.
 
 ## License
 

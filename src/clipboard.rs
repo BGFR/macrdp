@@ -542,6 +542,8 @@ impl CliprdrBackend for MacCliprdrBackend {
                             file_index: i as i32,
                             file_size: f.file_size,
                             router: self.download_router.clone(),
+                            sender: self.sender.clone(),
+                            rt_handle: tokio::runtime::Handle::current(),
                         },
                     ))
                 })

@@ -29,18 +29,80 @@
 #![cfg(target_os = "macos")]
 
 use std::collections::HashMap;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use block2::Block;
-use ironrdp_cliprdr::pdu::FileContentsResponse;
+use block2::{Block, RcBlock};
+use ironrdp_cliprdr::backend::ClipboardMessage;
+use ironrdp_cliprdr::pdu::{FileContentsFlags, FileContentsRequest, FileContentsResponse};
+use ironrdp_server::ServerEvent;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, ProtocolObject};
 use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
 use objc2_app_kit::{NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSPasteboard};
-use objc2_foundation::{NSArray, NSDictionary, NSError, NSObjectProtocol, NSString, NSURL};
-use tokio::sync::oneshot;
-use tracing::{debug, warn};
+use objc2_foundation::{NSArray, NSError, NSObjectProtocol, NSString, NSURL};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, info, warn};
+
+/// Wraps an `RcBlock` so it can move across tokio's `spawn` boundary.
+/// block2 conservatively marks blocks `!Send` because an arbitrary block
+/// may capture thread-affine ObjC objects. Cocoa hands us
+/// `NSFilePromiseProvider`'s completion block on a background
+/// `NSOperationQueue` and documents that the block may be invoked from
+/// any thread, so invoking it from a tokio worker is sound.
+///
+/// The inner pointer is held behind `Box::into_raw` so the closure
+/// auto-trait analysis (which looks at captured *fields*, not whole
+/// structs) cannot see the `NonNull<Block>` inside `RcBlock`. We only
+/// invoke the block from one thread (the tokio worker that polls the
+/// promise future), and the `Drop` impl reconstitutes the Box.
+struct SendBlock {
+    raw: *mut RcBlock<dyn Fn(*mut NSError)>,
+}
+// SAFETY: see above.
+unsafe impl Send for SendBlock {}
+
+impl SendBlock {
+    fn new(block: RcBlock<dyn Fn(*mut NSError)>) -> Self {
+        Self {
+            raw: Box::into_raw(Box::new(block)),
+        }
+    }
+    /// Invoke the block exactly once. Consumes self so a double-call is a
+    /// type error.
+    fn invoke(self, err: *mut NSError) {
+        let boxed = unsafe { Box::from_raw(self.raw) };
+        boxed.call((err,));
+        // Manually forget self because Drop would double-free.
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for SendBlock {
+    fn drop(&mut self) {
+        // Reached only if `invoke` was never called (e.g. spawned task
+        // panicked before reaching the call site). Reclaim the box so the
+        // RcBlock's underlying ObjC release runs.
+        unsafe {
+            let _ = Box::from_raw(self.raw);
+        }
+    }
+}
+
+/// Per-RANGE request size. mstsc / Microsoft Remote Desktop both seem to
+/// happily handle 1 MiB chunks; smaller would wake up the response loop
+/// more often, larger risks blowing past `MAX_FILE_RANGE_BYTES` on the
+/// other side or hitting some peer-specific cap. 1 MiB matches what mstsc
+/// itself asks for when fetching from us in the Mac→Windows direction.
+const CHUNK_SIZE: u32 = 1024 * 1024;
+
+/// Shared event sender used by both the cliprdr backend (for ack PDUs) and
+/// any promise-fulfilling task. Holding `Option<...>` lets the factory
+/// create the wiring before tokio hands it a real sender via
+/// `ServerEventSender::set_sender`.
+pub type EventSender = Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>;
 
 /// Routes `FileContentsResponse` PDUs back to whichever delegate task is
 /// awaiting them, keyed by `stream_id`. One instance lives on
@@ -86,21 +148,27 @@ impl DownloadRouter {
 /// in the remote's FILEGROUPDESCRIPTORW gets its own delegate so the
 /// state is naturally per-file rather than juggling indices through
 /// `provider.userInfo()`.
+#[derive(Clone)]
 pub struct PromiseIvars {
     /// Display name handed back from `fileNameForType:`.
     pub file_name: String,
-    /// Index into the remote's file list — Phase 2b uses this as
+    /// Index into the remote's file list — used as
     /// `FileContentsRequest.index` when fetching bytes.
-    #[allow(dead_code)]
     pub file_index: i32,
-    /// Total file size from the descriptor, or `None` for directories
-    /// (which can't be byte-fetched). Phase 2b will skip the SIZE round
-    /// trip when this is set and trust it as the streaming target length.
-    #[allow(dead_code)]
+    /// Total file size from the descriptor, or `None` if the remote
+    /// didn't set it. When `None` we'll do a SIZE round-trip first; when
+    /// set, we trust the value and skip straight to RANGE chunks.
     pub file_size: Option<u64>,
-    /// Shared with the backend so responses route back here.
-    #[allow(dead_code)]
+    /// Routes incoming `FileContentsResponse` back to the awaiting
+    /// download task; cloned from `MacCliprdr`.
     pub router: DownloadRouter,
+    /// Push `SendFileContentsRequest` events through the same channel the
+    /// cliprdr backend uses for its own messages.
+    pub sender: EventSender,
+    /// Captured at delegate-construction time (inside a tokio context)
+    /// so the Cocoa-thread `writePromiseToURL` callback can spawn back
+    /// onto our runtime.
+    pub rt_handle: tokio::runtime::Handle,
 }
 
 declare_class!(
@@ -148,21 +216,46 @@ declare_class!(
             url: &NSURL,
             completion_handler: &Block<dyn Fn(*mut NSError)>,
         ) {
-            // Phase 2a: paste isn't wired to the cliprdr fetch yet. Fail
-            // the promise immediately so Finder shows a "couldn't copy"
-            // dialog rather than hanging.
-            let path = url.path().map(|s| s.to_string()).unwrap_or_default();
-            warn!(file = %self.ivars().file_name, dest = %path, "Phase 2a promise: not yet implemented");
-            let domain = NSString::from_str("MacrdpFileClipboard");
-            let err = NSError::errorWithDomain_code_userInfo(
-                &domain,
-                -1,
-                Some(&NSDictionary::new()),
-            );
-            // SAFETY: blocks invoked from the same thread Cocoa called us
-            // on. NSError pointer ownership is +0 (caller of the block is
-            // responsible for retain/release semantics on Cocoa's side).
-            completion_handler.call((Retained::as_ptr(&err) as *mut _,));
+            let dst: PathBuf = match url.path() {
+                Some(p) => PathBuf::from(p.to_string()),
+                None => {
+                    warn!("file promise URL has no path; failing");
+                    completion_handler.call((fail_error("bad URL"),));
+                    return;
+                }
+            };
+            let state = self.ivars().clone();
+            // Retain the completion block so it outlives this synchronous
+            // callback and can be invoked from the spawned task. Without
+            // RcBlock::copy, the borrowed `&Block` becomes invalid the
+            // moment we return. RcBlock::copy returns Option because the
+            // underlying _Block_copy can theoretically fail under memory
+            // pressure; in practice it never does, but we have to handle
+            // the case — error the promise out so Finder doesn't hang.
+            let completion = match RcBlock::copy(completion_handler as *const _ as *mut _) {
+                Some(c) => SendBlock::new(c),
+                None => {
+                    completion_handler.call((fail_error("RcBlock::copy returned None"),));
+                    return;
+                }
+            };
+            let handle = state.rt_handle.clone();
+            handle.spawn(async move {
+                let err_ptr = match fetch_file(&state, &dst).await {
+                    Ok(()) => {
+                        info!(file = %state.file_name, dest = ?dst, "file promise fulfilled");
+                        std::ptr::null_mut()
+                    }
+                    Err(e) => {
+                        warn!(file = %state.file_name, dest = ?dst, "file promise failed: {e}");
+                        // Best-effort: drop a partial file rather than
+                        // leaving Finder with a half-written copy.
+                        let _ = std::fs::remove_file(&dst);
+                        fail_error(&e)
+                    }
+                };
+                completion.invoke(err_ptr);
+            });
         }
     }
 );
@@ -175,6 +268,113 @@ impl PromiseDelegate {
         let this = Self::alloc().set_ivars(ivars);
         unsafe { msg_send_id![super(this), init] }
     }
+}
+
+/// Build a leaked-pointer `NSError` suitable for handing to the completion
+/// handler. The block invokes Cocoa code that retains the error as it sees
+/// fit, so we drop ownership here (`Retained::into_raw`).
+///
+/// userInfo is intentionally `None` — the heterogeneous
+/// `NSDictionary<NSString, AnyObject>` shape Cocoa wants for a
+/// `localizedDescription` value is awkward to build through objc2's
+/// generics, and the message text is already in our tracing logs. The
+/// domain + code is enough for Finder to show its generic
+/// "couldn't paste" alert.
+fn fail_error(msg: &str) -> *mut NSError {
+    debug!("file promise error: {msg}");
+    let domain = NSString::from_str("MacrdpFileClipboard");
+    let err = unsafe { NSError::errorWithDomain_code_userInfo(&domain, -1, None) };
+    Retained::into_raw(err)
+}
+
+/// Drive the full SIZE-then-RANGE download for a single promised file
+/// and write the result to `dst`. Returns a human-readable error string
+/// on any failure (channel closed, peer returned CB_RESPONSE_FAIL,
+/// filesystem error, …) so the caller can package it into an `NSError`.
+async fn fetch_file(state: &PromiseIvars, dst: &std::path::Path) -> Result<(), String> {
+    // Prefer the descriptor-provided size; fall back to a SIZE round trip
+    // if the remote left it blank.
+    let total = match state.file_size {
+        Some(s) => s,
+        None => fetch_size(state).await?,
+    };
+    debug!(file = %state.file_name, total, "starting promise fetch");
+
+    let mut file = std::fs::File::create(dst).map_err(|e| format!("create {dst:?}: {e}"))?;
+    let mut position: u64 = 0;
+    while position < total {
+        let remaining = total - position;
+        let req_size = remaining.min(u64::from(CHUNK_SIZE)) as u32;
+        let chunk = fetch_range(state, position, req_size).await?;
+        if chunk.is_empty() {
+            // Remote returned no bytes — treat as premature EOF.
+            return Err(format!(
+                "short read at {position}; expected {req_size} bytes, got 0"
+            ));
+        }
+        file.write_all(&chunk)
+            .map_err(|e| format!("write {dst:?}: {e}"))?;
+        position += chunk.len() as u64;
+    }
+    file.flush().map_err(|e| format!("flush {dst:?}: {e}"))?;
+    Ok(())
+}
+
+async fn fetch_size(state: &PromiseIvars) -> Result<u64, String> {
+    let (stream_id, rx) = state.router.register();
+    push_request(
+        &state.sender,
+        FileContentsRequest {
+            stream_id,
+            index: state.file_index,
+            flags: FileContentsFlags::SIZE,
+            position: 0,
+            requested_size: 8,
+            data_id: None,
+        },
+    )?;
+    let resp = rx.await.map_err(|_| "size: channel closed".to_string())?;
+    if resp.is_error() {
+        return Err("size: remote returned CB_RESPONSE_FAIL".into());
+    }
+    resp.data_as_size().map_err(|e| format!("size decode: {e}"))
+}
+
+async fn fetch_range(
+    state: &PromiseIvars,
+    position: u64,
+    requested_size: u32,
+) -> Result<Vec<u8>, String> {
+    let (stream_id, rx) = state.router.register();
+    push_request(
+        &state.sender,
+        FileContentsRequest {
+            stream_id,
+            index: state.file_index,
+            flags: FileContentsFlags::RANGE,
+            position,
+            requested_size,
+            data_id: None,
+        },
+    )?;
+    let resp = rx.await.map_err(|_| "range: channel closed".to_string())?;
+    if resp.is_error() {
+        return Err(format!(
+            "range at {position}: remote returned CB_RESPONSE_FAIL"
+        ));
+    }
+    Ok(resp.data().to_vec())
+}
+
+fn push_request(sender: &EventSender, req: FileContentsRequest) -> Result<(), String> {
+    let guard = sender.lock().unwrap();
+    let s = guard
+        .as_ref()
+        .ok_or_else(|| "event sender unavailable (server shutting down?)".to_string())?;
+    s.send(ServerEvent::Clipboard(
+        ClipboardMessage::SendFileContentsRequest(req),
+    ))
+    .map_err(|_| "event channel closed".to_string())
 }
 
 /// Push N `NSFilePromiseProvider` objects onto the general pasteboard.

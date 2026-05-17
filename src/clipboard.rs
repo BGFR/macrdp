@@ -191,6 +191,12 @@ pub struct MacCliprdr {
     /// `request.index` back to a real path even when the advertise was sent
     /// from the poller in the factory.
     file_paths: Paths,
+    /// Windows→Mac file paste routing. Backend's
+    /// `on_file_contents_response` dispatches incoming bytes through this;
+    /// each in-flight promise delegate holds the matching receiver. See
+    /// `src/file_promise.rs`.
+    #[cfg(target_os = "macos")]
+    download_router: crate::file_promise::DownloadRouter,
 }
 
 impl MacCliprdr {
@@ -198,6 +204,8 @@ impl MacCliprdr {
         Self {
             sender: Arc::new(Mutex::new(None)),
             file_paths: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(target_os = "macos")]
+            download_router: crate::file_promise::DownloadRouter::default(),
         }
     }
 }
@@ -236,6 +244,8 @@ impl CliprdrBackendFactory for MacCliprdr {
             sender: self.sender.clone(),
             last_requested: None,
             file_paths: self.file_paths.clone(),
+            #[cfg(target_os = "macos")]
+            download_router: self.download_router.clone(),
         })
     }
 }
@@ -252,6 +262,10 @@ struct MacCliprdrBackend {
     // Shared with `MacCliprdr` so the poller and the backend agree on which
     // paths back the currently-advertised FILEGROUPDESCRIPTORW.
     file_paths: Paths,
+    // Windows→Mac side: route FileContentsResponses to whichever delegate
+    // task is awaiting the matching stream_id.
+    #[cfg(target_os = "macos")]
+    download_router: crate::file_promise::DownloadRouter,
 }
 
 impl ironrdp_core::AsAny for MacCliprdrBackend {
@@ -500,28 +514,42 @@ impl CliprdrBackend for MacCliprdrBackend {
     }
 
     fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
-        // Phase 1 of Windows→Mac file clipboard: just log what arrived so
-        // we can confirm the inbound protocol round-trip works end-to-end
-        // (FormatList → FormatDataRequest → FormatDataResponse → file list
-        // decoded by upstream cliprdr). The actual NSPasteboard
-        // advertising via NSFilePromiseProvider is Phase 2 in
-        // `src/file_promise.rs`.
         debug!(
             file_count = files.len(),
-            clip_data_id, "remote file list received (Phase 1: not yet placed on Mac pasteboard)"
+            clip_data_id, "remote file list received; placing on NSPasteboard"
         );
-        for (i, f) in files.iter().enumerate() {
-            debug!(
-                index = i,
-                name = %f.name,
-                relative_path = ?f.relative_path,
-                size = ?f.file_size,
-                is_dir = f.attributes
-                    .map(|a| a.contains(ClipboardFileAttributes::DIRECTORY))
-                    .unwrap_or(false),
-                "remote file"
-            );
+        #[cfg(target_os = "macos")]
+        {
+            let delegates: Vec<_> = files
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| {
+                    // Phase 2a: directories aren't byte-fetchable; skip
+                    // them. Recursive folder fetch needs the Phase 2b
+                    // streaming machinery + relative_path-aware
+                    // descriptor walk.
+                    let is_dir = f
+                        .attributes
+                        .map(|a| a.contains(ClipboardFileAttributes::DIRECTORY))
+                        .unwrap_or(false);
+                    if is_dir {
+                        debug!(name = %f.name, "skipping directory in Phase 2a");
+                        return None;
+                    }
+                    Some(crate::file_promise::PromiseDelegate::new(
+                        crate::file_promise::PromiseIvars {
+                            file_name: f.name.clone(),
+                            file_index: i as i32,
+                            file_size: f.file_size,
+                            router: self.download_router.clone(),
+                        },
+                    ))
+                })
+                .collect();
+            crate::file_promise::write_promises_to_pasteboard(&delegates);
         }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (files, clip_data_id);
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
@@ -627,7 +655,17 @@ impl CliprdrBackend for MacCliprdrBackend {
             .unwrap_or_else(|| FileContentsResponse::new_error(stream_id));
         self.push(ClipboardMessage::SendFileContentsResponse(response));
     }
-    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
+    fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
+        // Owned copy so we can hand it to the awaiting task (which lives
+        // past the lifetime of this borrow).
+        #[cfg(target_os = "macos")]
+        {
+            use ironrdp_core::IntoOwned;
+            self.download_router.deliver(response.into_owned());
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = response;
+    }
     fn on_lock(&mut self, _data_id: LockDataId) {}
     fn on_unlock(&mut self, _data_id: LockDataId) {}
 }

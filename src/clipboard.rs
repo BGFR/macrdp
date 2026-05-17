@@ -347,6 +347,9 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths) -> bool {
             let mut files = Vec::with_capacity(entries.len());
             for e in entries {
                 let mut fd = FileDescriptor::new(e.name);
+                if let Some(rp) = e.relative_path {
+                    fd = fd.with_relative_path(rp);
+                }
                 if e.is_dir {
                     fd = fd.with_attributes(ClipboardFileAttributes::DIRECTORY);
                 } else {
@@ -359,7 +362,10 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths) -> bool {
                 snapshot.push(e.path);
             }
             *paths.lock().unwrap() = snapshot;
-            debug!(file_count = files.len(), "advertising file copy to client");
+            debug!(
+                file_count = files.len(),
+                "advertising file copy to client (recursive)"
+            );
             return send(sender, ServerEvent::ClipboardFileCopy(files));
         }
         // Files claimed but read empty (race) — fall through to format list.
@@ -616,21 +622,37 @@ mod pb {
         pub size: Option<u64>,
         pub is_dir: bool,
         pub path: std::path::PathBuf,
+        /// MS-RDPECLIP relative directory path within the copied root,
+        /// using `\` as the separator (e.g. `MyFolder\sub`). `None` for the
+        /// top-level entries that came directly off the pasteboard.
+        pub relative_path: Option<String>,
     }
 
-    /// Return one entry per file URL item on the general pasteboard.
-    /// Cocoa stores multi-file selections as one pasteboard item per file,
-    /// each with its own `NSPasteboardTypeFileURL` string. We resolve names
-    /// and sizes via `std::fs::metadata`; unreadable paths are skipped so
-    /// the rest of a selection still pastes.
+    /// Cap on total descriptors produced by one pasteboard read. Upstream
+    /// `PackedFileList` rejects beyond `MAX_FILE_COUNT = 100_000`, but we cut
+    /// off earlier — paste of a giant tree (e.g. node_modules) shouldn't
+    /// stall the advertise round-trip for tens of seconds.
+    const MAX_FILES_PER_COPY: usize = 10_000;
+
+    /// Return one entry per file URL item on the general pasteboard, with
+    /// directories expanded recursively. Cocoa stores multi-file selections
+    /// as one pasteboard item per file; for any item that resolves to a
+    /// directory we emit one entry for the directory itself plus one for
+    /// each descendant, with `relative_path` set so the wire `cFileName`
+    /// reconstructs the full path inside the copied root.
+    ///
+    /// Symlinks are skipped entirely (both as top-level items and inside a
+    /// walked directory) to avoid following them into unintended paths and
+    /// to prevent cycles. Unreadable paths or directories we can't open are
+    /// logged but don't abort the rest of the walk.
     pub fn read_files() -> Vec<FileEntry> {
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
             let Some(items) = pb.pasteboardItems() else {
                 return Vec::new();
             };
-            let mut out = Vec::with_capacity(items.count());
-            for i in 0..items.count() {
+            let mut out: Vec<FileEntry> = Vec::new();
+            'items: for i in 0..items.count() {
                 let item = items.objectAtIndex(i);
                 let Some(url_str) = item.stringForType(NSPasteboardTypeFileURL) else {
                     continue;
@@ -642,20 +664,95 @@ mod pb {
                 else {
                     continue;
                 };
-                let meta = std::fs::metadata(&path).ok();
-                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                // For directories, the wire `file_size` field is unused
-                // (Windows queries it per-file when recursing).
-                let size = if is_dir { None } else { meta.map(|m| m.len()) };
+                // symlink_metadata so we don't transparently follow a
+                // top-level symlink into someone else's filesystem subtree.
+                let meta = match std::fs::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(?path, "metadata failed for pasteboard item: {e}");
+                        continue;
+                    }
+                };
+                if meta.file_type().is_symlink() {
+                    tracing::debug!(?path, "skipping symlink on pasteboard");
+                    continue;
+                }
+                let is_dir = meta.is_dir();
+                let size = if is_dir { None } else { Some(meta.len()) };
                 out.push(FileEntry {
-                    name,
+                    name: name.clone(),
                     size,
                     is_dir,
-                    path,
+                    path: path.clone(),
+                    relative_path: None,
                 });
+                if out.len() >= MAX_FILES_PER_COPY {
+                    break 'items;
+                }
+                if is_dir && !walk_inner(&mut out, &path, name) {
+                    break 'items;
+                }
+            }
+            if out.len() >= MAX_FILES_PER_COPY {
+                tracing::warn!(
+                    cap = MAX_FILES_PER_COPY,
+                    "file list truncated at cap; deeper entries omitted from this paste"
+                );
             }
             out
         })
+    }
+
+    /// Recursively append entries under `dir` to `out`. `relative_prefix`
+    /// is the wire-format directory path (using `\` separators) describing
+    /// `dir`'s location relative to the copied root — for example, when
+    /// expanding the top-level pasteboard item `MyFolder`, the first call
+    /// passes `relative_prefix = "MyFolder"`; descending into `MyFolder/sub`
+    /// recurses with `"MyFolder\\sub"`. Returns `false` if the per-copy cap
+    /// was hit so the caller can stop the outer walk.
+    pub(super) fn walk_inner(
+        out: &mut Vec<FileEntry>,
+        dir: &std::path::Path,
+        relative_prefix: String,
+    ) -> bool {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(it) => it,
+            Err(e) => {
+                tracing::warn!(?dir, "skipping unreadable directory: {e}");
+                return true;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+                continue;
+            };
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let is_dir = meta.is_dir();
+            let size = if is_dir { None } else { Some(meta.len()) };
+            out.push(FileEntry {
+                name: name.clone(),
+                size,
+                is_dir,
+                path: path.clone(),
+                relative_path: Some(relative_prefix.clone()),
+            });
+            if out.len() >= MAX_FILES_PER_COPY {
+                return false;
+            }
+            if is_dir {
+                let nested = format!("{relative_prefix}\\{name}");
+                if !walk_inner(out, &path, nested) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Turn a `NSPasteboardTypeFileURL` string into an absolute filesystem
@@ -760,6 +857,7 @@ mod pb {
         pub size: Option<u64>,
         pub is_dir: bool,
         pub path: std::path::PathBuf,
+        pub relative_path: Option<String>,
     }
     pub fn change_count() -> i64 {
         0
@@ -863,5 +961,107 @@ mod tests {
         let got = read_file_range(&f.0, 0, 8 * 1024 * 1024).unwrap();
         assert_eq!(got.len(), MAX_FILE_RANGE_BYTES as usize);
         assert!(got.iter().all(|&b| b == 0xAB));
+    }
+
+    /// Disposable temp directory; removed on drop. Standalone for the same
+    /// reason as `tempfile_path` above — avoids pulling in `tempfile` as a
+    /// dev-dep when std fs is enough.
+    #[cfg(target_os = "macos")]
+    struct TempDir(std::path::PathBuf);
+    #[cfg(target_os = "macos")]
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    fn tmpdir(label: &str) -> TempDir {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "macrdp-cliprdr-walk-{label}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+
+    /// Verify the recursive walk:
+    ///   root/
+    ///     a.txt
+    ///     sub/
+    ///       b.txt
+    ///       deep/
+    ///         c.txt
+    /// Should yield 5 descriptors with the right name + relative_path pairs
+    /// so the wire `cFileName` (relative_path\name) reconstructs the full
+    /// path under the copied root.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn walk_inner_emits_recursive_entries_with_relative_paths() {
+        use std::io::Write;
+        let root = tmpdir("nested");
+        let sub = root.0.join("sub");
+        let deep = sub.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::File::create(root.0.join("a.txt"))
+            .unwrap()
+            .write_all(b"a")
+            .unwrap();
+        std::fs::File::create(sub.join("b.txt"))
+            .unwrap()
+            .write_all(b"bb")
+            .unwrap();
+        std::fs::File::create(deep.join("c.txt"))
+            .unwrap()
+            .write_all(b"ccc")
+            .unwrap();
+
+        let root_name = root.0.file_name().unwrap().to_str().unwrap().to_owned();
+        let mut entries: Vec<pb::FileEntry> = Vec::new();
+        let ok = pb::walk_inner(&mut entries, &root.0, root_name.clone());
+        assert!(ok, "walk_inner should not hit the cap on a tiny tree");
+
+        // Build a (name, relative_path, is_dir) set so we can assert without
+        // depending on filesystem iteration order.
+        let mut seen: Vec<(String, Option<String>, bool, Option<u64>)> = entries
+            .into_iter()
+            .map(|e| (e.name, e.relative_path, e.is_dir, e.size))
+            .collect();
+        seen.sort();
+
+        let expected_sub_prefix = format!("{root_name}\\sub");
+        let mut expected: Vec<(String, Option<String>, bool, Option<u64>)> = vec![
+            ("a.txt".into(), Some(root_name.clone()), false, Some(1)),
+            ("sub".into(), Some(root_name.clone()), true, None),
+            (
+                "b.txt".into(),
+                Some(expected_sub_prefix.clone()),
+                false,
+                Some(2),
+            ),
+            ("deep".into(), Some(expected_sub_prefix.clone()), true, None),
+            (
+                "c.txt".into(),
+                Some(format!("{expected_sub_prefix}\\deep")),
+                false,
+                Some(3),
+            ),
+        ];
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
+
+    /// Empty / unreadable / nonexistent directory should not panic and not
+    /// stop the outer walk (returns `true`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn walk_inner_handles_missing_dir() {
+        let bogus = std::path::PathBuf::from("/no/such/dir/macrdp-test-does-not-exist");
+        let mut entries: Vec<pb::FileEntry> = Vec::new();
+        let ok = pb::walk_inner(&mut entries, &bogus, "root".to_owned());
+        assert!(ok);
+        assert!(entries.is_empty());
     }
 }

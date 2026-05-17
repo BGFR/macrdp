@@ -165,56 +165,74 @@ pub fn spawn_remote_paste(
             count = written.len(),
             "published remote paste to NSPasteboard"
         );
-        let summary = match written.as_slice() {
-            [single] => single
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| format!("{n} ready to paste"))
-                .unwrap_or_else(|| "File ready to paste".into()),
-            many => format!("{} files ready to paste", many.len()),
-        };
-        notify_user(&summary);
+        ready_signal();
     });
 }
 
-/// Fire a macOS desktop notification. Uses `osascript` because (a) it
-/// avoids the entitlements / app-bundle dance that
-/// `UNUserNotificationCenter` requires for an unbundled CLI and (b) it's
-/// already on the system. Notifications appear attributed to "Script
-/// Editor" in Notification Center settings — minor cosmetic quirk we
-/// accept in exchange for not having to ship a `.app` bundle.
+/// Audible "paste is ready" cue plus an opportunistic auto-Cmd-V if the
+/// user is still in Finder.
 ///
-/// We log osascript's exit status + stderr so a silent failure (e.g.
-/// Script Editor doesn't have notification permission yet, Do Not
-/// Disturb is on, osascript missing from PATH) shows up at debug
-/// level. The pasteboard content + the `published remote paste`
-/// info log are still the source of truth for "paste is ready."
-fn notify_user(message: &str) {
-    // AppleScript string literals — escape `\` and `"`.
-    let escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!("display notification \"{escaped}\" with title \"macrdp\"");
+/// We tried `osascript ... display notification` first but macOS attributes
+/// the banner to the parent process (macrdp, unsigned, no notification
+/// grant) and silently suppresses it. `afplay` doesn't go through the
+/// notification permission system at all — it's just audio playback —
+/// so the chime always plays. The Glass sound is short and unobtrusive.
+///
+/// The auto-paste piggy-backs on the same trigger because the typical
+/// flow is "user copied in Windows, switched to Finder, hit Cmd-V, got
+/// beep, is still staring at Finder." If Finder is the frontmost app
+/// when our download finishes, fire `Cmd-V` via System Events so the
+/// paste completes without the user having to do anything. If they've
+/// switched focus to another app, the chime alone is the cue to switch
+/// back and paste manually — we deliberately don't activate or steal
+/// focus to avoid pasting into the wrong text field.
+fn ready_signal() {
+    play_glass();
+    auto_paste_if_finder_front();
+}
+
+fn play_glass() {
+    if let Err(e) = std::process::Command::new("afplay")
+        .arg("/System/Library/Sounds/Glass.aiff")
+        .spawn()
+    {
+        debug!("afplay spawn failed: {e}");
+    }
+}
+
+fn auto_paste_if_finder_front() {
+    // AppleScript: only fire Cmd-V if Finder is the currently frontmost
+    // process. System Events handles the keystroke; the user only needs
+    // to have granted Accessibility access to System Events once.
+    let script = r#"
+        tell application "System Events"
+            set frontApp to name of first application process whose frontmost is true
+            if frontApp is "Finder" then
+                keystroke "v" using command down
+            end if
+        end tell
+    "#;
     let output = match std::process::Command::new("osascript")
         .arg("-e")
-        .arg(&script)
+        .arg(script)
         .output()
     {
         Ok(o) => o,
         Err(e) => {
-            warn!("osascript spawn failed: {e}");
+            debug!("osascript spawn failed for auto-paste: {e}");
             return;
         }
     };
-    if output.status.success() {
-        debug!(message, "fired desktop notification");
-    } else {
+    if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(
+        debug!(
             status = ?output.status,
             stderr = %stderr.trim(),
-            "osascript notification failed; grant Script Editor \
-             permission in System Settings → Notifications, or check \
-             Do Not Disturb"
+            "auto-paste osascript exited non-zero (typically: no Accessibility \
+             grant for System Events, or Finder not running)"
         );
+    } else {
+        debug!("auto-paste check completed");
     }
 }
 

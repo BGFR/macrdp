@@ -21,9 +21,9 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use image::{ImageEncoder, ImageReader};
 use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::{
-    ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId,
-    ClipboardGeneralCapabilityFlags, FileContentsFlags, FileContentsRequest, FileContentsResponse,
-    FileDescriptor, FormatDataRequest, FormatDataResponse, LockDataId, OwnedFormatDataResponse,
+    ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags,
+    FileContentsFlags, FileContentsRequest, FileContentsResponse, FileDescriptor,
+    FormatDataRequest, FormatDataResponse, LockDataId, OwnedFormatDataResponse,
 };
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
@@ -294,7 +294,12 @@ impl MacCliprdrBackend {
             return None;
         }
         if request.flags.contains(FileContentsFlags::SIZE) {
-            debug!(stream = request.stream_id, ?path, size = meta.len(), "SIZE response");
+            debug!(
+                stream = request.stream_id,
+                ?path,
+                size = meta.len(),
+                "SIZE response"
+            );
             return Some(FileContentsResponse::new_size_response(
                 request.stream_id,
                 meta.len(),
@@ -568,9 +573,9 @@ impl CliprdrBackend for MacCliprdrBackend {
 
     fn on_file_contents_request(&mut self, request: FileContentsRequest) {
         let stream_id = request.stream_id;
-        let response = self.serve_file_contents(request).unwrap_or_else(|| {
-            FileContentsResponse::new_error(stream_id)
-        });
+        let response = self
+            .serve_file_contents(request)
+            .unwrap_or_else(|| FileContentsResponse::new_error(stream_id));
         self.push(ClipboardMessage::SendFileContentsResponse(response));
     }
     fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
@@ -633,10 +638,7 @@ mod pb {
                 let Some(path) = resolve_file_url(&url_str) else {
                     continue;
                 };
-                let Some(name) = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(str::to_owned)
+                let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned)
                 else {
                     continue;
                 };
@@ -791,7 +793,10 @@ mod tests {
 
     fn tmpfile(content: &[u8]) -> tempfile_path::TempPath {
         let tp = tempfile_path::new();
-        std::fs::File::create(&tp.0).unwrap().write_all(content).unwrap();
+        std::fs::File::create(&tp.0)
+            .unwrap()
+            .write_all(content)
+            .unwrap();
         tp
     }
 

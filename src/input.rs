@@ -49,15 +49,36 @@ impl RdpServerInputHandler for MacInputHandler {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::time::{Duration, Instant};
+
     use anyhow::{anyhow, Result};
     use core_graphics::display::CGDisplay;
     use core_graphics::event::{
-        CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, ScrollEventUnit,
+        CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, EventField,
+        ScrollEventUnit,
     };
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use core_graphics::geometry::CGPoint;
     use ironrdp_server::{KeyboardEvent, MouseEvent};
     use tracing::{trace, warn};
+
+    /// macOS's default `NSEvent.doubleClickInterval` is 0.5 s. We don't read
+    /// the per-user setting (would need a CFPreferences call) — the default
+    /// matches what most users have, and using less than the real threshold
+    /// just means an aggressive double-click occasionally counts as two
+    /// single clicks (the worse alternative is missing all double-clicks).
+    const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+    /// Pixels of cursor movement allowed between consecutive clicks for them
+    /// to still count as a multi-click. macOS's slop is a few px; 5 is safe.
+    const DOUBLE_CLICK_SLOP_PX: f64 = 5.0;
+
+    #[derive(Clone, Copy)]
+    struct ClickState {
+        time: Instant,
+        x: f64,
+        y: f64,
+        count: i64,
+    }
 
     // CGEventSource wraps a thread-safe Core Foundation object; Apple documents
     // CF types as safe to send between threads. The crate doesn't impl Send
@@ -75,6 +96,13 @@ mod macos {
         flags: CGEventFlags,
         screen_width_pts: f64,
         screen_height_pts: f64,
+        // Per-button click history so a quick second press at (roughly) the
+        // same spot becomes click_count=2 and Finder recognises a double-
+        // click. Without this every press has click_count=1 implicitly and
+        // double-click actions never fire.
+        click_left: Option<ClickState>,
+        click_right: Option<ClickState>,
+        click_middle: Option<ClickState>,
     }
 
     impl Inner {
@@ -94,6 +122,9 @@ mod macos {
                 flags: CGEventFlags::CGEventFlagNull,
                 screen_width_pts: main.pixels_wide() as f64,
                 screen_height_pts: main.pixels_high() as f64,
+                click_left: None,
+                click_right: None,
+                click_middle: None,
             })
         }
 
@@ -216,6 +247,39 @@ mod macos {
                 CGMouseButton::Right => self.right_down = down,
                 CGMouseButton::Center => self.middle_down = down,
             }
+
+            // Compute the click count: increment on a down event close in
+            // time + space to the previous click; reset to 1 otherwise. The
+            // matching up event reuses the count from the most recent down
+            // so Finder sees a paired {down, up} with identical click_state.
+            let state_slot = match button {
+                CGMouseButton::Left => &mut self.click_left,
+                CGMouseButton::Right => &mut self.click_right,
+                CGMouseButton::Center => &mut self.click_middle,
+            };
+            let click_count = if down {
+                let now = Instant::now();
+                let count = match *state_slot {
+                    Some(prev)
+                        if now.duration_since(prev.time) <= DOUBLE_CLICK_INTERVAL
+                            && (self.last_x - prev.x).abs() <= DOUBLE_CLICK_SLOP_PX
+                            && (self.last_y - prev.y).abs() <= DOUBLE_CLICK_SLOP_PX =>
+                    {
+                        prev.count + 1
+                    }
+                    _ => 1,
+                };
+                *state_slot = Some(ClickState {
+                    time: now,
+                    x: self.last_x,
+                    y: self.last_y,
+                    count,
+                });
+                count
+            } else {
+                state_slot.map(|s| s.count).unwrap_or(1)
+            };
+
             let Ok(ev) = CGEvent::new_mouse_event(
                 self.source.clone(),
                 etype,
@@ -225,6 +289,7 @@ mod macos {
                 warn!("CGEvent mouse button create failed");
                 return;
             };
+            ev.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_count);
             ev.post(CGEventTapLocation::HID);
         }
 

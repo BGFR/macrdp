@@ -599,9 +599,28 @@ impl RdpServer {
                         warn!("No clipboard channel, dropping file-copy event");
                         continue;
                     };
-                    let msgs = cliprdr
-                        .initiate_file_copy(files)
-                        .context("failed to initiate file copy")?;
+                    debug!(
+                        file_count = files.len(),
+                        "ClipboardFileCopy: calling initiate_file_copy"
+                    );
+                    // Don't propagate the error: a failed initiate_file_copy
+                    // (e.g. STREAM_FILECLIP_ENABLED not negotiated, or the
+                    // channel state-machine not yet Ready) shouldn't tear down
+                    // the whole RDP connection — text/image clipboard and the
+                    // display still work.
+                    let msgs = match cliprdr.initiate_file_copy(files) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            // Cross-reference the earlier "clipboard
+                            // capabilities negotiated" log line to see
+                            // whether STREAM_FILECLIP_ENABLED is missing.
+                            warn!(
+                                ?e,
+                                "initiate_file_copy failed; file paste will fail until the next copy"
+                            );
+                            continue;
+                        }
+                    };
                     let channel_id = self
                         .get_channel_id_by_type::<CliprdrServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;

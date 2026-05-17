@@ -354,6 +354,7 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths) -> bool {
                 snapshot.push(e.path);
             }
             *paths.lock().unwrap() = snapshot;
+            debug!(file_count = files.len(), "advertising file copy to client");
             return send(sender, ServerEvent::ClipboardFileCopy(files));
         }
         // Files claimed but read empty (race) — fall through to format list.
@@ -435,8 +436,19 @@ impl CliprdrBackend for MacCliprdrBackend {
 
     fn on_process_negotiated_capabilities(
         &mut self,
-        _capabilities: ClipboardGeneralCapabilityFlags,
+        capabilities: ClipboardGeneralCapabilityFlags,
     ) {
+        // The flags here are the AND of what we advertised and what the
+        // client advertised. If STREAM_FILECLIP_ENABLED is missing, file
+        // paste will silently fail downstream with CB_RESPONSE_FAIL — log
+        // it once so the cause is obvious in the trace.
+        let has_stream_files =
+            capabilities.contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED);
+        tracing::info!(
+            ?capabilities,
+            file_clipboard_negotiated = has_stream_files,
+            "clipboard capabilities negotiated"
+        );
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
@@ -573,7 +585,7 @@ mod pb {
         NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeString,
         NSPasteboardTypeTIFF,
     };
-    use objc2_foundation::{NSData, NSString};
+    use objc2_foundation::{NSData, NSString, NSURL};
 
     pub fn change_count() -> i64 {
         unsafe {
@@ -618,11 +630,9 @@ mod pb {
                 let Some(url_str) = item.stringForType(NSPasteboardTypeFileURL) else {
                     continue;
                 };
-                let url = url_str.to_string();
-                let Some(path_str) = file_url_to_path(&url) else {
+                let Some(path) = resolve_file_url(&url_str) else {
                     continue;
                 };
-                let path = std::path::PathBuf::from(&path_str);
                 let Some(name) = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -646,33 +656,23 @@ mod pb {
         })
     }
 
-    /// Convert a `file://` URL to a filesystem path. NSPasteboard hands us
-    /// percent-encoded URLs (spaces -> `%20`, etc.) — strip the scheme and
-    /// decode. Anything else (http://, raw paths) is rejected.
-    fn file_url_to_path(url: &str) -> Option<String> {
-        let rest = url.strip_prefix("file://")?;
-        // RFC 3986 file URLs can have an empty authority (`file:///path`)
-        // or a `localhost` authority (`file://localhost/path`). Strip both.
-        let path = rest.strip_prefix("localhost").unwrap_or(rest);
-        percent_decode(path)
-    }
-
-    fn percent_decode(s: &str) -> Option<String> {
-        let bytes = s.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' && i + 2 < bytes.len() {
-                let hi = (bytes[i + 1] as char).to_digit(16)?;
-                let lo = (bytes[i + 2] as char).to_digit(16)?;
-                out.push(((hi << 4) | lo) as u8);
-                i += 3;
-            } else {
-                out.push(bytes[i]);
-                i += 1;
-            }
+    /// Turn a `NSPasteboardTypeFileURL` string into an absolute filesystem
+    /// path. Finder hands us either a percent-encoded `file:///Users/...`
+    /// URL or — frequently — a *file-reference* URL of the form
+    /// `file:///.file/id=NNNN.MMMM`. The latter can't be stat'd directly
+    /// (`/.file/id=…` is a volfs magic mount that only resolves through
+    /// the kernel's NSURL machinery), so we let NSURL convert it before
+    /// handing the result back to Rust's std::fs.
+    fn resolve_file_url(url_str: &NSString) -> Option<std::path::PathBuf> {
+        unsafe {
+            let url = NSURL::URLWithString(url_str)?;
+            // `URLByResolvingSymlinksInPath` is what turns the file-
+            // reference form into a real `/Users/...` URL; it is a no-op
+            // for already-resolved URLs.
+            let resolved = url.URLByResolvingSymlinksInPath().unwrap_or(url);
+            let path = resolved.path()?;
+            Some(std::path::PathBuf::from(path.to_string()))
         }
-        String::from_utf8(out).ok()
     }
 
     fn has_type(target: &objc2_app_kit::NSPasteboardType) -> bool {

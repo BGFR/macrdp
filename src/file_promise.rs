@@ -41,18 +41,18 @@ use objc2_foundation::{NSArray, NSString, NSURL};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-/// Per-RANGE request size. 4 MiB matches the cap we honour ourselves on
-/// the Mac→Windows side and is well within what mstsc serves in one
-/// response; pushing larger doesn't help because mstsc's
-/// FileContentsResponse PDU lengths top out around there anyway.
-const CHUNK_SIZE: u32 = 4 * 1024 * 1024;
+/// Per-RANGE request size. 1 MiB matches what mstsc itself asks for when
+/// fetching files from us in the Mac→Windows direction. Larger chunks
+/// (we tried 4 MiB) appeared to flood the SVC channel and starve the
+/// display/audio path — the connection felt unresponsive while a big
+/// download ran.
+const CHUNK_SIZE: u32 = 1024 * 1024;
 
 /// Maximum number of in-flight `FileContentsRequest` PDUs for a single
-/// file. Higher cuts wall-clock download time on high-latency links;
-/// lower keeps us off mstsc's nerves. 16 saturates a gigabit LAN
-/// comfortably (16 × 4 MiB = 64 MiB in flight) without flooding the
-/// channel.
-const MAX_PARALLEL_CHUNKS: usize = 16;
+/// file. 8 × 1 MiB = 8 MiB of pending response data is enough to keep
+/// the cliprdr round-trip pipelined on a LAN without head-of-line-
+/// blocking other static virtual channels.
+const MAX_PARALLEL_CHUNKS: usize = 8;
 
 /// Shared event sender used by both the cliprdr backend (for ack PDUs) and
 /// any eager-download task.

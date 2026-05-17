@@ -2,40 +2,42 @@
 //!
 //! Text (CF_UNICODETEXT ↔ NSPasteboardTypeString) and images
 //! (CF_DIB ↔ PNG/TIFF) flow both directions. File copy is **Mac → Windows
-//! only and metadata only** today: the file *names* and sizes are advertised
-//! as a FileGroupDescriptorW; any FileContentsRequest from the client is
-//! answered with CB_RESPONSE_FAIL so the paste shows the list but no bytes
-//! transfer. Streaming actual file bytes is Phase 2.
+//! only**: copying a file in Finder advertises FileGroupDescriptorW with
+//! the file names + sizes, and Windows can fetch the actual bytes via
+//! FileContentsRequest (SIZE for the per-file size query, RANGE for the
+//! body chunks). The backend snapshots the absolute paths at format-
+//! data-request time so subsequent content requests resolve to the same
+//! files even if the pasteboard changes underneath us.
 //!
 //! The factory owns the event sender and spawns a poller that detects
 //! Mac-side clipboard changes via `NSPasteboard.changeCount` and signals
 //! the protocol layer.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use image::{ImageEncoder, ImageReader};
 use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::{
-    ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId, ClipboardFormatName,
-    ClipboardGeneralCapabilityFlags, FileContentsRequest, FileContentsResponse, FileDescriptor,
-    FormatDataRequest, FormatDataResponse, LockDataId, OwnedFormatDataResponse, PackedFileList,
+    ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId,
+    ClipboardGeneralCapabilityFlags, FileContentsFlags, FileContentsRequest, FileContentsResponse,
+    FileDescriptor, FormatDataRequest, FormatDataResponse, LockDataId, OwnedFormatDataResponse,
 };
-use ironrdp_core::{Encode, WriteCursor};
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-/// Format ID we use locally to identify FileGroupDescriptorW in the format
-/// list we advertise. The Windows side identifies the format by *name*, not
-/// id, so this value is arbitrary — it just has to be in the
-/// `0xC000..=0xFFFF` registered-format range. `0xC0FE` matches what upstream
-/// IronRDP's `initiate_file_copy` uses, making the wire trace consistent
-/// across implementations.
-const FILE_LIST_FORMAT_ID: u32 = 0xC0FE;
+/// Hard ceiling on the number of bytes we'll return for a single RANGE
+/// request. mstsc and Microsoft Remote Desktop both chunk at <= 1 MiB in
+/// practice; this cap keeps a malicious or buggy peer from getting us to
+/// allocate gigabytes per request. We return a short response instead of
+/// erroring — the client will just re-request from the next offset.
+const MAX_FILE_RANGE_BYTES: u32 = 4 * 1024 * 1024;
 
 type Sender = Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>;
+type Paths = Arc<Mutex<Vec<PathBuf>>>;
 
 /// Maximum FormatDataResponse payload we'll accept from the client. An
 /// authenticated peer that paste-pumped a multi-gig DIB at us could
@@ -183,12 +185,19 @@ fn dib_to_png(dib: &[u8]) -> anyhow::Result<Vec<u8>> {
 #[derive(Debug)]
 pub struct MacCliprdr {
     sender: Sender,
+    /// Absolute paths corresponding to the FILEGROUPDESCRIPTORW most recently
+    /// pushed to the cliprdr server. Shared with every backend instance so
+    /// that `on_file_contents_request` (which runs on the backend) can map
+    /// `request.index` back to a real path even when the advertise was sent
+    /// from the poller in the factory.
+    file_paths: Paths,
 }
 
 impl MacCliprdr {
     pub fn new() -> Self {
         Self {
             sender: Arc::new(Mutex::new(None)),
+            file_paths: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -200,6 +209,7 @@ impl ServerEventSender for MacCliprdr {
         // Spawn a poller that notices Mac-side copies and tells the RDP
         // server to advertise the new content to the remote.
         let sender_arc = self.sender.clone();
+        let paths_arc = self.file_paths.clone();
         tokio::spawn(async move {
             // NSPasteboard.changeCount is monotonic; record the starting
             // value so we don't fire an event for whatever was already on
@@ -212,19 +222,7 @@ impl ServerEventSender for MacCliprdr {
                     continue;
                 }
                 last_seen = current;
-                let formats = advertised_formats();
-                if formats.is_empty() {
-                    continue;
-                }
-                let guard = sender_arc.lock().unwrap();
-                let Some(s) = guard.as_ref() else {
-                    break; // sender dropped, server is shutting down
-                };
-                if s.send(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(
-                    formats,
-                )))
-                .is_err()
-                {
+                if !advertise_pasteboard(&sender_arc, &paths_arc) {
                     break;
                 }
             }
@@ -237,6 +235,7 @@ impl CliprdrBackendFactory for MacCliprdr {
         Box::new(MacCliprdrBackend {
             sender: self.sender.clone(),
             last_requested: None,
+            file_paths: self.file_paths.clone(),
         })
     }
 }
@@ -250,6 +249,9 @@ struct MacCliprdrBackend {
     // doesn't include the format ID, so we keep it here to know whether to
     // decode the payload as UTF-16 text or as a DIB.
     last_requested: Option<ClipboardFormatId>,
+    // Shared with `MacCliprdr` so the poller and the backend agree on which
+    // paths back the currently-advertised FILEGROUPDESCRIPTORW.
+    file_paths: Paths,
 }
 
 impl ironrdp_core::AsAny for MacCliprdrBackend {
@@ -267,62 +269,148 @@ impl MacCliprdrBackend {
             let _ = s.send(ServerEvent::Clipboard(msg));
         }
     }
+
+    /// Serve a single FileContentsRequest against the path snapshot built
+    /// during the most recent file-copy advertise. Returns `None` on any
+    /// failure so the caller can synthesize a CB_RESPONSE_FAIL.
+    fn serve_file_contents(
+        &self,
+        request: FileContentsRequest,
+    ) -> Option<FileContentsResponse<'static>> {
+        let idx = usize::try_from(request.index).ok()?;
+        let path = {
+            let guard = self.file_paths.lock().unwrap();
+            guard.get(idx).cloned()?
+        };
+        let meta = std::fs::metadata(&path)
+            .map_err(|e| warn!(?path, "metadata failed: {e}"))
+            .ok()?;
+        // Directories appear in FILEGROUPDESCRIPTORW so the client can render
+        // them in the paste UI, but they aren't byte-readable. Phase 3 (if
+        // we ever do recursive directory copy) would generate per-entry
+        // descriptors with relative_path set instead.
+        if meta.is_dir() {
+            debug!(?path, "file contents requested on a directory; refusing");
+            return None;
+        }
+        if request.flags.contains(FileContentsFlags::SIZE) {
+            debug!(stream = request.stream_id, ?path, size = meta.len(), "SIZE response");
+            return Some(FileContentsResponse::new_size_response(
+                request.stream_id,
+                meta.len(),
+            ));
+        }
+        if request.flags.contains(FileContentsFlags::RANGE) {
+            let bytes = read_file_range(&path, request.position, request.requested_size)
+                .map_err(|e| warn!(?path, "read failed: {e}"))
+                .ok()?;
+            debug!(
+                stream = request.stream_id,
+                ?path,
+                position = request.position,
+                returned = bytes.len(),
+                "RANGE response",
+            );
+            return Some(FileContentsResponse::new_data_response(
+                request.stream_id,
+                bytes,
+            ));
+        }
+        // Upstream's decode rejects flag combinations other than exactly-
+        // one-of {SIZE, RANGE}, so this is unreachable in practice.
+        None
+    }
 }
 
-/// Build the format list to advertise based on what's currently on the
-/// Mac pasteboard. Order is best-format-first; clients pick what they
-/// can handle.
-fn advertised_formats() -> Vec<ClipboardFormat> {
-    let mut out = Vec::new();
-    // Files are checked before image/text because in macOS multi-selection
-    // a Finder copy can briefly look like "string + url" before the file URLs
-    // settle, and we want the file flavor to win when present.
+/// Read the current Mac pasteboard and push the appropriate "we have
+/// something to copy" event into the server. Returns `false` if the sender
+/// has been dropped (i.e. the server is shutting down) so callers know to
+/// stop polling.
+///
+/// File copies and non-file copies take different code paths inside
+/// ironrdp-cliprdr: a regular format list goes via `SendInitiateCopy`, but
+/// file lists must go via `initiate_file_copy` (exposed here through the
+/// vendored `ServerEvent::ClipboardFileCopy` variant) so that the cliprdr
+/// server populates its `local_file_list` and accepts subsequent
+/// FileContentsRequests instead of short-circuiting them with
+/// CB_RESPONSE_FAIL.
+fn advertise_pasteboard(sender: &Sender, paths: &Paths) -> bool {
     if pb::has_files() {
-        out.push(
-            ClipboardFormat::new(ClipboardFormatId::new(FILE_LIST_FORMAT_ID))
-                .with_name(ClipboardFormatName::FILE_LIST),
-        );
+        let entries = pb::read_files();
+        if !entries.is_empty() {
+            let mut snapshot = Vec::with_capacity(entries.len());
+            let mut files = Vec::with_capacity(entries.len());
+            for e in entries {
+                let mut fd = FileDescriptor::new(e.name);
+                if e.is_dir {
+                    fd = fd.with_attributes(ClipboardFileAttributes::DIRECTORY);
+                } else {
+                    fd = fd.with_attributes(ClipboardFileAttributes::NORMAL);
+                    if let Some(sz) = e.size {
+                        fd = fd.with_file_size(sz);
+                    }
+                }
+                files.push(fd);
+                snapshot.push(e.path);
+            }
+            *paths.lock().unwrap() = snapshot;
+            return send(sender, ServerEvent::ClipboardFileCopy(files));
+        }
+        // Files claimed but read empty (race) — fall through to format list.
     }
+
+    let mut formats = Vec::new();
     if pb::has_image() {
-        out.push(ClipboardFormat::new(ClipboardFormatId::CF_DIB));
+        formats.push(ClipboardFormat::new(ClipboardFormatId::CF_DIB));
     }
     if pb::has_string() {
-        out.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
+        formats.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
     }
-    out
+    if formats.is_empty() {
+        // Nothing to advertise but the sender is presumably still alive.
+        return true;
+    }
+    // Clear any stale file-paths snapshot so a leftover index can't be
+    // exploited by a slow follow-up FileContentsRequest.
+    paths.lock().unwrap().clear();
+    send(
+        sender,
+        ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)),
+    )
 }
 
-/// Serialize the current Mac file-pasteboard contents as a
-/// FILEGROUPDESCRIPTORW (`PackedFileList`) wire payload. Returns None if
-/// nothing on the pasteboard maps to a regular file/dir we can describe.
-fn encode_file_list() -> Option<Vec<u8>> {
-    let entries = pb::read_files();
-    if entries.is_empty() {
-        return None;
+fn send(sender: &Sender, event: ServerEvent) -> bool {
+    let guard = sender.lock().unwrap();
+    match guard.as_ref() {
+        Some(s) => s.send(event).is_ok(),
+        None => false,
     }
-    let files: Vec<FileDescriptor> = entries
-        .into_iter()
-        .map(|e| {
-            let mut fd = FileDescriptor::new(e.name);
-            if e.is_dir {
-                fd = fd.with_attributes(ClipboardFileAttributes::DIRECTORY);
-            } else {
-                fd = fd.with_attributes(ClipboardFileAttributes::NORMAL);
-                if let Some(sz) = e.size {
-                    fd = fd.with_file_size(sz);
-                }
-            }
-            fd
-        })
-        .collect();
-    let pdu = PackedFileList { files };
-    let mut buf = vec![0u8; pdu.size()];
-    let mut cur = WriteCursor::new(&mut buf);
-    if let Err(e) = pdu.encode(&mut cur) {
-        warn!("PackedFileList encode failed: {e}");
-        return None;
+}
+
+/// Read a `position..position+requested_size` slice out of `path`,
+/// honoring `MAX_FILE_RANGE_BYTES` and returning a short read at EOF.
+/// Centralized so the SIZE/RANGE handler logic stays compact and the read
+/// path has unit tests of its own.
+fn read_file_range(
+    path: &std::path::Path,
+    position: u64,
+    requested_size: u32,
+) -> std::io::Result<Vec<u8>> {
+    let cap = requested_size.min(MAX_FILE_RANGE_BYTES) as usize;
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(position))?;
+    let mut buf = vec![0u8; cap];
+    let mut filled = 0usize;
+    // Loop because `Read::read` is allowed to return a short read even
+    // before EOF; we want to either fill the buffer or stop at EOF.
+    while filled < cap {
+        match f.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
     }
-    Some(buf)
+    buf.truncate(filled);
+    Ok(buf)
 }
 
 impl CliprdrBackend for MacCliprdrBackend {
@@ -338,17 +426,11 @@ impl CliprdrBackend for MacCliprdrBackend {
     }
 
     fn on_ready(&mut self) {
-        let formats = advertised_formats();
-        if !formats.is_empty() {
-            self.push(ClipboardMessage::SendInitiateCopy(formats));
-        }
+        advertise_pasteboard(&self.sender, &self.file_paths);
     }
 
     fn on_request_format_list(&mut self) {
-        let formats = advertised_formats();
-        if !formats.is_empty() {
-            self.push(ClipboardMessage::SendInitiateCopy(formats));
-        }
+        advertise_pasteboard(&self.sender, &self.file_paths);
     }
 
     fn on_process_negotiated_capabilities(
@@ -377,16 +459,11 @@ impl CliprdrBackend for MacCliprdrBackend {
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
-        // FileGroupDescriptorW is identified by id (the one we advertised),
-        // not by a CF_* constant.
-        if request.format == ClipboardFormatId::new(FILE_LIST_FORMAT_ID) {
-            let response = match encode_file_list() {
-                Some(bytes) => OwnedFormatDataResponse::new_data(bytes),
-                None => OwnedFormatDataResponse::new_error(),
-            };
-            self.push(ClipboardMessage::SendFormatData(response));
-            return;
-        }
+        // FileGroupDescriptorW is handled internally by upstream cliprdr
+        // once we go through `initiate_file_copy` (the
+        // ServerEvent::ClipboardFileCopy path) — it answers the FormatData
+        // request from its stored `local_file_list` without ever reaching
+        // us. So we only deal with CF_UNICODETEXT and CF_DIB here.
         let response = match request.format {
             ClipboardFormatId::CF_UNICODETEXT => match pb::read_string() {
                 Some(s) => {
@@ -478,17 +555,11 @@ impl CliprdrBackend for MacCliprdrBackend {
     }
 
     fn on_file_contents_request(&mut self, request: FileContentsRequest) {
-        // Phase 1: we advertise the file list (names + sizes) but don't
-        // stream contents. Reply with CB_RESPONSE_FAIL so the client knows
-        // the paste failed instead of hanging on a missing response.
-        debug!(
-            stream_id = request.stream_id,
-            index = request.index,
-            "file contents requested; replying with error (Phase 1 metadata-only)"
-        );
-        self.push(ClipboardMessage::SendFileContentsResponse(
-            FileContentsResponse::new_error(request.stream_id),
-        ));
+        let stream_id = request.stream_id;
+        let response = self.serve_file_contents(request).unwrap_or_else(|| {
+            FileContentsResponse::new_error(stream_id)
+        });
+        self.push(ClipboardMessage::SendFileContentsResponse(response));
     }
     fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
     fn on_lock(&mut self, _data_id: LockDataId) {}
@@ -527,6 +598,7 @@ mod pb {
         pub name: String,
         pub size: Option<u64>,
         pub is_dir: bool,
+        pub path: std::path::PathBuf,
     }
 
     /// Return one entry per file URL item on the general pasteboard.
@@ -547,10 +619,11 @@ mod pb {
                     continue;
                 };
                 let url = url_str.to_string();
-                let Some(path) = file_url_to_path(&url) else {
+                let Some(path_str) = file_url_to_path(&url) else {
                     continue;
                 };
-                let Some(name) = std::path::Path::new(&path)
+                let path = std::path::PathBuf::from(&path_str);
+                let Some(name) = path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .map(str::to_owned)
@@ -562,7 +635,12 @@ mod pb {
                 // For directories, the wire `file_size` field is unused
                 // (Windows queries it per-file when recursing).
                 let size = if is_dir { None } else { meta.map(|m| m.len()) };
-                out.push(FileEntry { name, size, is_dir });
+                out.push(FileEntry {
+                    name,
+                    size,
+                    is_dir,
+                    path,
+                });
             }
             out
         })
@@ -679,6 +757,7 @@ mod pb {
         pub name: String,
         pub size: Option<u64>,
         pub is_dir: bool,
+        pub path: std::path::PathBuf,
     }
     pub fn change_count() -> i64 {
         0
@@ -702,5 +781,82 @@ mod pb {
     pub fn write_png(_: &[u8]) {}
     pub fn read_files() -> Vec<FileEntry> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn tmpfile(content: &[u8]) -> tempfile_path::TempPath {
+        let tp = tempfile_path::new();
+        std::fs::File::create(&tp.0).unwrap().write_all(content).unwrap();
+        tp
+    }
+
+    /// Manual tempfile helper — we don't want a dev-dep on the `tempfile`
+    /// crate just for these few tests, and the std fallback is one path.
+    mod tempfile_path {
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+
+        pub struct TempPath(pub PathBuf);
+        impl Drop for TempPath {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        pub fn new() -> TempPath {
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "macrdp-cliprdr-test-{}-{n}.bin",
+                std::process::id()
+            ));
+            TempPath(p)
+        }
+    }
+
+    #[test]
+    fn read_full_file_returns_all_bytes() {
+        let data = b"hello world";
+        let f = tmpfile(data);
+        let got = read_file_range(&f.0, 0, 1024).unwrap();
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn read_with_position_skips_prefix() {
+        let f = tmpfile(b"ABCDEFGHIJ");
+        let got = read_file_range(&f.0, 4, 3).unwrap();
+        assert_eq!(got, b"EFG");
+    }
+
+    #[test]
+    fn read_past_eof_returns_short() {
+        let f = tmpfile(b"abc");
+        // Request 10 bytes from offset 1 — file only has 2 bytes left.
+        let got = read_file_range(&f.0, 1, 10).unwrap();
+        assert_eq!(got, b"bc");
+    }
+
+    #[test]
+    fn read_at_eof_returns_empty() {
+        let f = tmpfile(b"xyz");
+        let got = read_file_range(&f.0, 3, 100).unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn read_caps_at_max_range_bytes() {
+        // 5 MiB file; ask for 8 MiB; should be clamped to MAX_FILE_RANGE_BYTES (4 MiB).
+        let data = vec![0xABu8; 5 * 1024 * 1024];
+        let f = tmpfile(&data);
+        let got = read_file_range(&f.0, 0, 8 * 1024 * 1024).unwrap();
+        assert_eq!(got.len(), MAX_FILE_RANGE_BYTES as usize);
+        assert!(got.iter().all(|&b| b == 0xAB));
     }
 }

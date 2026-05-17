@@ -6,6 +6,7 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, DesktopSize};
 use ironrdp_async::Framed;
 use ironrdp_cliprdr::backend::ClipboardMessage;
+use ironrdp_cliprdr::pdu::FileDescriptor;
 use ironrdp_cliprdr::CliprdrServer;
 use ironrdp_core::{decode, encode_vec, impl_as_any};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
@@ -234,6 +235,13 @@ pub struct RdpServer {
 pub enum ServerEvent {
     Quit(String),
     Clipboard(ClipboardMessage),
+    /// File-copy initiation that bypasses `ClipboardMessage::SendInitiateCopy`
+    /// and reaches `CliprdrServer::initiate_file_copy` directly. This is the
+    /// only way to populate the server's `local_file_list` so that an
+    /// inbound `FileContentsRequest` is forwarded to the backend instead of
+    /// rejected with CB_RESPONSE_FAIL. Upstream cliprdr never exposed this
+    /// path through the `ClipboardMessage` enum (see PR notes).
+    ClipboardFileCopy(Vec<FileDescriptor>),
     Rdpsnd(RdpsndServerMessage),
     SetCredentials(Credentials),
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
@@ -580,6 +588,20 @@ impl RdpServer {
                         }
                     }
                     .context("failed to send clipboard event")?;
+                    let channel_id = self
+                        .get_channel_id_by_type::<CliprdrServer>()
+                        .ok_or_else(|| anyhow!("SVC channel not found"))?;
+                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    writer.write_all(&data).await?;
+                }
+                ServerEvent::ClipboardFileCopy(files) => {
+                    let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
+                        warn!("No clipboard channel, dropping file-copy event");
+                        continue;
+                    };
+                    let msgs = cliprdr
+                        .initiate_file_copy(files)
+                        .context("failed to initiate file copy")?;
                     let channel_id = self
                         .get_channel_id_by_type::<CliprdrServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;

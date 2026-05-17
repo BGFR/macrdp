@@ -557,31 +557,25 @@ impl CliprdrBackend for MacCliprdrBackend {
         );
         #[cfg(target_os = "macos")]
         {
-            let remote_files: Vec<crate::file_promise::RemoteFile> = files
+            let entries: Vec<crate::file_promise::RemoteEntry> = files
                 .iter()
                 .enumerate()
-                .filter_map(|(i, f)| {
-                    // Directories aren't byte-fetchable. Recursive folder
-                    // copy in this direction would need the remote to
-                    // send descriptors with `relative_path` set; for now
-                    // we drop them and warn.
+                .map(|(i, f)| {
                     let is_dir = f
                         .attributes
                         .map(|a| a.contains(ClipboardFileAttributes::DIRECTORY))
                         .unwrap_or(false);
-                    if is_dir {
-                        debug!(name = %f.name, "skipping directory in Win->Mac paste");
-                        return None;
-                    }
-                    Some(crate::file_promise::RemoteFile {
+                    crate::file_promise::RemoteEntry {
                         index: i as i32,
                         name: f.name.clone(),
                         size: f.file_size,
-                    })
+                        is_dir,
+                        relative_path: f.relative_path.clone(),
+                    }
                 })
                 .collect();
             crate::file_promise::spawn_remote_paste(
-                remote_files,
+                entries,
                 self.download_router.clone(),
                 self.sender.clone(),
                 self.paste_temp_dir.clone(),

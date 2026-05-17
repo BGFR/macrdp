@@ -103,28 +103,34 @@ impl DownloadRouter {
     }
 }
 
-/// One file in a remote-copy batch. The download task takes a `Vec` of
-/// these and produces a `Vec<PathBuf>` of materialized temp paths.
+/// One entry in a remote-copy batch — file OR directory. Directories
+/// don't have an `index` worth fetching but DO have a path we need to
+/// `mkdir -p` before any descendant file lands.
 #[derive(Clone, Debug)]
-pub struct RemoteFile {
+pub struct RemoteEntry {
     pub index: i32,
     pub name: String,
     pub size: Option<u64>,
+    pub is_dir: bool,
+    /// MS-RDPECLIP relative directory path (using `\` as the separator),
+    /// e.g. `MyFolder\sub`. `None` for top-level entries.
+    pub relative_path: Option<String>,
 }
 
-/// Spawned by `on_remote_file_list`: downloads every file in `files`
-/// into a fresh temp directory, then publishes the resulting file URLs
-/// to NSPasteboard. Records the resulting `changeCount` so the
-/// Mac-side poller doesn't loop the paste back to Windows.
+/// Spawned by `on_remote_file_list`: downloads every entry in `entries`
+/// into a fresh temp directory (recreating the directory structure from
+/// the `relative_path` fields), then publishes the **top-level** paths
+/// (entries where `relative_path` is `None`) to NSPasteboard so Finder
+/// pastes the folder tree rather than 1000 leaf URLs.
 pub fn spawn_remote_paste(
-    files: Vec<RemoteFile>,
+    entries: Vec<RemoteEntry>,
     router: DownloadRouter,
     sender: EventSender,
     current_temp_dir: Arc<Mutex<Option<PathBuf>>>,
     self_change_count: SelfChangeCount,
     rt_handle: tokio::runtime::Handle,
 ) {
-    if files.is_empty() {
+    if entries.is_empty() {
         return;
     }
     rt_handle.spawn(async move {
@@ -142,31 +148,100 @@ pub fn spawn_remote_paste(
         };
         *current_temp_dir.lock().unwrap() = Some(dir.clone());
 
-        let mut written: Vec<PathBuf> = Vec::with_capacity(files.len());
-        for f in &files {
-            let dst = dir.join(&f.name);
-            match fetch_file(f, &dst, &router, &sender).await {
-                Ok(()) => {
-                    debug!(name = %f.name, dest = ?dst, "downloaded remote file");
-                    written.push(dst);
+        // Compute every entry's full destination path up front. Path-
+        // safety check rejects anything that escapes the temp root via
+        // `..` or absolute components — a malicious remote could otherwise
+        // craft a relative_path that writes outside the temp dir.
+        let mut top_level: Vec<PathBuf> = Vec::new();
+        let mut planned: Vec<(RemoteEntry, PathBuf)> = Vec::with_capacity(entries.len());
+        for e in entries {
+            let dst = match resolve_dest(&dir, &e) {
+                Some(p) => p,
+                None => {
+                    warn!(name = %e.name, "rejecting entry with unsafe relative_path");
+                    return;
                 }
-                Err(e) => {
-                    warn!(name = %f.name, "download failed: {e}");
-                    // Stop on first failure — a half-set on the
-                    // pasteboard would confuse the user. Leave the temp
-                    // dir behind for inspection; it'll get wiped on the
-                    // next remote copy.
+            };
+            if e.relative_path.is_none() {
+                top_level.push(dst.clone());
+            }
+            planned.push((e, dst));
+        }
+
+        // Create directories first so file fetches don't race the
+        // mkdir. Sort directories shortest-path-first so parent dirs
+        // exist before children.
+        let mut dirs: Vec<&PathBuf> = planned
+            .iter()
+            .filter(|(e, _)| e.is_dir)
+            .map(|(_, p)| p)
+            .collect();
+        dirs.sort_by_key(|p| p.components().count());
+        for d in dirs {
+            if let Err(err) = std::fs::create_dir_all(d) {
+                warn!(?d, "create_dir_all failed: {err}");
+                return;
+            }
+        }
+
+        // Now fetch files. Sequential per-file (each file uses parallel
+        // chunks internally), one failure aborts.
+        for (e, dst) in &planned {
+            if e.is_dir {
+                continue;
+            }
+            // Some clients only put descendant files in the descriptor
+            // list, not their parent directories. Ensure the dst's
+            // parent exists in that case.
+            if let Some(parent) = dst.parent() {
+                if let Err(err) = std::fs::create_dir_all(parent) {
+                    warn!(?parent, "create_dir_all for file parent failed: {err}");
+                    return;
+                }
+            }
+            match fetch_file_inner(e.index, e.size, dst, &router, &sender).await {
+                Ok(()) => {
+                    debug!(name = %e.name, dest = ?dst, "downloaded remote file");
+                }
+                Err(err) => {
+                    warn!(name = %e.name, "download failed: {err}");
                     return;
                 }
             }
         }
-        publish_to_pasteboard(&written, &self_change_count);
+
+        publish_to_pasteboard(&top_level, &self_change_count);
         info!(
-            count = written.len(),
+            files = planned.iter().filter(|(e, _)| !e.is_dir).count(),
+            roots = top_level.len(),
             "published remote paste to NSPasteboard"
         );
         ready_signal();
     });
+}
+
+/// Compute the on-disk destination for a remote entry, joining its
+/// `relative_path` components under `root` while rejecting any
+/// path-traversal attempts. Returns `None` on unsafe input so the caller
+/// can abort the whole paste.
+fn resolve_dest(root: &Path, entry: &RemoteEntry) -> Option<PathBuf> {
+    let mut p = root.to_path_buf();
+    if let Some(rp) = &entry.relative_path {
+        for component in rp.split('\\') {
+            if component.is_empty() {
+                continue;
+            }
+            if component == "." || component == ".." || component.contains('/') {
+                return None;
+            }
+            p.push(component);
+        }
+    }
+    if entry.name == "." || entry.name == ".." || entry.name.contains('/') {
+        return None;
+    }
+    p.push(&entry.name);
+    Some(p)
 }
 
 /// Audible "paste is ready" cue plus an opportunistic auto-Cmd-V if the
@@ -293,15 +368,16 @@ fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount)
 /// its own offset, and `pwrite`-like behavior via `seek+write` works as
 /// long as no two tasks write the same byte range (which by construction
 /// they don't — chunks are disjoint by `position`).
-async fn fetch_file(
-    file: &RemoteFile,
+async fn fetch_file_inner(
+    index: i32,
+    size_hint: Option<u64>,
     dst: &Path,
     router: &DownloadRouter,
     sender: &EventSender,
 ) -> Result<(), String> {
-    let total = match file.size {
+    let total = match size_hint {
         Some(s) => s,
-        None => fetch_size(file.index, router, sender).await?,
+        None => fetch_size(index, router, sender).await?,
     };
 
     // Pre-allocate the file to its final size so concurrent writers don't
@@ -329,7 +405,6 @@ async fn fetch_file(
     let mut set: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
     let mut next = 0usize;
     let dst_owned = dst.to_path_buf();
-    let index = file.index;
 
     // Prime the in-flight window.
     while next < plan.len() && set.len() < MAX_PARALLEL_CHUNKS {
@@ -464,4 +539,67 @@ fn push_request(sender: &EventSender, req: FileContentsRequest) -> Result<(), St
         ClipboardMessage::SendFileContentsRequest(req),
     ))
     .map_err(|_| "event channel closed".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str, rp: Option<&str>) -> RemoteEntry {
+        RemoteEntry {
+            index: 0,
+            name: name.to_owned(),
+            size: None,
+            is_dir: false,
+            relative_path: rp.map(|s| s.to_owned()),
+        }
+    }
+
+    #[test]
+    fn resolve_dest_top_level_file() {
+        let root = std::path::Path::new("/tmp/root");
+        assert_eq!(
+            resolve_dest(root, &entry("a.txt", None)).unwrap(),
+            std::path::PathBuf::from("/tmp/root/a.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_dest_joins_backslash_relative_path() {
+        let root = std::path::Path::new("/tmp/root");
+        assert_eq!(
+            resolve_dest(root, &entry("foo.txt", Some("MyFolder\\sub"))).unwrap(),
+            std::path::PathBuf::from("/tmp/root/MyFolder/sub/foo.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_dest_rejects_dot_dot_in_relative_path() {
+        let root = std::path::Path::new("/tmp/root");
+        assert!(resolve_dest(root, &entry("p.txt", Some("..\\evil"))).is_none());
+    }
+
+    #[test]
+    fn resolve_dest_rejects_dot_dot_in_name() {
+        let root = std::path::Path::new("/tmp/root");
+        assert!(resolve_dest(root, &entry("..", Some("MyFolder"))).is_none());
+    }
+
+    #[test]
+    fn resolve_dest_rejects_forward_slash_in_component() {
+        // A remote whose relative_path contains a literal `/` is trying
+        // to smuggle an extra path component past our `\`-split. Reject.
+        let root = std::path::Path::new("/tmp/root");
+        assert!(resolve_dest(root, &entry("p.txt", Some("MyFolder/sub"))).is_none());
+    }
+
+    #[test]
+    fn resolve_dest_handles_empty_relative_path() {
+        let root = std::path::Path::new("/tmp/root");
+        // Some clients send "" for top-level entries instead of None.
+        assert_eq!(
+            resolve_dest(root, &entry("a.txt", Some(""))).unwrap(),
+            std::path::PathBuf::from("/tmp/root/a.txt")
+        );
+    }
 }

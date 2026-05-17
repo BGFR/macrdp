@@ -216,6 +216,11 @@ declare_class!(
             url: &NSURL,
             completion_handler: &Block<dyn Fn(*mut NSError)>,
         ) {
+            // Top-of-function log so we can confirm Cocoa actually
+            // invoked us. If a paste beeps and this line is missing, the
+            // failure is upstream of our delegate (e.g. the
+            // NSFilePromiseProvider died because nothing kept it alive).
+            info!(file = %self.ivars().file_name, "writePromiseToURL entered");
             let dst: PathBuf = match url.path() {
                 Some(p) => PathBuf::from(p.to_string()),
                 None => {
@@ -377,17 +382,58 @@ fn push_request(sender: &EventSender, req: FileContentsRequest) -> Result<(), St
     .map_err(|_| "event channel closed".to_string())
 }
 
-/// Push N `NSFilePromiseProvider` objects onto the general pasteboard.
-/// Existing pasteboard contents are cleared first, so this is a
-/// single-shot "the remote just copied these files" advertisement.
+/// Stash of `NSFilePromiseProvider` instances that must outlive the
+/// `write_promises_to_pasteboard` call. NSPasteboard does **not** retain
+/// promise writers for us — once the providers go out of scope, the
+/// delegates die and Finder's later `writePromiseToURL` callback hits
+/// dead memory, so Cocoa silently emits a paste-failure beep with no
+/// log line on our side. Keeping them parked on the factory until the
+/// next file list replaces them keeps the promises live.
 ///
-/// `file_type_uti` is the UTI Cocoa hands back to `fileNameForType:`
+/// SAFETY: `Retained<NSFilePromiseProvider>` is `!Send` by default
+/// because ObjC `retain`/`release` aren't guaranteed atomic for every
+/// class. NSPasteboard writers are an exception — they're retained by
+/// Cocoa's cross-process pasteboard server with atomic refcounts. Our
+/// Rust-side use is purely "hand to NSPasteboard once, hold until
+/// replaced" with no method calls on the provider from outside Cocoa;
+/// the `Mutex` serializes our replace operation. `Providers` wraps the
+/// `Vec<Retained<_>>` with an `unsafe impl Send`/`Sync` to fit through
+/// the `CliprdrBackend: Send` trait bound.
+pub struct Providers(Vec<Retained<NSFilePromiseProvider>>);
+// SAFETY: see ProviderStash doc.
+unsafe impl Send for Providers {}
+// SAFETY: see ProviderStash doc.
+unsafe impl Sync for Providers {}
+
+impl std::fmt::Debug for Providers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Providers({} entries)", self.0.len())
+    }
+}
+
+pub type ProviderStash = Arc<Mutex<Providers>>;
+
+/// Convenience constructor for an empty stash, used by factory init.
+pub fn new_provider_stash() -> ProviderStash {
+    Arc::new(Mutex::new(Providers(Vec::new())))
+}
+
+/// Push N `NSFilePromiseProvider` objects onto the general pasteboard
+/// AND park them in `stash` so they survive long enough for Cocoa to
+/// call back. Existing pasteboard contents are cleared first; the
+/// previously-parked providers are dropped (they're stale now anyway).
+///
+/// `file_type` is the UTI Cocoa hands back to `fileNameForType:`
 /// callers — we default it to `"public.data"` (the catch-all binary type)
 /// since the remote rarely tells us anything more specific than the file
 /// name's extension. Finder happily accepts that and uses the basename
 /// extension to display the right icon.
-pub fn write_promises_to_pasteboard(delegates: &[Retained<PromiseDelegate>]) {
+pub fn write_promises_to_pasteboard(
+    delegates: &[Retained<PromiseDelegate>],
+    stash: &ProviderStash,
+) {
     if delegates.is_empty() {
+        stash.lock().unwrap().0.clear();
         return;
     }
     let file_type = NSString::from_str("public.data");
@@ -406,13 +452,9 @@ pub fn write_promises_to_pasteboard(delegates: &[Retained<PromiseDelegate>]) {
     // NSPasteboard.writeObjects takes NSArray<NSPasteboardWriting>.
     // NSFilePromiseProvider conforms to NSPasteboardWriting (gated on the
     // NSPasteboard feature in objc2-app-kit, which we already enable).
-    // from_vec is the constructor that accepts a Vec<Retained<T>> — needed
-    // because ProtocolObject<dyn NSPasteboardWriting> isn't IsRetainable
-    // (NSArray::from_slice wants &[&T] with T: IsRetainable, which only
-    // holds for class-bound types, not arbitrary protocols).
     let writers: Vec<Retained<ProtocolObject<dyn objc2_app_kit::NSPasteboardWriting>>> = providers
-        .into_iter()
-        .map(ProtocolObject::from_retained)
+        .iter()
+        .map(|p| ProtocolObject::from_retained(p.clone()))
         .collect();
     let array = NSArray::from_vec(writers);
     unsafe {
@@ -420,6 +462,9 @@ pub fn write_promises_to_pasteboard(delegates: &[Retained<PromiseDelegate>]) {
         pb.clearContents();
         let _wrote = pb.writeObjects(&array);
     }
+    // Replace the stash AFTER the pasteboard write so old promises tied
+    // to a previous remote copy drop in one swap.
+    *stash.lock().unwrap() = Providers(providers);
     debug!(
         count = delegates.len(),
         "wrote file promises to NSPasteboard"

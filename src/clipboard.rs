@@ -197,6 +197,13 @@ pub struct MacCliprdr {
     /// `src/file_promise.rs`.
     #[cfg(target_os = "macos")]
     download_router: crate::file_promise::DownloadRouter,
+    /// Keeps `NSFilePromiseProvider` instances alive across the
+    /// `on_remote_file_list` -> Cocoa-callback gap. NSPasteboard doesn't
+    /// retain promise writers; without our own stash they'd be freed
+    /// before Finder ever called `writePromiseToURL` and the paste would
+    /// silently beep with no log line on our side.
+    #[cfg(target_os = "macos")]
+    provider_stash: crate::file_promise::ProviderStash,
 }
 
 impl MacCliprdr {
@@ -206,6 +213,8 @@ impl MacCliprdr {
             file_paths: Arc::new(Mutex::new(Vec::new())),
             #[cfg(target_os = "macos")]
             download_router: crate::file_promise::DownloadRouter::default(),
+            #[cfg(target_os = "macos")]
+            provider_stash: crate::file_promise::new_provider_stash(),
         }
     }
 }
@@ -246,6 +255,8 @@ impl CliprdrBackendFactory for MacCliprdr {
             file_paths: self.file_paths.clone(),
             #[cfg(target_os = "macos")]
             download_router: self.download_router.clone(),
+            #[cfg(target_os = "macos")]
+            provider_stash: self.provider_stash.clone(),
         })
     }
 }
@@ -266,6 +277,10 @@ struct MacCliprdrBackend {
     // task is awaiting the matching stream_id.
     #[cfg(target_os = "macos")]
     download_router: crate::file_promise::DownloadRouter,
+    // Keeps NSFilePromiseProvider instances alive across the pasteboard-
+    // write -> Finder-callback gap. See `MacCliprdr::provider_stash`.
+    #[cfg(target_os = "macos")]
+    provider_stash: crate::file_promise::ProviderStash,
 }
 
 impl ironrdp_core::AsAny for MacCliprdrBackend {
@@ -548,7 +563,7 @@ impl CliprdrBackend for MacCliprdrBackend {
                     ))
                 })
                 .collect();
-            crate::file_promise::write_promises_to_pasteboard(&delegates);
+            crate::file_promise::write_promises_to_pasteboard(&delegates, &self.provider_stash);
         }
         #[cfg(not(target_os = "macos"))]
         let _ = (files, clip_data_id);

@@ -3,6 +3,8 @@ mod auth;
 mod capture;
 mod clipboard;
 mod cursor;
+#[cfg(target_os = "macos")]
+mod file_promise;
 mod input;
 
 use std::fs;

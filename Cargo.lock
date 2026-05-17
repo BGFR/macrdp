@@ -1825,6 +1825,7 @@ version = "0.5.17"
 dependencies = [
  "anyhow",
  "async-trait",
+ "block2",
  "bytes",
  "clap",
  "core-foundation 0.10.1",

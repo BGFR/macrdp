@@ -463,10 +463,28 @@ impl CliprdrBackend for MacCliprdrBackend {
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
-        // Remote (e.g. Windows) put something on its clipboard. Prefer
-        // DIBV5 over DIB (better color), then text. Asking for one format
-        // doesn't preclude later asking for another; we only need the user's
-        // single paste action so the first match wins.
+        // Remote (e.g. Windows) put something on its clipboard. Files are
+        // checked first because a Finder paste of files is the richer
+        // experience; image and text fall back if the remote didn't copy a
+        // file. FileGroupDescriptorW is identified by *name* per
+        // MS-RDPECLIP — the numeric format ID is assigned by the remote and
+        // varies, but the name is constant across all implementations.
+        if let Some(fmt) = available_formats.iter().find(|f| {
+            f.name
+                .as_ref()
+                .map(|n| n.value() == "FileGroupDescriptorW")
+                .unwrap_or(false)
+        }) {
+            debug!(format_id = ?fmt.id, "remote advertised files; requesting file list");
+            self.last_requested = Some(fmt.id);
+            self.push(ClipboardMessage::SendInitiatePaste(fmt.id));
+            return;
+        }
+
+        // Image/text fall-back. Prefer DIBV5 over DIB (better color), then
+        // text. Asking for one format doesn't preclude later asking for
+        // another; we only need the user's single paste action so the first
+        // match wins.
         let priority = [
             ClipboardFormatId::CF_DIBV5,
             ClipboardFormatId::CF_DIB,
@@ -478,6 +496,31 @@ impl CliprdrBackend for MacCliprdrBackend {
                 self.push(ClipboardMessage::SendInitiatePaste(fmt.id));
                 return;
             }
+        }
+    }
+
+    fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
+        // Phase 1 of Windows→Mac file clipboard: just log what arrived so
+        // we can confirm the inbound protocol round-trip works end-to-end
+        // (FormatList → FormatDataRequest → FormatDataResponse → file list
+        // decoded by upstream cliprdr). The actual NSPasteboard
+        // advertising via NSFilePromiseProvider is Phase 2 in
+        // `src/file_promise.rs`.
+        debug!(
+            file_count = files.len(),
+            clip_data_id, "remote file list received (Phase 1: not yet placed on Mac pasteboard)"
+        );
+        for (i, f) in files.iter().enumerate() {
+            debug!(
+                index = i,
+                name = %f.name,
+                relative_path = ?f.relative_path,
+                size = ?f.file_size,
+                is_dir = f.attributes
+                    .map(|a| a.contains(ClipboardFileAttributes::DIRECTORY))
+                    .unwrap_or(false),
+                "remote file"
+            );
         }
     }
 

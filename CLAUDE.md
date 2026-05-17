@@ -11,10 +11,11 @@ Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
 - See the real macOS cursor shape (I-beam, hand, etc.) overlaid by the client.
 - Copy/paste UTF-8 text and images (CF_DIB ↔ PNG) between Mac and remote.
 - Mac→Windows file copy, including whole folders: copying a file or directory in Finder and pasting on Windows produces a real file/tree in Explorer. The pasteboard walk recurses into directories (skipping symlinks, capped at 10 000 descriptors per copy) and emits one FILEGROUPDESCRIPTORW entry per leaf with `relative_path` set so upstream's wire encoder reconstructs the right `MyFolder\sub\file.txt` cFileName. Bytes stream via MS-RDPECLIP `FileContentsRequest` SIZE + RANGE chunks (4 MiB per chunk). Reaches upstream `Cliprdr::initiate_file_copy` via the vendored `ServerEvent::ClipboardFileCopy(Vec<FileDescriptor>)` variant — that's the only API that populates `local_file_list`, without which upstream short-circuits every byte fetch with CB_RESPONSE_FAIL. Finder hands out *file-reference* URLs (`/.file/id=...`); we resolve them through `NSURL::URLByResolvingSymlinksInPath` because `std::fs::metadata` can't stat them directly.
+- Windows→Mac file copy (single files): when Windows announces a `FileGroupDescriptorW` we **eagerly** download every file to `/tmp/macrdp-paste-<pid>-<nanos>/` via parallel `FileContentsRequest` chunks (1 MiB × 8 in flight), then publish the resulting paths to NSPasteboard as real `NSURL`s. The eager approach is forced because Cocoa's `NSFilePromiseProvider` / `NSFilePromiseReceiver` is drag-and-drop-only — Finder's Cmd-V never calls into a promise delegate. When the download lands we play `/System/Library/Sounds/Glass.aiff` (`afplay` bypasses notification permissions; `osascript display notification` was silently suppressed because macOS attributes the banner to the unsigned macrdp binary) and, *only if Finder is the frontmost app*, fire `Cmd-V` via System Events so the paste the user attempted finishes automatically. A `SelfChangeCount` atomic stops our own pasteboard write from being rebroadcast to Windows by the change-count poller.
 - Forward macOS system audio to the remote (RDPSND, 44.1 kHz stereo 16-bit PCM; SCK captures at 48 kHz and the capture loop resamples via `rubato`).
 - NLA / CredSSP authentication — no more "type username before Connect" mstsc workaround.
 
-Not yet implemented: multi-monitor, Windows→Mac file clipboard direction, non-US keyboard layouts, drive/printer redirection.
+Not yet implemented: multi-monitor, recursive directory copy in the Windows→Mac direction, non-US keyboard layouts, drive/printer redirection.
 
 ## Project goal
 
@@ -31,8 +32,10 @@ src/capture.rs    ScreenCaptureKit → BgrA32 BitmapUpdate, dirty-rect driven
 src/cursor.rs     NSCursor → RGBAPointer, hashed for change detection
 src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI)
 src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB
-                  + Mac→Windows file copy via FileGroupDescriptorW
+                  + Mac↔Windows file copy via FileGroupDescriptorW
                   and FileContentsRequest streaming)
+src/file_promise.rs  Windows→Mac eager download to /tmp + NSPasteboard
+                     publish + Glass-chime auto-paste into Finder
 src/audio.rs      RDPSND ← second SCK stream with system-audio capture,
                   rubato 48→44.1 kHz resample, latency-bounded
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary

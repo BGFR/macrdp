@@ -1,6 +1,6 @@
 [package]
 name = "macrdp"
-version = "0.5.17"
+version = "0.5.18"
 edition = "2021"
 description = "Native RDP server for macOS"
 license = "MIT OR Apache-2.0"
@@ -53,8 +53,7 @@ core-foundation = "0.10"
 # alternatives: `screencapturekit`, or direct `objc2`/`objc2-screen-capture-kit`.
 objc2 = "0.5"
 objc2-foundation = "0.2"
-objc2-app-kit = { version = "0.2", features = ["NSCursor", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics", "NSGraphicsContext", "NSPasteboard", "NSPasteboardItem", "NSFilePromiseProvider", "block2"] }
-block2 = "0.5"
+objc2-app-kit = { version = "0.2", features = ["NSCursor", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics", "NSGraphicsContext", "NSPasteboard", "NSPasteboardItem"] }
 screencapturekit = { version = "2.1", features = ["async"] }
 
 # All ironrdp-* crates pinned to a specific upstream commit. The published

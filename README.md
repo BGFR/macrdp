@@ -1,6 +1,6 @@
 # macrdp
 
-A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, Mac→Windows file copy, and system audio forwarding. NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
+A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, Mac↔Windows file copy, and system audio forwarding. NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
 
 This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
@@ -63,7 +63,7 @@ System audio rides over the RDPSND virtual channel as 16-bit stereo PCM at **44.
 ## Reason why this was made
 This was done to scratch an itch.  There are practically no active open source RDP servers for MacOS.  The closest project that does this functionality is xrdp; however this program only runs on Linux/Unix machines, and has no homebrew equivalent on Macs. Done in a few hours with the help of Claude and runs pretty well.
 
-Multi-monitor support is on the list when I'm bored or need a distraction from real life. As of v0.5.15, the Mac→Windows file clipboard streams real bytes end-to-end: copying a file in Finder and pasting on the Windows side produces an actual file in Explorer. Windows→Mac direction and recursive directory copy aren't wired yet.
+Multi-monitor support is on the list when I'm bored or need a distraction from real life. File copy is now bidirectional: Mac→Windows streams real bytes via the standard MS-RDPECLIP path; Windows→Mac eagerly downloads to `/tmp` the moment Windows announces a copy, publishes the file URLs to NSPasteboard, plays a Glass chime when ready, and automatically fires `Cmd-V` if Finder is the frontmost app so the paste completes without a second keystroke. Recursive directory copy works Mac→Windows but not yet Windows→Mac.
 
 ## License
 

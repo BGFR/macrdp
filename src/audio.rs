@@ -198,6 +198,21 @@ async fn capture_loop(
         Vec::with_capacity(RESAMPLE_CHUNK * 2),
         Vec::with_capacity(RESAMPLE_CHUNK * 2),
     ];
+    // Reused per resampler invocation so the hot path doesn't allocate two
+    // Vecs per chunk (`drain(..N).collect()` did at ~46 chunks/sec).
+    let mut chunk: [Vec<f32>; 2] = [vec![0.0; RESAMPLE_CHUNK], vec![0.0; RESAMPLE_CHUNK]];
+
+    // Resolve the sender once. The Mutex-guarded clone was happening on every
+    // emitted wave (~46/sec); the sender only changes between connections, so
+    // grabbing it here is sufficient — if it isn't set yet, the capture loop
+    // shouldn't be running anyway.
+    let s = {
+        let guard = sender.lock().unwrap();
+        let Some(s) = guard.clone() else {
+            return Ok(());
+        };
+        s
+    };
 
     // Shallow queue: SCK's async buffer is a drop-oldest ring of this depth.
     // Each slot is ~20 ms of audio, so 2 caps capture-side staleness at ~40 ms
@@ -258,24 +273,19 @@ async fn capture_loop(
         input_buf[1].extend_from_slice(&in_right);
 
         while input_buf[0].len() >= RESAMPLE_CHUNK && input_buf[1].len() >= RESAMPLE_CHUNK {
-            let chunk: [Vec<f32>; 2] = [
-                input_buf[0].drain(..RESAMPLE_CHUNK).collect(),
-                input_buf[1].drain(..RESAMPLE_CHUNK).collect(),
-            ];
+            chunk[0].copy_from_slice(&input_buf[0][..RESAMPLE_CHUNK]);
+            chunk[1].copy_from_slice(&input_buf[1][..RESAMPLE_CHUNK]);
             let resampled = resampler
                 .process(&chunk, None)
                 .map_err(|e| anyhow!("rubato resample: {e}"))?;
+            input_buf[0].drain(..RESAMPLE_CHUNK);
+            input_buf[1].drain(..RESAMPLE_CHUNK);
             let pcm = planar_f32_to_interleaved_i16(&resampled);
             if pcm.is_empty() {
                 continue;
             }
 
             let ts_ms = start_instant.elapsed().as_millis() as u32;
-            let s = {
-                let guard = sender.lock().unwrap();
-                guard.clone()
-            };
-            let Some(s) = s else { return Ok(()) };
             if s.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(pcm, ts_ms)))
                 .is_err()
             {

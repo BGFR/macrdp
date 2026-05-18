@@ -101,11 +101,14 @@ struct Args {
     bind: SocketAddr,
 
     /// Desktop width in pixels. Defaults to the primary display's native width
-    /// (queried via ScreenCaptureKit). Set to override scaling.
+    /// (queried via ScreenCaptureKit). Overriding to a non-native size makes
+    /// SCK scale internally; we then disable dirty-rect updates and ship a
+    /// full frame every tick, so bandwidth is higher than at native size.
     #[arg(long)]
     width: Option<u16>,
 
     /// Desktop height in pixels. Defaults to the primary display's native height.
+    /// Same trade-off as --width when overridden.
     #[arg(long)]
     height: Option<u16>,
 

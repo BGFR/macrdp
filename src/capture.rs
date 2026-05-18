@@ -89,6 +89,14 @@ mod macos {
         // bitmap cache starts in a known-good state; SCK's dirty rects
         // for frame 0 may not cover everything.
         seeded: bool,
+        // When the configured desktop size differs from the Mac's native
+        // display, SCK scales the output internally but emits dirty rects
+        // in *source* coordinates — they don't line up with the output
+        // buffer. RemoteFx (mstsc) renders the resulting mis-positioned
+        // tile updates as a black canvas. Force a full-frame BitmapUpdate
+        // every tick in that case; the upstream encoder's framebuffer diff
+        // then keeps the actual bandwidth reasonable.
+        force_full_frame: bool,
         cursor: CursorState,
     }
 
@@ -100,6 +108,20 @@ mod macos {
 
             let displays = content.displays();
             let display = displays.first().context("no displays available")?;
+
+            let native_w = u16::try_from(display.width()).context("display width > u16")?;
+            let native_h = u16::try_from(display.height()).context("display height > u16")?;
+            let force_full_frame = native_w != width || native_h != height;
+            if force_full_frame {
+                tracing::warn!(
+                    requested_w = width,
+                    requested_h = height,
+                    native_w,
+                    native_h,
+                    "configured size != native; SCK dirty rects are in source coords \
+                     and would misalign — sending full frames every tick (higher bandwidth)"
+                );
+            }
 
             let filter = SCContentFilter::create()
                 .with_display(display)
@@ -126,6 +148,7 @@ mod macos {
                 stream,
                 pending: std::collections::VecDeque::new(),
                 seeded: false,
+                force_full_frame,
                 cursor,
             })
         }
@@ -218,7 +241,7 @@ mod macos {
                 // After that, SCK's dirty_rects tells us what changed; if the
                 // attachment is missing (older macOS, no key), fall back to
                 // the full frame.
-                let dirty = if !self.seeded {
+                let dirty = if !self.seeded || self.force_full_frame {
                     None
                 } else {
                     sample.dirty_rects()

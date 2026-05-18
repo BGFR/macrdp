@@ -6,6 +6,7 @@ mod cursor;
 #[cfg(target_os = "macos")]
 mod file_promise;
 mod input;
+mod virtual_display;
 
 use std::fs;
 use std::io::BufReader;
@@ -158,6 +159,14 @@ struct Args {
     /// management on.
     #[arg(long)]
     allow_sleep: bool,
+
+    /// TEMPORARY (phase-1 verification): allocate a CGVirtualDisplay at
+    /// the configured --width/--height and idle until SIGINT/SIGTERM, so
+    /// you can confirm it appears in System Settings → Displays. Drops
+    /// (and the OS un-registers the display) on exit. Hidden from --help
+    /// and will be removed once the --virtual-display flag lands.
+    #[arg(long, hide = true)]
+    probe_virtual_display: bool,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -385,6 +394,24 @@ async fn main() -> Result<()> {
     }
     #[cfg(not(target_os = "macos"))]
     tracing::warn!("Built for a non-macOS target — capture is a static-rectangle stub.");
+
+    if args.probe_virtual_display {
+        let w = args.width.unwrap_or(1920);
+        let h = args.height.unwrap_or(1080);
+        let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), args.fps)
+            .context("creating probe virtual display")?;
+        info!(
+            display_id = vd.display_id(),
+            origin = ?vd.origin_pts(),
+            size = ?vd.size_pts(),
+            "probe virtual display attached — open System Settings → Displays \
+             to confirm. Ctrl-C to detach and exit."
+        );
+        shutdown_signal().await;
+        info!("detaching probe virtual display");
+        drop(vd);
+        return Ok(());
+    }
 
     let username = args
         .username

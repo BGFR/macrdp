@@ -398,7 +398,11 @@ async fn main() -> Result<()> {
     if args.probe_virtual_display {
         let w = args.width.unwrap_or(1920);
         let h = args.height.unwrap_or(1080);
-        let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), args.fps)
+        // Real displays bottom out at 24 Hz — our --fps default (15) is below
+        // that and would have CGVirtualDisplay reject the mode. The refresh
+        // rate is just metadata as far as macrdp is concerned (we control
+        // capture cadence separately), so always feed a sane 60 Hz here.
+        let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
             .context("creating probe virtual display")?;
         info!(
             display_id = vd.display_id(),

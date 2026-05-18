@@ -45,9 +45,7 @@ mod macos {
         /// resolved on this macOS version. Caller should treat that as
         /// "this feature isn't usable here," not a fatal bug.
         pub fn new(width: u32, height: u32, refresh_hz: u32) -> Result<Self> {
-            let api = private_api::PrivateApi::load()
-                .context("loading private CoreGraphics symbols")?;
-            let handle = private_api::create(&api, width, height, refresh_hz, "macrdp")
+            let handle = private_api::create(width, height, refresh_hz, "macrdp")
                 .context("creating virtual display")?;
 
             // CGDisplayBounds gives both the origin (in global point space)

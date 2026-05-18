@@ -5,6 +5,8 @@
 //! exercised on Linux CI.
 
 use std::num::{NonZeroU16, NonZeroUsize};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -12,8 +14,68 @@ use ironrdp_server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay,
     RdpServerDisplayUpdates,
 };
+use tokio::sync::Notify;
 
 use crate::cursor::CursorState;
+
+/// Live RDP-session counter. ironrdp_server calls `RdpServerDisplay::updates()`
+/// once per accepted client connection and drops the returned stream when the
+/// connection ends, so wrapping that stream is the natural place to count
+/// "how many clients are currently consuming our frames." Used by the
+/// `--detach-primary` watchdog in `main.rs` to auto-restore the original
+/// display layout if nothing connects (or every client disconnects).
+#[derive(Clone, Default)]
+pub struct SessionTracker {
+    pub count: Arc<AtomicUsize>,
+    /// Notified whenever `count` changes. `tokio::sync::Notify` is
+    /// edge-triggered; we wake one waiter per state transition, which
+    /// is what the watchdog needs.
+    pub notify: Arc<Notify>,
+}
+
+impl SessionTracker {
+    fn enter(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+    fn leave(&self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+}
+
+/// Wraps an `RdpServerDisplayUpdates` so its lifetime drives a
+/// `SessionTracker`. The inner trait is what ironrdp_server polls;
+/// our wrapper just forwards `next_update` and bumps the counter on
+/// new/drop. Zero overhead per frame — only construction and drop touch
+/// the atomic.
+struct CountedUpdates {
+    // `+ Send` so `next_update`'s async future is Send (ironrdp_server uses
+    // it under tokio::select!). The concrete inner types satisfy Send;
+    // the trait object would otherwise lose it.
+    inner: Box<dyn RdpServerDisplayUpdates + Send>,
+    tracker: SessionTracker,
+}
+
+impl CountedUpdates {
+    fn new(inner: Box<dyn RdpServerDisplayUpdates + Send>, tracker: SessionTracker) -> Self {
+        tracker.enter();
+        Self { inner, tracker }
+    }
+}
+
+impl Drop for CountedUpdates {
+    fn drop(&mut self) {
+        self.tracker.leave();
+    }
+}
+
+#[async_trait::async_trait]
+impl RdpServerDisplayUpdates for CountedUpdates {
+    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        self.inner.next_update().await
+    }
+}
 
 pub struct CaptureDisplay {
     pub width: u16,
@@ -31,6 +93,11 @@ pub struct CaptureDisplay {
     /// path. Caller queries it from `CGDisplay::main()` for the
     /// primary path, or from `VirtualDisplay::size_pts()`.
     pub screen_size_pts: (f64, f64),
+    /// Optional session tracker — when `Some`, the returned
+    /// `RdpServerDisplayUpdates` is wrapped so its lifetime bumps the
+    /// counter. The `--detach-primary` watchdog observes this. `None`
+    /// disables the wrap entirely (zero overhead).
+    pub session_tracker: Option<SessionTracker>,
 }
 
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
@@ -71,21 +138,23 @@ impl RdpServerDisplay for CaptureDisplay {
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
         #[cfg(target_os = "macos")]
-        {
-            let updates = macos::ScreenCaptureUpdates::start(
+        let inner: Box<dyn RdpServerDisplayUpdates + Send> = Box::new(
+            macos::ScreenCaptureUpdates::start(
                 self.width,
                 self.height,
                 self.fps,
                 self.display_id,
                 self.screen_size_pts,
             )
-            .await?;
-            Ok(Box::new(updates))
-        }
+            .await?,
+        );
         #[cfg(not(target_os = "macos"))]
-        {
-            Ok(Box::new(stub::StubUpdates::new(self.width, self.height)?))
-        }
+        let inner: Box<dyn RdpServerDisplayUpdates + Send> =
+            Box::new(stub::StubUpdates::new(self.width, self.height)?);
+        Ok(match self.session_tracker.clone() {
+            Some(tracker) => Box::new(CountedUpdates::new(inner, tracker)),
+            None => inner,
+        })
     }
 }
 

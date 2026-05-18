@@ -191,6 +191,37 @@ struct Args {
     /// future macOS releases.
     #[arg(long)]
     virtual_display: bool,
+
+    /// Promote the virtual display to be the system's primary display
+    /// for the duration of the run — the one with the menu bar, where
+    /// new app windows open. Use this when you want to drive the
+    /// remote desktop as your "main" workspace (e.g. headless remote
+    /// use). Restored on clean exit; the underlying CGConfigure call is
+    /// session-scoped so the layout also reverts on user logout if
+    /// macrdp exits uncleanly (signal, crash). Only valid with
+    /// --virtual-display.
+    #[arg(long)]
+    make_primary: bool,
+
+    /// Disable the original primary display entirely while macrdp is
+    /// running. Combined with --virtual-display, the Mac becomes a
+    /// headless server: built-in panel goes dark, no menu bar, cursor
+    /// can't cross onto it. Restored on clean exit, on user logout
+    /// (session-scoped CGConfigure), or by the connection watchdog
+    /// (see --detach-timeout-secs) if no client is connected — so a
+    /// flaky network can't lock you out of the Mac permanently. Only
+    /// valid with --virtual-display.
+    #[arg(long)]
+    detach_primary: bool,
+
+    /// Seconds the --detach-primary watchdog waits with zero active
+    /// RDP connections before auto-restoring the original display
+    /// layout and exiting. Counts both the startup-waits-for-first-
+    /// connection window AND the time after the last client
+    /// disconnects, so a brief network glitch is forgiven but a
+    /// persistent outage triggers recovery. Default 120.
+    #[arg(long, default_value_t = 120)]
+    detach_timeout_secs: u64,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -388,14 +419,50 @@ async fn main() -> Result<()> {
     };
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    if args.make_primary && !args.virtual_display {
+        return Err(anyhow!(
+            "--make-primary requires --virtual-display (it promotes the \
+             virtual display to be the system's primary)"
+        ));
+    }
+    if args.detach_primary && !args.virtual_display {
+        return Err(anyhow!(
+            "--detach-primary requires --virtual-display (you'd be left \
+             with no usable display otherwise)"
+        ));
+    }
+
+    // Shared slots so the signal handler / watchdog can drop the display
+    // RAII guards before process::exit and actually restore the user's
+    // setup. Populated later if the corresponding flag is set.
+    let primary_override: std::sync::Arc<
+        std::sync::Mutex<Option<virtual_display::PrimaryOverride>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let detached_primary: std::sync::Arc<
+        std::sync::Mutex<Option<virtual_display::DetachedPrimary>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+
     // Install signal handling before anything touches ScreenCaptureKit. Once an
     // SCK capture stream is live, macOS framework threads can leave the process
     // unkillable by Ctrl-C; a forced exit on SIGINT/SIGTERM sidesteps that — and
     // any other non-cooperative native threads — instead of relying on the
     // tokio runtime to unwind cleanly.
-    tokio::spawn(async {
+    //
+    // The display RAII guards (PrimaryOverride / DetachedPrimary) are
+    // dropped here first so the user's layout is restored before exit.
+    // Without this, Ctrl-C would leave the virtual display promoted or
+    // the built-in panel disabled until logout.
+    let cleanup_primary = primary_override.clone();
+    let cleanup_detach = detached_primary.clone();
+    tokio::spawn(async move {
         shutdown_signal().await;
         info!("shutdown signal received — exiting");
+        if let Some(ovr) = cleanup_detach.lock().expect("detach mutex poisoned").take() {
+            drop(ovr); // re-enables the built-in display
+        }
+        if let Some(ovr) = cleanup_primary.lock().expect("primary mutex poisoned").take() {
+            drop(ovr); // restores display arrangement
+        }
         std::process::exit(0);
     });
 
@@ -449,6 +516,91 @@ async fn main() -> Result<()> {
         None
     };
 
+    // If asked, promote the virtual display to be the system primary
+    // (menu bar lives there, new windows open there). Installed into
+    // the shared slot so the signal handler can restore on Ctrl-C.
+    // --detach-primary subsumes --make-primary: detaching also puts the
+    // virtual display at (0,0). If both are set, only detach runs.
+    let session_tracker = capture::SessionTracker::default();
+    if args.detach_primary {
+        let vd_id = virtual_display
+            .as_ref()
+            .expect("checked above when --detach-primary")
+            .display_id();
+        let ovr = virtual_display::DetachedPrimary::install(vd_id)
+            .context("disabling original primary display")?;
+        info!(
+            timeout_s = args.detach_timeout_secs,
+            "original primary detached — Mac is now headless via the virtual \
+             display. Watchdog will auto-restore if no RDP connection within \
+             timeout."
+        );
+        *detached_primary.lock().expect("detach mutex poisoned") = Some(ovr);
+
+        // Spawn the watchdog. Triggers when session_tracker.count has
+        // been 0 for `timeout` seconds; on trigger, drops the RAII
+        // guards (restoring the display) and exits.
+        let timeout = std::time::Duration::from_secs(args.detach_timeout_secs);
+        let tracker = session_tracker.clone();
+        let detach_for_wd = detached_primary.clone();
+        let primary_for_wd = primary_override.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering;
+            loop {
+                if tracker.count.load(Ordering::SeqCst) == 0 {
+                    let timed_out =
+                        tokio::time::timeout(timeout, tracker.notify.notified())
+                            .await
+                            .is_err();
+                    if timed_out && tracker.count.load(Ordering::SeqCst) == 0 {
+                        warn!(
+                            timeout_s = timeout.as_secs(),
+                            "no active RDP session — restoring display layout \
+                             and exiting (watchdog). Re-run macrdp to use again."
+                        );
+                        if let Some(o) =
+                            detach_for_wd.lock().expect("detach mutex poisoned").take()
+                        {
+                            drop(o);
+                        }
+                        if let Some(o) =
+                            primary_for_wd.lock().expect("primary mutex poisoned").take()
+                        {
+                            drop(o);
+                        }
+                        std::process::exit(2);
+                    }
+                } else {
+                    // Active session — sleep until the next state transition.
+                    tracker.notify.notified().await;
+                }
+            }
+        });
+    } else if args.make_primary {
+        let vd_id = virtual_display
+            .as_ref()
+            .expect("checked above when --make-primary")
+            .display_id();
+        match virtual_display::PrimaryOverride::install(vd_id)
+            .context("promoting virtual display to primary")?
+        {
+            Some(ovr) => {
+                info!(
+                    "virtual display promoted to primary — menu bar and new \
+                     windows move there. Original layout restored on exit \
+                     (or at next logout)."
+                );
+                *primary_override.lock().expect("override mutex poisoned") = Some(ovr);
+            }
+            None => {
+                info!(
+                    "virtual display is already the system primary (macOS \
+                     auto-placed it at origin) — no override needed"
+                );
+            }
+        }
+    }
+
     let username = args
         .username
         .clone()
@@ -499,13 +651,27 @@ async fn main() -> Result<()> {
             // Both required earlier, so the unwraps can't fire.
             let w = args.width.expect("checked above when --virtual-display set");
             let h = args.height.expect("checked above when --virtual-display set");
+            // Re-query CGDisplayBounds rather than trusting the cached
+            // values from VirtualDisplay creation: if --make-primary
+            // moved the display to (0, 0), the cached origin is stale.
+            #[cfg(target_os = "macos")]
+            let (origin, size) = {
+                let b = core_graphics::display::CGDisplay::new(vd.display_id()).bounds();
+                (
+                    (b.origin.x, b.origin.y),
+                    (b.size.width, b.size.height),
+                )
+            };
+            #[cfg(not(target_os = "macos"))]
+            let (origin, size) = (vd.origin_pts(), vd.size_pts());
             info!(
                 width = w,
                 height = h,
                 display_id = vd.display_id(),
+                origin = ?origin,
                 "desktop size (virtual display)"
             );
-            (w, h, Some(vd.display_id()), vd.origin_pts(), vd.size_pts())
+            (w, h, Some(vd.display_id()), origin, size)
         } else {
             let detected = primary_display_size().await?;
             let w = args
@@ -537,6 +703,9 @@ async fn main() -> Result<()> {
         fps: args.fps,
         display_id: capture_display_id,
         screen_size_pts,
+        // Only attach the tracker when the watchdog needs it. Saves
+        // a useless atomic increment/decrement per session otherwise.
+        session_tracker: args.detach_primary.then(|| session_tracker.clone()),
     };
 
     let input_handler =

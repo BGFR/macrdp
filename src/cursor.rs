@@ -15,11 +15,18 @@ pub struct CursorState {
 }
 
 impl CursorState {
-    pub fn new(desktop_w: u16, desktop_h: u16) -> anyhow::Result<Self> {
+    /// `screen_size_pts` is the target display's logical size in
+    /// points; only consumed by the (currently-disabled) position
+    /// polling path, but parameterized for symmetry with input.rs.
+    pub fn new(
+        desktop_w: u16,
+        desktop_h: u16,
+        screen_size_pts: (f64, f64),
+    ) -> anyhow::Result<Self> {
         #[cfg(target_os = "macos")]
-        let inner = macos::Inner::new(desktop_w, desktop_h)?;
+        let inner = macos::Inner::new(desktop_w, desktop_h, screen_size_pts)?;
         #[cfg(not(target_os = "macos"))]
-        let _ = (desktop_w, desktop_h);
+        let _ = (desktop_w, desktop_h, screen_size_pts);
         Ok(Self {
             #[cfg(target_os = "macos")]
             inner,
@@ -44,7 +51,6 @@ mod macos {
     use std::hash::{Hash, Hasher};
 
     use anyhow::{anyhow, Result};
-    use core_graphics::display::CGDisplay;
     use core_graphics::event::CGEvent;
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use ironrdp_pdu::pointer::PointerPositionAttribute;
@@ -75,18 +81,21 @@ mod macos {
     unsafe impl Send for Inner {}
 
     impl Inner {
-        pub fn new(desktop_w: u16, desktop_h: u16) -> Result<Self> {
+        pub fn new(
+            desktop_w: u16,
+            desktop_h: u16,
+            screen_size_pts: (f64, f64),
+        ) -> Result<Self> {
             let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                 .map_err(|_| anyhow!("CGEventSource::new failed"))?;
-            let main = CGDisplay::main();
             Ok(Self {
                 source,
                 last_hash: 0,
                 last_pos: None,
                 desktop_w,
                 desktop_h,
-                screen_w_pts: main.pixels_wide() as f64,
-                screen_h_pts: main.pixels_high() as f64,
+                screen_w_pts: screen_size_pts.0,
+                screen_h_pts: screen_size_pts.1,
             })
         }
 

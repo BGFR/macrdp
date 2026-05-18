@@ -74,6 +74,25 @@ fn bitmap_codecs() -> BitmapCodecs {
     ])
 }
 
+/// Bounds of the user's primary display in macOS's global point-coord
+/// space — origin is `(0, 0)` by convention. Used to feed input.rs and
+/// cursor.rs when we're capturing the primary panel; the virtual-display
+/// path queries `VirtualDisplay::{origin_pts, size_pts}` instead.
+#[cfg(target_os = "macos")]
+fn primary_screen_geometry() -> ((f64, f64), (f64, f64)) {
+    use core_graphics::display::CGDisplay;
+    let main = CGDisplay::main();
+    (
+        (0.0, 0.0),
+        (main.pixels_wide() as f64, main.pixels_high() as f64),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn primary_screen_geometry() -> ((f64, f64), (f64, f64)) {
+    ((0.0, 0.0), (0.0, 0.0))
+}
+
 #[cfg(target_os = "macos")]
 fn ensure_screen_recording_access() {
     use core_graphics::access::ScreenCaptureAccess;
@@ -420,6 +439,7 @@ async fn main() -> Result<()> {
             height: h,
             fps: args.fps,
             display_id: Some(vd.display_id()),
+            screen_size_pts: vd.size_pts(),
         };
         let _ = display.size().await; // satisfies the RdpServerDisplay trait
         let mut updates = display
@@ -522,14 +542,17 @@ async fn main() -> Result<()> {
         info!(width, height, "desktop size (no display detected)");
     }
 
+    let (screen_origin_pts, screen_size_pts) = primary_screen_geometry();
     let display = CaptureDisplay {
         width,
         height,
         fps: args.fps,
         display_id: None,
+        screen_size_pts,
     };
 
-    let input_handler = MacInputHandler::new(width, height)?;
+    let input_handler =
+        MacInputHandler::new(width, height, screen_origin_pts, screen_size_pts)?;
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> =
         Box::new(clipboard::MacCliprdr::new());
     let sound: Box<dyn ironrdp_server::SoundServerFactory> = Box::new(audio::MacRdpsnd::new());

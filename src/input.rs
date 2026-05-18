@@ -18,9 +18,21 @@ pub struct MacInputHandler {
 }
 
 impl MacInputHandler {
-    pub fn new(desktop_width: u16, desktop_height: u16) -> anyhow::Result<Self> {
+    /// `screen_origin_pts` and `screen_size_pts` are the bounds of the
+    /// target display in macOS's global point-coord space. For the
+    /// primary panel that's `(0,0)` and the panel's logical size; for a
+    /// `VirtualDisplay`, ask its `origin_pts()` / `size_pts()`. The
+    /// origin is what makes `CGEventPost` land on the right display.
+    pub fn new(
+        desktop_width: u16,
+        desktop_height: u16,
+        screen_origin_pts: (f64, f64),
+        screen_size_pts: (f64, f64),
+    ) -> anyhow::Result<Self> {
         #[cfg(target_os = "macos")]
-        let inner = macos::Inner::new()?;
+        let inner = macos::Inner::new(screen_origin_pts, screen_size_pts)?;
+        #[cfg(not(target_os = "macos"))]
+        let _ = (screen_origin_pts, screen_size_pts);
         Ok(Self {
             desktop_width,
             desktop_height,
@@ -52,7 +64,6 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use anyhow::{anyhow, Result};
-    use core_graphics::display::CGDisplay;
     use core_graphics::event::{
         CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, EventField,
         ScrollEventUnit,
@@ -94,6 +105,12 @@ mod macos {
         right_down: bool,
         middle_down: bool,
         flags: CGEventFlags,
+        // Target display bounds in global point-coord space. CGEvent
+        // takes global coords, so RDP-desktop coords are scaled into
+        // (origin + size) before posting — that's what routes events
+        // to the intended display (primary panel or virtual display).
+        screen_origin_x_pts: f64,
+        screen_origin_y_pts: f64,
         screen_width_pts: f64,
         screen_height_pts: f64,
         // Per-button click history so a quick second press at (roughly) the
@@ -106,12 +123,14 @@ mod macos {
     }
 
     impl Inner {
-        pub fn new() -> Result<Self> {
+        pub fn new(
+            screen_origin_pts: (f64, f64),
+            screen_size_pts: (f64, f64),
+        ) -> Result<Self> {
             // HIDSystemState merges our events into the global HID stream so
             // they look like real hardware input (correct for an RDP server).
             let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                 .map_err(|_| anyhow!("CGEventSource::new failed"))?;
-            let main = CGDisplay::main();
             Ok(Self {
                 source,
                 last_x: 0.0,
@@ -120,8 +139,10 @@ mod macos {
                 right_down: false,
                 middle_down: false,
                 flags: CGEventFlags::CGEventFlagNull,
-                screen_width_pts: main.pixels_wide() as f64,
-                screen_height_pts: main.pixels_high() as f64,
+                screen_origin_x_pts: screen_origin_pts.0,
+                screen_origin_y_pts: screen_origin_pts.1,
+                screen_width_pts: screen_size_pts.0,
+                screen_height_pts: screen_size_pts.1,
                 click_left: None,
                 click_right: None,
                 click_middle: None,
@@ -200,12 +221,15 @@ mod macos {
         }
 
         fn move_to(&mut self, x: u16, y: u16, desktop_w: u16, desktop_h: u16) {
-            // Scale desktop coords → screen points. ScreenCaptureKit captures at
-            // the display's full pixel resolution, but CGEvent takes points (which
-            // equal pixels on non-Retina and equal pixels/scale on Retina).
-            // We rely on the screen being the same aspect ratio as the desktop.
-            let sx = f64::from(x) * self.screen_width_pts / f64::from(desktop_w.max(1));
-            let sy = f64::from(y) * self.screen_height_pts / f64::from(desktop_h.max(1));
+            // Scale desktop coords → screen points, then translate into the
+            // target display's slot in the global coord space. The origin
+            // offset is what makes CGEventPost route events to a non-primary
+            // display (virtual or external) — the WindowServer dispatches by
+            // which display contains the global coord.
+            let sx = self.screen_origin_x_pts
+                + f64::from(x) * self.screen_width_pts / f64::from(desktop_w.max(1));
+            let sy = self.screen_origin_y_pts
+                + f64::from(y) * self.screen_height_pts / f64::from(desktop_h.max(1));
             self.last_x = sx;
             self.last_y = sy;
 

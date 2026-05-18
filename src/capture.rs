@@ -138,14 +138,20 @@ mod macos {
                 // (real-shape) cursor without doubling up.
                 .with_shows_cursor(false)
                 // Stretch the source to fill the output exactly instead of
-                // pillarboxing/letterboxing on aspect mismatch (SCK's default).
-                // Without this, asking for 1920x1080 on a 16:10 MacBook display
-                // leaves vertical black bars on the sides; the captured Mac
-                // content then sits in a shifted sub-rectangle, so when the
-                // client predicts the cursor position from mouse input the
-                // sprite drifts away from the actual click coord (offset grows
+                // pillarboxing/letterboxing on aspect mismatch. Without this,
+                // asking for 1920x1080 on a 16:10 MacBook leaves black bars
+                // on the sides; the captured Mac content then sits in a
+                // shifted sub-rectangle, so client-predicted cursor sprites
+                // drift away from the actual click coord (offset grows
                 // proportionally to distance from screen center).
-                .with_scales_to_fit(true);
+                //
+                // Apple replaced `scalesToFit` with `preservesAspectRatio`
+                // (inverse semantics) in macOS 14; on macOS 14+ the newer
+                // property is what actually takes effect. Set both so a single
+                // build works across versions — the no-longer-load-bearing one
+                // is a no-op on the version where it doesn't apply.
+                .with_scales_to_fit(true)
+                .with_preserves_aspect_ratio(false);
 
             let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
             stream

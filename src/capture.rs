@@ -136,7 +136,16 @@ mod macos {
                 // Hide the macOS cursor in the captured framebuffer; we forward
                 // it separately as RGBAPointer so the client renders its own
                 // (real-shape) cursor without doubling up.
-                .with_shows_cursor(false);
+                .with_shows_cursor(false)
+                // Stretch the source to fill the output exactly instead of
+                // pillarboxing/letterboxing on aspect mismatch (SCK's default).
+                // Without this, asking for 1920x1080 on a 16:10 MacBook display
+                // leaves vertical black bars on the sides; the captured Mac
+                // content then sits in a shifted sub-rectangle, so when the
+                // client predicts the cursor position from mouse input the
+                // sprite drifts away from the actual click coord (offset grows
+                // proportionally to distance from screen center).
+                .with_scales_to_fit(true);
 
             let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
             stream

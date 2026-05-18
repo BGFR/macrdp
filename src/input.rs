@@ -18,21 +18,22 @@ pub struct MacInputHandler {
 }
 
 impl MacInputHandler {
-    /// `screen_origin_pts` and `screen_size_pts` are the bounds of the
-    /// target display in macOS's global point-coord space. For the
-    /// primary panel that's `(0,0)` and the panel's logical size; for a
-    /// `VirtualDisplay`, ask its `origin_pts()` / `size_pts()`. The
-    /// origin is what makes `CGEventPost` land on the right display.
+    /// `target_display_id` identifies the macOS display we're posting
+    /// events into: `None` means the current primary panel; `Some(id)`
+    /// is the `CGDirectDisplayID` we should re-query bounds for on
+    /// every event. Re-querying matters because the target's global
+    /// origin can move *after* this handler is constructed — e.g.
+    /// `--detach-primary` disables the built-in panel mid-session,
+    /// which shifts the virtual display to `(0, 0)`.
     pub fn new(
         desktop_width: u16,
         desktop_height: u16,
-        screen_origin_pts: (f64, f64),
-        screen_size_pts: (f64, f64),
+        target_display_id: Option<u32>,
     ) -> anyhow::Result<Self> {
         #[cfg(target_os = "macos")]
-        let inner = macos::Inner::new(screen_origin_pts, screen_size_pts)?;
+        let inner = macos::Inner::new(target_display_id)?;
         #[cfg(not(target_os = "macos"))]
-        let _ = (screen_origin_pts, screen_size_pts);
+        let _ = target_display_id;
         Ok(Self {
             desktop_width,
             desktop_height,
@@ -64,6 +65,7 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use anyhow::{anyhow, Result};
+    use core_graphics::display::CGDisplay;
     use core_graphics::event::{
         CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, EventField,
         ScrollEventUnit,
@@ -105,14 +107,12 @@ mod macos {
         right_down: bool,
         middle_down: bool,
         flags: CGEventFlags,
-        // Target display bounds in global point-coord space. CGEvent
-        // takes global coords, so RDP-desktop coords are scaled into
-        // (origin + size) before posting — that's what routes events
-        // to the intended display (primary panel or virtual display).
-        screen_origin_x_pts: f64,
-        screen_origin_y_pts: f64,
-        screen_width_pts: f64,
-        screen_height_pts: f64,
+        // `None` → use CGDisplay::main() bounds; `Some(id)` → look up
+        // that specific display. Re-queried per mouse move so a
+        // mid-session bounds change (e.g. --detach-primary disabling
+        // the built-in mid-flight) doesn't strand events on stale
+        // coords.
+        target_display_id: Option<u32>,
         // Per-button click history so a quick second press at (roughly) the
         // same spot becomes click_count=2 and Finder recognises a double-
         // click. Without this every press has click_count=1 implicitly and
@@ -123,10 +123,7 @@ mod macos {
     }
 
     impl Inner {
-        pub fn new(
-            screen_origin_pts: (f64, f64),
-            screen_size_pts: (f64, f64),
-        ) -> Result<Self> {
+        pub fn new(target_display_id: Option<u32>) -> Result<Self> {
             // HIDSystemState merges our events into the global HID stream so
             // they look like real hardware input (correct for an RDP server).
             let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -139,14 +136,24 @@ mod macos {
                 right_down: false,
                 middle_down: false,
                 flags: CGEventFlags::CGEventFlagNull,
-                screen_origin_x_pts: screen_origin_pts.0,
-                screen_origin_y_pts: screen_origin_pts.1,
-                screen_width_pts: screen_size_pts.0,
-                screen_height_pts: screen_size_pts.1,
+                target_display_id,
                 click_left: None,
                 click_right: None,
                 click_middle: None,
             })
+        }
+
+        /// Current global-coord bounds of the target display, queried
+        /// fresh so a layout change since this handler was built (vd
+        /// moving to (0,0) when --detach-primary disables the built-in
+        /// panel) doesn't leave us posting to a stale rectangle.
+        fn target_bounds(&self) -> (f64, f64, f64, f64) {
+            let d = match self.target_display_id {
+                Some(id) => CGDisplay::new(id),
+                None => CGDisplay::main(),
+            };
+            let b = d.bounds();
+            (b.origin.x, b.origin.y, b.size.width, b.size.height)
         }
 
         pub fn keyboard(&mut self, event: KeyboardEvent) {
@@ -226,10 +233,9 @@ mod macos {
             // offset is what makes CGEventPost route events to a non-primary
             // display (virtual or external) — the WindowServer dispatches by
             // which display contains the global coord.
-            let sx = self.screen_origin_x_pts
-                + f64::from(x) * self.screen_width_pts / f64::from(desktop_w.max(1));
-            let sy = self.screen_origin_y_pts
-                + f64::from(y) * self.screen_height_pts / f64::from(desktop_h.max(1));
+            let (ox, oy, sw, sh) = self.target_bounds();
+            let sx = ox + f64::from(x) * sw / f64::from(desktop_w.max(1));
+            let sy = oy + f64::from(y) * sh / f64::from(desktop_h.max(1));
             self.last_x = sx;
             self.last_y = sy;
 

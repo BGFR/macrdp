@@ -22,8 +22,9 @@ use crate::cursor::CursorState;
 /// once per accepted client connection and drops the returned stream when the
 /// connection ends, so wrapping that stream is the natural place to count
 /// "how many clients are currently consuming our frames." Used by the
-/// `--detach-primary` watchdog in `main.rs` to auto-restore the original
-/// display layout if nothing connects (or every client disconnects).
+/// `--detach-primary` session-transition watcher in `main.rs` to disable the
+/// physical displays only while at least one client is connected, and re-
+/// attach them as soon as the last client disconnects.
 #[derive(Clone, Default)]
 pub struct SessionTracker {
     pub count: Arc<AtomicUsize>,
@@ -35,11 +36,13 @@ pub struct SessionTracker {
 
 impl SessionTracker {
     fn enter(&self) {
-        self.count.fetch_add(1, Ordering::SeqCst);
+        let prev = self.count.fetch_add(1, Ordering::SeqCst);
+        tracing::info!(prev, now = prev + 1, "SessionTracker::enter");
         self.notify.notify_one();
     }
     fn leave(&self) {
-        self.count.fetch_sub(1, Ordering::SeqCst);
+        let prev = self.count.fetch_sub(1, Ordering::SeqCst);
+        tracing::info!(prev, now = prev.saturating_sub(1), "SessionTracker::leave");
         self.notify.notify_one();
     }
 }
@@ -95,8 +98,8 @@ pub struct CaptureDisplay {
     pub screen_size_pts: (f64, f64),
     /// Optional session tracker — when `Some`, the returned
     /// `RdpServerDisplayUpdates` is wrapped so its lifetime bumps the
-    /// counter. The `--detach-primary` watchdog observes this. `None`
-    /// disables the wrap entirely (zero overhead).
+    /// counter that drives the `--detach-primary` session-transition
+    /// watcher. `None` disables the wrap entirely (zero overhead).
     pub session_tracker: Option<SessionTracker>,
 }
 

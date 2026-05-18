@@ -203,25 +203,30 @@ struct Args {
     #[arg(long)]
     make_primary: bool,
 
-    /// Disable the original primary display entirely while macrdp is
-    /// running. Combined with --virtual-display, the Mac becomes a
-    /// headless server: built-in panel goes dark, no menu bar, cursor
-    /// can't cross onto it. Restored on clean exit, on user logout
-    /// (session-scoped CGConfigure), or by the connection watchdog
-    /// (see --detach-timeout-secs) if no client is connected — so a
-    /// flaky network can't lock you out of the Mac permanently. Only
-    /// valid with --virtual-display.
+    /// While an RDP client is connected, disable every physical display
+    /// (built-in panel + any external monitors) so the Mac is headless
+    /// via the virtual display alone: backlights off, no menu bar, no
+    /// windows can be placed there, cursor can't cross onto them. As
+    /// soon as the last client disconnects, the displays come back and
+    /// the local workspace is restored. Also restored on clean exit
+    /// and — even if Drop doesn't run (signal, crash) — at the next
+    /// user logout via the session-scoped CGConfigure. Only valid with
+    /// --virtual-display.
     #[arg(long)]
     detach_primary: bool,
 
-    /// Seconds the --detach-primary watchdog waits with zero active
-    /// RDP connections before auto-restoring the original display
-    /// layout and exiting. Counts both the startup-waits-for-first-
-    /// connection window AND the time after the last client
-    /// disconnects, so a brief network glitch is forgiven but a
-    /// persistent outage triggers recovery. Default 120.
-    #[arg(long, default_value_t = 120)]
-    detach_timeout_secs: u64,
+    /// Alternative to --detach-primary: while a client is connected,
+    /// take **exclusive capture** of every physical display via
+    /// CGDisplayCapture. The panels go solid black (backlight stays
+    /// on) and the cursor can't be moved onto them. Drops the capture
+    /// on last disconnect. Captures are process-scoped, so a signal /
+    /// crash auto-releases — no logout dance. Use this when
+    /// --detach-primary doesn't actually go headless on your machine
+    /// (e.g. the disable transaction succeeds but the panel keeps
+    /// showing the desktop). Mutually exclusive with --detach-primary.
+    /// Only valid with --virtual-display.
+    #[arg(long)]
+    capture_primary: bool,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -396,6 +401,95 @@ fn make_tls_acceptor(cert_dir: &Path) -> Result<(TlsAcceptor, Vec<u8>)> {
     Ok((TlsAcceptor::from(Arc::new(config)), spki_der))
 }
 
+/// Spawn the session-transition watcher used by `--detach-primary`
+/// and `--capture-primary`. On the 0→≥1 client transition (after a
+/// short debounce that absorbs mstsc's cert-trust flap) it calls
+/// `install(vd_id)` and stows the returned guard in `slot`; on
+/// ≥1→0 it takes the guard back out and drops it (which is what
+/// runs the actual re-enable / release). Edge-triggered: changes
+/// between two non-zero counts are no-ops.
+fn spawn_primary_overlay_watcher<T: Send + 'static>(
+    label: &'static str,
+    vd_id: u32,
+    tracker: capture::SessionTracker,
+    slot: Arc<std::sync::Mutex<Option<T>>>,
+    install: fn(u32) -> Result<T>,
+) {
+    tokio::spawn(async move {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        // Minimum dwell time on the engaged state before honoring a
+        // re-attach. The WindowServer commits configure transactions
+        // asynchronously — a disable→enable cycle that races the
+        // first commit's propagation through SkyLight can be rejected
+        // with CGError 1001 by the second tx. Conservative for capture
+        // too where the API is synchronous; unifies the loop shape.
+        const ENGAGED_SETTLE: Duration = Duration::from_secs(3);
+        // mstsc's cert-trust handshake does a 0→1→0→1 flap within a
+        // few seconds. Waiting briefly before acting on a 0→≥1
+        // notification lets that bounce collapse to a no-op so we
+        // don't kick off a 10-second blocking install for a session
+        // that's already gone.
+        const CONNECT_DEBOUNCE: Duration = Duration::from_millis(750);
+        let mut was_zero = true;
+        let mut installed_at: Option<Instant> = None;
+        loop {
+            tracker.notify.notified().await;
+            let count = tracker.count.load(Ordering::SeqCst);
+            let now_zero = count == 0;
+            info!(label, was_zero, now_zero, count, "overlay watcher woke");
+            match (was_zero, now_zero) {
+                (true, false) => {
+                    tokio::time::sleep(CONNECT_DEBOUNCE).await;
+                    if tracker.count.load(Ordering::SeqCst) == 0 {
+                        info!(label, "connection flapped during debounce — skipping install");
+                        was_zero = true;
+                        continue;
+                    }
+                    match install(vd_id) {
+                        Ok(ovr) => {
+                            installed_at = Some(Instant::now());
+                            info!(
+                                label,
+                                "RDP client connected — Mac is now headless via the \
+                                 virtual display"
+                            );
+                            *slot.lock().expect("overlay mutex poisoned") = Some(ovr);
+                        }
+                        Err(e) => warn!(
+                            label,
+                            "could not engage headless overlay on client connect: {e:#}"
+                        ),
+                    }
+                }
+                (false, true) => {
+                    if let Some(installed) = installed_at {
+                        let elapsed = installed.elapsed();
+                        if elapsed < ENGAGED_SETTLE {
+                            let wait = ENGAGED_SETTLE - elapsed;
+                            info!(
+                                label,
+                                ?wait,
+                                "waiting for WindowServer to settle before disengaging"
+                            );
+                            tokio::time::sleep(wait).await;
+                        }
+                    }
+                    if let Some(ovr) = slot.lock().expect("overlay mutex poisoned").take() {
+                        // Drop runs the actual restore + emits its own
+                        // success/warn logs; don't claim a result here.
+                        drop(ovr);
+                        installed_at = None;
+                        info!(label, "last RDP client disconnected");
+                    }
+                }
+                _ => {}
+            }
+            was_zero = now_zero;
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = Args::parse();
@@ -431,15 +525,31 @@ async fn main() -> Result<()> {
              with no usable display otherwise)"
         ));
     }
+    if args.capture_primary && !args.virtual_display {
+        return Err(anyhow!(
+            "--capture-primary requires --virtual-display (you'd be left \
+             with no usable display otherwise)"
+        ));
+    }
+    if args.capture_primary && args.detach_primary {
+        return Err(anyhow!(
+            "--capture-primary and --detach-primary are mutually exclusive \
+             (pick one mechanism for going headless)"
+        ));
+    }
 
-    // Shared slots so the signal handler / watchdog can drop the display
-    // RAII guards before process::exit and actually restore the user's
-    // setup. Populated later if the corresponding flag is set.
+    // Shared slots so the signal handler and the session-transition
+    // watcher can drop the display RAII guards before process::exit and
+    // actually restore the user's setup. Populated later if the
+    // corresponding flag is set.
     let primary_override: std::sync::Arc<
         std::sync::Mutex<Option<virtual_display::PrimaryOverride>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
     let detached_primary: std::sync::Arc<
         std::sync::Mutex<Option<virtual_display::DetachedPrimary>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let captured_primary: std::sync::Arc<
+        std::sync::Mutex<Option<virtual_display::CapturedPrimary>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
 
     // Install signal handling before anything touches ScreenCaptureKit. Once an
@@ -454,11 +564,15 @@ async fn main() -> Result<()> {
     // the built-in panel disabled until logout.
     let cleanup_primary = primary_override.clone();
     let cleanup_detach = detached_primary.clone();
+    let cleanup_capture = captured_primary.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
         info!("shutdown signal received — exiting");
         if let Some(ovr) = cleanup_detach.lock().expect("detach mutex poisoned").take() {
             drop(ovr); // re-enables the built-in display
+        }
+        if let Some(ovr) = cleanup_capture.lock().expect("capture mutex poisoned").take() {
+            drop(ovr); // releases captured displays
         }
         if let Some(ovr) = cleanup_primary.lock().expect("primary mutex poisoned").take() {
             drop(ovr); // restores display arrangement
@@ -516,66 +630,37 @@ async fn main() -> Result<()> {
         None
     };
 
-    // If asked, promote the virtual display to be the system primary
-    // (menu bar lives there, new windows open there). Installed into
-    // the shared slot so the signal handler can restore on Ctrl-C.
-    // --detach-primary subsumes --make-primary: detaching also puts the
-    // virtual display at (0,0). If both are set, only detach runs.
+    // --detach-primary / --capture-primary are lazy: the headless
+    // mechanism is only engaged once a client actually connects. A
+    // session-transition watcher installs the corresponding RAII
+    // guard on 0→≥1 client transitions and drops it on ≥1→0. Both
+    // flags subsume --make-primary (each puts the virtual display
+    // at (0,0)), so if both are set, only the lazy path runs.
     let session_tracker = capture::SessionTracker::default();
     if args.detach_primary {
         let vd_id = virtual_display
             .as_ref()
             .expect("checked above when --detach-primary")
             .display_id();
-        let ovr = virtual_display::DetachedPrimary::install(vd_id)
-            .context("disabling original primary display")?;
-        info!(
-            timeout_s = args.detach_timeout_secs,
-            "original primary detached — Mac is now headless via the virtual \
-             display. Watchdog will auto-restore if no RDP connection within \
-             timeout."
+        spawn_primary_overlay_watcher(
+            "detach",
+            vd_id,
+            session_tracker.clone(),
+            detached_primary.clone(),
+            virtual_display::DetachedPrimary::install,
         );
-        *detached_primary.lock().expect("detach mutex poisoned") = Some(ovr);
-
-        // Spawn the watchdog. Triggers when session_tracker.count has
-        // been 0 for `timeout` seconds; on trigger, drops the RAII
-        // guards (restoring the display) and exits.
-        let timeout = std::time::Duration::from_secs(args.detach_timeout_secs);
-        let tracker = session_tracker.clone();
-        let detach_for_wd = detached_primary.clone();
-        let primary_for_wd = primary_override.clone();
-        tokio::spawn(async move {
-            use std::sync::atomic::Ordering;
-            loop {
-                if tracker.count.load(Ordering::SeqCst) == 0 {
-                    let timed_out =
-                        tokio::time::timeout(timeout, tracker.notify.notified())
-                            .await
-                            .is_err();
-                    if timed_out && tracker.count.load(Ordering::SeqCst) == 0 {
-                        warn!(
-                            timeout_s = timeout.as_secs(),
-                            "no active RDP session — restoring display layout \
-                             and exiting (watchdog). Re-run macrdp to use again."
-                        );
-                        if let Some(o) =
-                            detach_for_wd.lock().expect("detach mutex poisoned").take()
-                        {
-                            drop(o);
-                        }
-                        if let Some(o) =
-                            primary_for_wd.lock().expect("primary mutex poisoned").take()
-                        {
-                            drop(o);
-                        }
-                        std::process::exit(2);
-                    }
-                } else {
-                    // Active session — sleep until the next state transition.
-                    tracker.notify.notified().await;
-                }
-            }
-        });
+    } else if args.capture_primary {
+        let vd_id = virtual_display
+            .as_ref()
+            .expect("checked above when --capture-primary")
+            .display_id();
+        spawn_primary_overlay_watcher(
+            "capture",
+            vd_id,
+            session_tracker.clone(),
+            captured_primary.clone(),
+            virtual_display::CapturedPrimary::install,
+        );
     } else if args.make_primary {
         let vd_id = virtual_display
             .as_ref()
@@ -646,32 +731,29 @@ async fn main() -> Result<()> {
     //   - primary panel, no --width/--height override: query SCK for
     //     native size and use CGDisplay::main() for the point-space bounds.
     //   - primary panel with override: use the override + main geometry.
-    let (width, height, capture_display_id, screen_origin_pts, screen_size_pts) =
+    let (width, height, capture_display_id, screen_size_pts) =
         if let Some(vd) = &virtual_display {
             // Both required earlier, so the unwraps can't fire.
             let w = args.width.expect("checked above when --virtual-display set");
             let h = args.height.expect("checked above when --virtual-display set");
             // Re-query CGDisplayBounds rather than trusting the cached
             // values from VirtualDisplay creation: if --make-primary
-            // moved the display to (0, 0), the cached origin is stale.
+            // moved the display to (0, 0), the cached size is fine but
+            // we want a fresh read for parity with the input handler.
             #[cfg(target_os = "macos")]
-            let (origin, size) = {
+            let size = {
                 let b = core_graphics::display::CGDisplay::new(vd.display_id()).bounds();
-                (
-                    (b.origin.x, b.origin.y),
-                    (b.size.width, b.size.height),
-                )
+                (b.size.width, b.size.height)
             };
             #[cfg(not(target_os = "macos"))]
-            let (origin, size) = (vd.origin_pts(), vd.size_pts());
+            let size = vd.size_pts();
             info!(
                 width = w,
                 height = h,
                 display_id = vd.display_id(),
-                origin = ?origin,
                 "desktop size (virtual display)"
             );
-            (w, h, Some(vd.display_id()), origin, size)
+            (w, h, Some(vd.display_id()), size)
         } else {
             let detected = primary_display_size().await?;
             let w = args
@@ -693,8 +775,8 @@ async fn main() -> Result<()> {
             } else {
                 info!(width = w, height = h, "desktop size (no display detected)");
             }
-            let (origin, size) = primary_screen_geometry();
-            (w, h, None, origin, size)
+            let (_origin, size) = primary_screen_geometry();
+            (w, h, None, size)
         };
 
     let display = CaptureDisplay {
@@ -705,11 +787,11 @@ async fn main() -> Result<()> {
         screen_size_pts,
         // Only attach the tracker when the watchdog needs it. Saves
         // a useless atomic increment/decrement per session otherwise.
-        session_tracker: args.detach_primary.then(|| session_tracker.clone()),
+        session_tracker: (args.detach_primary || args.capture_primary)
+            .then(|| session_tracker.clone()),
     };
 
-    let input_handler =
-        MacInputHandler::new(width, height, screen_origin_pts, screen_size_pts)?;
+    let input_handler = MacInputHandler::new(width, height, capture_display_id)?;
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> =
         Box::new(clipboard::MacCliprdr::new());
     let sound: Box<dyn ironrdp_server::SoundServerFactory> = Box::new(audio::MacRdpsnd::new());

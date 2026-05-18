@@ -16,8 +16,9 @@ Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
   **Ctrl-C on a folder in Windows Explorer is a known no-op** — not our bug, and not fixable from the server side. Explorer puts `CFSTR_SHELLIDLIST` (Shell IDList Array) on the clipboard as the primary format and delay-renders `FileGroupDescriptorW` only when a shell-aware receiver asks. mstsc doesn't request the delayed format, so it never forwards anything via CLIPRDR — `cliprdr=debug` shows zero PDUs for the folder copy attempt. Workaround for the user: enter the folder in Explorer, `Ctrl-A` then `Ctrl-C` to copy the contents (with directory descriptors for any subfolders) — that path uses `FileGroupDescriptorW` directly and forwards correctly. True drag-from-Windows folder copy would need drive redirection (a different RDP feature, not clipboard).
 - Forward macOS system audio to the remote (RDPSND, 44.1 kHz stereo 16-bit PCM; SCK captures at 48 kHz and the capture loop resamples via `rubato`).
 - NLA / CredSSP authentication — no more "type username before Connect" mstsc workaround.
+- Optionally attach a **headless virtual display** (`--virtual-display --width W --height H`) and serve that to the client instead of mirroring the primary panel — behaves like plugging in an external monitor, so the local Mac screen stays available while the remote session has its own desktop at any requested resolution. Backed by undocumented `CGVirtualDisplay*` private API; see the maintenance note below.
 
-Not yet implemented: multi-monitor, non-US keyboard layouts, drive/printer redirection.
+Not yet implemented: multi-monitor (client-side multi-display), non-US keyboard layouts, drive/printer redirection.
 
 ## Project goal
 
@@ -40,6 +41,14 @@ src/file_promise.rs  Windows→Mac eager download to /tmp + NSPasteboard
                      publish + Glass-chime auto-paste into Finder
 src/audio.rs      RDPSND ← second SCK stream with system-audio capture,
                   rubato 48→44.1 kHz resample, latency-bounded
+src/virtual_display/    Opt-in headless display via undocumented
+  mod.rs                CGVirtualDisplay* private API. Public Rust
+  private_api.rs        surface is `VirtualDisplay::new(w,h,hz)` +
+                        display_id/origin_pts/size_pts; ALL touches to
+                        private Obj-C classes/symbols are confined to
+                        private_api.rs (the maintenance boundary —
+                        when Apple changes the API in a future macOS,
+                        update only that file).
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
 vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in
@@ -55,7 +64,7 @@ vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in
 Cross-cutting:
 - **TLS** terminates inside the acceptor; `rustls` with a self-signed cert at `~/Library/Application Support/macrdp/{cert,key}.pem` (generated on first run, persisted thereafter for stable client TOFU). `RdpServerSecurity::Hybrid` is used so the negotiation response advertises CredSSP — the public-key bytes handed to ironrdp are the raw `subjectPublicKey` BIT STRING from the X.509 cert (not the SPKI sequence, not the keypair-derived bytes), since that's what sspi hashes client-side.
 - **Auth** at startup: `--username` (defaults to `$USER`) + interactive password prompt → PAM `checkpw` service → set as the static credential ironrdp_server checks per-connection. `--skip-auth` bypasses for dev.
-- **Session model** — v0 attaches to the console session of the logged-in user (single session). Multi-session / headless virtual displays would need a private framebuffer and are out of scope.
+- **Session model** — by default macrdp attaches to the console session of the logged-in user (single session, mirrors the primary panel). With `--virtual-display --width W --height H`, the server instead allocates a headless `CGVirtualDisplay` and serves *that*; the local Mac screen is untouched and the remote sees its own desktop at the requested resolution. The CG-side display is owned by `main()`'s scope, registered via `[CGVirtualDisplay initWithDescriptor:]` + `applySettings:`, and torn down on normal exit (signal-driven `std::process::exit(0)` skips Drop, but macOS reaps the registration when the owning process dies). Capture / input / cursor all parameterize on `(displayID, origin_pts, size_pts)` so they target the right surface regardless of which path is in effect.
 - **Signal handling** — `main.rs` spawns a task that awaits SIGINT/SIGTERM and `std::process::exit(0)`s. Without it, ScreenCaptureKit's framework threads can leave the process unkillable by Ctrl-C once an SCStream is active.
 - **Audio rate** — SCK only supports 8/16/24/48 kHz, so capture is at 48 kHz, but `src/audio.rs` resamples to 44.1 kHz via `rubato` before sending. 44.1 matches the native rate of most Windows audio endpoints, so the client plays directly without internal resampling — which used to cause a ~20% sustained over-feed and multi-second audio backlogs on mstsc. The advertised RDPSND `AudioFormat` is therefore 44.1 kHz / 2 ch / 16-bit.
 - **Single capture loop** — `MacRdpsnd` (the audio factory) holds an `Arc<AtomicU64>` generation counter shared with every backend it builds. Each `start()` claims a fresh generation; older capture loops observe the bump on their next iteration and exit. Without this, an mstsc cert-prompt reconnect leaves the first capture loop running while the second starts, both feeding the shared event channel → ~2× audio reaching the client.
@@ -70,12 +79,15 @@ When adding a feature, locate it in one of those modules first; if it spans them
 - **Posting events to the login window or secure-input contexts** (password fields, lock screen) is blocked by the OS and cannot be worked around — document the limitation rather than fighting it.
 - **Default RDP port 3389 is privileged**; bind 3389 only with elevated rights, otherwise default to 3390 in dev.
 - **OpenPAM, not Linux-PAM.** `checkpw` uses `use_first_pass`, so `pam_opendirectory` reads the password from `pam_set_item(PAM_AUTHTOK, ...)` and never invokes the conv callback. See `src/auth.rs`.
+- **`CGVirtualDisplay*` is a moving target.** macOS 26 (and presumably forward) replaced the older C-function surface (`CGVirtualDisplayCreate` / `ApplySettings` / `GetDisplayID`, which BetterDisplay's wrappers document) with an Obj-C class (`-[CGVirtualDisplay initWithDescriptor:]` / `applySettings:` / `displayID`). `private_api.rs` is written against the new shape only; if a future release renames a class or selector again, error messages from `VirtualDisplay::new` will name what's gone. BetterDisplay's open-source Swift wrappers are the canonical reference when adapting. Symbols are resolved via `AnyClass::get(...)` so missing-class failures are clean runtime errors, never link-time breakage.
+- **Virtual-display refresh rate must be ≥ 24 Hz.** `applySettings` rejects modes below the real-monitor floor; the `VirtualDisplay::new` callers pass a hard-coded 60 Hz regardless of `--fps` (capture cadence is independent — `--fps` controls the SCK stream, refresh rate is metadata as far as the RDP server is concerned).
 
 ### Known behavioural quirks
 
 - **Server-side scaling forces full-frame updates + fills the frame.** Passing `--width N --height M` when N×M ≠ the Mac's native size makes SCK scale internally, and SCK's default behaviour leaks both ways: dirty-rects come in *source* (native) coords (clients that strictly respect tile coordinates render a black canvas with only the cursor sprite — mstsc/RemoteFx is the worst offender) and aspect-mismatch causes pillarbox/letterbox padding (the captured Mac content sits in a sub-rectangle of the output, so client-predicted cursor sprite drifts proportionally from the click position as you move away from screen center). `capture.rs` works around both: detects size mismatch up front, skips dirty-rect emission (full BitmapUpdate every tick — the upstream encoder's framebuffer diff still keeps unchanged-region cost low when SCK returns exactly the configured size), and sets `scalesToFit=true` on the SCK config so source content stretches to fill the requested frame instead of getting padded. The cost at non-native sizes: higher bandwidth, plus non-uniform scaling on aspect mismatch (e.g., 16:10 MacBook panel into a 16:9 frame shows ~13.5% vertical compression). Prefer native if you can.
 - **No server PointerPosition forwarding (intentional).** mstsc and Microsoft Remote Desktop local-predict the cursor from the user's mouse input; any `PointerPositionAttribute` PDU we send arrives one encode-plus-network round-trip late and snaps the cursor back to a stale position on fast moves. The current design (`poll_shape` only, `poll_position` defined but unwired) is deliberately the right one for all interactive use. *Do not* simply wire `poll_position` up — that's the bug, not the fix. The only thing this design misses is Mac-side *programmatic* cursor moves (an app calling `CGWarpMouseCursorPosition`, rare); fixing that properly requires emitting position only when the Mac cursor diverges from where the last RDP mouse event left it and enough time has passed since that event, which needs shared state between `input.rs` and `cursor.rs`.
 - **Codec mismatch with Microsoft Remote Desktop on macOS.** That client only offers NSCodec; the server advertises RemoteFx/QOI. They fall back to legacy BitmapUpdate, which works but is bandwidth-heavy.
+- **Cursor sprite shape is process-global on macOS, not per-display.** `NSCursor::currentSystemCursor()` reflects whatever the foreground application set in *this process*'s perspective, not "the cursor on display X." When `--virtual-display` is active, the RDP client sees the cursor shape that whatever app is foreground locally has set (typically the arrow), regardless of what an app on the virtual display might want. Probably fine in practice — the cursor *position* on the virtual display is correct because `input.rs` translates RDP coords by the vdisplay's origin in global space; only the visual shape is shared. Fixing this properly needs a per-display NSCursor query, which AppKit doesn't expose.
 
 ## Commands
 
@@ -84,6 +96,7 @@ cargo build                    # debug build
 cargo build --release          # release build (LTO, ~30s)
 cargo run                      # prompts for password, runs against PAM
 cargo run -- --skip-auth --password test  # bypass PAM for quick tests
+cargo run -- --virtual-display --width 1920 --height 1080  # headless remote desktop, local screen untouched
 cargo test                     # run all tests
 cargo clippy --all-targets -- -D warnings  # lint as errors
 cargo fmt                      # format

@@ -931,6 +931,17 @@ mod macos {
             let mut metas: Vec<AppMeta> = Vec::with_capacity(all.count());
             for i in 0..all.count() {
                 let app = all.objectAtIndex(i);
+                let pid = app.processIdentifier();
+                // `isTerminated` lags the kernel by a few hundred ms
+                // when an app quits — long enough for the first Cmd+Tab
+                // after a close to still see the dead instance in the
+                // candidate list (and, via MRU, potentially target it).
+                // `kill(pid, 0)` is authoritative: returns 0 if the
+                // process is alive, -1/ESRCH if it isn't. EPERM means
+                // it exists but is not ours to signal — still alive.
+                let kernel_dead = pid <= 0
+                    || (libc::kill(pid, 0) == -1
+                        && *libc::__error() == libc::ESRCH);
                 metas.push(AppMeta {
                     bundle: app
                         .bundleIdentifier()
@@ -940,9 +951,9 @@ mod macos {
                         .localizedName()
                         .map(|s| s.to_string())
                         .unwrap_or_default(),
-                    pid: app.processIdentifier(),
+                    pid,
                     policy: app.activationPolicy(),
-                    terminated: app.isTerminated(),
+                    terminated: app.isTerminated() || kernel_dead,
                 });
             }
 

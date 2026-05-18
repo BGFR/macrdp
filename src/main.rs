@@ -179,13 +179,18 @@ struct Args {
     #[arg(long)]
     allow_sleep: bool,
 
-    /// TEMPORARY (phase-1 verification): allocate a CGVirtualDisplay at
-    /// the configured --width/--height and idle until SIGINT/SIGTERM, so
-    /// you can confirm it appears in System Settings → Displays. Drops
-    /// (and the OS un-registers the display) on exit. Hidden from --help
-    /// and will be removed once the --virtual-display flag lands.
-    #[arg(long, hide = true)]
-    probe_virtual_display: bool,
+    /// Attach a headless virtual display at --width × --height and serve
+    /// THAT to the RDP client instead of mirroring the user's primary
+    /// panel. Behaves like plugging in an external monitor — the local
+    /// screen stays untouched and you can keep working on the Mac
+    /// locally while the remote session uses its own desktop.
+    ///
+    /// Requires --width and --height (the virtual display has no
+    /// "native" size to fall back to). Backed by undocumented
+    /// CoreGraphics private API (CGVirtualDisplay*); may break on
+    /// future macOS releases.
+    #[arg(long)]
+    virtual_display: bool,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -414,73 +419,35 @@ async fn main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     tracing::warn!("Built for a non-macOS target — capture is a static-rectangle stub.");
 
-    if args.probe_virtual_display {
-        use ironrdp_server::{DisplayUpdate, RdpServerDisplay};
-        let w = args.width.unwrap_or(1920);
-        let h = args.height.unwrap_or(1080);
-        // Real displays bottom out at 24 Hz — our --fps default (15) is below
-        // that and would have CGVirtualDisplay reject the mode. The refresh
-        // rate is just metadata as far as macrdp is concerned (we control
-        // capture cadence separately), so always feed a sane 60 Hz here.
+    // Allocate the virtual display BEFORE anything else queries SCK, so
+    // it's visible in SCShareableContent's enumeration when capture
+    // resolves the displayID. Held in main's scope so its Drop runs on
+    // normal exit (signal-driven exit goes through std::process::exit
+    // and skips Drop, but macOS reaps virtual displays when the owning
+    // process dies, so cleanup still happens — just not via Drop).
+    let virtual_display: Option<virtual_display::VirtualDisplay> = if args.virtual_display {
+        let w = args
+            .width
+            .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
+        let h = args
+            .height
+            .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
+        // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
+        // metadata here (capture cadence is governed by --fps); pass a
+        // safe value so CGVirtualDisplay doesn't reject the mode.
         let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
-            .context("creating probe virtual display")?;
+            .context("attaching virtual display")?;
         info!(
             display_id = vd.display_id(),
             origin = ?vd.origin_pts(),
             size = ?vd.size_pts(),
-            "probe virtual display attached"
+            "virtual display attached — the RDP session uses this surface; \
+             your primary panel is untouched"
         );
-
-        // Step-2 verification: spin up CaptureDisplay targeting the vdisplay
-        // and drain a few updates so we know SCK actually sees it and emits
-        // frames. This is the same code path the real RDP server will use.
-        let mut display = capture::CaptureDisplay {
-            width: w,
-            height: h,
-            fps: args.fps,
-            display_id: Some(vd.display_id()),
-            screen_size_pts: vd.size_pts(),
-        };
-        let _ = display.size().await; // satisfies the RdpServerDisplay trait
-        let mut updates = display
-            .updates()
-            .await
-            .context("starting SCK capture against virtual display")?;
-        info!("capture stream started against virtual display — draining ~30 updates");
-        let mut bitmap_count = 0usize;
-        let mut pointer_count = 0usize;
-        for _ in 0..30 {
-            match updates.next_update().await? {
-                Some(DisplayUpdate::Bitmap(b)) => {
-                    bitmap_count += 1;
-                    if bitmap_count == 1 {
-                        info!(
-                            x = b.x,
-                            y = b.y,
-                            w = b.width.get(),
-                            h = b.height.get(),
-                            stride = b.stride.get(),
-                            bytes = b.data.len(),
-                            "first bitmap from virtual display"
-                        );
-                    }
-                }
-                Some(_) => pointer_count += 1,
-                None => break,
-            }
-        }
-        info!(
-            bitmaps = bitmap_count,
-            pointer = pointer_count,
-            "drained updates — Ctrl-C to exit"
-        );
-
-        shutdown_signal().await;
-        drop(updates);
-        info!("detaching probe virtual display");
-        drop(vd);
-        return Ok(());
-    }
+        Some(vd)
+    } else {
+        None
+    };
 
     let username = args
         .username
@@ -521,33 +488,54 @@ async fn main() -> Result<()> {
     };
     let (tls, spki_der) = make_tls_acceptor(&cert_dir)?;
 
-    let detected = primary_display_size().await?;
-    let width = args
-        .width
-        .or(detected.map(|(w, _)| w))
-        .unwrap_or(FALLBACK_WIDTH);
-    let height = args
-        .height
-        .or(detected.map(|(_, h)| h))
-        .unwrap_or(FALLBACK_HEIGHT);
-    if let Some((dw, dh)) = detected {
-        info!(
-            width,
-            height,
-            detected_w = dw,
-            detected_h = dh,
-            "desktop size"
-        );
-    } else {
-        info!(width, height, "desktop size (no display detected)");
-    }
+    // Resolve desktop dimensions + geometry. Three paths:
+    //   - virtual display: width/height are already enforced as required
+    //     above; geometry comes from the vdisplay's CGDisplayBounds.
+    //   - primary panel, no --width/--height override: query SCK for
+    //     native size and use CGDisplay::main() for the point-space bounds.
+    //   - primary panel with override: use the override + main geometry.
+    let (width, height, capture_display_id, screen_origin_pts, screen_size_pts) =
+        if let Some(vd) = &virtual_display {
+            // Both required earlier, so the unwraps can't fire.
+            let w = args.width.expect("checked above when --virtual-display set");
+            let h = args.height.expect("checked above when --virtual-display set");
+            info!(
+                width = w,
+                height = h,
+                display_id = vd.display_id(),
+                "desktop size (virtual display)"
+            );
+            (w, h, Some(vd.display_id()), vd.origin_pts(), vd.size_pts())
+        } else {
+            let detected = primary_display_size().await?;
+            let w = args
+                .width
+                .or(detected.map(|(w, _)| w))
+                .unwrap_or(FALLBACK_WIDTH);
+            let h = args
+                .height
+                .or(detected.map(|(_, h)| h))
+                .unwrap_or(FALLBACK_HEIGHT);
+            if let Some((dw, dh)) = detected {
+                info!(
+                    width = w,
+                    height = h,
+                    detected_w = dw,
+                    detected_h = dh,
+                    "desktop size"
+                );
+            } else {
+                info!(width = w, height = h, "desktop size (no display detected)");
+            }
+            let (origin, size) = primary_screen_geometry();
+            (w, h, None, origin, size)
+        };
 
-    let (screen_origin_pts, screen_size_pts) = primary_screen_geometry();
     let display = CaptureDisplay {
         width,
         height,
         fps: args.fps,
-        display_id: None,
+        display_id: capture_display_id,
         screen_size_pts,
     };
 

@@ -396,6 +396,7 @@ async fn main() -> Result<()> {
     tracing::warn!("Built for a non-macOS target — capture is a static-rectangle stub.");
 
     if args.probe_virtual_display {
+        use ironrdp_server::{DisplayUpdate, RdpServerDisplay};
         let w = args.width.unwrap_or(1920);
         let h = args.height.unwrap_or(1080);
         // Real displays bottom out at 24 Hz — our --fps default (15) is below
@@ -408,10 +409,54 @@ async fn main() -> Result<()> {
             display_id = vd.display_id(),
             origin = ?vd.origin_pts(),
             size = ?vd.size_pts(),
-            "probe virtual display attached — open System Settings → Displays \
-             to confirm. Ctrl-C to detach and exit."
+            "probe virtual display attached"
         );
+
+        // Step-2 verification: spin up CaptureDisplay targeting the vdisplay
+        // and drain a few updates so we know SCK actually sees it and emits
+        // frames. This is the same code path the real RDP server will use.
+        let mut display = capture::CaptureDisplay {
+            width: w,
+            height: h,
+            fps: args.fps,
+            display_id: Some(vd.display_id()),
+        };
+        let _ = display.size().await; // satisfies the RdpServerDisplay trait
+        let mut updates = display
+            .updates()
+            .await
+            .context("starting SCK capture against virtual display")?;
+        info!("capture stream started against virtual display — draining ~30 updates");
+        let mut bitmap_count = 0usize;
+        let mut pointer_count = 0usize;
+        for _ in 0..30 {
+            match updates.next_update().await? {
+                Some(DisplayUpdate::Bitmap(b)) => {
+                    bitmap_count += 1;
+                    if bitmap_count == 1 {
+                        info!(
+                            x = b.x,
+                            y = b.y,
+                            w = b.width.get(),
+                            h = b.height.get(),
+                            stride = b.stride.get(),
+                            bytes = b.data.len(),
+                            "first bitmap from virtual display"
+                        );
+                    }
+                }
+                Some(_) => pointer_count += 1,
+                None => break,
+            }
+        }
+        info!(
+            bitmaps = bitmap_count,
+            pointer = pointer_count,
+            "drained updates — Ctrl-C to exit"
+        );
+
         shutdown_signal().await;
+        drop(updates);
         info!("detaching probe virtual display");
         drop(vd);
         return Ok(());
@@ -481,6 +526,7 @@ async fn main() -> Result<()> {
         width,
         height,
         fps: args.fps,
+        display_id: None,
     };
 
     let input_handler = MacInputHandler::new(width, height)?;

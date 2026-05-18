@@ -19,6 +19,13 @@ pub struct CaptureDisplay {
     pub width: u16,
     pub height: u16,
     pub fps: u32,
+    /// `Some(CGDirectDisplayID)` captures that specific display (e.g. a
+    /// `VirtualDisplay`); `None` captures the first SCK display, which
+    /// is the user's primary panel. SCK's enumeration order isn't
+    /// formally documented as "main first," but in practice it is —
+    /// and we only fall through to it when the caller didn't ask for
+    /// anything specific.
+    pub display_id: Option<u32>,
 }
 
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
@@ -60,8 +67,13 @@ impl RdpServerDisplay for CaptureDisplay {
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
         #[cfg(target_os = "macos")]
         {
-            let updates =
-                macos::ScreenCaptureUpdates::start(self.width, self.height, self.fps).await?;
+            let updates = macos::ScreenCaptureUpdates::start(
+                self.width,
+                self.height,
+                self.fps,
+                self.display_id,
+            )
+            .await?;
             Ok(Box::new(updates))
         }
         #[cfg(not(target_os = "macos"))]
@@ -101,13 +113,40 @@ mod macos {
     }
 
     impl ScreenCaptureUpdates {
-        pub async fn start(width: u16, height: u16, fps: u32) -> Result<Self> {
+        pub async fn start(
+            width: u16,
+            height: u16,
+            fps: u32,
+            target_display_id: Option<u32>,
+        ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
                 .await
                 .map_err(|e| anyhow!("AsyncSCShareableContent::get failed (likely Screen Recording permission denied): {e:?}"))?;
 
             let displays = content.displays();
-            let display = displays.first().context("no displays available")?;
+            let display = match target_display_id {
+                Some(id) => displays
+                    .iter()
+                    .find(|d| d.display_id() == id)
+                    .with_context(|| {
+                        format!(
+                            "SCK enumeration has no display with id={id} — the \
+                             virtual display didn't register, or the WindowServer \
+                             hasn't picked it up yet. SCK sees: [{}]",
+                            displays
+                                .iter()
+                                .map(|d| format!(
+                                    "id={} {}x{}",
+                                    d.display_id(),
+                                    d.width(),
+                                    d.height()
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })?,
+                None => displays.first().context("no displays available")?,
+            };
 
             let native_w = u16::try_from(display.width()).context("display width > u16")?;
             let native_h = u16::try_from(display.height()).context("display height > u16")?;

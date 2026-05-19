@@ -52,9 +52,69 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
 --width / --height        Override autodetected display size
 --fps N                   Frame rate cap (default 15)
 --cert-dir PATH           Persisted TLS cert (default ~/Library/Application Support/macrdp)
+--virtual-display         Serve a headless virtual display at --width × --height
+                          instead of mirroring the primary panel — local screen
+                          stays untouched. Requires --width and --height.
+--make-primary            Promote the virtual display to system primary (the one
+                          with the menu bar). Only valid with --virtual-display.
+--detach-primary          While a client is connected, disable every physical
+                          display (backlights off, no menu bar). Restored on
+                          disconnect / exit. Only with --virtual-display.
+--capture-primary         Alternative to --detach-primary: exclusive
+                          CGDisplayCapture of every physical display, then
+                          gamma-clamp to black. Panels stay backlit but render
+                          solid black. Use when --detach-primary doesn't
+                          actually blank the panel on your hardware. Mutually
+                          exclusive with --detach-primary. Only with
+                          --virtual-display.
 ```
 
 `RUST_LOG=debug` for verbose logging.
+
+## Headless mode
+
+`--virtual-display --width W --height H` allocates a headless display via undocumented `CGVirtualDisplay*` private API and serves it over RDP instead of mirroring the Mac's panel. Behaves like plugging in an external monitor — the remote session gets its own desktop at the requested resolution, and you keep using the Mac locally as normal. Add `--make-primary` to give the virtual display the menu bar so new app windows open there.
+
+To go *fully* headless while a client is connected, pick one:
+
+- **`--detach-primary`** — turns the backlight off on every built-in / external panel via `CGSConfigureDisplayEnabled`. Cleanest visually. On some macOS versions / displays the disable transaction succeeds but the panel keeps showing the desktop; if you hit that, switch to:
+- **`--capture-primary`** — takes exclusive `CGDisplayCapture` of every physical display and forces the gamma LUT to map every input to black. Backlight stays on but panels render solid black. Works everywhere capture is allowed; uses only public CG symbols.
+
+Both restore the original layout when the last client disconnects, and both auto-revert on `SIGKILL` / panic (no logout required). Pick `--detach-primary` first; fall back to `--capture-primary` if your hardware doesn't honor the disable.
+
+## Examples
+
+```bash
+# Default — loopback only, mirror primary panel, prompt for password.
+./macrdp
+
+# Accept LAN connections, force a non-$USER account.
+./macrdp --bind 0.0.0.0:3390 --username clint
+
+# Higher frame rate, custom cert dir.
+./macrdp --fps 30 --cert-dir ~/.macrdp-certs
+
+# Verbose logs (DEBUG level).
+./macrdp -v
+
+# Headless virtual display at 1440p — local Mac screen stays available.
+./macrdp --virtual-display --width 2560 --height 1440
+
+# Same, but the virtual display owns the menu bar (drive it as your main desktop).
+./macrdp --virtual-display --width 2560 --height 1440 --make-primary
+
+# Fully headless on connect: physical panels go dark, revived on disconnect.
+./macrdp --virtual-display --width 2560 --height 1440 --detach-primary
+
+# Same idea, for hardware where --detach-primary doesn't actually blank the panel.
+./macrdp --virtual-display --width 2560 --height 1440 --capture-primary
+
+# Non-interactive launch (used by dist/install.sh): password from Keychain.
+./macrdp --keychain
+
+# Quick dev test on loopback — skips PAM, accepts --password verbatim.
+./macrdp --skip-auth --password test
+```
 
 ## Audio
 

@@ -1,6 +1,7 @@
 use core::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, DesktopSize};
@@ -229,6 +230,16 @@ pub struct RdpServer {
     ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
     creds: Option<Credentials>,
     local_addr: Option<SocketAddr>,
+    /// Total real-audio duration shipped to the client so far. Compared
+    /// against wall-clock elapsed time to estimate the client's playback
+    /// buffer depth and drop waves before that buffer drifts unboundedly
+    /// (typical trigger: bursts of small client window move/resize pauses
+    /// each leaking a sub-WAVE_KEEP-batch amount of latency).
+    audio_shipped_ms: f64,
+    /// Wall-clock origin for the audio-lag calculation. Lazily set on the
+    /// first dispatch so the model starts at "zero buffer" instead of
+    /// pretending audio is in flight from server boot.
+    audio_clock_start: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -290,6 +301,8 @@ impl RdpServer {
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
             creds: None,
             local_addr: None,
+            audio_shipped_ms: 0.0,
+            audio_clock_start: None,
         }
     }
 
@@ -326,6 +339,17 @@ impl RdpServer {
     }
 
     pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
+        // Per-connection reset of audio-lag tracking. The capture loop in
+        // src/audio.rs spawns a fresh `start_instant` on every backend
+        // `start()` call, so leaving these set from a previous connection
+        // would leave us with a stale audio_shipped_ms vs. real_elapsed_ms
+        // ratio (typically `audio_shipped_ms` lagging by however long the
+        // disconnect lasted), which disables drop protection until the
+        // counters re-converge over real time. Reset here so the model
+        // starts each session with "zero buffer, zero elapsed."
+        self.audio_shipped_ms = 0.0;
+        self.audio_clock_start = None;
+
         let framed = TokioFramed::new(stream);
 
         let size = self.display.lock().await.size().await;
@@ -513,23 +537,64 @@ impl RdpServer {
         writer: &mut impl FramedWrite,
         user_channel_id: u16,
     ) -> Result<RunState> {
-        // Cap a runaway audio backlog without dropping audio during normal
-        // operation. A dispatch stall (a video encode holding the server lock)
-        // only bunches a handful of waves per batch; dropping those starves
-        // the client's jitter buffer and makes it slow playback down (audible
-        // as drift + lowered pitch). 64 waves is ~1.3s of audio — far above
-        // normal bunching — so this only fires on a genuine multi-second
-        // backlog, and when it does it keeps the NEWEST waves, not the oldest.
-        // (Upstream 0.10.0 kept the oldest 4, turning any stall into permanent
-        // latency; 4 was also low enough to drop audio in normal operation.)
-        const WAVE_KEEP: usize = 64;
+        // Cross-batch audio-lag control.
+        //
+        // The earlier per-batch WAVE_KEEP = 64 cap caught a single multi-second
+        // stall in one big batch, but slow drift from many small client pauses
+        // (e.g. repeated mstsc window move/resize, each blocking writes for
+        // ~50–200 ms) never tripped the cap — every batch stayed under 64 —
+        // yet the client's playback buffer filled across batches and audio
+        // ended up seconds behind real-time.
+        //
+        // The fix tracks two scalars across calls:
+        //   audio_shipped_ms — total real-audio duration we have *sent* the
+        //                      client (incremented per wave actually shipped)
+        //   audio_clock_start — wall-clock origin set on first dispatch
+        //
+        // Their difference, `audio_shipped_ms - (now - start) * 1000`, is the
+        // estimated client-side buffer depth in milliseconds (i.e. how much
+        // future audio the client already holds). When that would exceed
+        // MAX_LAG_MS after shipping this batch, we drop the *oldest* waves
+        // until the post-batch projection sits at MAX_LAG_MS. The projection
+        // can go negative during quiet periods (real time elapses without
+        // new waves); that's harmless — the `if projected > MAX_LAG_MS`
+        // guard simply doesn't fire, and the next active stretch ships at
+        // normal rate until the diff returns to ~zero.
+        //
+        // WAVE_MS is the *real-audio duration* of one wave, which is the
+        // input chunk size 1024 samples at 48 kHz capture rate — the resample
+        // to 44.1 kHz changes sample count but not the represented duration.
+        const WAVE_MS: f64 = 1024.0 / 48.0; // ≈ 21.33 ms
+        const MAX_LAG_MS: f64 = 200.0;
+
+        let now = Instant::now();
+        let start = *self.audio_clock_start.get_or_insert(now);
+        let real_elapsed_ms = (now - start).as_secs_f64() * 1000.0;
+
         let wave_total = events
             .iter()
             .filter(|e| matches!(e, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(..))))
             .count();
-        let mut wave_skip = wave_total.saturating_sub(WAVE_KEEP);
+        let projected_buffer_ms =
+            self.audio_shipped_ms + wave_total as f64 * WAVE_MS - real_elapsed_ms;
+        let mut wave_skip = if projected_buffer_ms > MAX_LAG_MS {
+            let excess = projected_buffer_ms - MAX_LAG_MS;
+            ((excess / WAVE_MS).ceil() as usize).min(wave_total)
+        } else {
+            0
+        };
         if wave_skip > 0 {
-            debug!(wave_total, dropped = wave_skip, "audio backlog: dropping oldest waves");
+            // Dedicated target so callers can filter for *just* this line
+            // without lifting the whole `ironrdp_server::server` module to
+            // debug (which would surface a lot of unrelated noise).
+            // Enable with: RUST_LOG=audio_backlog=debug
+            debug!(
+                target: "audio_backlog",
+                wave_total,
+                dropped = wave_skip,
+                projected_buffer_ms,
+                "dropping oldest waves"
+            );
         }
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
@@ -549,12 +614,21 @@ impl RdpServer {
                         warn!("No rdpsnd channel, dropping event");
                         continue;
                     };
+                    // Set inside the wave arm; applied after `rdpsnd` is dropped
+                    // (the &mut self borrow extends across the whole match) so
+                    // we can mutate self.audio_shipped_ms without a conflict.
+                    let mut shipped_wave_ms: f64 = 0.0;
                     let msgs = match s {
                         RdpsndServerMessage::Wave(data, ts) => {
                             if wave_skip > 0 {
                                 wave_skip -= 1;
                                 continue;
                             }
+                            // Account for the wave we're about to ship so the
+                            // next dispatch's buffer-depth projection is right.
+                            // Skipped waves intentionally do NOT advance this —
+                            // those bytes never reach the client.
+                            shipped_wave_ms = WAVE_MS;
                             rdpsnd.wave(data, ts)
                         }
                         RdpsndServerMessage::SetVolume { left, right } => rdpsnd.set_volume(left, right),
@@ -565,6 +639,8 @@ impl RdpServer {
                         }
                     }
                     .context("failed to send rdpsnd event")?;
+                    // rdpsnd's &mut self borrow is dropped here — safe to mutate.
+                    self.audio_shipped_ms += shipped_wave_ms;
                     let channel_id = self
                         .get_channel_id_by_type::<RdpsndServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;

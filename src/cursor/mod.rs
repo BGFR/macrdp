@@ -1,9 +1,22 @@
 //! Forward the macOS system cursor to RDP clients.
 //!
-//! Apple has no public API for "read the current cursor bitmap"; we use
-//! NSCursor.currentSystem + draw the NSImage into a known-format
-//! NSBitmapImageRep, then ship the bytes as a DisplayUpdate::RGBAPointer.
-//! Position is read via CGEvent.location() on a fresh no-op event.
+//! Primary path: `private_api::copy_current_system_cursor` (SkyLight
+//! `SLSGetGlobalCursorData`) — reads the WindowServer's actually-
+//! composited cursor, so I-beams in other apps, crosshairs during
+//! `screencapture -i`, hand pointers over links, etc. all forward
+//! correctly. Returns raw RGBA bytes + hotspot directly, no CGImage
+//! round-trip.
+//!
+//! Fallback path: `NSCursor.currentSystemCursor` rendered via
+//! `NSBitmapImageRep` — process-local cursor stack, only sees cursors
+//! set in macrdp's own process. Kept as a last resort in case a future
+//! macOS removes/renames the SLS symbols.
+//!
+//! Position is read via CGEvent.location() on a fresh no-op event but
+//! intentionally not forwarded — see `poll` for the reasoning.
+
+#[cfg(target_os = "macos")]
+mod private_api;
 
 use ironrdp_server::DisplayUpdate;
 
@@ -63,6 +76,8 @@ mod macos {
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use tracing::trace;
+
+    use super::private_api;
 
     #[allow(dead_code)] // last_pos / desktop+screen fields are kept warm for
                         // re-enabling position polling in non-RDP-driven cases
@@ -170,11 +185,25 @@ mod macos {
     /// Snapshot the current system cursor into a tightly-packed RGBA buffer.
     /// Returns `(data, width, height, hot_x, hot_y)` or `None` if anything
     /// went wrong (no cursor available, weird image size, draw failed).
+    ///
+    /// Two-tier lookup:
+    ///   1. SkyLight `SLSGetGlobalCursorData` → the actually-rendered
+    ///      system cursor (any process's I-beam, crosshair, hand, etc.).
+    ///      Returns bitmap + hotspot directly.
+    ///   2. Fallback to `NSCursor.currentSystemCursor` for the (rare)
+    ///      case where SkyLight refuses the call or the symbols vanish
+    ///      in a future macOS.
     unsafe fn read_cursor_bitmap() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
-        // currentCursor returns the cursor "as set by NSCursor methods" —
-        // i.e., whatever the foreground app set. currentSystemCursor returns
-        // the system's current cursor including ones set by other processes,
-        // but it's optional.
+        // Try SkyLight first — this sees cursors set by other processes
+        // (Safari's I-beam, `screencapture -i`'s crosshair, web link hand
+        // pointers, etc.) and gives us the real hotspot in one call.
+        if let Some(t) = private_api::copy_current_system_cursor() {
+            return Some(t);
+        }
+
+        // Fallback: NSCursor only sees cursors set in macrdp's process,
+        // but works as a last resort if the private SkyLight symbols are
+        // ever removed.
         let cursor: Retained<NSCursor> = match NSCursor::currentSystemCursor() {
             Some(c) => c,
             None => NSCursor::currentCursor(),

@@ -427,13 +427,9 @@ mod macos {
                 // resumed. This replaces the old time-based grace,
                 // which falsely split sessions whenever the user
                 // paused mid-hold longer than 2 s.
-                if matches!(vk, VK_LCMD | VK_RCMD)
-                    && !down
-                    && !self.mods.l_cmd
-                    && !self.mods.r_cmd
+                if matches!(vk, VK_LCMD | VK_RCMD) && !down && !self.mods.l_cmd && !self.mods.r_cmd
                 {
-                    CMD_RELEASE_GENERATION
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    CMD_RELEASE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     commit_cycle_session();
                 }
                 return;
@@ -958,8 +954,7 @@ mod macos {
         cmd_release_gen: u64,
     }
 
-    static CYCLE_SESSION: std::sync::Mutex<Option<CycleSession>> =
-        std::sync::Mutex::new(None);
+    static CYCLE_SESSION: std::sync::Mutex<Option<CycleSession>> = std::sync::Mutex::new(None);
 
     /// Incremented every time both Cmd halves transition to released
     /// (see `commit_cycle_session` callers). A `CycleSession` stamps
@@ -990,8 +985,7 @@ mod macos {
     /// activation) — we reset both statics and trust workspace again.
     static LAST_AX_ACTIVATED_PID: std::sync::Mutex<Option<libc::pid_t>> =
         std::sync::Mutex::new(None);
-    static WORKSPACE_LIE_FRONT: std::sync::Mutex<Option<libc::pid_t>> =
-        std::sync::Mutex::new(None);
+    static WORKSPACE_LIE_FRONT: std::sync::Mutex<Option<libc::pid_t>> = std::sync::Mutex::new(None);
 
     /// Enumerate every running process by PID directly from the kernel.
     ///
@@ -1011,8 +1005,7 @@ mod macos {
     /// most processes from view.
     fn list_all_pids() -> Vec<libc::pid_t> {
         extern "C" {
-            fn proc_listallpids(buffer: *mut libc::c_int, buffersize: libc::c_int)
-                -> libc::c_int;
+            fn proc_listallpids(buffer: *mut libc::c_int, buffersize: libc::c_int) -> libc::c_int;
         }
         unsafe {
             // Sizing call: NULL buffer / 0 size returns the pid count
@@ -1219,9 +1212,7 @@ mod macos {
     /// released, and lazily from cycle_apps when the grace timeout
     /// has elapsed.
     fn commit_cycle_session() {
-        let mut guard = CYCLE_SESSION
-            .lock()
-            .expect("cycle session mutex poisoned");
+        let mut guard = CYCLE_SESSION.lock().expect("cycle session mutex poisoned");
         if let Some(session) = guard.take() {
             if let Some((bundle, _, _)) = session
                 .snapshot
@@ -1282,9 +1273,8 @@ mod macos {
                 // `kill(pid, 0)` is authoritative: returns 0 if the
                 // process is alive, -1/ESRCH if it isn't. EPERM means
                 // it exists but is not ours to signal — still alive.
-                let kernel_dead = pid <= 0
-                    || (libc::kill(pid, 0) == -1
-                        && *libc::__error() == libc::ESRCH);
+                let kernel_dead =
+                    pid <= 0 || (libc::kill(pid, 0) == -1 && *libc::__error() == libc::ESRCH);
                 metas.push(AppMeta {
                     bundle: app
                         .bundleIdentifier()
@@ -1326,11 +1316,7 @@ mod macos {
                     }
                 }
                 // Drop stale entries pointing at quit / terminated PIDs.
-                guard.retain(|_, pid| {
-                    metas
-                        .iter()
-                        .any(|m| m.pid == *pid && !m.terminated)
-                });
+                guard.retain(|_, pid| metas.iter().any(|m| m.pid == *pid && !m.terminated));
             }
             let mru_snapshot: std::collections::HashMap<String, libc::pid_t> = {
                 let mru = mru_map();
@@ -1423,16 +1409,14 @@ mod macos {
             let now = Instant::now();
             let current_release_gen =
                 CMD_RELEASE_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
-            let mut session_guard = CYCLE_SESSION
-                .lock()
-                .expect("cycle session mutex poisoned");
+            let mut session_guard = CYCLE_SESSION.lock().expect("cycle session mutex poisoned");
             // Continue if the session's stored release-generation
-                                // matches *and* the session is younger than the safety
-                                // bound. Generation matching is the real authority —
-                                // it's true iff Cmd has been held continuously since
-                                // session start. The grace check only kicks in to
-                                // recover from a missed Cmd-release event (RDP focus
-                                // loss eating the keyup).
+            // matches *and* the session is younger than the safety
+            // bound. Generation matching is the real authority —
+            // it's true iff Cmd has been held continuously since
+            // session start. The grace check only kicks in to
+            // recover from a missed Cmd-release event (RDP focus
+            // loss eating the keyup).
             let continuing = session_guard.as_ref().is_some_and(|s| {
                 s.cmd_release_gen == current_release_gen
                     && now.duration_since(s.last_press_at) < CYCLE_RESUME_GRACE
@@ -1467,8 +1451,7 @@ mod macos {
                     let s = session_guard.as_mut().unwrap();
                     // Drop snapshot entries whose pid is no longer a
                     // running regular-policy app (quit mid-cycle).
-                    let live: HashSet<libc::pid_t> =
-                        regular.iter().map(|(_, _, p)| *p).collect();
+                    let live: HashSet<libc::pid_t> = regular.iter().map(|(_, _, p)| *p).collect();
                     s.snapshot.retain(|(_, _, p)| live.contains(p));
                     let cursor = s.cursor_pid;
                     (s.snapshot.clone(), cursor)
@@ -1674,10 +1657,7 @@ mod macos {
     extern "C" {
         fn AXUIElementCreateApplication(pid: libc::pid_t) -> *mut std::ffi::c_void;
         fn AXUIElementCreateSystemWide() -> *mut std::ffi::c_void;
-        fn AXUIElementGetPid(
-            element: *mut std::ffi::c_void,
-            pid: *mut libc::pid_t,
-        ) -> i32;
+        fn AXUIElementGetPid(element: *mut std::ffi::c_void, pid: *mut libc::pid_t) -> i32;
         fn AXUIElementSetAttributeValue(
             element: *mut std::ffi::c_void,
             attribute: core_foundation::base::CFTypeRef,
@@ -1826,8 +1806,7 @@ mod macos {
         if count < 2 {
             debug!(
                 pid,
-                count,
-                "ax_cycle_windows_of_front: app has <2 windows — nothing to cycle"
+                count, "ax_cycle_windows_of_front: app has <2 windows — nothing to cycle"
             );
             unsafe {
                 CFRelease(windows.cast());
@@ -2111,9 +2090,7 @@ mod macos {
 
             // Build a CGEvent source — fresh for this click so we
             // don't tangle with the keyboard-input source state.
-            let Ok(source) =
-                CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
-            else {
+            let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
                 debug!("ax_press_spotlight: CGEventSource::new failed");
                 return false;
             };
@@ -2164,8 +2141,7 @@ mod macos {
 
     fn invoke_spotlight_via_osascript() {
         debug!("invoke_spotlight: spawning osascript");
-        let script =
-            r#"tell application "System Events" to key code 49 using {command down}"#;
+        let script = r#"tell application "System Events" to key code 49 using {command down}"#;
         let res = Command::new("/usr/bin/osascript")
             .arg("-e")
             .arg(script)

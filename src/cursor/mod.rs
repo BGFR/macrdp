@@ -96,11 +96,7 @@ mod macos {
     unsafe impl Send for Inner {}
 
     impl Inner {
-        pub fn new(
-            desktop_w: u16,
-            desktop_h: u16,
-            screen_size_pts: (f64, f64),
-        ) -> Result<Self> {
+        pub fn new(desktop_w: u16, desktop_h: u16, screen_size_pts: (f64, f64)) -> Result<Self> {
             let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                 .map_err(|_| anyhow!("CGEventSource::new failed"))?;
             Ok(Self {

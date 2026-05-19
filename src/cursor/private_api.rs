@@ -37,8 +37,7 @@ use std::sync::OnceLock;
 type CGSConnectionID = c_int;
 
 type SLSMainConnectionIDFn = unsafe extern "C" fn() -> CGSConnectionID;
-type SLSGetGlobalCursorDataSizeFn =
-    unsafe extern "C" fn(CGSConnectionID, *mut c_int) -> c_int;
+type SLSGetGlobalCursorDataSizeFn = unsafe extern "C" fn(CGSConnectionID, *mut c_int) -> c_int;
 // Signature (9 out params after the connection):
 //   data:             buffer to fill (caller-allocated, size from -DataSize)
 //   data_size:        IN size of buffer / OUT bytes actually written

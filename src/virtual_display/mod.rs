@@ -338,17 +338,13 @@ mod macos {
                 let d = CGDisplay::new(*id);
                 if d.is_active() {
                     d.configure_display_origin(&config, x_off, 0).map_err(|e| {
-                        anyhow!(
-                            "CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}"
-                        )
+                        anyhow!("CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}")
                     })?;
                     x_off += d.bounds().size.width.round() as i32;
                 }
             }
             any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
-                .map_err(|e| {
-                    anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}")
-                })?;
+                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}"))?;
 
             std::thread::sleep(TX_SETTLE);
 
@@ -365,9 +361,7 @@ mod macos {
                 }
             }
             any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
-                .map_err(|e| {
-                    anyhow!("CGCompleteDisplayConfiguration (disable-tx): CGError {e}")
-                })?;
+                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (disable-tx): CGError {e}"))?;
 
             tracing::info!(
                 detached_count = detached.len(),
@@ -424,15 +418,10 @@ mod macos {
                 };
                 for (id, _) in &self.detached {
                     if let Err(e) = self.enabler.set(config, *id, true) {
-                        tracing::warn!(
-                            attempt,
-                            "could not queue enable for display {id} ({e})"
-                        );
+                        tracing::warn!(attempt, "could not queue enable for display {id} ({e})");
                     }
                 }
-                match any
-                    .complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
-                {
+                match any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly) {
                     Ok(()) => {
                         if attempt > 1 {
                             tracing::info!(attempt, "enable-tx succeeded on retry");
@@ -601,17 +590,13 @@ mod macos {
                 let d = CGDisplay::new(*id);
                 if d.is_active() {
                     d.configure_display_origin(&config, x_off, 0).map_err(|e| {
-                        anyhow!(
-                            "CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}"
-                        )
+                        anyhow!("CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}")
                     })?;
                     x_off += d.bounds().size.width.round() as i32;
                 }
             }
             any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
-                .map_err(|e| {
-                    anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}")
-                })?;
+                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}"))?;
 
             std::thread::sleep(TX_SETTLE);
 
@@ -641,9 +626,7 @@ mod macos {
             // but the capture is still in effect.
             for (id, _) in &held {
                 let err = unsafe {
-                    CGSetDisplayTransferByFormula(
-                        *id, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0,
-                    )
+                    CGSetDisplayTransferByFormula(*id, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0)
                 };
                 if err != 0 {
                     tracing::warn!(
@@ -747,9 +730,15 @@ mod stub {
                  different target"
             ))
         }
-        pub fn display_id(&self) -> u32 { 0 }
-        pub fn origin_pts(&self) -> (f64, f64) { (0.0, 0.0) }
-        pub fn size_pts(&self) -> (f64, f64) { (0.0, 0.0) }
+        pub fn display_id(&self) -> u32 {
+            0
+        }
+        pub fn origin_pts(&self) -> (f64, f64) {
+            (0.0, 0.0)
+        }
+        pub fn size_pts(&self) -> (f64, f64) {
+            (0.0, 0.0)
+        }
     }
 
     pub struct PrimaryOverride;

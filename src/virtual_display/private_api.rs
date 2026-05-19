@@ -45,9 +45,7 @@ type CGDirectDisplayID = u32;
 /// between `CGBeginDisplayConfiguration` / `CGCompleteDisplayConfiguration`
 /// to enable or disable a display from the WindowServer's perspective
 /// (backlight off, no menu bar, no windows can be placed there).
-pub(super) struct DisplayEnabler(
-    unsafe extern "C" fn(*mut c_void, CGDirectDisplayID, bool) -> i32,
-);
+pub(super) struct DisplayEnabler(unsafe extern "C" fn(*mut c_void, CGDirectDisplayID, bool) -> i32);
 
 impl DisplayEnabler {
     pub(super) fn load() -> Result<Self> {

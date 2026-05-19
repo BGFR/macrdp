@@ -442,7 +442,10 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                 (true, false) => {
                     tokio::time::sleep(CONNECT_DEBOUNCE).await;
                     if tracker.count.load(Ordering::SeqCst) == 0 {
-                        info!(label, "connection flapped during debounce — skipping install");
+                        info!(
+                            label,
+                            "connection flapped during debounce — skipping install"
+                        );
                         was_zero = true;
                         continue;
                     }
@@ -571,10 +574,18 @@ async fn main() -> Result<()> {
         if let Some(ovr) = cleanup_detach.lock().expect("detach mutex poisoned").take() {
             drop(ovr); // re-enables the built-in display
         }
-        if let Some(ovr) = cleanup_capture.lock().expect("capture mutex poisoned").take() {
+        if let Some(ovr) = cleanup_capture
+            .lock()
+            .expect("capture mutex poisoned")
+            .take()
+        {
             drop(ovr); // releases captured displays
         }
-        if let Some(ovr) = cleanup_primary.lock().expect("primary mutex poisoned").take() {
+        if let Some(ovr) = cleanup_primary
+            .lock()
+            .expect("primary mutex poisoned")
+            .take()
+        {
             drop(ovr); // restores display arrangement
         }
         std::process::exit(0);
@@ -731,53 +742,56 @@ async fn main() -> Result<()> {
     //   - primary panel, no --width/--height override: query SCK for
     //     native size and use CGDisplay::main() for the point-space bounds.
     //   - primary panel with override: use the override + main geometry.
-    let (width, height, capture_display_id, screen_size_pts) =
-        if let Some(vd) = &virtual_display {
-            // Both required earlier, so the unwraps can't fire.
-            let w = args.width.expect("checked above when --virtual-display set");
-            let h = args.height.expect("checked above when --virtual-display set");
-            // Re-query CGDisplayBounds rather than trusting the cached
-            // values from VirtualDisplay creation: if --make-primary
-            // moved the display to (0, 0), the cached size is fine but
-            // we want a fresh read for parity with the input handler.
-            #[cfg(target_os = "macos")]
-            let size = {
-                let b = core_graphics::display::CGDisplay::new(vd.display_id()).bounds();
-                (b.size.width, b.size.height)
-            };
-            #[cfg(not(target_os = "macos"))]
-            let size = vd.size_pts();
+    let (width, height, capture_display_id, screen_size_pts) = if let Some(vd) = &virtual_display {
+        // Both required earlier, so the unwraps can't fire.
+        let w = args
+            .width
+            .expect("checked above when --virtual-display set");
+        let h = args
+            .height
+            .expect("checked above when --virtual-display set");
+        // Re-query CGDisplayBounds rather than trusting the cached
+        // values from VirtualDisplay creation: if --make-primary
+        // moved the display to (0, 0), the cached size is fine but
+        // we want a fresh read for parity with the input handler.
+        #[cfg(target_os = "macos")]
+        let size = {
+            let b = core_graphics::display::CGDisplay::new(vd.display_id()).bounds();
+            (b.size.width, b.size.height)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let size = vd.size_pts();
+        info!(
+            width = w,
+            height = h,
+            display_id = vd.display_id(),
+            "desktop size (virtual display)"
+        );
+        (w, h, Some(vd.display_id()), size)
+    } else {
+        let detected = primary_display_size().await?;
+        let w = args
+            .width
+            .or(detected.map(|(w, _)| w))
+            .unwrap_or(FALLBACK_WIDTH);
+        let h = args
+            .height
+            .or(detected.map(|(_, h)| h))
+            .unwrap_or(FALLBACK_HEIGHT);
+        if let Some((dw, dh)) = detected {
             info!(
                 width = w,
                 height = h,
-                display_id = vd.display_id(),
-                "desktop size (virtual display)"
+                detected_w = dw,
+                detected_h = dh,
+                "desktop size"
             );
-            (w, h, Some(vd.display_id()), size)
         } else {
-            let detected = primary_display_size().await?;
-            let w = args
-                .width
-                .or(detected.map(|(w, _)| w))
-                .unwrap_or(FALLBACK_WIDTH);
-            let h = args
-                .height
-                .or(detected.map(|(_, h)| h))
-                .unwrap_or(FALLBACK_HEIGHT);
-            if let Some((dw, dh)) = detected {
-                info!(
-                    width = w,
-                    height = h,
-                    detected_w = dw,
-                    detected_h = dh,
-                    "desktop size"
-                );
-            } else {
-                info!(width = w, height = h, "desktop size (no display detected)");
-            }
-            let (_origin, size) = primary_screen_geometry();
-            (w, h, None, size)
-        };
+            info!(width = w, height = h, "desktop size (no display detected)");
+        }
+        let (_origin, size) = primary_screen_geometry();
+        (w, h, None, size)
+    };
 
     let display = CaptureDisplay {
         width,

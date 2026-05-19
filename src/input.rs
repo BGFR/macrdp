@@ -76,7 +76,7 @@ mod macos {
     use core_graphics::geometry::CGPoint;
     use ironrdp_pdu::input::fast_path::SynchronizeFlags;
     use ironrdp_server::{KeyboardEvent, MouseEvent};
-    use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
+    use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace};
     use tracing::{debug, trace, warn};
 
     // kVK_* constants we match on for symbolic-hotkey interception.
@@ -325,6 +325,11 @@ mod macos {
                 .map_err(|_| anyhow!("CGEventSource::new(CombinedSessionState) failed"))?;
             let source_hid = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                 .map_err(|_| anyhow!("CGEventSource::new(HIDSystemState) failed"))?;
+            // Start the workspace-frontmost poller so the global MRU
+            // tracks ALL focus changes (Dock clicks, app launches, etc.),
+            // not just our Cmd+Tab commits. Idempotent — only one thread
+            // is ever spawned across handler reconstructions.
+            start_workspace_mru_poller();
             Ok(Self {
                 source,
                 source_hid,
@@ -409,6 +414,27 @@ mod macos {
                 );
                 if changed {
                     self.post_flags_changed(vk);
+                }
+                // Commit any active Cmd+Tab session the moment both
+                // Cmd halves are released. Matches native macOS: the
+                // app the cursor landed on becomes MRU front only on
+                // release, not on each intermediate Tab press.
+                //
+                // Also bump CMD_RELEASE_GENERATION so the next Cmd+Tab
+                // can detect this release happened — a session whose
+                // stored generation differs from the current value
+                // started in a *previous* Cmd hold and shouldn't be
+                // resumed. This replaces the old time-based grace,
+                // which falsely split sessions whenever the user
+                // paused mid-hold longer than 2 s.
+                if matches!(vk, VK_LCMD | VK_RCMD)
+                    && !down
+                    && !self.mods.l_cmd
+                    && !self.mods.r_cmd
+                {
+                    CMD_RELEASE_GENERATION
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    commit_cycle_session();
                 }
                 return;
             }
@@ -862,33 +888,332 @@ mod macos {
         )
     }
 
-    /// Process-wide cursor for `cycle_apps`. macOS's
-    /// `NSWorkspace.frontmostApplication` does not update for app
-    /// activations driven through the Accessibility API on the macOS
-    /// versions we've seen — every press of Cmd+Tab resolves the same
-    /// app as "current front" and we cycle in place. By remembering the
-    /// app *we* last activated and starting from there, the cycle
-    /// advances regardless of whether the OS's frontmost tracker
-    /// catches up. Cleared automatically if the target later quits.
-    static LAST_CYCLE_PID: std::sync::Mutex<Option<libc::pid_t>> =
-        std::sync::Mutex::new(None);
-
-    /// Per-bundle "most recently in front" PID. Updated each Cmd+Tab
-    /// press from whatever NSWorkspace currently reports as frontmost,
-    /// AND each time we AX-activate a target. Used during dedup to pick
-    /// the right instance when multiple processes share a bundle ID
-    /// (two VSCode windows opened as separate projects, two Firefox
+    /// Per-bundle "most recently in front" PID. Used during dedup to
+    /// pick the right instance when multiple processes share a bundle
+    /// ID (two VSCode windows opened as separate projects, two Firefox
     /// profiles, etc.) — without this we'd keep the first-launched
     /// instance and the cycle would route the user to the "wrong"
-    /// VSCode. Note: we only learn about user-initiated switches
-    /// (Dock click, mouse) at the next Cmd+Tab — if they swap A→B by
-    /// clicking and immediately Cmd+Tab away, that press updates MRU
-    /// to B before activating the next app. Good enough in practice.
+    /// VSCode. Distinct from the *bundle-level* MRU in `mru_bundles`
+    /// (which orders the cycle list): this one only resolves
+    /// bundle → which-pid.
     fn mru_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, libc::pid_t>> {
         use std::collections::HashMap;
         use std::sync::OnceLock;
         static MRU: OnceLock<std::sync::Mutex<HashMap<String, libc::pid_t>>> = OnceLock::new();
         MRU.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+    }
+
+    /// Global most-recently-used ordering of bundle identifiers, front
+    /// of the vec = most recent. Drives the cycle order so Cmd+Tab
+    /// behaves like native macOS: one press goes to the previous app,
+    /// two presses to the one before, etc. — independent of process
+    /// launch order. Updated only when (a) a new bundle is first seen,
+    /// (b) a fresh cycle session starts (current frontmost bumped to
+    /// the front), or (c) a cycle session commits on Cmd release
+    /// (cursor target bumped to the front). Critically NOT updated by
+    /// each intra-session Cmd+Tab press — that would reshuffle the
+    /// list and ping-pong the cursor between two apps.
+    fn mru_bundles() -> &'static std::sync::Mutex<Vec<String>> {
+        use std::sync::OnceLock;
+        static MRU: OnceLock<std::sync::Mutex<Vec<String>>> = OnceLock::new();
+        MRU.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn promote_bundle_to_front(bundle: &str) {
+        if bundle == "<no-bundle-id>" {
+            return;
+        }
+        let mru = mru_bundles();
+        let mut guard = mru.lock().expect("MRU bundles mutex poisoned");
+        guard.retain(|b| b != bundle);
+        guard.insert(0, bundle.to_string());
+    }
+
+    /// Active Cmd+Tab session. `snapshot` is the MRU-ordered candidate
+    /// list frozen at session start; `cursor_pid` advances through it
+    /// as the user holds Cmd and taps Tab. The snapshot does NOT
+    /// reshuffle mid-session even though we activate each step —
+    /// without that freeze, the activation would move the target to
+    /// MRU front, and the next press would cycle right back to where
+    /// we started.
+    ///
+    /// `cmd_release_gen` captures `CMD_RELEASE_GENERATION` at session
+    /// start. Every observed Cmd release bumps the global counter;
+    /// if the session's stored value still matches on the next press
+    /// we know Cmd has been held continuously since this session
+    /// began (no matter how long the user paused between Tab taps)
+    /// and the session continues. When it differs, the user released
+    /// Cmd between presses — commit the cursor to MRU and start fresh.
+    /// This replaced an earlier 2 s time-based grace that incorrectly
+    /// split sessions whenever a user paused mid-hold.
+    ///
+    /// `last_press_at` only serves as a hard upper bound on session
+    /// lifetime (`CYCLE_RESUME_GRACE`) — a safety net for the rare
+    /// case where a Cmd-release event is eaten before reaching us
+    /// (RDP client focus loss taking the keyup with it).
+    struct CycleSession {
+        snapshot: Vec<(String, String, libc::pid_t)>,
+        cursor_pid: libc::pid_t,
+        last_press_at: Instant,
+        cmd_release_gen: u64,
+    }
+
+    static CYCLE_SESSION: std::sync::Mutex<Option<CycleSession>> =
+        std::sync::Mutex::new(None);
+
+    /// Incremented every time both Cmd halves transition to released
+    /// (see `commit_cycle_session` callers). A `CycleSession` stamps
+    /// its start-time value; on later presses, a match means "Cmd has
+    /// not been released since this session started" — so we
+    /// continue, regardless of pause length.
+    static CMD_RELEASE_GENERATION: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// `NSWorkspace.frontmostApplication()` does NOT update for app
+    /// activations driven through the Accessibility API — it keeps
+    /// returning the app that was front BEFORE our first AX activation,
+    /// even after we've activated several others successfully. So we
+    /// can't trust workspace alone to know "what app is the user
+    /// actually in" on session start, which means every fresh Cmd+Tab
+    /// would re-promote the stale workspace value to MRU front and
+    /// undo the previous session's commit.
+    ///
+    /// `LAST_AX_ACTIVATED_PID` is our authoritative "this is what's
+    /// really front" — updated after every successful AX activation,
+    /// survives across cycle sessions.
+    ///
+    /// `WORKSPACE_LIE_FRONT` is the value `frontmostApplication()` was
+    /// returning at the moment we did our first AX activation. While
+    /// workspace keeps returning this value we treat it as stale. When
+    /// workspace returns *anything else*, the OS has observed a focus
+    /// change through a non-AX path (Dock click, menu, app self-
+    /// activation) — we reset both statics and trust workspace again.
+    static LAST_AX_ACTIVATED_PID: std::sync::Mutex<Option<libc::pid_t>> =
+        std::sync::Mutex::new(None);
+    static WORKSPACE_LIE_FRONT: std::sync::Mutex<Option<libc::pid_t>> =
+        std::sync::Mutex::new(None);
+
+    /// Enumerate every running process by PID directly from the kernel.
+    ///
+    /// We can't use `NSWorkspace.runningApplications()` for this — that
+    /// API returns a cache that's only refreshed by Cocoa notifications
+    /// delivered through the main thread's runloop, and we don't pump
+    /// one (tokio owns the main thread). Apps launched after macrdp
+    /// starts never appear there. `proc_listallpids` reads the proc
+    /// table directly via the BSD-style libproc API, so it always
+    /// reflects current kernel state.
+    ///
+    /// Note on the libproc API shape: `proc_listallpids` returns the
+    /// **count of PIDs** (XNU wraps `proc_listpids` and divides by
+    /// `sizeof(int)` before returning), and the buffer size passed in
+    /// must be in **bytes**. Earlier versions of this function divided
+    /// the return value by 4 again, producing `count=13` and clipping
+    /// most processes from view.
+    fn list_all_pids() -> Vec<libc::pid_t> {
+        extern "C" {
+            fn proc_listallpids(buffer: *mut libc::c_int, buffersize: libc::c_int)
+                -> libc::c_int;
+        }
+        unsafe {
+            // Sizing call: NULL buffer / 0 size returns the pid count
+            // the kernel would have written. Add headroom for procs
+            // that may launch between this call and the populated one.
+            let probe = proc_listallpids(std::ptr::null_mut(), 0);
+            if probe <= 0 {
+                return Vec::new();
+            }
+            let capacity = probe as usize + 64;
+            let mut buffer: Vec<libc::pid_t> = vec![0; capacity];
+            let pid_count = proc_listallpids(
+                buffer.as_mut_ptr() as *mut libc::c_int,
+                (buffer.len() * std::mem::size_of::<libc::c_int>()) as libc::c_int,
+            );
+            if pid_count <= 0 {
+                return Vec::new();
+            }
+            buffer.truncate(pid_count as usize);
+            buffer.retain(|&p| p > 0);
+            buffer
+        }
+    }
+
+    /// Reconcile NSWorkspace's view of "frontmost app" with our own AX
+    /// activation history. Returns the pid we believe is actually
+    /// front (drives cycle decisions, MRU promotions, snapshot
+    /// exclusion). See LAST_AX_ACTIVATED_PID / WORKSPACE_LIE_FRONT
+    /// docs above.
+    ///
+    /// `workspace_pid` is whatever `frontmostApplication()` just
+    /// returned. `is_alive` validates our tracked AX pid against the
+    /// caller's notion of "this pid still runs" — `cycle_apps` already
+    /// has `metas` so passes a `metas`-backed predicate; the Cmd+`
+    /// window cycler doesn't and passes `kill(pid, 0)` instead.
+    fn effective_front_pid(
+        workspace_pid: libc::pid_t,
+        is_alive: impl FnOnce(libc::pid_t) -> bool,
+    ) -> libc::pid_t {
+        let mut lie = WORKSPACE_LIE_FRONT
+            .lock()
+            .expect("workspace lie front mutex poisoned");
+        let mut last_ax = LAST_AX_ACTIVATED_PID
+            .lock()
+            .expect("last AX activated pid mutex poisoned");
+        if let (Some(lie_pid), Some(ax_pid)) = (*lie, *last_ax) {
+            if lie_pid == workspace_pid && is_alive(ax_pid) {
+                return ax_pid;
+            }
+        }
+        // Workspace moved past whatever it was lying about (or never
+        // lied yet, or our AX target died) — reset and trust workspace.
+        *lie = None;
+        *last_ax = None;
+        workspace_pid
+    }
+
+    /// Spawn a background thread that polls the Accessibility system-wide
+    /// focused application and promotes its bundle to `mru_bundles[0]`
+    /// whenever it changes. Idempotent — only one thread is ever spawned.
+    ///
+    /// We originally polled `NSWorkspace.frontmostApplication()` for this,
+    /// but in `--capture-primary` / virtual-display setups it stops tracking
+    /// dock-click activations entirely (the property pins to whatever was
+    /// front when the capture engaged and never updates, even though apps
+    /// really are becoming frontmost when the user clicks the dock on the
+    /// virtual display). AX's system-wide `kAXFocusedApplicationAttribute`
+    /// reflects WindowServer's actual focus state directly and tracks
+    /// these activations correctly.
+    ///
+    /// Skips promotion when a Cmd+Tab cycle session is active so that the
+    /// AX activations *we* drive don't get re-promoted (mid-cycle reshuffles
+    /// would corrupt the frozen snapshot's MRU ordering on the next session
+    /// start). Our cycle commits already promote the cursor target on Cmd
+    /// release; intra-cycle targets shouldn't bake into MRU.
+    fn start_workspace_mru_poller() {
+        use std::sync::OnceLock;
+        static STARTED: OnceLock<()> = OnceLock::new();
+        STARTED.get_or_init(|| {
+            let _ = std::thread::Builder::new()
+                .name("ax-focus-mru-poller".into())
+                .spawn(ax_focus_mru_poller_loop);
+        });
+    }
+
+    /// Read the pid of the AX system-wide focused application. Returns
+    /// None if AX can't resolve it (permission missing, focus on a non-
+    /// AX-bearing element, etc.).
+    fn ax_focused_application_pid() -> Option<libc::pid_t> {
+        use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
+        use core_foundation::string::CFString;
+        use std::ffi::c_void;
+        use std::ptr;
+
+        unsafe {
+            let systemwide = AXUIElementCreateSystemWide();
+            if systemwide.is_null() {
+                return None;
+            }
+            let attr = CFString::from_static_string("AXFocusedApplication");
+            let mut focused: CFTypeRef = ptr::null();
+            let err = AXUIElementCopyAttributeValue(
+                systemwide,
+                attr.as_concrete_TypeRef().cast(),
+                &mut focused,
+            );
+            CFRelease(systemwide as *const c_void);
+            if err != AX_ERROR_SUCCESS || focused.is_null() {
+                return None;
+            }
+            let mut pid: libc::pid_t = 0;
+            let pid_err = AXUIElementGetPid(focused as *mut c_void, &mut pid);
+            CFRelease(focused as *const c_void);
+            if pid_err != AX_ERROR_SUCCESS || pid <= 0 {
+                return None;
+            }
+            Some(pid)
+        }
+    }
+
+    /// Look up the bundle identifier of a running app by pid. Used by
+    /// the AX poller to translate the focused-app pid into the bundle
+    /// string our MRU is keyed by. Uses
+    /// `NSRunningApplication.runningApplicationWithProcessIdentifier`
+    /// directly — that path does a fresh per-call lookup against
+    /// LaunchServices and sees newly-launched apps, unlike
+    /// `NSWorkspace.runningApplications()` which is cached and stale
+    /// in our (non-Cocoa-runloop) process.
+    fn bundle_identifier_for_pid(pid: libc::pid_t) -> Option<String> {
+        unsafe {
+            NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?
+                .bundleIdentifier()
+                .map(|s| s.to_string())
+        }
+    }
+
+    fn ax_focus_mru_poller_loop() {
+        let mut last_seen_pid: libc::pid_t = 0;
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            let Some(pid) = ax_focused_application_pid() else {
+                continue;
+            };
+            if pid == last_seen_pid {
+                continue;
+            }
+            last_seen_pid = pid;
+
+            // Skip while a Cmd+Tab cycle is in flight — our own AX
+            // activations are causing the focus changes the poller is
+            // seeing, and we don't want them double-counted into MRU.
+            // (Cmd-release commit already promotes the final target.)
+            let cycle_active = CYCLE_SESSION
+                .lock()
+                .expect("cycle session mutex poisoned")
+                .is_some();
+            if cycle_active {
+                continue;
+            }
+
+            let Some(bundle) = bundle_identifier_for_pid(pid) else {
+                continue;
+            };
+            if bundle.is_empty() {
+                continue;
+            }
+            promote_bundle_to_front(&bundle);
+            debug!(
+                pid,
+                bundle = %bundle,
+                "AX focus MRU poller promoted bundle"
+            );
+        }
+    }
+
+    /// Hard upper bound on cycle-session lifetime. Generation matching
+    /// is the primary "is the session still alive" signal — this
+    /// timeout is only a safety net for the rare case where the
+    /// Cmd-release event was eaten before reaching us (RDP client
+    /// focus loss taking the keyup with it). 5 min comfortably
+    /// accommodates "user paused to read something" cases while still
+    /// eventually recovering from a stuck session.
+    const CYCLE_RESUME_GRACE: Duration = Duration::from_secs(300);
+
+    /// Commit the active cycle session — promote cursor's bundle to
+    /// MRU front and clear the session. Called when Cmd is fully
+    /// released, and lazily from cycle_apps when the grace timeout
+    /// has elapsed.
+    fn commit_cycle_session() {
+        let mut guard = CYCLE_SESSION
+            .lock()
+            .expect("cycle session mutex poisoned");
+        if let Some(session) = guard.take() {
+            if let Some((bundle, _, _)) = session
+                .snapshot
+                .iter()
+                .find(|(_, _, p)| *p == session.cursor_pid)
+            {
+                promote_bundle_to_front(bundle);
+            }
+        }
     }
 
     /// Cycle to the next (or previous) regular-policy running app and
@@ -899,28 +1224,26 @@ mod macos {
         // safe for these read-only queries.
         unsafe {
             let workspace = NSWorkspace::sharedWorkspace();
-            let all = workspace.runningApplications();
-            // `NSRunningApplication.isActive` lives on each snapshot
-            // returned by runningApplications() and reflects WindowServer's
-            // active-state property at the moment that snapshot was built.
-            // After we trigger an AX activation, the next snapshot's
-            // `isActive` does NOT update to reflect the new frontmost —
-            // empirically Terminal kept showing active=true even after
-            // Firefox was visibly on top, which made front_idx always
-            // resolve back to Terminal and cycling stuck on the same
-            // target. `NSWorkspace.frontmostApplication` is the
-            // live-queryable replacement: it walks the active app fresh
-            // each call. We compare by PID since the NSRunningApplication
-            // identity from frontmostApplication isn't the same object
-            // as the one in the runningApplications array.
-            let front_pid = workspace
+            // `NSWorkspace.frontmostApplication` is the live-queryable
+            // replacement for `isActive` checks on cached snapshots: it
+            // walks the active app fresh each call. We compare by PID
+            // since NSRunningApplication instances don't share identity
+            // across queries.
+            let workspace_front_pid = workspace
                 .frontmostApplication()
                 .map(|a| a.processIdentifier())
                 .unwrap_or(0);
-            // Pass 1: gather every running app's metadata. We do dedup
-            // in a separate pass so we can prefer the MRU instance of a
-            // bundle (the VSCode the user was last actually in) over
-            // whichever launched first.
+            // Pass 1: gather every running app's metadata.
+            //
+            // We deliberately AVOID `NSWorkspace.runningApplications()`
+            // here: its result is a cache refreshed via Cocoa
+            // notifications that require a main-thread runloop, and
+            // tokio owns our main thread. Apps launched after macrdp
+            // starts never appear in that cache. Instead we read the
+            // kernel proc table directly via `proc_listallpids` and
+            // ask NSRunningApplication for each PID — that path does
+            // a fresh per-call lookup and sees newly-launched apps
+            // immediately.
             struct AppMeta {
                 bundle: String,
                 name: String,
@@ -928,10 +1251,13 @@ mod macos {
                 policy: NSApplicationActivationPolicy,
                 terminated: bool,
             }
-            let mut metas: Vec<AppMeta> = Vec::with_capacity(all.count());
-            for i in 0..all.count() {
-                let app = all.objectAtIndex(i);
-                let pid = app.processIdentifier();
+            let pids = list_all_pids();
+            let mut metas: Vec<AppMeta> = Vec::with_capacity(pids.len());
+            for pid in pids {
+                let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+                else {
+                    continue;
+                };
                 // `isTerminated` lags the kernel by a few hundred ms
                 // when an app quits — long enough for the first Cmd+Tab
                 // after a close to still see the dead instance in the
@@ -956,6 +1282,19 @@ mod macos {
                     terminated: app.isTerminated() || kernel_dead,
                 });
             }
+            let all_count = metas.len();
+
+            // Reconcile workspace's notion of "front" against what we
+            // last AX-activated. Workspace lies (returns the pre-AX
+            // app) after we've activated something, so trusting it
+            // blindly would re-promote the stale value to MRU front on
+            // every session start and undo the previous commit. Using
+            // the reconciled `front_pid` from here on means MRU
+            // tracking actually survives a Cmd+Tab → release → Cmd+Tab
+            // cycle.
+            let front_pid = effective_front_pid(workspace_front_pid, |p| {
+                metas.iter().any(|m| m.pid == p && !m.terminated)
+            });
 
             // Refresh MRU. Whichever bundle is currently frontmost is the
             // one the user just left (or was working in if this is their
@@ -1043,9 +1382,10 @@ mod macos {
                 })
                 .collect();
             debug!(
-                count = all.count(),
+                count = all_count,
                 regular_count = regular.len(),
                 front_pid,
+                workspace_front_pid,
                 "cycle_apps: full app list:\n  {}",
                 all_summary.join("\n  ")
             );
@@ -1053,61 +1393,183 @@ mod macos {
                 warn!("cycle_apps: no regular apps running");
                 return;
             }
-            // Pick the cycle cursor. Preference order:
-            //   1. The app WE most recently activated, if it still exists.
-            //      Lets repeated Cmd+Tab presses advance through the list
-            //      even when the OS's frontmost tracker hasn't caught up
-            //      with the AX activation we just did.
-            //   2. The live frontmost via NSWorkspace (handles the first
-            //      press after macrdp launches, or the case where the
-            //      user manually clicked into another app via the Dock
-            //      since our last activation).
-            //   3. Index 0 as a final fallback (frontmost not in the
-            //      regular-policy candidate set, e.g. Spotlight overlay).
-            let mut last_cycle_guard = LAST_CYCLE_PID
+
+            // Decide: continue an existing held-Cmd session, or start
+            // a fresh one. A fresh session rebuilds the snapshot in
+            // MRU order (most recently used first) so press #1 lands
+            // on the previous-MRU app, press #2 on the one before
+            // that, etc. — matching native macOS Cmd+Tab. A continued
+            // session reuses the frozen snapshot so successive
+            // presses walk further back without the list reshuffling
+            // under us (each AX activation would otherwise promote
+            // the new target and ping-pong the cursor).
+            let now = Instant::now();
+            let current_release_gen =
+                CMD_RELEASE_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+            let mut session_guard = CYCLE_SESSION
                 .lock()
-                .expect("cycle PID mutex poisoned");
-            let cursor_pid = last_cycle_guard
-                .filter(|p| regular.iter().any(|(_, _, pid)| pid == p))
-                .unwrap_or(front_pid);
-            let front_idx = regular
-                .iter()
-                .position(|(_, _, pid)| *pid == cursor_pid)
-                .unwrap_or(0);
-            let n = regular.len();
-            let next_idx = if reverse {
-                (front_idx + n - 1) % n
-            } else {
-                (front_idx + 1) % n
+                .expect("cycle session mutex poisoned");
+            // Continue if the session's stored release-generation
+                                // matches *and* the session is younger than the safety
+                                // bound. Generation matching is the real authority —
+                                // it's true iff Cmd has been held continuously since
+                                // session start. The grace check only kicks in to
+                                // recover from a missed Cmd-release event (RDP focus
+                                // loss eating the keyup).
+            let continuing = session_guard.as_ref().is_some_and(|s| {
+                s.cmd_release_gen == current_release_gen
+                    && now.duration_since(s.last_press_at) < CYCLE_RESUME_GRACE
+            });
+            if !continuing && session_guard.is_some() {
+                // Either Cmd was released between presses (generation
+                // bumped) or the safety bound elapsed. Treat
+                // any pending cursor as the user's last actual
+                // selection and commit it to MRU before starting over.
+                if let Some(stale) = session_guard.take() {
+                    if let Some((bundle, _, _)) = stale
+                        .snapshot
+                        .iter()
+                        .find(|(_, _, p)| *p == stale.cursor_pid)
+                    {
+                        promote_bundle_to_front(bundle);
+                    }
+                }
+            }
+
+            // Build (or reuse) the snapshot. The session origin (the
+            // front-at-start app) IS included so the cycle has the
+            // full set of regular apps. Native macOS Cmd+Tab cycles
+            // through all apps including back to the starting one —
+            // mirroring that gives users a familiar "I can reach all
+            // N of my apps in one Cmd hold" experience. Each press
+            // visibly switches to a different app (since we re-issue
+            // AX activation every step), so even the wrap-back-to-
+            // origin shows on screen.
+            let (snapshot, cursor_pid_in): (Vec<(String, String, libc::pid_t)>, libc::pid_t) =
+                if continuing {
+                    let s = session_guard.as_mut().unwrap();
+                    // Drop snapshot entries whose pid is no longer a
+                    // running regular-policy app (quit mid-cycle).
+                    let live: HashSet<libc::pid_t> =
+                        regular.iter().map(|(_, _, p)| *p).collect();
+                    s.snapshot.retain(|(_, _, p)| live.contains(p));
+                    let cursor = s.cursor_pid;
+                    (s.snapshot.clone(), cursor)
+                } else {
+                    // Fresh session. Ingest any new bundles into
+                    // mru_bundles (append at the end — least-recently
+                    // used by default), then bump the live frontmost
+                    // bundle to the front so it becomes the cycle
+                    // origin even if NSWorkspace's frontmost tracker
+                    // is stale relative to our last AX activation.
+                    {
+                        let mru = mru_bundles();
+                        let mut guard = mru.lock().expect("MRU bundles mutex poisoned");
+                        for (bundle, _, _) in &regular {
+                            if bundle != "<no-bundle-id>" && !guard.iter().any(|b| b == bundle) {
+                                guard.push(bundle.clone());
+                            }
+                        }
+                    }
+                    if let Some(m) = metas.iter().find(|m| m.pid == front_pid) {
+                        promote_bundle_to_front(&m.bundle);
+                    }
+                    // Sort regular[] by MRU position. `<no-bundle-id>`
+                    // entries (rare for regular-policy apps) sort to
+                    // the end. Front_pid is at MRU[0] post-promote, so
+                    // it lands at index 0 of the snapshot — the cursor
+                    // starts there and the first Tab press advances
+                    // to index 1 = previous-MRU app.
+                    let mru_order: Vec<String> = mru_bundles()
+                        .lock()
+                        .expect("MRU bundles mutex poisoned")
+                        .clone();
+                    let mut ordered = regular.clone();
+                    ordered.sort_by_key(|(bundle, _, _)| {
+                        mru_order
+                            .iter()
+                            .position(|b| b == bundle)
+                            .unwrap_or(usize::MAX)
+                    });
+                    (ordered, front_pid)
+                };
+
+            if snapshot.is_empty() {
+                *session_guard = None;
+                debug!("cycle_apps: nothing to cycle to (no regular apps)");
+                return;
+            }
+
+            let n = snapshot.len();
+            // Locate cursor in the snapshot and advance ±1 with wrap.
+            // If the cursor pid isn't in the snapshot (e.g., front_pid
+            // was a non-regular app like Spotlight that doesn't appear
+            // in `regular`), land on the most-recent MRU entry as the
+            // best-effort starting point.
+            let next_idx = match snapshot.iter().position(|(_, _, p)| *p == cursor_pid_in) {
+                Some(i) => {
+                    if reverse {
+                        (i + n - 1) % n
+                    } else {
+                        (i + 1) % n
+                    }
+                }
+                None => {
+                    if reverse {
+                        n - 1
+                    } else {
+                        0
+                    }
+                }
             };
-            let (target_bundle, target_name, target_pid) = &regular[next_idx];
-            let target_bundle = target_bundle.clone();
-            let target_name = target_name.clone();
-            let target_pid = *target_pid;
-            // Record our pick now so a subsequent Cmd+Tab advances from
-            // here regardless of whether the OS's frontmost tracker
-            // reflects our activation.
-            *last_cycle_guard = Some(target_pid);
-            drop(last_cycle_guard);
-            // Also pin the MRU for this bundle to the instance we're
-            // about to activate. If the user cycles away and back, the
-            // bundle should resolve to this same instance — not the
-            // first-launched one.
+            let (target_bundle, target_name, target_pid) = snapshot[next_idx].clone();
+
+            // Save updated session so the next intra-hold press
+            // advances from where we are now. Snapshot stays frozen —
+            // do NOT promote target to MRU front here; that happens
+            // at session commit (Cmd release / grace expiry).
+            *session_guard = Some(CycleSession {
+                snapshot: snapshot.clone(),
+                cursor_pid: target_pid,
+                last_press_at: now,
+                cmd_release_gen: current_release_gen,
+            });
+            drop(session_guard);
+
+            // Pin the per-bundle MRU pid to the instance we're
+            // activating, so if the user cycles away and back the
+            // dedup keeps the same instance.
             if target_bundle != "<no-bundle-id>" {
-                let mru = mru_map();
-                mru.lock()
+                mru_map()
+                    .lock()
                     .expect("MRU mutex poisoned")
                     .insert(target_bundle.clone(), target_pid);
             }
+            // Dump the snapshot order (the actual cycle order, with
+            // session-origin excluded) and the underlying global MRU
+            // list, so a confusing cycle decision is debuggable from
+            // the log alone without re-deriving state.
+            let snapshot_order: Vec<String> = snapshot
+                .iter()
+                .map(|(b, _, p)| format!("{b}#{p}"))
+                .collect();
+            let mru_order: Vec<String> = mru_bundles()
+                .lock()
+                .expect("MRU bundles mutex poisoned")
+                .clone();
             debug!(
                 reverse,
-                front_idx,
+                continuing,
+                cursor_pid_in,
                 next_idx,
-                cursor_pid,
-                os_front_pid = front_pid,
+                snapshot_len = n,
+                effective_front_pid = front_pid,
+                workspace_front_pid,
                 target = %target_bundle,
                 name = %target_name,
                 pid = target_pid,
+                snapshot_order = ?snapshot_order,
+                mru_bundles = ?mru_order,
                 "cycle_apps activating"
             );
             // Three activation paths exist on modern macOS:
@@ -1132,8 +1594,39 @@ mod macos {
             // is the same gesture the Dock uses internally. No
             // front-app-only block, and — critically — doesn't relaunch
             // dead processes.
+            // Capture workspace's current value the first time we're
+            // about to make it go stale. After this AX activation,
+            // `frontmostApplication()` will keep returning whatever
+            // it was returning *right now*, and that's the value
+            // `effective_front_pid` needs to recognize as lying.
+            // Only set if currently None — within a held-Cmd cycle the
+            // first activation already captured it; subsequent intra-
+            // cycle activations don't change what workspace is lying
+            // about.
+            {
+                let mut lie = WORKSPACE_LIE_FRONT
+                    .lock()
+                    .expect("workspace lie front mutex poisoned");
+                if lie.is_none() {
+                    *lie = Some(workspace_front_pid);
+                }
+            }
             let ax_err = ax_make_frontmost(target_pid);
             if ax_err == AX_ERROR_SUCCESS {
+                *LAST_AX_ACTIVATED_PID
+                    .lock()
+                    .expect("last AX activated pid mutex poisoned") = Some(target_pid);
+                // Promote on every successful activation, not just on
+                // Cmd-release commit. Our cycle has no switcher UI, so
+                // each Tab press visibly switches apps and the user
+                // experiences every step as a real visit — MRU should
+                // reflect that or the next session's cycle order will
+                // disagree with what they just saw on screen. Snapshot
+                // is frozen so this doesn't disrupt the active cycle;
+                // it only affects what subsequent sessions consult.
+                if target_bundle != "<no-bundle-id>" {
+                    promote_bundle_to_front(&target_bundle);
+                }
                 debug!(target = %target_bundle, pid = target_pid, "cycle_apps: AX activation ok");
             } else {
                 warn!(
@@ -1163,6 +1656,11 @@ mod macos {
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn AXUIElementCreateApplication(pid: libc::pid_t) -> *mut std::ffi::c_void;
+        fn AXUIElementCreateSystemWide() -> *mut std::ffi::c_void;
+        fn AXUIElementGetPid(
+            element: *mut std::ffi::c_void,
+            pid: *mut libc::pid_t,
+        ) -> i32;
         fn AXUIElementSetAttributeValue(
             element: *mut std::ffi::c_void,
             attribute: core_foundation::base::CFTypeRef,
@@ -1262,34 +1760,24 @@ mod macos {
         use std::ptr;
 
         // Source-of-truth for "what app is the user actually in":
-        //   1. LAST_CYCLE_PID — set every time we AX-activate via
-        //      Cmd+Tab. This is the authoritative answer when the user
-        //      has been navigating via macrdp's cycle.
-        //   2. NSWorkspace.frontmostApplication — bootstrap before any
-        //      Cmd+Tab has happened, or fallback when LAST_CYCLE_PID
-        //      is unset.
-        // NSWorkspace.frontmostApplication is NOT trustworthy after we
-        // AX-activate: it keeps reporting the pre-activation app, which
-        // is why we previously saw Cmd+` cycle through Terminal's
-        // windows when the user was visually in VSCode (Terminal was
-        // still NSWorkspace's notion of frontmost).
-        let pid = {
-            let cycle_pid = *LAST_CYCLE_PID
-                .lock()
-                .expect("cycle PID mutex poisoned");
-            match cycle_pid {
-                Some(p) => p,
-                None => unsafe {
-                    let ws = objc2_app_kit::NSWorkspace::sharedWorkspace();
-                    match ws.frontmostApplication() {
-                        Some(app) => app.processIdentifier(),
-                        None => return false,
-                    }
-                },
-            }
+        // delegate to `effective_front_pid`, which reconciles
+        // `NSWorkspace.frontmostApplication` against the
+        // LAST_AX_ACTIVATED_PID / WORKSPACE_LIE_FRONT tracking that
+        // cycle_apps maintains. Without this reconciliation, Cmd+`
+        // would key off the stale workspace value and try to cycle
+        // windows of whatever app we *used to* be in, not the one we
+        // just landed on via Cmd+Tab.
+        let pid = unsafe {
+            let ws = objc2_app_kit::NSWorkspace::sharedWorkspace();
+            let workspace_pid = match ws.frontmostApplication() {
+                Some(app) => app.processIdentifier(),
+                None => return false,
+            };
+            effective_front_pid(workspace_pid, |p| libc::kill(p, 0) == 0)
         };
         let app_ref = unsafe { AXUIElementCreateApplication(pid) };
         if app_ref.is_null() {
+            debug!(pid, "ax_cycle_windows_of_front: null app_ref (bad pid)");
             return false;
         }
 
@@ -1303,11 +1791,22 @@ mod macos {
             )
         };
         if copy_err != AX_ERROR_SUCCESS || windows.is_null() {
+            debug!(
+                pid,
+                copy_err,
+                windows_null = windows.is_null(),
+                "ax_cycle_windows_of_front: AXWindows copy failed"
+            );
             unsafe { CFRelease(app_ref as *const c_void) };
             return false;
         }
         let count = unsafe { CFArrayGetCount(windows.cast()) };
         if count < 2 {
+            debug!(
+                pid,
+                count,
+                "ax_cycle_windows_of_front: app has <2 windows — nothing to cycle"
+            );
             unsafe {
                 CFRelease(windows.cast());
                 CFRelease(app_ref as *const c_void);

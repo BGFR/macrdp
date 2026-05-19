@@ -1125,7 +1125,7 @@ mod macos {
             }
             let mut pid: libc::pid_t = 0;
             let pid_err = AXUIElementGetPid(focused as *mut c_void, &mut pid);
-            CFRelease(focused as *const c_void);
+            CFRelease(focused);
             if pid_err != AX_ERROR_SUCCESS || pid <= 0 {
                 return None;
             }

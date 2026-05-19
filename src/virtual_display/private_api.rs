@@ -61,7 +61,10 @@ impl DisplayEnabler {
                      not found — display detach is unavailable on this macOS"
                 ));
             }
-            Ok(Self(std::mem::transmute::<*mut c_void, _>(p)))
+            Ok(Self(std::mem::transmute::<
+                *mut c_void,
+                unsafe extern "C" fn(*mut c_void, CGDirectDisplayID, bool) -> i32,
+            >(p)))
         }
     }
 

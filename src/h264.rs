@@ -193,17 +193,28 @@ impl Gfx {
                 self.setup_locked(ctx)?;
             }
             // Backpressure: if the client hasn't acked enough in-flight frames,
-            // skip this capture entirely (keeps VT state aligned with what the
-            // client actually holds) and arm a keyframe for when we resume.
+            // skip this capture entirely. We do NOT arm a keyframe here:
+            // skipping a *capture* (before it's encoded) doesn't break the
+            // reference chain — the next encoded frame is still a valid P-frame
+            // against the last *encoded* frame, which was already handed to the
+            // reliable (TLS/TCP) transport. Forcing an IDR on resume just emits
+            // a large frame that re-trips backpressure → a keyframe cascade /
+            // periodic stutter. The only forced keyframe is the first frame of
+            // the connection (armed in on_ready).
             if ctx.server_handle.lock().unwrap().should_backpressure() {
-                ctx.need_keyframe = true;
                 trace!("EGFX backpressured; skipping frame");
                 return Ok(true); // still the active path; just dropped this frame
             }
             std::mem::replace(&mut ctx.need_keyframe, false)
         };
 
-        // Encode (async output) then non-blocking drain.
+        // Encode (async output), then drain — waiting briefly for THIS frame
+        // to finish so a single change (keystroke, caret) ships now instead of
+        // sitting in VT until the next captured frame drains it (which, on a
+        // static screen, may not arrive). Budget is ~half a frame interval: long
+        // enough to catch the just-encoded frame (VT RealTime emits in a few ms),
+        // short enough not to throttle the capture cadence.
+        let budget = std::time::Duration::from_millis((1000 / u64::from(self.fps.max(1))).max(4));
         let frames = {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
@@ -213,7 +224,7 @@ impl Gfx {
                 return Ok(true);
             };
             encoder.encode_bgra(bgra, stride, force_keyframe)?;
-            encoder.drain()
+            encoder.drain_wait(budget)
         };
 
         if !frames.is_empty() {
@@ -470,6 +481,15 @@ struct GfxHandler {
 }
 
 impl GraphicsPipelineHandler for GfxHandler {
+    /// Allow more frames in flight than the upstream default of 3. A larger
+    /// window means a single larger frame (e.g. an occasional keyframe) doesn't
+    /// immediately starve the pipeline and force capture skips. On a healthy
+    /// link `in_flight` stays low regardless (frames ack quickly), so this only
+    /// trades a little buffering for smoothness when a burst is in flight.
+    fn max_frames_in_flight(&self) -> u32 {
+        6
+    }
+
     fn capabilities_advertise(&mut self, pdu: &CapabilitiesAdvertisePdu) {
         let supports_avc = caps_indicate_avc(&pdu.0);
         info!(

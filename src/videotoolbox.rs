@@ -134,6 +134,27 @@ impl Encoder {
         out
     }
 
+    /// Like `drain()`, but if nothing is ready yet, wait up to `budget` for the
+    /// callback to deliver the frame that was just submitted, then sweep up any
+    /// others. This is what makes a single change (a keystroke, the blinking
+    /// caret) actually ship *this* tick instead of sitting in VideoToolbox until
+    /// the next captured frame happens to drain it — which on a static screen
+    /// may never come. The wait is bounded and per-frame (it returns as soon as
+    /// the frame arrives), so it does NOT serialize the pipeline like the full
+    /// `flush()` / `CompleteFrames` barrier does.
+    pub fn drain_wait(&mut self, budget: std::time::Duration) -> Vec<EncodedFrame> {
+        let mut out = self.drain();
+        if out.is_empty() {
+            if let Ok(frame) = self.rx.recv_timeout(budget) {
+                out.push(frame);
+                while let Ok(frame) = self.rx.try_recv() {
+                    out.push(frame);
+                }
+            }
+        }
+        out
+    }
+
     /// Block until every frame submitted so far has been encoded and
     /// delivered to the output callback. The live pipeline uses the
     /// non-blocking `drain()`; `flush` is kept for shutdown / deterministic
@@ -239,6 +260,7 @@ mod ffi {
         pub(super) static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
+        pub(super) static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
         pub(super) static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
         pub(super) static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
         pub(super) static kCFBooleanTrue: CFBooleanRef;
@@ -409,6 +431,12 @@ mod ffi {
                 kVTCompressionPropertyKey_AllowFrameReordering,
                 kCFBooleanFalse,
             )?;
+            // Don't let the encoder hold frames waiting for future input — emit
+            // each one as soon as it's coded. Without this VT buffers a frame
+            // and only flushes it when the NEXT frame is submitted, so a single
+            // change (keystroke / caret) renders "one behind" until you type
+            // again. Best-effort: ignore if a VT version rejects the value.
+            let _ = set_i32(session, kVTCompressionPropertyKey_MaxFrameDelayCount, 0);
             set_string(
                 session,
                 kVTCompressionPropertyKey_ProfileLevel,
@@ -419,13 +447,16 @@ mod ffi {
                 kVTCompressionPropertyKey_AverageBitRate,
                 bitrate_bps as i32,
             )?;
-            // Force a keyframe at most every `fps * 2` frames (~2s). The
-            // RDP client also has cap-bound keyframe expectations; tune
-            // in Phase 3.
+            // Keyframe interval. RDP runs over reliable TLS/TCP, so periodic
+            // IDRs (a lossy-transport recovery mechanism) aren't needed — they
+            // just emit a large frame that hitches an otherwise smooth P-frame
+            // stream (very visible while typing) and can trip backpressure. Set
+            // a long interval (~30s) as a light safety net; the real first
+            // keyframe is forced explicitly on connect via encode_bgra().
             set_i32(
                 session,
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                (fps * 2) as i32,
+                (fps * 30) as i32,
             )?;
         }
 

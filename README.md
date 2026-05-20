@@ -1,6 +1,6 @@
 # macrdp
 
-A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, Mac↔Windows file copy, and system audio forwarding. NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
+A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, Mac↔Windows file copy, system audio forwarding, and optional H.264 video (EGFX/AVC420, hardware-encoded). NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
 
 This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
@@ -51,6 +51,10 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
                           drop the connection mid-session)
 --width / --height        Override autodetected display size
 --fps N                   Frame rate cap (default 15)
+--enable-h264             Stream the display as H.264 over EGFX (AVC420),
+                          hardware-encoded via VideoToolbox, instead of legacy
+                          bitmaps. Falls back to legacy automatically for
+                          clients that don't negotiate H.264. See "Video".
 --cert-dir PATH           Persisted TLS cert (default ~/Library/Application Support/macrdp)
 --virtual-display         Serve a headless virtual display at --width × --height
                           instead of mirroring the primary panel — local screen
@@ -94,6 +98,9 @@ Both restore the original layout when the last client disconnects, and both auto
 # Higher frame rate, custom cert dir.
 ./macrdp --fps 30 --cert-dir ~/.macrdp-certs
 
+# H.264 video over EGFX (much lower bandwidth than legacy bitmaps).
+./macrdp --enable-h264
+
 # Verbose logs (DEBUG level).
 ./macrdp -v
 
@@ -116,6 +123,21 @@ Both restore the original layout when the last client disconnects, and both auto
 ./macrdp --skip-auth --password test
 ```
 
+## Video (H.264)
+
+By default the display is sent as legacy bitmaps (RemoteFx/QOI to mstsc, NSCodec/raw to others) — works everywhere, but bandwidth-heavy. Pass **`--enable-h264`** to stream the desktop as **H.264 over the EGFX virtual channel** (MS-RDPEGFX, AVC420), hardware-encoded with VideoToolbox. Far less bandwidth, especially for video/scrolling/photos.
+
+How it behaves:
+
+- **Automatic fallback.** Clients that don't advertise H.264 (AVC420) decode — e.g. a FreeRDP build without an H.264 decoder, or Microsoft Remote Desktop on macOS (NSCodec only) — transparently fall back to legacy bitmaps. No need to match the flag to the client.
+- **Wire format.** The AVC420 payload is Annex-B framed (what Microsoft's decoder expects). The bitstream is verified rendering on `mstsc` and on FreeRDP built with H.264 (e.g. the [Thincast client]).
+
+### Known limitations
+
+- **Reconnecting `mstsc` to a still-running macrdp can show a black screen** (with a live cursor). This is an mstsc-specific quirk: it retains EGFX surfaces for the lifetime of its process and mis-composites on reconnect. It is *not* a server bug — FreeRDP reconnects cleanly over the same stream. **Workaround:** restart macrdp, or fully close and reopen the mstsc window. (Fresh connections always render fine.)
+- **The new Windows App client may fail to connect** (it sends a GCC block the underlying IronRDP parser rejects, before any video negotiation — so this affects all modes, not just H.264). Use `mstsc`, FreeRDP, or a FreeRDP-based client (e.g. [Thincast]) instead.
+- H.264 is **macOS-only** (VideoToolbox) and still maturing — bitrate/quality tuning and dirty-region encoding are not yet done.
+
 ## Audio
 
 System audio rides over the RDPSND virtual channel as 16-bit stereo PCM at **44.1 kHz**. ScreenCaptureKit only supports 8 / 16 / 24 / 48 kHz, so the capture loop captures at 48 kHz and resamples to 44.1 with [`rubato`](https://github.com/HEnquist/rubato) before sending. 44.1 matches the native rate of most Windows audio endpoints, which avoids the client-side resampling drift that otherwise accumulates into multi-second audio backlogs. A generation counter on the audio factory keeps a client reconnect from leaving a second capture loop feeding the channel. The vendored `ironrdp-server` carries a single patch that makes `dispatch_server_events` keep the *newest* queued waves on per-batch overflow instead of the oldest — without it, a one-off video-encode stall would bake a permanent audio-latency offset into the session.
@@ -136,3 +158,5 @@ Multi-monitor support is on the list when I'm bored or need a distraction from r
 MIT OR Apache-2.0.
 
 [IronRDP]: https://github.com/Devolutions/IronRDP
+[Thincast client]: https://thincast.com/en/products/client
+[Thincast]: https://thincast.com/en/products/client

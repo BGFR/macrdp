@@ -1,6 +1,6 @@
 [package]
 name = "macrdp"
-version = "0.5.31"
+version = "0.5.32"
 edition = "2021"
 description = "Native RDP server for macOS"
 license = "MIT OR Apache-2.0"
@@ -84,7 +84,7 @@ ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git",
 ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
 ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
 ironrdp-dvc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
-ironrdp-egfx             = { path = "vendor/ironrdp-egfx" }  # vendored: adds force_create_surface (see vendor/ironrdp-egfx/Cargo.toml)
+ironrdp-egfx             = { path = "vendor/ironrdp-egfx" }  # vendored: adds create_surface_with_id (see vendor/ironrdp-egfx/Cargo.toml)
 ironrdp-graphics         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
 ironrdp-pdu              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
 ironrdp-rdpsnd           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }

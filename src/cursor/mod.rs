@@ -169,6 +169,12 @@ mod macos {
             self.last_hash = hash;
             trace!(w, h, hot_x, hot_y, "cursor shape changed");
             out.push(DisplayUpdate::RGBAPointer(RGBAPointer {
+                // macrdp doesn't maintain a client-side pointer cache; every
+                // shape change re-sends the full bitmap to slot 0 (the encoder
+                // always emits NewPointer for RGBAPointer, never CachedPointer),
+                // so a single fixed index is correct and won't freeze animated
+                // cursors (beachball/watch).
+                cache_index: 0,
                 width: w,
                 height: h,
                 hot_x,

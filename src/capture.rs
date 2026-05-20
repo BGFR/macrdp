@@ -101,6 +101,12 @@ pub struct CaptureDisplay {
     /// counter that drives the `--detach-primary` session-transition
     /// watcher. `None` disables the wrap entirely (zero overhead).
     pub session_tracker: Option<SessionTracker>,
+    /// EGFX/H.264 frame sink (macOS-only, opt-in via `--enable-h264`). When
+    /// `Some`, every captured SCK frame is submitted to the H.264 encoder; once
+    /// EGFX has negotiated, the legacy BitmapUpdate path is suppressed and the
+    /// display is served entirely over EGFX.
+    #[cfg(target_os = "macos")]
+    pub gfx: Option<crate::h264::Gfx>,
 }
 
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
@@ -148,6 +154,7 @@ impl RdpServerDisplay for CaptureDisplay {
                 self.fps,
                 self.display_id,
                 self.screen_size_pts,
+                self.gfx.clone(),
             )
             .await?,
         );
@@ -188,6 +195,8 @@ mod macos {
         // then keeps the actual bandwidth reasonable.
         force_full_frame: bool,
         cursor: CursorState,
+        /// EGFX/H.264 frame sink; `None` unless `--enable-h264`.
+        gfx: Option<crate::h264::Gfx>,
     }
 
     impl ScreenCaptureUpdates {
@@ -197,6 +206,7 @@ mod macos {
             fps: u32,
             target_display_id: Option<u32>,
             screen_size_pts: (f64, f64),
+            gfx: Option<crate::h264::Gfx>,
         ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
                 .await
@@ -283,6 +293,7 @@ mod macos {
                 seeded: false,
                 force_full_frame,
                 cursor,
+                gfx,
             })
         }
     }
@@ -368,6 +379,22 @@ mod macos {
                     u16::try_from(guard.height()).context("pixel buffer height > u16")?;
                 let stride_bytes = guard.bytes_per_row();
                 let src = guard.as_slice();
+
+                // EGFX/H.264 path: submit the full frame to the encoder. Once
+                // EGFX has negotiated (`Ok(true)`), it owns the display — skip
+                // the legacy BitmapUpdate emission entirely (cursor still flows
+                // via the poll at the top of the loop). Before negotiation, or
+                // for non-EGFX clients (`Ok(false)`), fall through to legacy.
+                if let Some(gfx) = self.gfx.as_ref() {
+                    match gfx.submit_bgra(src, stride_bytes) {
+                        Ok(true) => {
+                            self.seeded = true;
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!(error = ?e, "EGFX submit_bgra failed"),
+                    }
+                }
 
                 // Decide the rect set to emit. On the first frame we always
                 // send the full frame so the client's bitmap cache is seeded.

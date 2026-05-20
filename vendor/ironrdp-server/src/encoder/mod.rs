@@ -1,16 +1,18 @@
 use core::fmt;
 use core::num::NonZeroU16;
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use ironrdp_acceptor::DesktopSize;
-use ironrdp_graphics::diff::{find_different_rects_sub, Rect};
+use ironrdp_graphics::diff::{Rect, find_different_rects_sub};
 use ironrdp_pdu::encode_vec;
 use ironrdp_pdu::fast_path::UpdateCode;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
-use ironrdp_pdu::pointer::{ColorPointerAttribute, Point16, PointerAttribute, PointerPositionAttribute};
+use ironrdp_pdu::pointer::{
+    CachedPointerAttribute, ColorPointerAttribute, Point16, PointerAttribute, PointerPositionAttribute,
+};
 use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits};
 use ironrdp_pdu::surface_commands::{ExtendedBitmapDataPdu, SurfaceBitsPdu, SurfaceCommand};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use self::bitmap::BitmapEncoder;
 use self::rfx::RfxEncoder;
@@ -20,7 +22,6 @@ use crate::{ColorPointer, DisplayUpdate, Framebuffer, RGBAPointer};
 
 mod bitmap;
 mod fast_path;
-mod nscodec;
 pub(crate) mod rfx;
 
 pub(crate) use fast_path::*;
@@ -46,7 +47,6 @@ impl CodecId {
 #[derive(Debug)]
 pub(crate) struct UpdateEncoderCodecs {
     remotefx: Option<(EntropyBits, u8)>,
-    nscodec: Option<u8>,
     #[cfg(feature = "qoi")]
     qoi: Option<u8>,
     #[cfg(feature = "qoiz")]
@@ -58,7 +58,6 @@ impl UpdateEncoderCodecs {
     pub(crate) fn new() -> Self {
         Self {
             remotefx: None,
-            nscodec: None,
             #[cfg(feature = "qoi")]
             qoi: None,
             #[cfg(feature = "qoiz")]
@@ -69,11 +68,6 @@ impl UpdateEncoderCodecs {
     #[cfg_attr(feature = "__bench", visibility::make(pub))]
     pub(crate) fn set_remotefx(&mut self, remotefx: Option<(EntropyBits, u8)>) {
         self.remotefx = remotefx
-    }
-
-    #[cfg_attr(feature = "__bench", visibility::make(pub))]
-    pub(crate) fn set_nscodec(&mut self, nscodec: Option<u8>) {
-        self.nscodec = nscodec
     }
 
     #[cfg(feature = "qoi")]
@@ -100,6 +94,10 @@ pub(crate) struct UpdateEncoder {
     desktop_size: DesktopSize,
     framebuffer: Option<Framebuffer>,
     bitmap_updater: Option<BitmapUpdater>,
+    /// Negotiated MultifragmentUpdate reassembly buffer size. Used to split
+    /// oversized bitmaps into strips that fit within the limit when sent as
+    /// uncompressed surface commands.
+    max_request_size: usize,
 }
 
 impl fmt::Debug for UpdateEncoder {
@@ -112,56 +110,35 @@ impl fmt::Debug for UpdateEncoder {
 
 impl UpdateEncoder {
     #[cfg_attr(feature = "__bench", visibility::make(pub))]
-    pub(crate) fn new(desktop_size: DesktopSize, surface_flags: CmdFlags, codecs: UpdateEncoderCodecs) -> Result<Self> {
+    pub(crate) fn new(
+        desktop_size: DesktopSize,
+        surface_flags: CmdFlags,
+        codecs: UpdateEncoderCodecs,
+        max_request_size: u32,
+    ) -> Result<Self> {
         let bitmap_updater = if surface_flags.contains(CmdFlags::SET_SURFACE_BITS) {
-            let mut bitmap = BitmapUpdater::None(NoneHandler);
-
-            // NSCodec is the lowest-priority real codec — clients that ALSO
-            // speak RemoteFx/QOI/QOIZ get the better codec via the overrides
-            // below. Microsoft Remote Desktop on macOS only speaks NSCodec,
-            // so this is the only path it can land on (apart from legacy
-            // bitmap when SurfaceCommands aren't supported).
-            if let Some(id) = codecs.nscodec {
-                bitmap = BitmapUpdater::NsCodec(NsCodecHandler::new(id));
+            match codecs {
+                #[cfg(feature = "qoiz")]
+                UpdateEncoderCodecs { qoiz: Some(id), .. } => {
+                    BitmapUpdater::Qoiz(QoizHandler::new(id).context("failed to initialize qoiz handler")?)
+                }
+                #[cfg(feature = "qoi")]
+                UpdateEncoderCodecs { qoi: Some(id), .. } => BitmapUpdater::Qoi(QoiHandler::new(id)),
+                UpdateEncoderCodecs {
+                    remotefx: Some((algo, id)),
+                    ..
+                } => BitmapUpdater::RemoteFx(RemoteFxHandler::new(algo, id, desktop_size)),
+                _ => BitmapUpdater::None(NoneHandler),
             }
-
-            if let Some((algo, id)) = codecs.remotefx {
-                bitmap = BitmapUpdater::RemoteFx(RemoteFxHandler::new(algo, id, desktop_size));
-            }
-
-            #[cfg(feature = "qoi")]
-            if let Some(id) = codecs.qoi {
-                bitmap = BitmapUpdater::Qoi(QoiHandler::new(id));
-            }
-            #[cfg(feature = "qoiz")]
-            if let Some(id) = codecs.qoiz {
-                bitmap = BitmapUpdater::Qoiz(QoizHandler::new(id).context("failed to initialize qoiz handler")?);
-            }
-
-            bitmap
         } else {
             BitmapUpdater::Bitmap(BitmapHandler::new())
         };
-
-        info!(
-            codec = match &bitmap_updater {
-                BitmapUpdater::None(_) => "none (raw surface bits)",
-                BitmapUpdater::Bitmap(_) => "legacy bitmap (no SurfaceCommands)",
-                BitmapUpdater::RemoteFx(_) => "RemoteFx",
-                BitmapUpdater::NsCodec(_) => "NSCodec",
-                #[cfg(feature = "qoi")]
-                BitmapUpdater::Qoi(_) => "QOI",
-                #[cfg(feature = "qoiz")]
-                BitmapUpdater::Qoiz(_) => "QOIZ",
-            },
-            surface_bits = surface_flags.contains(CmdFlags::SET_SURFACE_BITS),
-            "video encoder negotiated"
-        );
 
         Ok(Self {
             desktop_size,
             framebuffer: None,
             bitmap_updater: Some(bitmap_updater),
+            max_request_size: usize::try_from(max_request_size).context("max_request_size")?,
         })
     }
 
@@ -189,7 +166,7 @@ impl UpdateEncoder {
             y: ptr.hot_y,
         };
         let color_pointer = ColorPointerAttribute {
-            cache_index: 0,
+            cache_index: ptr.cache_index,
             hot_spot,
             width: ptr.width,
             height: ptr.height,
@@ -209,7 +186,7 @@ impl UpdateEncoder {
             y: ptr.hot_y,
         };
         let ptr = ColorPointerAttribute {
-            cache_index: 0,
+            cache_index: ptr.cache_index,
             hot_spot,
             width: ptr.width,
             height: ptr.height,
@@ -217,6 +194,11 @@ impl UpdateEncoder {
             and_mask: &ptr.and_mask,
         };
         Ok(UpdateFragmenter::new(UpdateCode::ColorPointer, encode_vec(&ptr)?))
+    }
+
+    fn cached_pointer(cache_index: u16) -> Result<UpdateFragmenter> {
+        let ptr = CachedPointerAttribute { cache_index };
+        Ok(UpdateFragmenter::new(UpdateCode::CachedPointer, encode_vec(&ptr)?))
     }
 
     fn default_pointer() -> Result<UpdateFragmenter> {
@@ -235,7 +217,7 @@ impl UpdateEncoder {
         // TODO: we may want to make it optional for servers that already provide damaged regions
         const USE_DIFFS: bool = true;
 
-        if let Some(Framebuffer {
+        let diffs = if let Some(Framebuffer {
             data,
             stride,
             width,
@@ -262,7 +244,51 @@ impl UpdateEncoder {
                 width: bitmap.width.get().into(),
                 height: bitmap.height.get().into(),
             }]
+        };
+
+        // Subdivide diff rects whose uncompressed size would exceed the
+        // MultifragmentUpdate reassembly buffer.
+        let mut tiled = Vec::with_capacity(diffs.len());
+        for rect in diffs {
+            if rect.width * rect.height * 4 <= self.max_request_size {
+                tiled.push(rect);
+            } else {
+                let rects = self.split_diff(rect);
+                tiled.extend(rects);
+            }
         }
+        tiled
+    }
+
+    /// Split a rect into tiles that fit within `max_request_size`.
+    /// Splits by height first, then by width within each horizontal strip.
+    fn split_diff(&self, rect: Rect) -> Vec<Rect> {
+        let mut rects = Vec::new();
+
+        let max_height = (self.max_request_size / (rect.width * 4)).max(1);
+        let mut y = rect.y;
+        let y_end = rect.y + rect.height;
+        while y < y_end {
+            let h = (y_end - y).min(max_height);
+            // Width splitting is unlikely in practice (would require
+            // max_request_size < ~256 KB), but ensures correctness.
+            let max_width = (self.max_request_size / (h * 4)).max(1);
+            let mut x = rect.x;
+            let x_end = rect.x + rect.width;
+            while x < x_end {
+                let w = (x_end - x).min(max_width);
+                rects.push(Rect {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                });
+                x += max_width;
+            }
+            y += max_height;
+        }
+
+        rects
     }
 
     fn bitmap_update_framebuffer(&mut self, bitmap: BitmapUpdate, diffs: &[Rect]) {
@@ -325,6 +351,15 @@ impl EncoderIter<'_> {
             let res = match state {
                 State::Start(update) => match update {
                     DisplayUpdate::Bitmap(bitmap) => {
+                        let ds = encoder.desktop_size;
+                        if bitmap.x + bitmap.width.get() > ds.width || bitmap.y + bitmap.height.get() > ds.height {
+                            debug!(
+                                "Dropping bitmap update that exceeds desktop size: \
+                                 bitmap ({}, {}) {}x{} vs desktop {}x{}",
+                                bitmap.x, bitmap.y, bitmap.width, bitmap.height, ds.width, ds.height,
+                            );
+                            continue;
+                        }
                         let diffs = encoder.bitmap_diffs(&bitmap);
                         self.state = State::BitmapDiffs { diffs, bitmap, pos: 0 };
                         continue;
@@ -334,6 +369,7 @@ impl EncoderIter<'_> {
                     DisplayUpdate::ColorPointer(ptr) => UpdateEncoder::color_pointer(ptr),
                     DisplayUpdate::HidePointer => UpdateEncoder::hide_pointer(),
                     DisplayUpdate::DefaultPointer => UpdateEncoder::default_pointer(),
+                    DisplayUpdate::CachedPointer(idx) => UpdateEncoder::cached_pointer(idx),
                     DisplayUpdate::Resize(_) => return None,
                 },
                 State::BitmapDiffs { diffs, bitmap, pos } => {
@@ -391,7 +427,6 @@ enum BitmapUpdater {
     None(NoneHandler),
     Bitmap(BitmapHandler),
     RemoteFx(RemoteFxHandler),
-    NsCodec(NsCodecHandler),
     #[cfg(feature = "qoi")]
     Qoi(QoiHandler),
     #[cfg(feature = "qoiz")]
@@ -404,7 +439,6 @@ impl BitmapUpdater {
             Self::None(up) => up.handle(bitmap),
             Self::Bitmap(up) => up.handle(bitmap),
             Self::RemoteFx(up) => up.handle(bitmap),
-            Self::NsCodec(up) => up.handle(bitmap),
             #[cfg(feature = "qoi")]
             Self::Qoi(up) => up.handle(bitmap),
             #[cfg(feature = "qoiz")]
@@ -521,32 +555,6 @@ impl BitmapUpdateHandler for RemoteFxHandler {
         };
 
         set_surface(bitmap, self.codec_id, &buffer[..len])
-    }
-}
-
-/// MS-RDPNSC encoder handler. The actual codec lives in
-/// `encoder/nscodec.rs`; this struct just plumbs encoded bytes through
-/// `set_surface` as a `SurfaceBitsPdu`.
-///
-/// Color-loss-level (CLL) **must match** what was advertised to the client in
-/// the `NsCodec` capability (currently 3, set in `src/main.rs::bitmap_codecs`).
-#[derive(Clone, Debug)]
-struct NsCodecHandler {
-    codec_id: u8,
-}
-
-const NSCODEC_COLOR_LOSS_LEVEL: u8 = 3;
-
-impl NsCodecHandler {
-    fn new(codec_id: u8) -> Self {
-        Self { codec_id }
-    }
-}
-
-impl BitmapUpdateHandler for NsCodecHandler {
-    fn handle(&mut self, bitmap: &BitmapUpdate) -> Result<UpdateFragmenter> {
-        let encoded = nscodec::encode(bitmap, NSCODEC_COLOR_LOSS_LEVEL);
-        set_surface(bitmap, self.codec_id, &encoded)
     }
 }
 

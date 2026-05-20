@@ -5,7 +5,10 @@ mod clipboard;
 mod cursor;
 #[cfg(target_os = "macos")]
 mod file_promise;
+#[cfg(target_os = "macos")]
+mod h264;
 mod input;
+mod videotoolbox;
 mod virtual_display;
 
 use std::fs;
@@ -227,6 +230,14 @@ struct Args {
     /// Only valid with --virtual-display.
     #[arg(long)]
     capture_primary: bool,
+
+    /// Serve the display as H.264 video over the EGFX virtual channel
+    /// (MS-RDPEGFX, AVC420) instead of legacy RemoteFx/QOI BitmapUpdates.
+    /// Hardware-encoded via VideoToolbox. Falls back to the legacy path
+    /// automatically for clients that don't negotiate EGFX. Experimental;
+    /// macOS-only.
+    #[arg(long)]
+    enable_h264: bool,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -793,6 +804,14 @@ async fn main() -> Result<()> {
         (w, h, None, size)
     };
 
+    // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
+    // clone drives the builder's GfxServerFactory (protocol side); another
+    // rides on CaptureDisplay, where the capture loop feeds it BGRA frames.
+    #[cfg(target_os = "macos")]
+    let gfx = args
+        .enable_h264
+        .then(|| h264::Gfx::new(width, height, args.fps, h264::DEFAULT_BITRATE_BPS));
+
     let display = CaptureDisplay {
         width,
         height,
@@ -803,6 +822,8 @@ async fn main() -> Result<()> {
         // a useless atomic increment/decrement per session otherwise.
         session_tracker: (args.detach_primary || args.capture_primary)
             .then(|| session_tracker.clone()),
+        #[cfg(target_os = "macos")]
+        gfx: gfx.clone(),
     };
 
     let input_handler = MacInputHandler::new(width, height, capture_display_id)?;
@@ -813,6 +834,12 @@ async fn main() -> Result<()> {
     // with_hybrid advertises HYBRID | HYBRID_EX so clients run CredSSP/NLA
     // over TLS. ironrdp_acceptor's accept_credssp reads our set_credentials
     // and validates the client's NTLM response against it.
+    #[cfg(target_os = "macos")]
+    let gfx_factory: Option<Box<dyn ironrdp_server::GfxServerFactory>> =
+        gfx.map(|g| Box::new(g) as Box<dyn ironrdp_server::GfxServerFactory>);
+    #[cfg(not(target_os = "macos"))]
+    let gfx_factory: Option<Box<dyn ironrdp_server::GfxServerFactory>> = None;
+
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
         .with_hybrid(tls, spki_der)
@@ -821,6 +848,7 @@ async fn main() -> Result<()> {
         .with_cliprdr_factory(Some(cliprdr))
         .with_sound_factory(Some(sound))
         .with_bitmap_codecs(bitmap_codecs())
+        .with_gfx_factory(gfx_factory)
         .build();
 
     // ironrdp_server::Credentials holds a plain String, so this copy is

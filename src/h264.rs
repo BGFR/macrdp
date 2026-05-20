@@ -1,0 +1,603 @@
+//! H.264 / EGFX video pipeline (app side).
+//!
+//! Rewritten from scratch after `h264-attempt-1` (which negotiated EGFX but
+//! never rendered correctly). The salvaged VideoToolbox encoder lives in
+//! `src/videotoolbox.rs`; this module bridges it to upstream's
+//! `GraphicsPipelineServer` via the vendored `GfxServerFactory` hooks.
+//!
+//! Flow per captured frame, all on the capture thread (no spawned tasks):
+//!   1. `capture.rs` calls `submit_bgra(bgra, stride)` once per SCK frame.
+//!   2. First call lazily creates the EGFX surface + VT encoder (we must NOT
+//!      do this in `on_ready`, which runs while the server mutex is held).
+//!   3. `Encoder::encode_bgra` submits to VideoToolbox; output is async.
+//!   4. `Encoder::drain()` (NON-blocking — no per-frame `flush()`, which was
+//!      attempt-1's ~8 fps cap) collects whatever NALs VT has finished.
+//!   5. Ready frames are framed (see `WireFormat`) and handed to
+//!      `GraphicsPipelineServer::send_avc420_frame`, which queues
+//!      StartFrame / WireToSurface1 / EndFrame.
+//!   6. `drain_output()` collects those as `DvcMessage`s, wrapped through
+//!      DRDYNVC and shipped via `ServerEvent::Egfx(SendMessages)`.
+//!
+//! ## The bitstream-format question (see memory: avc420-bitstream-format-trap)
+//!
+//! VideoToolbox emits **AVCC** (4-byte big-endian length-prefixed NALs), with
+//! SPS/PPS out-of-band. The AVC420 wire payload can be either AVCC
+//! (length-prefixed) or Annex-B (start codes). ironrdp's own decoder expects
+//! length-prefixed, but **Microsoft's mstsc decoder requires Annex-B** — this
+//! was settled empirically 2026-05-20: mstsc renders with Annex-B, but with
+//! length-prefixed it never sends a single frame-ack and the surface stays
+//! blank. So we DEFAULT to Annex-B and keep length-prefixed one env var away
+//! (`MACRDP_H264_LENGTH_PREFIXED=1`) for ironrdp-decoder interop testing.
+
+#![cfg(target_os = "macos")]
+
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use anyhow::{anyhow, Result};
+use ironrdp_dvc::encode_dvc_messages;
+use ironrdp_egfx::pdu::{
+    Avc420Region, CapabilitiesAdvertisePdu, CapabilitiesV103Flags, CapabilitiesV104Flags,
+    CapabilitiesV107Flags, CapabilitiesV10Flags, CapabilitiesV81Flags, CapabilitySet, PixelFormat,
+};
+use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer};
+use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
+use ironrdp_server::{
+    EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
+    ServerEventSender,
+};
+use ironrdp_svc::ChannelFlags;
+use tokio::sync::mpsc;
+use tracing::{debug, info, trace, warn};
+
+use crate::videotoolbox::{EncodedFrame, Encoder};
+
+/// Default target bitrate. Deliberately generous for first-light tests on
+/// loopback; tuned down in M3.
+pub const DEFAULT_BITRATE_BPS: u32 = 12_000_000;
+
+/// How the H.264 NAL units are framed inside the AVC420 wire payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireFormat {
+    /// 4-byte big-endian length prefix per NAL (VideoToolbox's native AVCC).
+    /// ironrdp's decoder documents this as the expected format.
+    LengthPrefixed,
+    /// `00 00 00 01` start codes (historical Windows/FreeRDP convention).
+    AnnexB,
+}
+
+impl WireFormat {
+    /// Annex-B is the verified-correct framing for Microsoft's decoder
+    /// (mstsc renders the desktop with it; length-prefixed AVCC gets ZERO
+    /// frame-acks and a blank surface — confirmed empirically 2026-05-20).
+    /// Default to Annex-B; keep length-prefixed one env var away
+    /// (`MACRDP_H264_LENGTH_PREFIXED=1`) for ironrdp-decoder interop testing.
+    /// The legacy `MACRDP_H264_ANNEXB=1` is still accepted (now a no-op since
+    /// Annex-B is the default).
+    fn from_env() -> Self {
+        match std::env::var("MACRDP_H264_LENGTH_PREFIXED") {
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Self::LengthPrefixed,
+            _ => Self::AnnexB,
+        }
+    }
+}
+
+/// Per-connection state, shared between the `Gfx` factory/handle (capture
+/// side) and the `GfxHandler` callbacks (protocol side) via `Arc<Mutex<>>`.
+struct ConnectionContext {
+    server_handle: GfxServerHandle,
+    encoder: Option<Encoder>,
+    surface_id: Option<u16>,
+    is_ready: bool,
+    epoch: Instant,
+    /// True once the next shipped frame must be a forced keyframe (IDR):
+    /// before the first frame, and after any backpressure-induced skip, so
+    /// the client never applies P-frame deltas against frames it never got.
+    need_keyframe: bool,
+    /// Whether the client's advertised EGFX caps indicate AVC420 (H.264)
+    /// decode support. Set in `capabilities_advertise`, read in `on_ready`:
+    /// if false we leave `is_ready` false so `submit_bgra` returns `Ok(false)`
+    /// and capture.rs falls back to legacy BitmapUpdate, instead of shipping
+    /// AVC420 to a client that can't decode it (which it rejects with
+    /// ERROR_NOT_SUPPORTED and a dead graphics channel).
+    client_supports_avc: bool,
+}
+
+/// Cloneable factory + frame-submit handle. One clone is boxed into
+/// `RdpServer::builder().with_gfx_factory(...)`; another lives on the capture
+/// side as the `submit_bgra` entry point.
+#[derive(Clone)]
+pub struct Gfx {
+    sender: Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>,
+    ctx: Arc<Mutex<Option<ConnectionContext>>>,
+    width: u16,
+    height: u16,
+    fps: u32,
+    bitrate_bps: u32,
+    wire_format: WireFormat,
+    /// Monotonic EGFX surface-id source. Each connection claims the next value
+    /// and creates its surface at that never-before-seen id, so mstsc — which
+    /// retains surfaces by id for its whole process lifetime and no-ops a
+    /// CreateSurface for an id it already holds — always paints (the
+    /// reconnect-blank cause). Seeded from / written through to a temp file so
+    /// the counter keeps climbing across macrdp restarts instead of resetting
+    /// into mstsc's already-cached id range. See [[h264-reconnect-blank]].
+    surface_seq: Arc<AtomicU16>,
+}
+
+/// Temp-file path holding the next EGFX surface id, so the monotonic counter
+/// survives macrdp restarts (mstsc keeps its surface cache across them).
+fn surface_seq_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("macrdp-egfx-next-surface-id")
+}
+
+/// First-run surface-id base (when the temp file is absent): the low 16 bits of
+/// the wall-clock seconds. Starts the counter well above the small ids any
+/// prior build/session is likely to have left in mstsc's surface cache, and
+/// differs across restarts on its own even before the temp file is written.
+fn initial_surface_seq() -> u16 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u16)
+        .unwrap_or(0)
+}
+
+impl Gfx {
+    pub fn new(width: u16, height: u16, fps: u32, bitrate_bps: u32) -> Self {
+        let wire_format = WireFormat::from_env();
+        info!(
+            ?wire_format,
+            width, height, fps, "EGFX/H.264 pipeline configured"
+        );
+        Self {
+            sender: Arc::new(Mutex::new(None)),
+            ctx: Arc::new(Mutex::new(None)),
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            wire_format,
+            // Resume the surface-id counter from the temp file (or a wall-clock
+            // seed on first run) so a macrdp restart against a still-open mstsc
+            // keeps using fresh, never-cached ids.
+            surface_seq: Arc::new(AtomicU16::new(
+                std::fs::read_to_string(surface_seq_path())
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u16>().ok())
+                    .unwrap_or_else(initial_surface_seq),
+            )),
+        }
+    }
+
+    /// Feed one full-frame BGRA buffer. Never blocks on the encoder.
+    ///
+    /// Returns `Ok(true)` when EGFX is the active display path (so the caller
+    /// should suppress legacy BitmapUpdates for this frame — even if this
+    /// particular frame was skipped for backpressure or isn't encoded yet).
+    /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
+    /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
+    pub fn submit_bgra(&self, bgra: &[u8], stride: usize) -> Result<bool> {
+        // Decide whether to encode this frame, and whether it must be a
+        // keyframe. Scoped lock so we don't hold `ctx` across the encode.
+        let force_keyframe = {
+            let mut guard = self.ctx.lock().unwrap();
+            let Some(ctx) = guard.as_mut() else {
+                return Ok(false); // no active connection
+            };
+            if !ctx.is_ready {
+                return Ok(false); // channel not negotiated yet (or non-EGFX client)
+            }
+            // Lazy one-time setup on the first ready frame.
+            if ctx.surface_id.is_none() || ctx.encoder.is_none() {
+                self.setup_locked(ctx)?;
+            }
+            // Backpressure: if the client hasn't acked enough in-flight frames,
+            // skip this capture entirely (keeps VT state aligned with what the
+            // client actually holds) and arm a keyframe for when we resume.
+            if ctx.server_handle.lock().unwrap().should_backpressure() {
+                ctx.need_keyframe = true;
+                trace!("EGFX backpressured; skipping frame");
+                return Ok(true); // still the active path; just dropped this frame
+            }
+            std::mem::replace(&mut ctx.need_keyframe, false)
+        };
+
+        // Encode (async output) then non-blocking drain.
+        let frames = {
+            let mut guard = self.ctx.lock().unwrap();
+            let Some(ctx) = guard.as_mut() else {
+                return Ok(true);
+            };
+            let Some(encoder) = ctx.encoder.as_mut() else {
+                return Ok(true);
+            };
+            encoder.encode_bgra(bgra, stride, force_keyframe)?;
+            encoder.drain()
+        };
+
+        if !frames.is_empty() {
+            self.ship_frames(&frames)?; // VT may not have finished earlier frames yet
+        }
+        Ok(true)
+    }
+
+    /// One-time per-connection surface + encoder setup. Caller holds `ctx`.
+    fn setup_locked(&self, ctx: &mut ConnectionContext) -> Result<()> {
+        if ctx.surface_id.is_none() {
+            let mut server = ctx.server_handle.lock().unwrap();
+            server.set_output_dimensions(self.width, self.height);
+            // Emit RESET_GRAPHICS with an explicit single-monitor layout
+            // covering the full desktop, BEFORE create_surface. The auto-reset
+            // path inside create_surface sends an EMPTY monitor array; mstsc
+            // tolerates that on the first GFX session (it falls back to the
+            // demand-active desktop region) but NOT on reconnect — with no
+            // monitor defining the graphics output region, a correctly decoded
+            // + acked surface has nowhere to composite and the screen stays
+            // blank. resize_with_monitors sets reset_graphics_sent=true so the
+            // empty-monitor reset never fires. (reconnect-blank fix 2026-05-20.)
+            let monitor = Monitor {
+                left: 0,
+                top: 0,
+                right: i32::from(self.width).saturating_sub(1),
+                bottom: i32::from(self.height).saturating_sub(1),
+                flags: MonitorFlags::PRIMARY,
+            };
+            server.resize_with_monitors(self.width, self.height, vec![monitor]);
+            // Claim a fresh, never-before-seen surface id for this session and
+            // create the surface at it (no DeleteSurface — deleting an id the
+            // client doesn't hold breaks the GFX channel on mstsc). Because the
+            // id is new, mstsc can't no-op the CreateSurface against a retained
+            // copy, so it always paints. The counter is persisted across
+            // restarts (see `surface_seq`). (CONFIRMED reconnect-blank fix
+            // 2026-05-20 — see vendor/ironrdp-egfx::create_surface_with_id.)
+            let sid = self.surface_seq.fetch_add(1, Ordering::Relaxed);
+            let _ = std::fs::write(surface_seq_path(), sid.wrapping_add(1).to_string());
+            if !server.create_surface_with_id(sid, self.width, self.height, PixelFormat::XRgb) {
+                return Err(anyhow!("EGFX: create_surface_with_id failed (not ready?)"));
+            }
+            if !server.map_surface_to_output(sid, 0, 0) {
+                return Err(anyhow!("EGFX: map_surface_to_output failed"));
+            }
+            ctx.surface_id = Some(sid);
+            info!(
+                surface_id = sid,
+                w = self.width,
+                h = self.height,
+                "EGFX surface created + mapped"
+            );
+        }
+        if ctx.encoder.is_none() {
+            // Pass actual dims; VideoToolbox pads to 16-px macroblocks
+            // internally and encodes the crop in the SPS, so the client
+            // decodes back to actual dims.
+            ctx.encoder = Some(Encoder::new(
+                self.width,
+                self.height,
+                self.fps,
+                self.bitrate_bps,
+            )?);
+            info!("EGFX VideoToolbox encoder initialized");
+        }
+        Ok(())
+    }
+
+    fn ship_frames(&self, frames: &[EncodedFrame]) -> Result<()> {
+        let (dvc_messages, egfx_channel_id) = {
+            let mut guard = self.ctx.lock().unwrap();
+            let ctx = guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("EGFX: ctx vanished mid-submit"))?;
+            let surface_id = ctx
+                .surface_id
+                .ok_or_else(|| anyhow!("EGFX: no surface_id"))?;
+            let epoch = ctx.epoch;
+            let mut server = ctx.server_handle.lock().unwrap();
+            let egfx_channel_id = server
+                .channel_id()
+                .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
+
+            for f in frames {
+                // Region = full actual frame, inclusive bounds. QP 22 /
+                // quality 100 are first-light defaults; tuned in M3. Rebuilt
+                // per frame because `Avc420Region` isn't `Copy`.
+                let region = Avc420Region {
+                    left: 0,
+                    top: 0,
+                    right: self.width.saturating_sub(1),
+                    bottom: self.height.saturating_sub(1),
+                    quantization_parameter: 22,
+                    quality: 100,
+                };
+                let payload = self.frame_payload(f);
+                let ts_ms =
+                    u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
+                // Diagnostic for the reconnect-blank investigation: keyframes
+                // are rare (session start + backpressure resume), so log each
+                // at INFO. A correct (re)connect must emit an IDR with SPS/PPS
+                // as the FIRST frame of the session; if the first shipped frame
+                // after "EGFX surface created" is a P-frame (keyframe=false /
+                // param_sets=0), the new client has no reference to paint and
+                // the surface stays blank.
+                let ps_count = f.parameter_sets.len();
+                let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
+                match server.send_avc420_frame(surface_id, &payload, &[region], ts_ms) {
+                    Some(frame_id) if f.is_keyframe => debug!(
+                        frame_id,
+                        ?self.wire_format,
+                        param_sets = ps_count,
+                        param_bytes = ps_bytes,
+                        payload_bytes = payload.len(),
+                        "EGFX shipped keyframe (IDR)"
+                    ),
+                    Some(frame_id) => trace!(
+                        frame_id,
+                        keyframe = false,
+                        payload_bytes = payload.len(),
+                        "EGFX shipped frame"
+                    ),
+                    None => debug!(
+                        keyframe = f.is_keyframe,
+                        param_sets = ps_count,
+                        bytes = payload.len(),
+                        "send_avc420_frame returned None"
+                    ),
+                }
+            }
+            (server.drain_output(), egfx_channel_id)
+        };
+
+        if dvc_messages.is_empty() {
+            return Ok(());
+        }
+        // DRDYNVC framing, addressed to the EGFX dynamic channel. SHOW_PROTOCOL
+        // matches what upstream's Echo handler uses for DRDYNVC-wrapped data.
+        let svc_messages =
+            encode_dvc_messages(egfx_channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))?;
+        let sender = self
+            .sender
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
+        sender
+            .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                messages: svc_messages,
+            }))
+            .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
+        Ok(())
+    }
+
+    /// Frame the encoded NALs for the wire per the selected `WireFormat`,
+    /// prepending SPS/PPS (from VT's format description) on keyframes.
+    fn frame_payload(&self, f: &EncodedFrame) -> Vec<u8> {
+        match self.wire_format {
+            // VT data is already AVCC (length-prefixed); just prepend the
+            // parameter sets as length-prefixed NALs on keyframes.
+            WireFormat::LengthPrefixed => {
+                if !f.is_keyframe || f.parameter_sets.is_empty() {
+                    return f.data.clone();
+                }
+                let mut out = Vec::with_capacity(f.data.len() + 64);
+                for ps in &f.parameter_sets {
+                    out.extend_from_slice(&(ps.len() as u32).to_be_bytes());
+                    out.extend_from_slice(ps);
+                }
+                out.extend_from_slice(&f.data);
+                out
+            }
+            WireFormat::AnnexB => avcc_to_annex_b(&f.data, &f.parameter_sets, f.is_keyframe),
+        }
+    }
+}
+
+impl core::fmt::Debug for Gfx {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Gfx")
+            .field("w", &self.width)
+            .field("h", &self.height)
+            .field("fps", &self.fps)
+            .field("bitrate", &self.bitrate_bps)
+            .field("wire_format", &self.wire_format)
+            .finish()
+    }
+}
+
+impl ServerEventSender for Gfx {
+    fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
+        *self.sender.lock().unwrap() = Some(sender);
+    }
+}
+
+impl GfxServerFactory for Gfx {
+    fn build_gfx_handler(&self) -> Box<dyn GraphicsPipelineHandler> {
+        // We override build_server_with_handle, so this is only a safety stub.
+        Box::new(StubHandler)
+    }
+
+    fn build_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
+        let handler = Box::new(GfxHandler {
+            ctx: self.ctx.clone(),
+        });
+        let server = GraphicsPipelineServer::new(handler);
+        let handle: GfxServerHandle = Arc::new(Mutex::new(server));
+        *self.ctx.lock().unwrap() = Some(ConnectionContext {
+            server_handle: handle.clone(),
+            encoder: None,
+            surface_id: None,
+            is_ready: false,
+            epoch: Instant::now(),
+            need_keyframe: true,
+            client_supports_avc: false,
+        });
+        Some((GfxDvcBridge::new(handle.clone()), handle))
+    }
+}
+
+/// Whether the client's advertised EGFX capabilities indicate AVC420 (H.264)
+/// decode support.
+///
+/// Returns true only on a POSITIVE signal: V8.1 with `AVC420_ENABLED`, or a
+/// V10+ capset whose flags lack `AVC_DISABLED`. Bare `V8` / `V10_1` carry no AVC
+/// flag and are treated as no-signal (a decoder-less client advertises both of
+/// those plus `AVC_DISABLED` on every flagged V10 capset, so it yields false and
+/// we fall back to legacy). Verified against three real clients: decoder-less
+/// FreeRDP → false; mstsc (V10 without AVC_DISABLED) → true; FreeRDP-with-H.264
+/// (V8.1 + AVC420_ENABLED) → true.
+fn caps_indicate_avc(caps: &[CapabilitySet]) -> bool {
+    caps.iter().any(|c| match c {
+        CapabilitySet::V8_1 { flags } => flags.contains(CapabilitiesV81Flags::AVC420_ENABLED),
+        CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => {
+            !flags.contains(CapabilitiesV10Flags::AVC_DISABLED)
+        }
+        CapabilitySet::V10_3 { flags } => !flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
+        CapabilitySet::V10_4 { flags }
+        | CapabilitySet::V10_5 { flags }
+        | CapabilitySet::V10_6 { flags }
+        | CapabilitySet::V10_6Err { flags } => !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
+        CapabilitySet::V10_7 { flags } => !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+        CapabilitySet::V8 { .. } | CapabilitySet::V10_1 => false,
+        // Bare V8 / V10_1 / anything unrecognized: no positive AVC signal.
+        _ => false,
+    })
+}
+
+/// Per-connection EGFX state callbacks from upstream `GraphicsPipelineServer`.
+/// MUST NOT lock `server_handle` from these — the server mutex is already held.
+struct GfxHandler {
+    ctx: Arc<Mutex<Option<ConnectionContext>>>,
+}
+
+impl GraphicsPipelineHandler for GfxHandler {
+    fn capabilities_advertise(&mut self, pdu: &CapabilitiesAdvertisePdu) {
+        let supports_avc = caps_indicate_avc(&pdu.0);
+        info!(
+            count = pdu.0.len(),
+            supports_avc,
+            caps = ?pdu.0,
+            "EGFX: client advertised capabilities"
+        );
+        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+            ctx.client_supports_avc = supports_avc;
+        }
+    }
+
+    fn on_ready(&mut self, negotiated: &CapabilitySet) {
+        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+            // Only drive the H.264 path if the client advertised AVC420 decode
+            // support. Otherwise leave is_ready false → submit_bgra returns
+            // Ok(false) → capture.rs uses legacy BitmapUpdate. Shipping AVC420
+            // to a non-AVC client gets it rejected (ERROR_NOT_SUPPORTED) and
+            // kills the graphics channel.
+            if ctx.client_supports_avc {
+                ctx.is_ready = true;
+                ctx.need_keyframe = true;
+                info!(?negotiated, "EGFX channel ready (H.264 active)");
+            } else {
+                ctx.is_ready = false;
+                warn!(
+                    ?negotiated,
+                    "EGFX client advertised no AVC420 support — falling back to legacy BitmapUpdate"
+                );
+            }
+        }
+    }
+
+    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32) {
+        trace!(frame_id, queue_depth, "EGFX frame ack");
+    }
+
+    fn on_close(&mut self) {
+        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+            ctx.is_ready = false;
+            ctx.encoder = None;
+            ctx.surface_id = None;
+            ctx.need_keyframe = true;
+        }
+    }
+}
+
+/// Fallback handler for the default `build_gfx_handler` path, which our
+/// `build_server_with_handle` override means we never actually hit.
+struct StubHandler;
+
+impl GraphicsPipelineHandler for StubHandler {
+    fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {}
+    fn on_ready(&mut self, _negotiated: &CapabilitySet) {
+        warn!("EGFX StubHandler::on_ready — build_server_with_handle should have replaced this");
+    }
+}
+
+/// Rewrite AVCC (4-byte length-prefixed NALs) to Annex-B (`00 00 00 01` start
+/// codes), prepending SPS/PPS on keyframes. Only used when `MACRDP_H264_ANNEXB`
+/// selects Annex-B framing.
+fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -> Vec<u8> {
+    const START_CODE: [u8; 4] = [0, 0, 0, 1];
+    let mut out = Vec::with_capacity(avcc.len() + 64);
+
+    if is_keyframe {
+        for ps in parameter_sets {
+            out.extend_from_slice(&START_CODE);
+            out.extend_from_slice(ps);
+        }
+    }
+
+    let mut i = 0;
+    while i + 4 <= avcc.len() {
+        let nal_len = u32::from_be_bytes([avcc[i], avcc[i + 1], avcc[i + 2], avcc[i + 3]]) as usize;
+        i += 4;
+        if i + nal_len > avcc.len() {
+            warn!(
+                avcc_len = avcc.len(),
+                offset = i,
+                nal_len,
+                "AVCC NAL length overflows buffer; truncating"
+            );
+            break;
+        }
+        out.extend_from_slice(&START_CODE);
+        out.extend_from_slice(&avcc[i..i + nal_len]);
+        i += nal_len;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avcc_to_annex_b_rewrites_length_prefixes() {
+        let mut avcc = Vec::new();
+        avcc.extend_from_slice(&3u32.to_be_bytes());
+        avcc.extend_from_slice(&[0xAA, 0xAA, 0xAA]);
+        avcc.extend_from_slice(&5u32.to_be_bytes());
+        avcc.extend_from_slice(&[0xBB, 0xBB, 0xBB, 0xBB, 0xBB]);
+        let out = avcc_to_annex_b(&avcc, &[], false);
+        let expected: Vec<u8> = [
+            0, 0, 0, 1, 0xAA, 0xAA, 0xAA, 0, 0, 0, 1, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,
+        ]
+        .into();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn avcc_to_annex_b_prepends_parameter_sets_on_keyframe() {
+        let sps = vec![0x67, 0x42, 0x00];
+        let pps = vec![0x68, 0xCE, 0x06];
+        let avcc = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&2u32.to_be_bytes());
+            v.extend_from_slice(&[0x65, 0x88]);
+            v
+        };
+        let out = avcc_to_annex_b(&avcc, &[sps.clone(), pps.clone()], true);
+        assert_eq!(&out[0..4], &[0, 0, 0, 1]);
+        assert_eq!(&out[4..7], sps.as_slice());
+        assert_eq!(&out[7..11], &[0, 0, 0, 1]);
+        assert_eq!(&out[11..14], pps.as_slice());
+        assert_eq!(&out[14..18], &[0, 0, 0, 1]);
+        assert_eq!(&out[18..20], &[0x65, 0x88]);
+    }
+}

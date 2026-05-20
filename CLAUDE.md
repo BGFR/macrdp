@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
 - Connect over TLS to the Mac on port 3390 with a local Mac username/password.
 - See the primary display at native resolution with incremental damage-region updates.
+- Optionally stream the display as **H.264 over EGFX** (`--enable-h264`, AVC420, Annex-B framing, VideoToolbox-encoded) — far less bandwidth than legacy bitmaps. Verified rendering on mstsc and on FreeRDP built with H.264 decode. Clients that don't advertise AVC420 decode (decoder-less FreeRDP, Microsoft Remote Desktop on macOS) fall back to legacy BitmapUpdate automatically. **Caveat:** reconnecting *mstsc* to a still-running macrdp can show a blank screen (mstsc-specific EGFX surface-handling quirk — confirmed not a server bug, since FreeRDP reconnects cleanly); workaround is to restart macrdp or fully reopen the mstsc window. See the H.264 quirk note below.
 - Drive keyboard and mouse, including modifier keys (per-side L/R tracking with NX_DEVICE bits, Caps Lock as a toggle, MS-RDPBCGR Synchronize lock-state reconciliation), mouse buttons, and wheel.
 - Forward macOS symbolic hotkeys that WindowServer's dispatcher refuses to fire for user-space CGEventPost: Cmd+Tab / Cmd+Shift+Tab cycle apps via Accessibility API (per-bundle dedup with MRU, dead-pid filtering via `kill(pid, 0)`), Cmd+\` / Cmd+Shift+\` cycle windows of the current app (AXRaise + window AXMain + app AXMainWindow for Electron compatibility), Cmd+Space invokes Spotlight via AppleScript, Cmd+Shift+3/4/5 shell out to `/usr/sbin/screencapture` or open Screenshot.app.
 - See the real macOS cursor shape (I-beam, hand, etc.) overlaid by the client.
@@ -59,6 +60,15 @@ src/virtual_display/    Opt-in headless display via undocumented
                         private_api.rs (the maintenance boundary —
                         when Apple changes the API in a future macOS,
                         update only that file).
+src/h264.rs       EGFX/H.264 video pipeline (opt-in via --enable-h264).
+                  Bridges the VideoToolbox encoder (src/videotoolbox.rs) to
+                  upstream's GraphicsPipelineServer: per SCK frame, encode →
+                  non-blocking drain → AVC420 (Annex-B framing) → DRDYNVC →
+                  ServerEvent::Egfx. Each connection uses a fresh, monotonic,
+                  temp-file-persisted surface id (no DeleteSurface — see the
+                  H.264 quirk note below). Falls back to legacy BitmapUpdate
+                  for clients that don't advertise AVC420 decode.
+src/videotoolbox.rs  VideoToolbox H.264 encoder (AVCC NALs + SPS/PPS).
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
 vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in
@@ -69,6 +79,13 @@ vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in
                           bakes any dispatch stall into a permanent audio
                           offset). Submitted upstream — delete this vendor
                           dir once it lands in a released version.
+
+vendor/ironrdp-egfx/      Local fork of ironrdp-egfx (same upstream rev as the
+                          git-pinned siblings), pulled in via [patch.crates-io].
+                          Adds GraphicsPipelineServer::create_surface_with_id so
+                          src/h264.rs can drive surface ids from an external
+                          monotonic counter (fresh id per session). Drop once
+                          upstreamed.
 ```
 
 Cross-cutting:
@@ -98,6 +115,7 @@ When adding a feature, locate it in one of those modules first; if it spans them
 - **Server-side scaling forces full-frame updates + fills the frame.** Passing `--width N --height M` when N×M ≠ the Mac's native size makes SCK scale internally, and SCK's default behaviour leaks both ways: dirty-rects come in *source* (native) coords (clients that strictly respect tile coordinates render a black canvas with only the cursor sprite — mstsc/RemoteFx is the worst offender) and aspect-mismatch causes pillarbox/letterbox padding (the captured Mac content sits in a sub-rectangle of the output, so client-predicted cursor sprite drifts proportionally from the click position as you move away from screen center). `capture.rs` works around both: detects size mismatch up front, skips dirty-rect emission (full BitmapUpdate every tick — the upstream encoder's framebuffer diff still keeps unchanged-region cost low when SCK returns exactly the configured size), and sets `scalesToFit=true` on the SCK config so source content stretches to fill the requested frame instead of getting padded. The cost at non-native sizes: higher bandwidth, plus non-uniform scaling on aspect mismatch (e.g., 16:10 MacBook panel into a 16:9 frame shows ~13.5% vertical compression). Prefer native if you can.
 - **No server PointerPosition forwarding (intentional).** mstsc and Microsoft Remote Desktop local-predict the cursor from the user's mouse input; any `PointerPositionAttribute` PDU we send arrives one encode-plus-network round-trip late and snaps the cursor back to a stale position on fast moves. The current design (`poll_shape` only, `poll_position` defined but unwired) is deliberately the right one for all interactive use. *Do not* simply wire `poll_position` up — that's the bug, not the fix. The only thing this design misses is Mac-side *programmatic* cursor moves (an app calling `CGWarpMouseCursorPosition`, rare); fixing that properly requires emitting position only when the Mac cursor diverges from where the last RDP mouse event left it and enough time has passed since that event, which needs shared state between `input.rs` and `cursor.rs`.
 - **Codec mismatch with Microsoft Remote Desktop on macOS.** That client only offers NSCodec; the server advertises RemoteFx/QOI. They fall back to legacy BitmapUpdate, which works but is bandwidth-heavy.
+- **H.264 wire format must be Annex-B, and mstsc retains EGFX surfaces.** Two hard-won facts behind `src/h264.rs` (`--enable-h264`): (1) the AVC420 payload must be **Annex-B** (start codes + in-band SPS/PPS) — Microsoft's decoder gives zero frame-acks for length-prefixed AVCC, so the default is Annex-B (`MACRDP_H264_LENGTH_PREFIXED=1` flips it for ironrdp-decoder interop). (2) **mstsc retains EGFX surfaces by id for its whole process lifetime** (across reconnects and even macrdp restarts) and no-ops a `CreateSurface` for an id it already holds → frames decode into a stale surface → black screen + live cursor on reconnect. We work around it by using a fresh, monotonic, temp-file-persisted surface id per session (so the id is never one mstsc cached). **Do NOT try to fix this with `DeleteSurface`** — deleting a surface mstsc doesn't currently hold (or one mapped to the output) breaks its GFX channel entirely (no acks, then disconnect). This was confirmed twice; the fresh-unique-id approach is the only safe lever. FreeRDP (with H.264) has none of these quirks — it renders and reconnects cleanly, which is how we proved the server output is spec-correct. The residual mstsc reconnect blank is therefore a documented client limitation, not a server bug.
 - **Cursor sprite shape is process-global on macOS, not per-display.** `NSCursor::currentSystemCursor()` reflects whatever the foreground application set in *this process*'s perspective, not "the cursor on display X." When `--virtual-display` is active, the RDP client sees the cursor shape that whatever app is foreground locally has set (typically the arrow), regardless of what an app on the virtual display might want. Probably fine in practice — the cursor *position* on the virtual display is correct because `input.rs` translates RDP coords by the vdisplay's origin in global space; only the visual shape is shared. Fixing this properly needs a per-display NSCursor query, which AppKit doesn't expose.
 - **mstsc gates Win-combos by full-screen by default.** mstsc → Local Resources → Keyboard → "Apply Windows key combinations" defaults to "Only when using the full screen", so a windowed mstsc session eats `Win+Tab` (the Cmd+Tab we want to forward) locally as Task View — macrdp never sees the press. The #1 false-positive when debugging "Cmd+Tab doesn't work" is the user being windowed. Set it to "On the remote computer" or go full-screen. `xfreerdp` is more permissive by default and a useful cross-check.
 - **Symbolic-hotkey dispatcher needs kernel HID; CGEventPost can't wake it.** WindowServer's internal Cmd+Tab / Cmd+Space / Cmd+Shift+3/4/5 / Mission Control dispatcher only fires on kernel-injected HID events. User-space CGEventPost cannot trigger it regardless of source state or tap location. A `src/virtual_hid.rs` module that registered a virtual USB-style HID keyboard via `IOHIDUserDeviceCreate` was tried for this and reverted — didn't unblock the dispatcher (likely needs entitlements / signing we don't have) and added a parallel scancode-mapping table to maintain. The current design instead reimplements each symbolic combo in user space (`cycle_apps` via AX, `invoke_spotlight` via osascript, `screencapture` via the binary). Do not resurrect IOHIDUserDevice without new evidence.
@@ -124,6 +142,7 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
 --skip-auth               # bypass PAM (also skips password validation)
 --width  / --height       # override autodetected display size
 --fps N                   # default 15
+--enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
 --cert-dir PATH           # default ~/Library/Application Support/macrdp
 ```
 

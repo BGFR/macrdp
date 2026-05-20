@@ -1,0 +1,42 @@
+[package]
+name = "ironrdp-egfx"
+version = "0.1.0"
+readme = "README.md"
+description = "Graphics pipeline dynamic channel extension implementation"
+publish = false
+# Vendored copy of upstream ironrdp-egfx (Devolutions/IronRDP@0282d18) so we can
+# add `force_create_surface` (delete-then-create at a fixed surface id) — needed
+# to defeat mstsc's cross-session surface-id retention, which makes a plain
+# CreateSurface for a retained id a no-op (black screen on reconnect). See
+# src/h264.rs. Workspace-inherited fields are inlined because we're not inside
+# the IronRDP cargo workspace; sibling deps are version-only and resolve via the
+# root macrdp Cargo.toml's [patch.crates-io] git pins.
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/Devolutions/IronRDP"
+repository = "https://github.com/Devolutions/IronRDP"
+authors = ["Devolutions Inc. <infos@devolutions.net>"]
+keywords = ["rdp", "remote-desktop", "network", "protocol"]
+categories = ["network-programming"]
+
+[lib]
+doctest = false
+
+[dependencies]
+bit_field = "0.10"
+bitflags = "2.11"
+ironrdp-core = "0.1" # public
+ironrdp-dvc = "0.5" # public
+ironrdp-graphics = "0.7" # public
+ironrdp-pdu = "0.7" # public
+openh264 = { version = "0.9", optional = true, default-features = false }
+tracing = { version = "0.1", features = ["log"] }
+
+[features]
+openh264 = ["dep:openh264"]
+openh264-bundled = ["openh264", "openh264/source"]
+openh264-libloading = ["openh264", "openh264/libloading"]
+
+# [lints] workspace = true — inlined as empty since we're not in the workspace.
+[lints]

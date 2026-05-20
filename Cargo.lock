@@ -895,7 +895,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1595,6 +1595,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-echo"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1a7bbc7c27e34a94dd701827e3d977b6a87fedd448d0ab48f5a014aa98fd798"
+dependencies = [
+ "ironrdp-core",
+ "ironrdp-dvc",
+ "ironrdp-pdu",
+ "tracing",
+]
+
+[[package]]
+name = "ironrdp-egfx"
+version = "0.1.0"
+dependencies = [
+ "bit_field",
+ "bitflags 2.11.1",
+ "ironrdp-core",
+ "ironrdp-dvc",
+ "ironrdp-graphics",
+ "ironrdp-pdu",
+ "tracing",
+]
+
+[[package]]
 name = "ironrdp-error"
 version = "0.1.3"
 source = "git+https://github.com/Devolutions/IronRDP.git?rev=0282d1821cdb87926a4fd9ebc80342b79102e9ce#0282d1821cdb87926a4fd9ebc80342b79102e9ce"
@@ -1663,6 +1688,8 @@ dependencies = [
  "ironrdp-core",
  "ironrdp-displaycontrol",
  "ironrdp-dvc",
+ "ironrdp-echo",
+ "ironrdp-egfx",
  "ironrdp-graphics",
  "ironrdp-pdu",
  "ironrdp-rdpsnd",
@@ -1835,9 +1862,12 @@ dependencies = [
  "ironrdp-acceptor",
  "ironrdp-cliprdr",
  "ironrdp-core",
+ "ironrdp-dvc",
+ "ironrdp-egfx",
  "ironrdp-pdu",
  "ironrdp-rdpsnd",
  "ironrdp-server",
+ "ironrdp-svc",
  "libc",
  "objc2",
  "objc2-app-kit",
@@ -1954,7 +1984,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

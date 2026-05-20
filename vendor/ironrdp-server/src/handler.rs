@@ -4,7 +4,7 @@ use ironrdp_pdu::input::mouse::PointerFlags;
 use ironrdp_pdu::input::mouse_rel::PointerRelFlags;
 use ironrdp_pdu::input::mouse_x::PointerXFlags;
 use ironrdp_pdu::input::sync::SyncToggleFlags;
-use ironrdp_pdu::input::{scan_code, unicode, MousePdu, MouseRelPdu, MouseXPdu};
+use ironrdp_pdu::input::{MousePdu, MouseRelPdu, MouseXPdu, scan_code, unicode};
 
 /// Keyboard Event
 ///
@@ -142,7 +142,7 @@ impl From<SyncToggleFlags> for KeyboardEvent {
         reason = "we are truncating the value on purpose"
     )]
     fn from(value: SyncToggleFlags) -> Self {
-        KeyboardEvent::Synchronize(SynchronizeFlags::from_bits_truncate(value.bits() as u8))
+        KeyboardEvent::Synchronize(SynchronizeFlags::from_bits_retain(value.bits() as u8))
     }
 }
 

@@ -38,12 +38,16 @@ der = "0.7"
 
 # RDP protocol — ironrdp is split into many sub-crates; add only what you use.
 ironrdp = "0.14"
-ironrdp-server = "0.10"  # patched locally — see [patch.crates-io] below
+ironrdp-server = { version = "0.10", features = ["egfx"] }  # patched locally — see [patch.crates-io] below
 ironrdp-acceptor = "0.8"
 ironrdp-pdu = "0.7"
 ironrdp-cliprdr = "0.5"
 ironrdp-core = "0.1"
 ironrdp-rdpsnd = "0.7"
+# EGFX / H.264 video pipeline (gated at runtime by --enable-h264).
+ironrdp-egfx = "0.1"
+ironrdp-dvc = "0.5"
+ironrdp-svc = "0.6"
 
 # macOS-only: screen capture + input synthesis
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -80,6 +84,7 @@ ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git",
 ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
 ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
 ironrdp-dvc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-egfx             = { path = "vendor/ironrdp-egfx" }  # vendored: adds force_create_surface (see vendor/ironrdp-egfx/Cargo.toml)
 ironrdp-graphics         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
 ironrdp-pdu              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
 ironrdp-rdpsnd           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }

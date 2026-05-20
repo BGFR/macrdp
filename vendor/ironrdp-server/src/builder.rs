@@ -1,13 +1,15 @@
 use core::net::SocketAddr;
 
 use anyhow::Result;
-use ironrdp_pdu::rdp::capability_sets::{server_codecs_capabilities, BitmapCodecs};
+use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, server_codecs_capabilities};
 use tokio_rustls::TlsAcceptor;
 
 use super::clipboard::CliprdrServerFactory;
 use super::display::{DesktopSize, RdpServerDisplay};
+#[cfg(feature = "egfx")]
+use super::gfx::GfxServerFactory;
 use super::handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
-use super::server::{RdpServer, RdpServerOptions, RdpServerSecurity};
+use super::server::{ConnectionHandler, RdpServer, RdpServerOptions, RdpServerSecurity};
 use crate::{DisplayUpdate, RdpServerDisplayUpdates, SoundServerFactory};
 
 pub struct WantsAddr {}
@@ -27,10 +29,14 @@ pub struct BuilderDone {
     addr: SocketAddr,
     security: RdpServerSecurity,
     codecs: BitmapCodecs,
+    max_request_size: u32,
     handler: Box<dyn RdpServerInputHandler>,
     display: Box<dyn RdpServerDisplay>,
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
+    connection_handler: Option<Box<dyn ConnectionHandler>>,
+    #[cfg(feature = "egfx")]
+    gfx_factory: Option<Box<dyn GfxServerFactory>>,
 }
 
 pub struct RdpServerBuilder<State> {
@@ -123,7 +129,11 @@ impl RdpServerBuilder<WantsDisplay> {
                 display: Box::new(display),
                 sound_factory: None,
                 cliprdr_factory: None,
+                connection_handler: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
+                max_request_size: RdpServerOptions::DEFAULT_MAX_REQUEST_SIZE,
+                #[cfg(feature = "egfx")]
+                gfx_factory: None,
             },
         }
     }
@@ -137,7 +147,11 @@ impl RdpServerBuilder<WantsDisplay> {
                 display: Box::new(NoopDisplay),
                 sound_factory: None,
                 cliprdr_factory: None,
+                connection_handler: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
+                max_request_size: RdpServerOptions::DEFAULT_MAX_REQUEST_SIZE,
+                #[cfg(feature = "egfx")]
+                gfx_factory: None,
             },
         }
     }
@@ -154,8 +168,33 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// Configure EGFX (Graphics Pipeline Extension) for H.264 video streaming.
+    #[cfg(feature = "egfx")]
+    pub fn with_gfx_factory(mut self, gfx_factory: Option<Box<dyn GfxServerFactory>>) -> Self {
+        self.state.gfx_factory = gfx_factory;
+        self
+    }
+
     pub fn with_bitmap_codecs(mut self, codecs: BitmapCodecs) -> Self {
         self.state.codecs = codecs;
+        self
+    }
+
+    /// Sets the [MultifragmentUpdate] maximum reassembly buffer size advertised
+    /// during capability exchange.
+    ///
+    /// Defaults to [`RdpServerOptions::DEFAULT_MAX_REQUEST_SIZE`] (8 MB).
+    ///
+    /// [MultifragmentUpdate]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/01717954-716a-424d-af35-28fb2b86df89
+    pub fn with_max_request_size(mut self, max_request_size: u32) -> Self {
+        self.state.max_request_size = max_request_size;
+        self
+    }
+
+    /// Set a handler for connection lifecycle events (accept filtering,
+    /// post-disconnect cleanup).
+    pub fn with_connection_handler(mut self, handler: Option<Box<dyn ConnectionHandler>>) -> Self {
+        self.state.connection_handler = handler;
         self
     }
 
@@ -165,11 +204,15 @@ impl RdpServerBuilder<BuilderDone> {
                 addr: self.state.addr,
                 security: self.state.security,
                 codecs: self.state.codecs,
+                max_request_size: self.state.max_request_size,
             },
             self.state.handler,
             self.state.display,
             self.state.sound_factory,
             self.state.cliprdr_factory,
+            self.state.connection_handler,
+            #[cfg(feature = "egfx")]
+            self.state.gfx_factory,
         )
     }
 }

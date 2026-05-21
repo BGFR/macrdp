@@ -276,6 +276,22 @@ struct Args {
     #[arg(long = "keyframe-on-change", action = clap::ArgAction::SetTrue, hide = true)]
     #[allow(dead_code)]
     keyframe_on_change_compat: bool,
+
+    /// Dirty-area threshold (percent of the frame) that triggers an on-change
+    /// keyframe (only with --enable-h264 + on-change keyframes). Lower catches
+    /// smaller updates (more IDRs); higher is more conservative. Default 20.
+    #[arg(long, default_value_t = 20)]
+    keyframe_change_pct: u64,
+
+    /// Lowered dirty-area threshold (percent) used briefly after a mouse click,
+    /// to catch moderate click-driven updates (dropdowns, dialogs). Default 5.
+    #[arg(long, default_value_t = 5)]
+    keyframe_click_pct: u64,
+
+    /// How long (milliseconds) after a click the --keyframe-click-pct threshold
+    /// applies. Default 400.
+    #[arg(long, default_value_t = 400)]
+    keyframe_click_window_ms: u64,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -862,13 +878,18 @@ async fn main() -> Result<()> {
     });
 
     // On-change keyframes are on by default; --no-keyframe-on-change opts out.
-    let keyframe_on_change = !args.no_keyframe_on_change;
+    let keyframe_on_change = crate::capture::KeyframeOnChange {
+        enabled: !args.no_keyframe_on_change,
+        change_pct: args.keyframe_change_pct,
+        click_pct: args.keyframe_click_pct,
+        click_window: std::time::Duration::from_millis(args.keyframe_click_window_ms),
+    };
 
     // Mouse-click hint shared by the input handler (which records clicks) and
     // the H.264 capture path (which lowers its keyframe threshold briefly after
     // a click). Only allocated when the on-demand-keyframe feature is enabled.
     let click_signal =
-        (args.enable_h264 && keyframe_on_change).then(crate::capture::ClickSignal::new);
+        (args.enable_h264 && keyframe_on_change.enabled).then(crate::capture::ClickSignal::new);
 
     let display = CaptureDisplay {
         width,

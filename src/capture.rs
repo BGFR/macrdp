@@ -21,26 +21,34 @@ use std::time::{Duration, Instant};
 
 use crate::cursor::CursorState;
 
-/// Dirty-area threshold (percent of the frame) at or above which the H.264 path
-/// asks the encoder for an immediate keyframe. A change this large (window
-/// raised to front, scroll, app launch) renders as a big P-frame that some
-/// clients only resolve cleanly at the next periodic IDR; an on-demand IDR lands
-/// it at once. Typing/caret changes are a few percent and stay below this.
-/// Fired only on the rising edge (see `kf_armed`), so this is "a large change
-/// *began*", not "is ongoing".
-#[cfg(target_os = "macos")]
-const KEYFRAME_CHANGE_PCT: u64 = 20;
+/// Tuning for the H.264 on-demand-keyframe feature (`--keyframe-on-change`).
+/// Built from CLI flags in `main.rs`; all percentages are of the full frame.
+#[derive(Clone, Copy, Debug)]
+pub struct KeyframeOnChange {
+    /// Master switch (`--keyframe-on-change` / `--no-keyframe-on-change`).
+    pub enabled: bool,
+    /// Dirty-area threshold at or above which an immediate keyframe is forced.
+    /// A change this large (window raised to front, scroll, app launch) renders
+    /// as a big P-frame that some clients resolve cleanly only on the next
+    /// periodic IDR; an on-demand IDR lands it at once. Typing/caret changes are
+    /// a few percent and stay below this. Fired only on the rising edge (see
+    /// `kf_armed`), so this is "a large change *began*", not "is ongoing".
+    pub change_pct: u64,
+    /// Lowered threshold used briefly after a mouse click. A click often drives a
+    /// moderate change (dropdown, dialog, button repaint) below the normal bar;
+    /// the IDR still only fires if a real change follows, so no-op clicks cost
+    /// nothing.
+    pub click_pct: u64,
+    /// How long after a click the lowered `click_pct` threshold applies.
+    pub click_window: Duration,
+}
 
-/// Lowered dirty-area threshold used briefly after a mouse click. A click often
-/// drives a moderate change (dropdown, dialog, button repaint) that's below the
-/// normal bar but still garbles on some clients; the IDR still only fires if a
-/// real change actually follows the click, so no-op clicks cost nothing.
+/// Idle-frame suppression: once EGFX owns the display, an unchanged frame is
+/// skipped (no encode, no wire frame) — but never for longer than this, so a
+/// heartbeat frame still flows (heals any under-reported dirty region and keeps
+/// the periodic keyframe ticking).
 #[cfg(target_os = "macos")]
-const KEYFRAME_CHANGE_PCT_POST_CLICK: u64 = 5;
-
-/// How long after a click the lowered threshold applies.
-#[cfg(target_os = "macos")]
-const POST_CLICK_WINDOW: Duration = Duration::from_millis(400);
+const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
 
 /// Shared click→keyframe hint. `input.rs` records a mouse-down timestamp; the
 /// H.264 capture path lowers its keyframe dirty-area threshold for a short
@@ -182,12 +190,11 @@ pub struct CaptureDisplay {
     /// display is served entirely over EGFX.
     #[cfg(target_os = "macos")]
     pub gfx: Option<crate::h264::Gfx>,
-    /// When true (`--keyframe-on-change`), the H.264 path forces a keyframe on
-    /// large dirty-area changes (and, briefly after a click, on smaller ones).
-    /// Off by default → the periodic `--keyframe-interval` is the only IDR
+    /// On-demand-keyframe tuning (`--keyframe-on-change` and its threshold
+    /// flags). When disabled, the periodic `--keyframe-interval` is the only IDR
     /// driver besides the forced first frame.
-    pub keyframe_on_change: bool,
-    /// Shared mouse-click hint, used only when `keyframe_on_change` is set. Lets
+    pub keyframe_on_change: KeyframeOnChange,
+    /// Shared mouse-click hint, used only when `keyframe_on_change.enabled`. Lets
     /// the H.264 path lower its keyframe threshold briefly after a click — see
     /// [`ClickSignal`].
     pub click_signal: Option<ClickSignal>,
@@ -283,17 +290,24 @@ mod macos {
         cursor: CursorState,
         /// EGFX/H.264 frame sink; `None` unless `--enable-h264`.
         gfx: Option<crate::h264::Gfx>,
-        /// Whether the H.264 path forces keyframes on large dirty-area changes
-        /// (`--keyframe-on-change`). When false, no dirty-area work is done.
-        keyframe_on_change: bool,
+        /// On-demand-keyframe tuning (`--keyframe-on-change`). When disabled, no
+        /// dirty-area work is done for keyframe decisions.
+        keyframe_on_change: KeyframeOnChange,
         /// Rising-edge state for `keyframe_on_change`: true means "ready to fire
         /// on the next large change". Cleared when one fires; re-armed once the
         /// dirty area subsides below half the threshold (hysteresis). Stops
         /// sustained churn (e.g. video) from forcing an IDR every frame.
         kf_armed: bool,
         /// Mouse-click hint for the post-click keyframe-threshold drop. Only
-        /// consulted when `keyframe_on_change` is set.
+        /// consulted when `keyframe_on_change.enabled`.
         click_signal: Option<ClickSignal>,
+        /// True once EGFX has negotiated and owns the display (first `Ok(true)`
+        /// from `submit_bgra`). Gates idle-frame suppression — we only skip
+        /// unchanged frames once the H.264 path is actually serving the display.
+        gfx_active: bool,
+        /// When the last frame was submitted to the encoder. Drives the
+        /// idle-skip heartbeat (see `IDLE_HEARTBEAT`).
+        last_submit: Option<Instant>,
     }
 
     impl ScreenCaptureUpdates {
@@ -305,7 +319,7 @@ mod macos {
             target_display_id: Option<u32>,
             screen_size_pts: (f64, f64),
             gfx: Option<crate::h264::Gfx>,
-            keyframe_on_change: bool,
+            keyframe_on_change: KeyframeOnChange,
             click_signal: Option<ClickSignal>,
         ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
@@ -397,6 +411,8 @@ mod macos {
                 keyframe_on_change,
                 kf_armed: true,
                 click_signal,
+                gfx_active: false,
+                last_submit: None,
             })
         }
     }
@@ -489,42 +505,61 @@ mod macos {
                 // via the poll at the top of the loop). Before negotiation, or
                 // for non-EGFX clients (`Ok(false)`), fall through to legacy.
                 if let Some(gfx) = self.gfx.as_ref() {
+                    // Dirty-rect area drives both idle-frame suppression and the
+                    // on-demand-keyframe decision. `dirty_known` is false when the
+                    // attachment is absent (older macOS) — then we can't tell what
+                    // changed, so we never skip. Dirty rects may be in source
+                    // coords when scaling, but the area fraction is still a good
+                    // "how much moved" heuristic.
+                    let frame_px = u64::from(pb_width) * u64::from(pb_height);
+                    let dirty = sample.dirty_rects();
+                    let dirty_known = dirty.is_some();
+                    let changed_px: u64 = dirty
+                        .map(|rects| {
+                            rects
+                                .iter()
+                                .map(|r| {
+                                    let s = r.size();
+                                    (s.width.max(0.0) as u64) * (s.height.max(0.0) as u64)
+                                })
+                                .sum()
+                        })
+                        .unwrap_or(0);
+
+                    // Idle-frame suppression: once EGFX owns the display, skip an
+                    // unchanged frame (no NV12 conversion, no encode, no wire
+                    // frame) — but never longer than IDLE_HEARTBEAT, so a frame
+                    // still flows periodically to heal any under-reported dirty
+                    // region and keep the periodic keyframe ticking.
+                    if self.gfx_active && dirty_known && changed_px == 0 {
+                        let recent = self
+                            .last_submit
+                            .is_some_and(|t| t.elapsed() < IDLE_HEARTBEAT);
+                        if recent {
+                            continue;
+                        }
+                    }
+
                     // On-demand keyframes (opt-in via --keyframe-on-change). A
-                    // large change at once (window raised to front, a scroll, an
-                    // app launch) is applied cleanly by some clients (mstsc) only
-                    // on a keyframe — as a P-frame it can render garbled or stale
-                    // until the next periodic IDR ("takes a while to come to
-                    // front"). Detect it from the dirty-rect area and ask for an
-                    // immediate IDR; small changes (typing, caret) stay below the
-                    // threshold and remain cheap P-frames. Dirty rects may be in
-                    // source coords when scaling, but the area fraction is still
-                    // a good "how much moved" heuristic. Disabled by default →
-                    // the periodic --keyframe-interval is the only extra IDR.
-                    let big_change = if self.keyframe_on_change {
-                        let frame_px = u64::from(pb_width) * u64::from(pb_height);
-                        let changed_px: u64 = sample
-                            .dirty_rects()
-                            .map(|rects| {
-                                rects
-                                    .iter()
-                                    .map(|r| {
-                                        let s = r.size();
-                                        (s.width.max(0.0) as u64) * (s.height.max(0.0) as u64)
-                                    })
-                                    .sum()
-                            })
-                            .unwrap_or(0);
+                    // large change at once (window raised to front, scroll, app
+                    // launch) is applied cleanly by some clients (mstsc) only on a
+                    // keyframe — as a P-frame it can render garbled/stale until the
+                    // next periodic IDR. Force an IDR on the rising edge of a large
+                    // dirty area; small changes (typing, caret) stay below the
+                    // threshold and remain cheap P-frames.
+                    let kfc = self.keyframe_on_change;
+                    let big_change = if kfc.enabled {
                         // Briefly after a click, treat a much smaller change as
                         // keyframe-worthy too (a click usually precedes a UI
                         // update; the IDR still only fires if a change follows).
                         let high = if self
                             .click_signal
                             .as_ref()
-                            .is_some_and(|s| s.within(POST_CLICK_WINDOW))
+                            .is_some_and(|s| s.within(kfc.click_window))
                         {
-                            KEYFRAME_CHANGE_PCT_POST_CLICK
+                            kfc.click_pct
                         } else {
-                            KEYFRAME_CHANGE_PCT
+                            kfc.change_pct
                         };
                         let low = (high / 2).max(1); // hysteresis re-arm band
                         let is_big = frame_px > 0 && changed_px * 100 >= frame_px * high;
@@ -548,6 +583,8 @@ mod macos {
                     match gfx.submit_bgra(src, stride_bytes, big_change) {
                         Ok(true) => {
                             self.seeded = true;
+                            self.gfx_active = true;
+                            self.last_submit = Some(std::time::Instant::now());
                             continue;
                         }
                         Ok(false) => {}

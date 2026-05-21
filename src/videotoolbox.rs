@@ -63,6 +63,16 @@ pub struct Encoder {
     /// blacks there. FreeRDP honors the range flag so it stays correct either
     /// way. Opt back out to video-range with `MACRDP_H264_FULL_RANGE=0`.
     full_range: bool,
+    /// Frames submitted to VT vs frames pulled back out. With
+    /// `MaxFrameDelayCount = 0` (no reordering/look-ahead) VT emits exactly one
+    /// frame per submit, in order, so `submitted - delivered` is how many of our
+    /// submissions haven't come out yet. `drain_wait` uses this to wait for
+    /// *this tick's* frame specifically rather than shipping whatever happens to
+    /// be ready — otherwise the capture/encode/drain timing phase (which shifts
+    /// with conversion speed: scalar vs vImage) decides whether we ship the
+    /// current frame or a stale one, reintroducing "one frame behind" lag.
+    submitted: u64,
+    delivered: u64,
 }
 
 impl Encoder {
@@ -103,6 +113,8 @@ impl Encoder {
             next_pts: 0,
             fps,
             full_range,
+            submitted: 0,
+            delivered: 0,
         })
     }
 
@@ -146,7 +158,10 @@ impl Encoder {
             self.fps,
             force_keyframe,
             self.full_range,
-        )
+        )?;
+        // One submit == one eventual output frame (MaxFrameDelayCount=0).
+        self.submitted += 1;
+        Ok(())
     }
 
     /// Pull every encoded frame the callback has produced so far.
@@ -156,24 +171,46 @@ impl Encoder {
         while let Ok(frame) = self.rx.try_recv() {
             out.push(frame);
         }
+        self.delivered += out.len() as u64;
         out
     }
 
-    /// Like `drain()`, but if nothing is ready yet, wait up to `budget` for the
-    /// callback to deliver the frame that was just submitted, then sweep up any
-    /// others. This is what makes a single change (a keystroke, the blinking
-    /// caret) actually ship *this* tick instead of sitting in VideoToolbox until
-    /// the next captured frame happens to drain it — which on a static screen
-    /// may never come. The wait is bounded and per-frame (it returns as soon as
-    /// the frame arrives), so it does NOT serialize the pipeline like the full
-    /// `flush()` / `CompleteFrames` barrier does.
+    /// Collect encoded frames, waiting (up to `budget`) until *this tick's*
+    /// just-submitted frame has actually come out of VideoToolbox — i.e. until
+    /// `delivered` catches up to `submitted`. This is what makes a single change
+    /// (a keystroke, the blinking caret) ship *this* tick instead of one tick
+    /// late.
+    ///
+    /// Why count-based instead of "wait only if drain() was empty": VT delivers
+    /// asynchronously on its own thread, and whether the current frame is ready
+    /// at the moment we drain depends on the capture/encode timing phase — which
+    /// shifts with how fast the BGRA→NV12 conversion is. The old heuristic
+    /// happened to ship the current frame with the slow scalar conversion but
+    /// shipped a stale one (current frame deferred to next tick → "one frame
+    /// behind") once vImage made the conversion ~30x faster. Explicitly waiting
+    /// for the outstanding frame is robust to that phase. Still bounded and at
+    /// most one frame's worth of wait (no reordering), so it does NOT serialize
+    /// the pipeline like the old `flush()` / `CompleteFrames` barrier.
     pub fn drain_wait(&mut self, budget: std::time::Duration) -> Vec<EncodedFrame> {
+        let deadline = std::time::Instant::now() + budget;
         let mut out = self.drain();
-        if out.is_empty() {
-            if let Ok(frame) = self.rx.recv_timeout(budget) {
-                out.push(frame);
-                while let Ok(frame) = self.rx.try_recv() {
+        while self.delivered < self.submitted {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                // VT hasn't produced the outstanding frame within budget (rare —
+                // a slow/dropped encode). Resync so we don't burn the full budget
+                // every tick forever; the late frame, if any, is swept next tick.
+                self.delivered = self.submitted;
+                break;
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(frame) => {
                     out.push(frame);
+                    self.delivered += 1;
+                }
+                Err(_) => {
+                    self.delivered = self.submitted;
+                    break;
                 }
             }
         }

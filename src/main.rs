@@ -135,8 +135,12 @@ struct Args {
     #[arg(long)]
     height: Option<u16>,
 
-    #[arg(long, default_value_t = 15)]
-    fps: u32,
+    /// Frame rate cap. Defaults to 15 for the legacy bitmap path, or 60 with
+    /// --enable-h264 (H.264 over mstsc holds a ~2-frame presentation buffer, so
+    /// 60fps keeps that buffer's wall-clock latency low enough that typing feels
+    /// immediate — at 30fps it lags ~2 keystrokes). Set explicitly to override.
+    #[arg(long)]
+    fps: Option<u32>,
 
     /// Mac account the client authenticates as. Defaults to $USER. The
     /// password is validated against the local account via PAM (checkpw
@@ -838,6 +842,11 @@ async fn main() -> Result<()> {
         (w, h, None, size)
     };
 
+    // Frame rate: explicit --fps wins; otherwise 60 for H.264 (mstsc holds a
+    // ~2-frame presentation buffer, so 60fps keeps typing latency low) or 15 for
+    // the legacy bitmap path (which has no such buffer and is bandwidth-heavier).
+    let fps = args.fps.unwrap_or(if args.enable_h264 { 60 } else { 15 });
+
     // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
     // clone drives the builder's GfxServerFactory (protocol side); another
     // rides on CaptureDisplay, where the capture loop feeds it BGRA frames.
@@ -846,7 +855,7 @@ async fn main() -> Result<()> {
         h264::Gfx::new(
             width,
             height,
-            args.fps,
+            fps,
             args.bitrate.max(1).saturating_mul(1_000_000),
             args.keyframe_interval,
         )
@@ -864,7 +873,7 @@ async fn main() -> Result<()> {
     let display = CaptureDisplay {
         width,
         height,
-        fps: args.fps,
+        fps,
         display_id: capture_display_id,
         screen_size_pts,
         // Only attach the tracker when the watchdog needs it. Saves

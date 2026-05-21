@@ -69,6 +69,11 @@ src/h264.rs       EGFX/H.264 video pipeline (opt-in via --enable-h264).
                   H.264 quirk note below). Falls back to legacy BitmapUpdate
                   for clients that don't advertise AVC420 decode.
 src/videotoolbox.rs  VideoToolbox H.264 encoder (AVCC NALs + SPS/PPS).
+                  Feeds VT a full-range BT.709 NV12 (420f) buffer it builds
+                  from the captured BGRA — VT would otherwise emit video-range
+                  YUV, which mstsc renders washed-out. The BGRA→NV12 conversion
+                  is vImage (Accelerate/NEON) accelerated, ~24-32x over the
+                  scalar reference kept as a fallback + benchmark baseline.
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
 vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in

@@ -647,6 +647,163 @@ mod ffi {
         }
     }
 
+    // --- vImage (Accelerate) accelerated BGRA -> full-range NV12 -------------
+    //
+    // The scalar `bgra_to_nv12_full_range` above is correct and fine at 1080p,
+    // but at 4K/60 (or on weak CPUs) it exceeds the frame budget. vImage does
+    // the same RGB->Y'CbCr math on the CPU's vector units (NEON on Apple
+    // Silicon), typically several times faster. All struct layouts/enum values
+    // are transcribed from the macOS SDK's vImage headers; the conversion
+    // descriptor is generated once (it's constant) and reused.
+
+    /// `vImage_Buffer`. `height`/`width` are `vImagePixelCount` (unsigned long),
+    /// `row_bytes` is `size_t` — all `usize` on 64-bit.
+    #[repr(C)]
+    struct VImageBuffer {
+        data: *mut c_void,
+        height: usize,
+        width: usize,
+        row_bytes: usize,
+    }
+
+    /// `vImage_YpCbCrPixelRange` (8 × int32). Full-range 8-bit values per the
+    /// header's own example `{0,128,255,255,255,0,255,0}` (Y' 0-255, no clamp).
+    #[repr(C)]
+    struct VImageYpCbCrPixelRange {
+        yp_bias: i32,
+        cbcr_bias: i32,
+        yp_range_max: i32,
+        cbcr_range_max: i32,
+        yp_max: i32,
+        yp_min: i32,
+        cbcr_max: i32,
+        cbcr_min: i32,
+    }
+
+    /// `vImage_ARGBToYpCbCr` — opaque 128-byte, 16-aligned conversion descriptor.
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    struct VImageArgbToYpCbCr {
+        opaque: [u8; 128],
+    }
+
+    /// `vImage_ARGBToYpCbCrMatrix` — opaque to us; we only hold a pointer to the
+    /// framework-provided BT.709 constant, never construct or read it.
+    #[repr(C)]
+    struct VImageArgbToYpCbCrMatrix {
+        _private: [u8; 0],
+    }
+
+    const K_VIMAGE_NO_FLAGS: u32 = 0;
+    const K_VIMAGE_ARGB8888: u32 = 0; // vImageARGBType::kvImageARGB8888
+    const K_VIMAGE_420YP8_CBCR8: u32 = 4; // vImageYpCbCrType::kvImage420Yp8_CbCr8
+
+    #[link(name = "Accelerate", kind = "framework")]
+    extern "C" {
+        /// `const vImage_ARGBToYpCbCrMatrix *` — the symbol itself is a pointer.
+        static kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2: *const VImageArgbToYpCbCrMatrix;
+        fn vImageConvert_ARGBToYpCbCr_GenerateConversion(
+            matrix: *const VImageArgbToYpCbCrMatrix,
+            pixel_range: *const VImageYpCbCrPixelRange,
+            out_info: *mut VImageArgbToYpCbCr,
+            in_argb_type: u32,
+            out_ypcbcr_type: u32,
+            flags: u32,
+        ) -> isize; // vImage_Error = ssize_t
+        fn vImageConvert_ARGB8888To420Yp8_CbCr8(
+            src: *const VImageBuffer,
+            dest_yp: *const VImageBuffer,
+            dest_cbcr: *const VImageBuffer,
+            info: *const VImageArgbToYpCbCr,
+            permute_map: *const u8,
+            flags: u32,
+        ) -> isize;
+    }
+
+    /// The conversion descriptor (709 + full-range, ARGB8888 -> NV12). Constant,
+    /// so generate once and share — vImage docs say these are reusable across
+    /// threads. `None` if generation failed (then callers fall back to scalar).
+    fn vimage_conv_info() -> Option<&'static VImageArgbToYpCbCr> {
+        static INFO: std::sync::OnceLock<Option<VImageArgbToYpCbCr>> = std::sync::OnceLock::new();
+        INFO.get_or_init(|| {
+            let range = VImageYpCbCrPixelRange {
+                yp_bias: 0,
+                cbcr_bias: 128,
+                yp_range_max: 255,
+                cbcr_range_max: 255,
+                yp_max: 255,
+                yp_min: 0,
+                cbcr_max: 255,
+                cbcr_min: 0,
+            };
+            let mut info = VImageArgbToYpCbCr { opaque: [0u8; 128] };
+            let err = unsafe {
+                vImageConvert_ARGBToYpCbCr_GenerateConversion(
+                    kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2,
+                    &range,
+                    &mut info,
+                    K_VIMAGE_ARGB8888,
+                    K_VIMAGE_420YP8_CBCR8,
+                    K_VIMAGE_NO_FLAGS,
+                )
+            };
+            (err == 0).then_some(info)
+        })
+        .as_ref()
+    }
+
+    /// vImage equivalent of `bgra_to_nv12_full_range`. `Err` if vImage isn't
+    /// usable for this frame (descriptor generation failed, or the convert call
+    /// errored — e.g. odd dimensions); callers fall back to the scalar path.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bgra_to_nv12_full_range_vimage(
+        bgra: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        y_plane: &mut [u8],
+        y_stride: usize,
+        cbcr_plane: &mut [u8],
+        cbcr_stride: usize,
+    ) -> Result<()> {
+        let info = vimage_conv_info().ok_or_else(|| anyhow!("vImage conv-info unavailable"))?;
+        let src = VImageBuffer {
+            data: bgra.as_ptr() as *mut c_void,
+            height,
+            width,
+            row_bytes: src_stride,
+        };
+        let dest_yp = VImageBuffer {
+            data: y_plane.as_mut_ptr() as *mut c_void,
+            height,
+            width,
+            row_bytes: y_stride,
+        };
+        let dest_cbcr = VImageBuffer {
+            data: cbcr_plane.as_mut_ptr() as *mut c_void,
+            height: height / 2,
+            width: width / 2,
+            row_bytes: cbcr_stride,
+        };
+        // Source is BGRA (byte order B,G,R,A); vImage's ARGB8888 is A,R,G,B.
+        // permuteMap[dest] = source index: A<-3, R<-2, G<-1, B<-0.
+        let permute: [u8; 4] = [3, 2, 1, 0];
+        let err = unsafe {
+            vImageConvert_ARGB8888To420Yp8_CbCr8(
+                &src,
+                &dest_yp,
+                &dest_cbcr,
+                info,
+                permute.as_ptr(),
+                K_VIMAGE_NO_FLAGS,
+            )
+        };
+        if err != 0 {
+            bail!("vImageConvert_ARGB8888To420Yp8_CbCr8 failed: {err}");
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)] // internal FFI helper; grouping into a struct adds no clarity
     pub(super) fn encode_frame(
         guard: &SessionGuard,
@@ -700,7 +857,11 @@ mod ffi {
                     cbcr_base,
                     cbcr_stride * (usize::from(height) / 2),
                 );
-                bgra_to_nv12_full_range(
+                // Prefer the vImage (SIMD) path; fall back to the scalar
+                // conversion if vImage can't handle this frame (descriptor
+                // generation failed, or odd dimensions). Both produce full-range
+                // BT.709 NV12, so the fallback is transparent.
+                if bgra_to_nv12_full_range_vimage(
                     bgra,
                     stride,
                     width.into(),
@@ -709,7 +870,20 @@ mod ffi {
                     y_stride,
                     cbcr_plane,
                     cbcr_stride,
-                );
+                )
+                .is_err()
+                {
+                    bgra_to_nv12_full_range(
+                        bgra,
+                        stride,
+                        width.into(),
+                        height.into(),
+                        y_plane,
+                        y_stride,
+                        cbcr_plane,
+                        cbcr_stride,
+                    );
+                }
             } else {
                 let dst = CVPixelBufferGetBaseAddress(pbuf) as *mut u8;
                 let dst_stride = CVPixelBufferGetBytesPerRow(pbuf);
@@ -935,19 +1109,84 @@ mod tests {
         assert_eq!((cbcr[0], cbcr[1]), (128, 128), "neutral chroma");
     }
 
-    /// Microbenchmark for the scalar BGRA->full-range-NV12 conversion. Ignored
-    /// by default; run in RELEASE (debug is ~10x slower and misleading):
+    /// The vImage path must produce the same full-range BT.709 NV12 as the
+    /// scalar reference (validates the FFI wiring, the BGRA->ARGB permute, and
+    /// the full-range matrix/range). Solid colors so 4:2:0 subsampling is exact
+    /// regardless of vImage's downsample filter, isolating the color math.
+    #[test]
+    fn vimage_matches_scalar_full_range() {
+        use super::ffi::{bgra_to_nv12_full_range, bgra_to_nv12_full_range_vimage};
+        // BGRA byte order [B, G, R, A]. A red channel swap (bad permute) would
+        // diverge here on the pure-red / pure-blue cases.
+        let colors: [[u8; 4]; 6] = [
+            [0, 0, 0, 255],       // black
+            [255, 255, 255, 255], // white
+            [0, 0, 255, 255],     // red
+            [0, 255, 0, 255],     // green
+            [255, 0, 0, 255],     // blue
+            [128, 128, 128, 255], // gray
+        ];
+        let (w, h) = (4usize, 4usize);
+        let stride = w * 4;
+        for c in colors {
+            let mut bgra = vec![0u8; stride * h];
+            for px in bgra.chunks_exact_mut(4) {
+                px.copy_from_slice(&c);
+            }
+            let (mut y_s, mut cbcr_s) = (vec![0u8; w * h], vec![0u8; w * (h / 2)]);
+            let (mut y_v, mut cbcr_v) = (vec![0u8; w * h], vec![0u8; w * (h / 2)]);
+            bgra_to_nv12_full_range(&bgra, stride, w, h, &mut y_s, w, &mut cbcr_s, w);
+            bgra_to_nv12_full_range_vimage(&bgra, stride, w, h, &mut y_v, w, &mut cbcr_v, w)
+                .expect("vImage conversion should succeed");
+            let near = |a: u8, b: u8| (i32::from(a) - i32::from(b)).abs() <= 3;
+            assert!(
+                near(y_s[0], y_v[0]),
+                "Y mismatch {c:?}: {} vs {}",
+                y_s[0],
+                y_v[0]
+            );
+            assert!(
+                near(cbcr_s[0], cbcr_v[0]),
+                "Cb mismatch {c:?}: {} vs {}",
+                cbcr_s[0],
+                cbcr_v[0]
+            );
+            assert!(
+                near(cbcr_s[1], cbcr_v[1]),
+                "Cr mismatch {c:?}: {} vs {}",
+                cbcr_s[1],
+                cbcr_v[1]
+            );
+        }
+    }
+
+    /// Microbenchmark: scalar vs vImage BGRA->full-range-NV12. Ignored by
+    /// default; run in RELEASE (debug is ~10x slower and misleading):
     ///   cargo test --release bench_nv12_full_range -- --ignored --nocapture
     #[test]
     #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
     fn bench_nv12_full_range() {
-        use super::ffi::bgra_to_nv12_full_range;
+        use super::ffi::{bgra_to_nv12_full_range, bgra_to_nv12_full_range_vimage};
+        use std::hint::black_box;
         use std::time::{Duration, Instant};
 
-        println!("\nBGRA->NV12 (full-range BT.709) scalar conversion — single thread");
+        fn time_ms(mut f: impl FnMut()) -> f64 {
+            for _ in 0..5 {
+                f();
+            }
+            let mut iters = 0u64;
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_millis(400) {
+                f();
+                iters += 1;
+            }
+            t.elapsed().as_secs_f64() * 1000.0 / iters as f64
+        }
+
+        println!("\nBGRA->NV12 (full-range BT.709) ms/frame, single thread");
         println!(
-            "{:>28}  {:>10}  {:>16}  {:>14}",
-            "resolution", "ms/frame", "% of 60fps (16.67ms)", "max fps (1 core)"
+            "{:>26}  {:>12}  {:>12}  {:>8}",
+            "resolution", "scalar ms", "vImage ms", "speedup"
         );
         for &(w, h, label) in &[
             (1470usize, 956usize, "1470x956 (Air native)"),
@@ -960,10 +1199,12 @@ mod tests {
             let mut y = vec![0u8; w * h];
             let mut cbcr = vec![0u8; w * (h / 2)];
 
-            // Warmup.
-            for _ in 0..5 {
-                bgra_to_nv12_full_range(
-                    std::hint::black_box(&bgra),
+            let scalar_ms = time_ms(|| {
+                bgra_to_nv12_full_range(black_box(&bgra), stride, w, h, &mut y, w, &mut cbcr, w);
+            });
+            let vimage_ms = time_ms(|| {
+                let _ = bgra_to_nv12_full_range_vimage(
+                    black_box(&bgra),
                     stride,
                     w,
                     h,
@@ -972,31 +1213,13 @@ mod tests {
                     &mut cbcr,
                     w,
                 );
-            }
-
-            // Time-bounded loop so big resolutions don't run forever.
-            let mut iters = 0u64;
-            let t = Instant::now();
-            while t.elapsed() < Duration::from_millis(600) {
-                bgra_to_nv12_full_range(
-                    std::hint::black_box(&bgra),
-                    stride,
-                    w,
-                    h,
-                    &mut y,
-                    w,
-                    &mut cbcr,
-                    w,
-                );
-                iters += 1;
-            }
-            std::hint::black_box(y[0]);
-            std::hint::black_box(cbcr[0]);
-
-            let per_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-            let pct = per_ms / (1000.0 / 60.0) * 100.0;
-            let max_fps = 1000.0 / per_ms;
-            println!("{label:>28}  {per_ms:10.3}  {pct:15.1}%  {max_fps:14.0}");
+            });
+            black_box(y[0]);
+            black_box(cbcr[0]);
+            println!(
+                "{label:>26}  {scalar_ms:12.3}  {vimage_ms:12.3}  {:7.1}x",
+                scalar_ms / vimage_ms
+            );
         }
     }
 

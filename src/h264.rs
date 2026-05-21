@@ -53,10 +53,6 @@ use tracing::{debug, info, trace, warn};
 
 use crate::videotoolbox::{EncodedFrame, Encoder};
 
-/// Default target bitrate. Deliberately generous for first-light tests on
-/// loopback; tuned down in M3.
-pub const DEFAULT_BITRATE_BPS: u32 = 12_000_000;
-
 /// How the H.264 NAL units are framed inside the AVC420 wire payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WireFormat {

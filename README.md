@@ -55,6 +55,8 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
                           hardware-encoded via VideoToolbox, instead of legacy
                           bitmaps. Falls back to legacy automatically for
                           clients that don't negotiate H.264. See "Video".
+--bitrate N               Target H.264 bitrate in Mbps (default 12; only with
+                          --enable-h264). Lower it (4–8) if audio lags on Wi-Fi.
 --cert-dir PATH           Persisted TLS cert (default ~/Library/Application Support/macrdp)
 --virtual-display         Serve a headless virtual display at --width × --height
                           instead of mirroring the primary panel — local screen
@@ -131,12 +133,13 @@ How it behaves:
 
 - **Automatic fallback.** Clients that don't advertise H.264 (AVC420) decode — e.g. a FreeRDP build without an H.264 decoder, or Microsoft Remote Desktop on macOS (NSCodec only) — transparently fall back to legacy bitmaps. No need to match the flag to the client.
 - **Wire format.** The AVC420 payload is Annex-B framed (what Microsoft's decoder expects). The bitstream is verified rendering on `mstsc` and on FreeRDP built with H.264 (e.g. the [Thincast client]).
+- **Bitrate.** `--bitrate N` sets the target encoder bitrate in megabits/sec (default `12`, only meaningful with `--enable-h264`). Lowering it shrinks each frame, so the big per-frame writes are less likely to fill the socket buffer and delay audio on a constrained link — try `4`–`8` if audio lags over Wi-Fi.
 
 ### Known limitations
 
-- **Reconnecting `mstsc` to a still-running macrdp can show a black screen** (with a live cursor). This is an mstsc-specific quirk: it retains EGFX surfaces for the lifetime of its process and mis-composites on reconnect. It is *not* a server bug — FreeRDP reconnects cleanly over the same stream. **Workaround:** restart macrdp, or fully close and reopen the mstsc window. (Fresh connections always render fine.)
+- **Reconnecting `mstsc` to a still-running macrdp can show a black screen** (with a live cursor). This is an mstsc-specific quirk: it retains EGFX surfaces for the lifetime of its process and mis-composites on reconnect. It is *not* a server bug — FreeRDP reconnects cleanly over the same stream. **Reliable workaround:** quit macrdp and relaunch it before reconnecting — a fresh macrdp run hands mstsc a never-cached surface id, so the desktop renders every time, with no Windows reboot needed. (Reopening the mstsc window also works; fresh connections always render fine.)
 - **The new Windows App client may fail to connect** (it sends a GCC block the underlying IronRDP parser rejects, before any video negotiation — so this affects all modes, not just H.264). Use `mstsc`, FreeRDP, or a FreeRDP-based client (e.g. [Thincast]) instead.
-- H.264 is **macOS-only** (VideoToolbox) and still maturing — bitrate/quality tuning and dirty-region encoding are not yet done.
+- H.264 is **macOS-only** (VideoToolbox) and still maturing — bitrate is tunable via `--bitrate` (above), but dirty-region encoding is not yet done (every frame is a full encode).
 
 ## Audio
 

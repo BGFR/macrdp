@@ -238,6 +238,13 @@ struct Args {
     /// macOS-only.
     #[arg(long)]
     enable_h264: bool,
+
+    /// Target H.264 bitrate in megabits/sec (only with --enable-h264).
+    /// Default 12. Lowering it shrinks each frame, so the big per-frame writes
+    /// are less likely to fill the socket buffer and delay audio on a
+    /// constrained link (e.g. Wi-Fi) — try 4–8 if audio lags under H.264.
+    #[arg(long, default_value_t = 12)]
+    bitrate: u32,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -808,9 +815,14 @@ async fn main() -> Result<()> {
     // clone drives the builder's GfxServerFactory (protocol side); another
     // rides on CaptureDisplay, where the capture loop feeds it BGRA frames.
     #[cfg(target_os = "macos")]
-    let gfx = args
-        .enable_h264
-        .then(|| h264::Gfx::new(width, height, args.fps, h264::DEFAULT_BITRATE_BPS));
+    let gfx = args.enable_h264.then(|| {
+        h264::Gfx::new(
+            width,
+            height,
+            args.fps,
+            args.bitrate.max(1).saturating_mul(1_000_000),
+        )
+    });
 
     let display = CaptureDisplay {
         width,

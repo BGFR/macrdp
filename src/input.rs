@@ -13,6 +13,9 @@ pub struct MacInputHandler {
     desktop_width: u16,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     desktop_height: u16,
+    /// Records mouse-button-down timestamps so the H.264 path can lower its
+    /// keyframe threshold briefly after a click. `None` unless `--enable-h264`.
+    click_signal: Option<crate::capture::ClickSignal>,
     #[cfg(target_os = "macos")]
     inner: macos::Inner,
 }
@@ -29,6 +32,7 @@ impl MacInputHandler {
         desktop_width: u16,
         desktop_height: u16,
         target_display_id: Option<u32>,
+        click_signal: Option<crate::capture::ClickSignal>,
     ) -> anyhow::Result<Self> {
         #[cfg(target_os = "macos")]
         let inner = macos::Inner::new(target_display_id)?;
@@ -37,6 +41,7 @@ impl MacInputHandler {
         Ok(Self {
             desktop_width,
             desktop_height,
+            click_signal,
             #[cfg(target_os = "macos")]
             inner,
         })
@@ -52,6 +57,17 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
+        // A button-down is the "user intent" signal the H.264 path uses to lower
+        // its keyframe threshold for a moment (a click usually precedes a UI
+        // change). Record before delegating, since `inner.mouse` takes `event`.
+        if let Some(sig) = &self.click_signal {
+            if matches!(
+                event,
+                MouseEvent::LeftPressed | MouseEvent::RightPressed | MouseEvent::MiddlePressed
+            ) {
+                sig.record_click();
+            }
+        }
         #[cfg(target_os = "macos")]
         self.inner
             .mouse(event, self.desktop_width, self.desktop_height);

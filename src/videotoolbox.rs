@@ -69,7 +69,13 @@ impl Encoder {
     /// Create a new H.264 encoder. `bitrate_bps` is the target average
     /// bitrate; `fps` sets the frame-duration hint used by VT's rate
     /// controller. The first encoded frame will always be a keyframe.
-    pub fn new(width: u16, height: u16, fps: u32, bitrate_bps: u32) -> Result<Self> {
+    pub fn new(
+        width: u16,
+        height: u16,
+        fps: u32,
+        bitrate_bps: u32,
+        keyframe_secs: f32,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<EncodedFrame>();
         // The callback receives the raw `*mut Sender` and clones it per
         // delivery — see `ffi::output_callback`. Keep the original Box
@@ -84,7 +90,12 @@ impl Encoder {
             std::env::var("MACRDP_H264_FULL_RANGE").as_deref(),
             Ok("0") | Ok("false") | Ok("FALSE")
         );
-        let session = ffi::create_session(width, height, fps, bitrate_bps, tx_ptr)?;
+        // Keyframe interval is a frame count; derive it from the requested
+        // seconds and the frame rate. At least 1 (every frame an IDR).
+        let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs))
+            .round()
+            .max(1.0) as u32;
+        let session = ffi::create_session(width, height, bitrate_bps, keyframe_frames, tx_ptr)?;
         Ok(Self {
             inner: session,
             rx,
@@ -437,8 +448,8 @@ mod ffi {
     pub(super) fn create_session(
         width: u16,
         height: u16,
-        fps: u32,
         bitrate_bps: u32,
+        keyframe_frames: u32,
         tx_ctx: *mut c_void,
     ) -> Result<SessionGuard> {
         let mut session: VTCompressionSessionRef = ptr::null();
@@ -516,20 +527,15 @@ mod ffi {
             // long GOP a single bad P-frame is never corrected — the symptom
             // that "heals on redraw / after a while". An IDR does cost a brief
             // hitch (a large intra frame can trip EGFX backpressure), so lower =
-            // faster recovery, higher = smoother typing. Default ~5s; override
-            // live (no rebuild) via MACRDP_H264_KEYFRAME_SECS. The session's
-            // first keyframe is still forced explicitly in encode_bgra(); this
-            // governs only the periodic safety net. (Was fps*30 ≈ 30s, which let
-            // mstsc corruption persist for half a minute.)
-            let keyframe_secs = std::env::var("MACRDP_H264_KEYFRAME_SECS")
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .filter(|&s| s > 0)
-                .unwrap_or(5);
+            // faster recovery, higher = smoother typing. The session's first
+            // keyframe is still forced explicitly in encode_bgra(); this governs
+            // only the periodic safety net. (Was fps*30 ≈ 30s, which let mstsc
+            // corruption persist for half a minute.) Set via --keyframe-interval
+            // (seconds), already converted to a frame count by the caller.
             set_i32(
                 session,
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                fps.saturating_mul(keyframe_secs) as i32,
+                keyframe_frames.max(1) as i32,
             )?;
         }
 
@@ -940,7 +946,7 @@ mod tests {
             px[3] = 0xff; // A
         }
 
-        let mut enc = Encoder::new(w, h, 30, 4_000_000)?;
+        let mut enc = Encoder::new(w, h, 30, 4_000_000, 5.0)?;
         enc.encode_bgra(&frame, stride, false)?;
         let frames = enc.flush()?;
         assert!(!frames.is_empty(), "expected at least one encoded frame");

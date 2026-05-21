@@ -16,7 +16,80 @@ use ironrdp_server::{
 };
 use tokio::sync::Notify;
 
+use std::sync::atomic::AtomicU64;
+use std::time::{Duration, Instant};
+
 use crate::cursor::CursorState;
+
+/// Dirty-area threshold (percent of the frame) above which the H.264 path asks
+/// the encoder for an immediate keyframe. A change this large (window raised to
+/// front, scroll, app launch) renders as a big P-frame that some clients only
+/// resolve cleanly at the next periodic IDR; an on-demand IDR lands it at once.
+/// Typing/caret changes are a few percent and stay below this as cheap P-frames.
+#[cfg(target_os = "macos")]
+const KEYFRAME_CHANGE_PCT: u64 = 30;
+
+/// Lowered dirty-area threshold used briefly after a mouse click. A click often
+/// drives a moderate change (dropdown, dialog, button repaint) that's below the
+/// normal bar but still garbles on some clients; the IDR still only fires if a
+/// real change actually follows the click, so no-op clicks cost nothing.
+#[cfg(target_os = "macos")]
+const KEYFRAME_CHANGE_PCT_POST_CLICK: u64 = 5;
+
+/// How long after a click the lowered threshold applies.
+#[cfg(target_os = "macos")]
+const POST_CLICK_WINDOW: Duration = Duration::from_millis(300);
+
+/// Shared click→keyframe hint. `input.rs` records a mouse-down timestamp; the
+/// H.264 capture path lowers its keyframe dirty-area threshold for a short
+/// window afterward (see [`KEYFRAME_CHANGE_PCT_POST_CLICK`]). Cheap to clone
+/// (one `Arc`); the timestamp is a relaxed atomic since exact ordering doesn't
+/// matter for a heuristic.
+#[derive(Clone)]
+pub struct ClickSignal {
+    inner: Arc<ClickInner>,
+}
+
+struct ClickInner {
+    epoch: Instant,
+    /// Milliseconds since `epoch` of the last click; 0 means "never clicked".
+    last_click_ms: AtomicU64,
+}
+
+impl ClickSignal {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(ClickInner {
+                epoch: Instant::now(),
+                last_click_ms: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// Record a click "now". Called from the input handler on mouse-button down.
+    pub fn record_click(&self) {
+        let ms = self.inner.epoch.elapsed().as_millis() as u64;
+        // max(1) so a click at t≈0 isn't mistaken for "never".
+        self.inner.last_click_ms.store(ms.max(1), Ordering::Relaxed);
+    }
+
+    /// True if the last click was within `window` of now.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn within(&self, window: Duration) -> bool {
+        let last = self.inner.last_click_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let now = self.inner.epoch.elapsed().as_millis() as u64;
+        now.saturating_sub(last) <= window.as_millis() as u64
+    }
+}
+
+impl Default for ClickSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Live RDP-session counter. ironrdp_server calls `RdpServerDisplay::updates()`
 /// once per accepted client connection and drops the returned stream when the
@@ -107,6 +180,15 @@ pub struct CaptureDisplay {
     /// display is served entirely over EGFX.
     #[cfg(target_os = "macos")]
     pub gfx: Option<crate::h264::Gfx>,
+    /// When true (`--keyframe-on-change`), the H.264 path forces a keyframe on
+    /// large dirty-area changes (and, briefly after a click, on smaller ones).
+    /// Off by default → the periodic `--keyframe-interval` is the only IDR
+    /// driver besides the forced first frame.
+    pub keyframe_on_change: bool,
+    /// Shared mouse-click hint, used only when `keyframe_on_change` is set. Lets
+    /// the H.264 path lower its keyframe threshold briefly after a click — see
+    /// [`ClickSignal`].
+    pub click_signal: Option<ClickSignal>,
 }
 
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
@@ -155,6 +237,8 @@ impl RdpServerDisplay for CaptureDisplay {
                 self.display_id,
                 self.screen_size_pts,
                 self.gfx.clone(),
+                self.keyframe_on_change,
+                self.click_signal.clone(),
             )
             .await?,
         );
@@ -197,9 +281,16 @@ mod macos {
         cursor: CursorState,
         /// EGFX/H.264 frame sink; `None` unless `--enable-h264`.
         gfx: Option<crate::h264::Gfx>,
+        /// Whether the H.264 path forces keyframes on large dirty-area changes
+        /// (`--keyframe-on-change`). When false, no dirty-area work is done.
+        keyframe_on_change: bool,
+        /// Mouse-click hint for the post-click keyframe-threshold drop. Only
+        /// consulted when `keyframe_on_change` is set.
+        click_signal: Option<ClickSignal>,
     }
 
     impl ScreenCaptureUpdates {
+        #[allow(clippy::too_many_arguments)]
         pub async fn start(
             width: u16,
             height: u16,
@@ -207,6 +298,8 @@ mod macos {
             target_display_id: Option<u32>,
             screen_size_pts: (f64, f64),
             gfx: Option<crate::h264::Gfx>,
+            keyframe_on_change: bool,
+            click_signal: Option<ClickSignal>,
         ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
                 .await
@@ -294,6 +387,8 @@ mod macos {
                 force_full_frame,
                 cursor,
                 gfx,
+                keyframe_on_change,
+                click_signal,
             })
         }
     }
@@ -386,7 +481,48 @@ mod macos {
                 // via the poll at the top of the loop). Before negotiation, or
                 // for non-EGFX clients (`Ok(false)`), fall through to legacy.
                 if let Some(gfx) = self.gfx.as_ref() {
-                    match gfx.submit_bgra(src, stride_bytes) {
+                    // On-demand keyframes (opt-in via --keyframe-on-change). A
+                    // large change at once (window raised to front, a scroll, an
+                    // app launch) is applied cleanly by some clients (mstsc) only
+                    // on a keyframe — as a P-frame it can render garbled or stale
+                    // until the next periodic IDR ("takes a while to come to
+                    // front"). Detect it from the dirty-rect area and ask for an
+                    // immediate IDR; small changes (typing, caret) stay below the
+                    // threshold and remain cheap P-frames. Dirty rects may be in
+                    // source coords when scaling, but the area fraction is still
+                    // a good "how much moved" heuristic. Disabled by default →
+                    // the periodic --keyframe-interval is the only extra IDR.
+                    let big_change = if self.keyframe_on_change {
+                        let frame_px = u64::from(pb_width) * u64::from(pb_height);
+                        let changed_px: u64 = sample
+                            .dirty_rects()
+                            .map(|rects| {
+                                rects
+                                    .iter()
+                                    .map(|r| {
+                                        let s = r.size();
+                                        (s.width.max(0.0) as u64) * (s.height.max(0.0) as u64)
+                                    })
+                                    .sum()
+                            })
+                            .unwrap_or(0);
+                        // Briefly after a click, treat a much smaller change as
+                        // keyframe-worthy too (a click usually precedes a UI
+                        // update; the IDR still only fires if a change follows).
+                        let threshold_pct = if self
+                            .click_signal
+                            .as_ref()
+                            .is_some_and(|s| s.within(POST_CLICK_WINDOW))
+                        {
+                            KEYFRAME_CHANGE_PCT_POST_CLICK
+                        } else {
+                            KEYFRAME_CHANGE_PCT
+                        };
+                        frame_px > 0 && changed_px * 100 >= frame_px * threshold_pct
+                    } else {
+                        false
+                    };
+                    match gfx.submit_bgra(src, stride_bytes, big_change) {
                         Ok(true) => {
                             self.seeded = true;
                             continue;

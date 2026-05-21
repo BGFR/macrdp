@@ -111,6 +111,9 @@ pub struct Gfx {
     height: u16,
     fps: u32,
     bitrate_bps: u32,
+    /// Periodic keyframe (IDR) interval in seconds (from `--keyframe-interval`).
+    /// Heal-vs-smoothness knob; converted to a frame count by `Encoder::new`.
+    keyframe_secs: f32,
     wire_format: WireFormat,
     /// Monotonic EGFX surface-id source. Each connection claims the next value
     /// and creates its surface at that never-before-seen id, so mstsc — which
@@ -140,11 +143,11 @@ fn initial_surface_seq() -> u16 {
 }
 
 impl Gfx {
-    pub fn new(width: u16, height: u16, fps: u32, bitrate_bps: u32) -> Self {
+    pub fn new(width: u16, height: u16, fps: u32, bitrate_bps: u32, keyframe_secs: f32) -> Self {
         let wire_format = WireFormat::from_env();
         info!(
             ?wire_format,
-            width, height, fps, "EGFX/H.264 pipeline configured"
+            width, height, fps, keyframe_secs, "EGFX/H.264 pipeline configured"
         );
         Self {
             sender: Arc::new(Mutex::new(None)),
@@ -153,6 +156,7 @@ impl Gfx {
             height,
             fps,
             bitrate_bps,
+            keyframe_secs,
             wire_format,
             // Resume the surface-id counter from the temp file (or a wall-clock
             // seed on first run) so a macrdp restart against a still-open mstsc
@@ -168,12 +172,18 @@ impl Gfx {
 
     /// Feed one full-frame BGRA buffer. Never blocks on the encoder.
     ///
+    /// `request_keyframe` asks for the next encoded frame to be a forced IDR —
+    /// pass it when a lot of the screen just changed (a window raised to front,
+    /// a scroll, an app launch). Such large updates render as a big P-frame that
+    /// some clients (mstsc) only resolve cleanly at the next periodic IDR (the
+    /// "takes a while to come to front" lag); a forced IDR lands them at once.
+    ///
     /// Returns `Ok(true)` when EGFX is the active display path (so the caller
     /// should suppress legacy BitmapUpdates for this frame — even if this
     /// particular frame was skipped for backpressure or isn't encoded yet).
     /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
     /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
-    pub fn submit_bgra(&self, bgra: &[u8], stride: usize) -> Result<bool> {
+    pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
         // Decide whether to encode this frame, and whether it must be a
         // keyframe. Scoped lock so we don't hold `ctx` across the encode.
         let force_keyframe = {
@@ -184,19 +194,26 @@ impl Gfx {
             if !ctx.is_ready {
                 return Ok(false); // channel not negotiated yet (or non-EGFX client)
             }
+            // Arm the keyframe BEFORE the backpressure check so a large change
+            // that lands on a skipped frame still forces the IDR on the next
+            // encoded frame (the change is still on screen by then).
+            if request_keyframe {
+                ctx.need_keyframe = true;
+            }
             // Lazy one-time setup on the first ready frame.
             if ctx.surface_id.is_none() || ctx.encoder.is_none() {
                 self.setup_locked(ctx)?;
             }
             // Backpressure: if the client hasn't acked enough in-flight frames,
-            // skip this capture entirely. We do NOT arm a keyframe here:
-            // skipping a *capture* (before it's encoded) doesn't break the
-            // reference chain — the next encoded frame is still a valid P-frame
-            // against the last *encoded* frame, which was already handed to the
-            // reliable (TLS/TCP) transport. Forcing an IDR on resume just emits
-            // a large frame that re-trips backpressure → a keyframe cascade /
-            // periodic stutter. The only forced keyframe is the first frame of
-            // the connection (armed in on_ready).
+            // skip this capture entirely. We do NOT arm a keyframe *because of*
+            // the skip: skipping a *capture* (before it's encoded) doesn't break
+            // the reference chain — the next encoded frame is still a valid
+            // P-frame against the last *encoded* frame, which was already handed
+            // to the reliable (TLS/TCP) transport. Forcing an IDR on resume just
+            // emits a large frame that re-trips backpressure → a keyframe cascade
+            // / periodic stutter. Forced keyframes come only from the first frame
+            // of the connection or an explicit `request_keyframe` (armed above,
+            // so it persists across this skip).
             if ctx.server_handle.lock().unwrap().should_backpressure() {
                 trace!("EGFX backpressured; skipping frame");
                 return Ok(true); // still the active path; just dropped this frame
@@ -283,6 +300,7 @@ impl Gfx {
                 self.height,
                 self.fps,
                 self.bitrate_bps,
+                self.keyframe_secs,
             )?);
             info!("EGFX VideoToolbox encoder initialized");
         }
@@ -406,6 +424,7 @@ impl core::fmt::Debug for Gfx {
             .field("h", &self.height)
             .field("fps", &self.fps)
             .field("bitrate", &self.bitrate_bps)
+            .field("keyframe_secs", &self.keyframe_secs)
             .field("wire_format", &self.wire_format)
             .finish()
     }

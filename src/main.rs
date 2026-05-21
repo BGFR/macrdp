@@ -245,6 +245,26 @@ struct Args {
     /// constrained link (e.g. Wi-Fi) — try 4–8 if audio lags under H.264.
     #[arg(long, default_value_t = 12)]
     bitrate: u32,
+
+    /// H.264 periodic keyframe (IDR) interval in seconds (only with
+    /// --enable-h264). Default 2. This is a safety net for transient decode
+    /// glitches on small changes (e.g. mstsc's lingering garbled text while
+    /// typing); large changes (window-to-front, scroll) already force an
+    /// immediate IDR on their own. Lower self-heals faster but frequent IDRs
+    /// cost bandwidth/quality at a fixed bitrate and can stutter. Fractional
+    /// values are allowed (e.g. 0.25). The session's first frame is a keyframe.
+    #[arg(long, default_value_t = 2.0)]
+    keyframe_interval: f32,
+
+    /// Force an H.264 keyframe when a lot of the screen changes at once — a
+    /// window raised to front, a scroll, an app launch — instead of waiting for
+    /// the periodic --keyframe-interval (only with --enable-h264). Off by
+    /// default. Also briefly lowers the change threshold after a mouse click.
+    /// Helps large updates render immediately on clients (e.g. mstsc) that apply
+    /// big P-frames cleanly only on a keyframe, at the cost of occasional extra
+    /// IDRs (bandwidth/quality).
+    #[arg(long)]
+    keyframe_on_change: bool,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -821,8 +841,15 @@ async fn main() -> Result<()> {
             height,
             args.fps,
             args.bitrate.max(1).saturating_mul(1_000_000),
+            args.keyframe_interval,
         )
     });
+
+    // Mouse-click hint shared by the input handler (which records clicks) and
+    // the H.264 capture path (which lowers its keyframe threshold briefly after
+    // a click). Only allocated when the on-demand-keyframe feature is enabled.
+    let click_signal =
+        (args.enable_h264 && args.keyframe_on_change).then(crate::capture::ClickSignal::new);
 
     let display = CaptureDisplay {
         width,
@@ -836,9 +863,11 @@ async fn main() -> Result<()> {
             .then(|| session_tracker.clone()),
         #[cfg(target_os = "macos")]
         gfx: gfx.clone(),
+        keyframe_on_change: args.keyframe_on_change,
+        click_signal: click_signal.clone(),
     };
 
-    let input_handler = MacInputHandler::new(width, height, capture_display_id)?;
+    let input_handler = MacInputHandler::new(width, height, capture_display_id, click_signal)?;
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> =
         Box::new(clipboard::MacCliprdr::new());
     let sound: Box<dyn ironrdp_server::SoundServerFactory> = Box::new(audio::MacRdpsnd::new());

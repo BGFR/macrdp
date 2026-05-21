@@ -21,13 +21,15 @@ use std::time::{Duration, Instant};
 
 use crate::cursor::CursorState;
 
-/// Dirty-area threshold (percent of the frame) above which the H.264 path asks
-/// the encoder for an immediate keyframe. A change this large (window raised to
-/// front, scroll, app launch) renders as a big P-frame that some clients only
-/// resolve cleanly at the next periodic IDR; an on-demand IDR lands it at once.
-/// Typing/caret changes are a few percent and stay below this as cheap P-frames.
+/// Dirty-area threshold (percent of the frame) at or above which the H.264 path
+/// asks the encoder for an immediate keyframe. A change this large (window
+/// raised to front, scroll, app launch) renders as a big P-frame that some
+/// clients only resolve cleanly at the next periodic IDR; an on-demand IDR lands
+/// it at once. Typing/caret changes are a few percent and stay below this.
+/// Fired only on the rising edge (see `kf_armed`), so this is "a large change
+/// *began*", not "is ongoing".
 #[cfg(target_os = "macos")]
-const KEYFRAME_CHANGE_PCT: u64 = 30;
+const KEYFRAME_CHANGE_PCT: u64 = 20;
 
 /// Lowered dirty-area threshold used briefly after a mouse click. A click often
 /// drives a moderate change (dropdown, dialog, button repaint) that's below the
@@ -38,7 +40,7 @@ const KEYFRAME_CHANGE_PCT_POST_CLICK: u64 = 5;
 
 /// How long after a click the lowered threshold applies.
 #[cfg(target_os = "macos")]
-const POST_CLICK_WINDOW: Duration = Duration::from_millis(300);
+const POST_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
 /// Shared click→keyframe hint. `input.rs` records a mouse-down timestamp; the
 /// H.264 capture path lowers its keyframe dirty-area threshold for a short
@@ -284,6 +286,11 @@ mod macos {
         /// Whether the H.264 path forces keyframes on large dirty-area changes
         /// (`--keyframe-on-change`). When false, no dirty-area work is done.
         keyframe_on_change: bool,
+        /// Rising-edge state for `keyframe_on_change`: true means "ready to fire
+        /// on the next large change". Cleared when one fires; re-armed once the
+        /// dirty area subsides below half the threshold (hysteresis). Stops
+        /// sustained churn (e.g. video) from forcing an IDR every frame.
+        kf_armed: bool,
         /// Mouse-click hint for the post-click keyframe-threshold drop. Only
         /// consulted when `keyframe_on_change` is set.
         click_signal: Option<ClickSignal>,
@@ -388,6 +395,7 @@ mod macos {
                 cursor,
                 gfx,
                 keyframe_on_change,
+                kf_armed: true,
                 click_signal,
             })
         }
@@ -509,7 +517,7 @@ mod macos {
                         // Briefly after a click, treat a much smaller change as
                         // keyframe-worthy too (a click usually precedes a UI
                         // update; the IDR still only fires if a change follows).
-                        let threshold_pct = if self
+                        let high = if self
                             .click_signal
                             .as_ref()
                             .is_some_and(|s| s.within(POST_CLICK_WINDOW))
@@ -518,7 +526,22 @@ mod macos {
                         } else {
                             KEYFRAME_CHANGE_PCT
                         };
-                        frame_px > 0 && changed_px * 100 >= frame_px * threshold_pct
+                        let low = (high / 2).max(1); // hysteresis re-arm band
+                        let is_big = frame_px > 0 && changed_px * 100 >= frame_px * high;
+                        let is_quiet = frame_px == 0 || changed_px * 100 < frame_px * low;
+                        // Rising edge only: fire once when a large change begins,
+                        // then stay quiet until it subsides below `low`. Without
+                        // this, sustained churn (video, htop) above the threshold
+                        // would force an IDR every frame and wreck quality.
+                        if self.kf_armed && is_big {
+                            self.kf_armed = false;
+                            true
+                        } else if is_quiet {
+                            self.kf_armed = true;
+                            false
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     };

@@ -43,13 +43,6 @@ pub struct KeyframeOnChange {
     pub click_window: Duration,
 }
 
-/// Idle-frame suppression: once EGFX owns the display, an unchanged frame is
-/// skipped (no encode, no wire frame) — but never for longer than this, so a
-/// heartbeat frame still flows (heals any under-reported dirty region and keeps
-/// the periodic keyframe ticking).
-#[cfg(target_os = "macos")]
-const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
-
 /// Shared click→keyframe hint. `input.rs` records a mouse-down timestamp; the
 /// H.264 capture path lowers its keyframe dirty-area threshold for a short
 /// window afterward (see [`KEYFRAME_CHANGE_PCT_POST_CLICK`]). Cheap to clone
@@ -301,13 +294,6 @@ mod macos {
         /// Mouse-click hint for the post-click keyframe-threshold drop. Only
         /// consulted when `keyframe_on_change.enabled`.
         click_signal: Option<ClickSignal>,
-        /// True once EGFX has negotiated and owns the display (first `Ok(true)`
-        /// from `submit_bgra`). Gates idle-frame suppression — we only skip
-        /// unchanged frames once the H.264 path is actually serving the display.
-        gfx_active: bool,
-        /// When the last frame was submitted to the encoder. Drives the
-        /// idle-skip heartbeat (see `IDLE_HEARTBEAT`).
-        last_submit: Option<Instant>,
     }
 
     impl ScreenCaptureUpdates {
@@ -411,8 +397,6 @@ mod macos {
                 keyframe_on_change,
                 kf_armed: true,
                 click_signal,
-                gfx_active: false,
-                last_submit: None,
             })
         }
     }
@@ -505,50 +489,34 @@ mod macos {
                 // via the poll at the top of the loop). Before negotiation, or
                 // for non-EGFX clients (`Ok(false)`), fall through to legacy.
                 if let Some(gfx) = self.gfx.as_ref() {
-                    // Dirty-rect area drives both idle-frame suppression and the
-                    // on-demand-keyframe decision. `dirty_known` is false when the
-                    // attachment is absent (older macOS) — then we can't tell what
-                    // changed, so we never skip. Dirty rects may be in source
-                    // coords when scaling, but the area fraction is still a good
-                    // "how much moved" heuristic.
-                    let frame_px = u64::from(pb_width) * u64::from(pb_height);
-                    let dirty = sample.dirty_rects();
-                    let dirty_known = dirty.is_some();
-                    let changed_px: u64 = dirty
-                        .map(|rects| {
-                            rects
-                                .iter()
-                                .map(|r| {
-                                    let s = r.size();
-                                    (s.width.max(0.0) as u64) * (s.height.max(0.0) as u64)
-                                })
-                                .sum()
-                        })
-                        .unwrap_or(0);
-
-                    // Idle-frame suppression: once EGFX owns the display, skip an
-                    // unchanged frame (no NV12 conversion, no encode, no wire
-                    // frame) — but never longer than IDLE_HEARTBEAT, so a frame
-                    // still flows periodically to heal any under-reported dirty
-                    // region and keep the periodic keyframe ticking.
-                    if self.gfx_active && dirty_known && changed_px == 0 {
-                        let recent = self
-                            .last_submit
-                            .is_some_and(|t| t.elapsed() < IDLE_HEARTBEAT);
-                        if recent {
-                            continue;
-                        }
-                    }
-
                     // On-demand keyframes (opt-in via --keyframe-on-change). A
                     // large change at once (window raised to front, scroll, app
                     // launch) is applied cleanly by some clients (mstsc) only on a
                     // keyframe — as a P-frame it can render garbled/stale until the
                     // next periodic IDR. Force an IDR on the rising edge of a large
                     // dirty area; small changes (typing, caret) stay below the
-                    // threshold and remain cheap P-frames.
+                    // threshold and remain cheap P-frames. (We deliberately do NOT
+                    // skip unchanged frames here — mstsc only flushes its ~2-frame
+                    // presentation buffer when frames keep arriving, so a continuous
+                    // stream is what keeps typing/window-switching snappy at 60fps.
+                    // The vImage conversion makes a steady stream cheap anyway.)
                     let kfc = self.keyframe_on_change;
                     let big_change = if kfc.enabled {
+                        let frame_px = u64::from(pb_width) * u64::from(pb_height);
+                        // Dirty-rect area as a "how much moved" fraction (rects may
+                        // be in source coords when scaling, but the ratio holds).
+                        let changed_px: u64 = sample
+                            .dirty_rects()
+                            .map(|rects| {
+                                rects
+                                    .iter()
+                                    .map(|r| {
+                                        let s = r.size();
+                                        (s.width.max(0.0) as u64) * (s.height.max(0.0) as u64)
+                                    })
+                                    .sum()
+                            })
+                            .unwrap_or(0);
                         // Briefly after a click, treat a much smaller change as
                         // keyframe-worthy too (a click usually precedes a UI
                         // update; the IDR still only fires if a change follows).
@@ -583,8 +551,6 @@ mod macos {
                     match gfx.submit_bgra(src, stride_bytes, big_change) {
                         Ok(true) => {
                             self.seeded = true;
-                            self.gfx_active = true;
-                            self.last_submit = Some(std::time::Instant::now());
                             continue;
                         }
                         Ok(false) => {}

@@ -933,6 +933,50 @@ mod tests {
         assert_eq!((cbcr[0], cbcr[1]), (128, 128), "neutral chroma");
     }
 
+    /// Microbenchmark for the scalar BGRA->full-range-NV12 conversion. Ignored
+    /// by default; run in RELEASE (debug is ~10x slower and misleading):
+    ///   cargo test --release bench_nv12_full_range -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_nv12_full_range() {
+        use super::ffi::bgra_to_nv12_full_range;
+        use std::time::{Duration, Instant};
+
+        println!("\nBGRA->NV12 (full-range BT.709) scalar conversion — single thread");
+        println!("{:>28}  {:>10}  {:>16}  {:>14}", "resolution", "ms/frame", "% of 60fps (16.67ms)", "max fps (1 core)");
+        for &(w, h, label) in &[
+            (1470usize, 956usize, "1470x956 (Air native)"),
+            (1920, 1080, "1920x1080"),
+            (2560, 1440, "2560x1440"),
+            (3840, 2160, "3840x2160 (4K)"),
+        ] {
+            let stride = w * 4;
+            let bgra = vec![0x80u8; stride * h];
+            let mut y = vec![0u8; w * h];
+            let mut cbcr = vec![0u8; w * (h / 2)];
+
+            // Warmup.
+            for _ in 0..5 {
+                bgra_to_nv12_full_range(std::hint::black_box(&bgra), stride, w, h, &mut y, w, &mut cbcr, w);
+            }
+
+            // Time-bounded loop so big resolutions don't run forever.
+            let mut iters = 0u64;
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_millis(600) {
+                bgra_to_nv12_full_range(std::hint::black_box(&bgra), stride, w, h, &mut y, w, &mut cbcr, w);
+                iters += 1;
+            }
+            std::hint::black_box(y[0]);
+            std::hint::black_box(cbcr[0]);
+
+            let per_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            let pct = per_ms / (1000.0 / 60.0) * 100.0;
+            let max_fps = 1000.0 / per_ms;
+            println!("{label:>28}  {per_ms:10.3}  {pct:15.1}%  {max_fps:14.0}");
+        }
+    }
+
     #[test]
     fn encodes_a_keyframe() -> Result<()> {
         let w: u16 = 320;

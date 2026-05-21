@@ -92,9 +92,7 @@ impl Encoder {
         );
         // Keyframe interval is a frame count; derive it from the requested
         // seconds and the frame rate. At least 1 (every frame an IDR).
-        let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs))
-            .round()
-            .max(1.0) as u32;
+        let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
         let session = ffi::create_session(width, height, bitrate_bps, keyframe_frames, tx_ptr)?;
         Ok(Self {
             inner: session,
@@ -226,10 +224,10 @@ mod ffi {
     // Four-char codes are big-endian-packed on macOS.
     // 'B' 'G' 'R' 'A' = 0x42 0x47 0x52 0x41
     pub(super) const K_CV_PIXEL_FORMAT_TYPE_32_BGRA: OSType = 0x4247_5241; // 'BGRA'
-    // '4' '2' '0' 'f' — bi-planar (NV12) Y'CbCr 4:2:0, FULL range (luma 0-255).
-    // Used when the full-range path is enabled so mstsc — which reads AVC420
-    // luma as full-range and washes video-range content lighter — gets data
-    // whose range matches its assumption.
+                                                                           // '4' '2' '0' 'f' — bi-planar (NV12) Y'CbCr 4:2:0, FULL range (luma 0-255).
+                                                                           // Used when the full-range path is enabled so mstsc — which reads AVC420
+                                                                           // luma as full-range and washes video-range content lighter — gets data
+                                                                           // whose range matches its assumption.
     pub(super) const K_CV_PIXEL_FORMAT_TYPE_420F: OSType = 0x3432_3066; // '420f'
                                                                         // 'a' 'v' 'c' '1' = 0x61 0x76 0x63 0x31
     pub(super) const K_CM_VIDEO_CODEC_TYPE_H264: OSType = 0x6176_6331; // 'avc1'
@@ -696,7 +694,8 @@ mod ffi {
                 let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 0);
                 let cbcr_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 1) as *mut u8;
                 let cbcr_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 1);
-                let y_plane = std::slice::from_raw_parts_mut(y_base, y_stride * usize::from(height));
+                let y_plane =
+                    std::slice::from_raw_parts_mut(y_base, y_stride * usize::from(height));
                 let cbcr_plane = std::slice::from_raw_parts_mut(
                     cbcr_base,
                     cbcr_stride * (usize::from(height) / 2),
@@ -918,10 +917,13 @@ mod tests {
         let stride = w * 4;
         let mut y = vec![0u8; w * h];
         let mut cbcr = vec![0u8; w]; // one 2x2 chroma sample = 2 bytes
-        // Black (B=G=R=0).
+                                     // Black (B=G=R=0).
         let black = vec![0u8; stride * h];
         bgra_to_nv12_full_range(&black, stride, w, h, &mut y, w, &mut cbcr, w);
-        assert!(y.iter().all(|&v| v == 0), "full-range black luma should be 0");
+        assert!(
+            y.iter().all(|&v| v == 0),
+            "full-range black luma should be 0"
+        );
         assert_eq!((cbcr[0], cbcr[1]), (128, 128), "neutral chroma");
         // White (B=G=R=255).
         let white = vec![0xFFu8; stride * h];
@@ -943,7 +945,10 @@ mod tests {
         use std::time::{Duration, Instant};
 
         println!("\nBGRA->NV12 (full-range BT.709) scalar conversion — single thread");
-        println!("{:>28}  {:>10}  {:>16}  {:>14}", "resolution", "ms/frame", "% of 60fps (16.67ms)", "max fps (1 core)");
+        println!(
+            "{:>28}  {:>10}  {:>16}  {:>14}",
+            "resolution", "ms/frame", "% of 60fps (16.67ms)", "max fps (1 core)"
+        );
         for &(w, h, label) in &[
             (1470usize, 956usize, "1470x956 (Air native)"),
             (1920, 1080, "1920x1080"),
@@ -957,14 +962,32 @@ mod tests {
 
             // Warmup.
             for _ in 0..5 {
-                bgra_to_nv12_full_range(std::hint::black_box(&bgra), stride, w, h, &mut y, w, &mut cbcr, w);
+                bgra_to_nv12_full_range(
+                    std::hint::black_box(&bgra),
+                    stride,
+                    w,
+                    h,
+                    &mut y,
+                    w,
+                    &mut cbcr,
+                    w,
+                );
             }
 
             // Time-bounded loop so big resolutions don't run forever.
             let mut iters = 0u64;
             let t = Instant::now();
             while t.elapsed() < Duration::from_millis(600) {
-                bgra_to_nv12_full_range(std::hint::black_box(&bgra), stride, w, h, &mut y, w, &mut cbcr, w);
+                bgra_to_nv12_full_range(
+                    std::hint::black_box(&bgra),
+                    stride,
+                    w,
+                    h,
+                    &mut y,
+                    w,
+                    &mut cbcr,
+                    w,
+                );
                 iters += 1;
             }
             std::hint::black_box(y[0]);

@@ -140,7 +140,7 @@ By default the display is sent as legacy bitmaps (RemoteFx/QOI to mstsc, NSCodec
 
 How it behaves:
 
-- **Automatic fallback.** Clients that don't advertise H.264 (AVC420) decode — e.g. a FreeRDP build without an H.264 decoder, or Microsoft Remote Desktop on macOS (NSCodec only) — transparently fall back to legacy bitmaps. No need to match the flag to the client.
+- **Automatic fallback.** Clients that don't advertise H.264 (AVC420) decode — e.g. a FreeRDP build without an H.264 decoder — transparently fall back to legacy bitmaps. No need to match the flag to the client. mstsc, FreeRDP-with-H.264, and the macOS **Windows App** / Microsoft Remote Desktop client all decode the H.264 stream.
 - **Wire format.** The AVC420 payload is Annex-B framed (what Microsoft's decoder expects). The bitstream is verified rendering on `mstsc` and on FreeRDP built with H.264 (e.g. the [Thincast client]).
 - **Bitrate.** `--bitrate N` sets the target encoder bitrate in megabits/sec (default `6`, only meaningful with `--enable-h264`). Raising it sharpens detail but grows each frame, so the big per-frame writes are more likely to fill the socket buffer and delay audio on a constrained link — `6` is a good balance; try `8`–`12` if you have headroom.
 - **Color.** The stream is encoded as full-range BT.709. This matters for `mstsc`, which reads AVC420 luma as full-range regardless of the bitstream flag — video-range output otherwise renders washed-out / lighter there. FreeRDP honors the flag and is correct either way. To get full range we convert each captured BGRA frame to full-range NV12 ourselves (VideoToolbox would otherwise emit video-range from a BGRA source); that conversion is **vImage**-accelerated — see [Color conversion: scalar vs vImage](#color-conversion-scalar-vs-vimage).
@@ -151,7 +151,6 @@ How it behaves:
 ### Known limitations
 
 - **Reconnecting `mstsc` to a still-running macrdp can show a black screen** (with a live cursor). This is an mstsc-specific quirk: it retains EGFX surfaces for the lifetime of its process and mis-composites on reconnect. It is *not* a server bug — FreeRDP reconnects cleanly over the same stream. **Reliable workaround:** quit macrdp and relaunch it before reconnecting — a fresh macrdp run hands mstsc a never-cached surface id, so the desktop renders every time, with no Windows reboot needed. (Reopening the mstsc window also works; fresh connections always render fine.)
-- **The new Windows App client may fail to connect** (it sends a GCC block the underlying IronRDP parser rejects, before any video negotiation — so this affects all modes, not just H.264). Use `mstsc`, FreeRDP, or a FreeRDP-based client (e.g. [Thincast]) instead.
 - H.264 is **macOS-only** (VideoToolbox) and still maturing — bitrate and keyframe behavior are tunable (above), but dirty-region *encoding* is not yet done: every *changed* frame is a full encode (dirty rects are used to skip unchanged frames and to time keyframes, but not to encode sub-regions). H.264's own inter-prediction keeps unchanged regions cheap regardless.
 
 ### Color conversion: scalar vs vImage

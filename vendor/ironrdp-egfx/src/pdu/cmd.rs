@@ -1592,12 +1592,25 @@ impl<'de> Decode<'de> for CapabilitySet {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         ensure_fixed_part_size!(in: src);
 
-        let version = CapabilityVersion::try_from(src.read_u32())?;
+        let version_raw = src.read_u32();
         let data_length: usize = cast_length!("dataLength", src.read_u32())?;
 
         ensure_size!(in: src, size: data_length);
         let data = src.read_slice(data_length);
         let mut cur = ReadCursor::new(data);
+
+        // Tolerate unknown/newer capability versions instead of failing the
+        // whole PDU. A strict error here is fatal to the *entire connection*:
+        // Windows App for Mac (com.microsoft.rdc.macos) advertises a capset
+        // version this build doesn't recognize, which otherwise kills the EGFX
+        // channel during CapabilitiesAdvertise — before the AVC-vs-legacy
+        // fallback can run, so the client can't connect at all with
+        // --enable-h264. Keeping the raw bytes as `Unknown` lets negotiation
+        // finish (and we fall back to legacy BitmapUpdate if no AVC420 capset is
+        // present). (macrdp vendor divergence — candidate for upstreaming.)
+        let Ok(version) = CapabilityVersion::try_from(version_raw) else {
+            return Ok(CapabilitySet::Unknown(data.to_vec()));
+        };
 
         let size = match version {
             CapabilityVersion::V8

@@ -56,6 +56,13 @@ pub struct Encoder {
     /// Frame duration as a `CMTime` ratio (numerator, denominator).
     /// VT uses this for rate control even when we drive PTS manually.
     fps: u32,
+    /// When true (the default), convert BGRA → full-range (0-255) NV12 ourselves
+    /// and feed VT a `420f` buffer, so the encoded stream is full-range. mstsc
+    /// reads AVC420 luma as full-range regardless of the VUI flag, so
+    /// video-range output (VT's default from a BGRA source) shows raised/washed
+    /// blacks there. FreeRDP honors the range flag so it stays correct either
+    /// way. Opt back out to video-range with `MACRDP_H264_FULL_RANGE=0`.
+    full_range: bool,
 }
 
 impl Encoder {
@@ -70,6 +77,13 @@ impl Encoder {
         let tx_box = Box::new(tx);
         let tx_ptr = Box::as_ref(&tx_box) as *const mpsc::Sender<EncodedFrame> as *mut c_void;
 
+        // Default to full-range NV12 — verified to fix mstsc's washed/lighter
+        // image while keeping FreeRDP correct. Opt back out to video-range (let
+        // VT convert from BGRA) with MACRDP_H264_FULL_RANGE=0 for debugging.
+        let full_range = !matches!(
+            std::env::var("MACRDP_H264_FULL_RANGE").as_deref(),
+            Ok("0") | Ok("false") | Ok("FALSE")
+        );
         let session = ffi::create_session(width, height, fps, bitrate_bps, tx_ptr)?;
         Ok(Self {
             inner: session,
@@ -79,6 +93,7 @@ impl Encoder {
             height,
             next_pts: 0,
             fps,
+            full_range,
         })
     }
 
@@ -121,6 +136,7 @@ impl Encoder {
             pts,
             self.fps,
             force_keyframe,
+            self.full_range,
         )
     }
 
@@ -199,7 +215,12 @@ mod ffi {
     // Four-char codes are big-endian-packed on macOS.
     // 'B' 'G' 'R' 'A' = 0x42 0x47 0x52 0x41
     pub(super) const K_CV_PIXEL_FORMAT_TYPE_32_BGRA: OSType = 0x4247_5241; // 'BGRA'
-                                                                           // 'a' 'v' 'c' '1' = 0x61 0x76 0x63 0x31
+    // '4' '2' '0' 'f' — bi-planar (NV12) Y'CbCr 4:2:0, FULL range (luma 0-255).
+    // Used when the full-range path is enabled so mstsc — which reads AVC420
+    // luma as full-range and washes video-range content lighter — gets data
+    // whose range matches its assumption.
+    pub(super) const K_CV_PIXEL_FORMAT_TYPE_420F: OSType = 0x3432_3066; // '420f'
+                                                                        // 'a' 'v' 'c' '1' = 0x61 0x76 0x63 0x31
     pub(super) const K_CM_VIDEO_CODEC_TYPE_H264: OSType = 0x6176_6331; // 'avc1'
 
     #[repr(C)]
@@ -263,6 +284,17 @@ mod ffi {
         pub(super) static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
         pub(super) static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
         pub(super) static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
+        // Color-space signaling so the encoded SPS VUI describes its color
+        // space explicitly instead of leaving the decoder to guess (which is
+        // why mstsc washed the image lighter while FreeRDP guessed right).
+        pub(super) static kVTCompressionPropertyKey_ColorPrimaries: CFStringRef;
+        pub(super) static kVTCompressionPropertyKey_TransferFunction: CFStringRef;
+        pub(super) static kVTCompressionPropertyKey_YCbCrMatrix: CFStringRef;
+        // BT.709 — the HD convention RDP H.264 clients expect. Symbols live in
+        // CoreVideo (already linked below).
+        pub(super) static kCVImageBufferColorPrimaries_ITU_R_709_2: CFStringRef;
+        pub(super) static kCVImageBufferTransferFunction_ITU_R_709_2: CFStringRef;
+        pub(super) static kCVImageBufferYCbCrMatrix_ITU_R_709_2: CFStringRef;
         pub(super) static kCFBooleanTrue: CFBooleanRef;
         pub(super) static kCFBooleanFalse: CFBooleanRef;
 
@@ -301,6 +333,14 @@ mod ffi {
         ) -> i32;
         pub(super) fn CVPixelBufferGetBaseAddress(pixel_buffer: CVPixelBufferRef) -> *mut c_void;
         pub(super) fn CVPixelBufferGetBytesPerRow(pixel_buffer: CVPixelBufferRef) -> usize;
+        pub(super) fn CVPixelBufferGetBaseAddressOfPlane(
+            pixel_buffer: CVPixelBufferRef,
+            plane_index: usize,
+        ) -> *mut c_void;
+        pub(super) fn CVPixelBufferGetBytesPerRowOfPlane(
+            pixel_buffer: CVPixelBufferRef,
+            plane_index: usize,
+        ) -> usize;
 
         // CMSampleBuffer accessors used in the output callback.
         pub(super) fn CMSampleBufferGetDataBuffer(sbuf: CMSampleBufferRef) -> CMBlockBufferRef;
@@ -442,21 +482,54 @@ mod ffi {
                 kVTCompressionPropertyKey_ProfileLevel,
                 kVTProfileLevel_H264_Baseline_AutoLevel,
             )?;
+            // Tag the bitstream's color space explicitly (BT.709). Without this
+            // VideoToolbox leaves the SPS VUI under-specified and each decoder
+            // guesses: FreeRDP guessed right, mstsc guessed wrong and raised the
+            // black level so the whole image looked lighter/washed out once the
+            // H.264 stream took over from the legacy bitmap seed. Best-effort —
+            // ignore on a VT version that rejects a key rather than fail encode.
+            let _ = set_string(
+                session,
+                kVTCompressionPropertyKey_ColorPrimaries,
+                kCVImageBufferColorPrimaries_ITU_R_709_2,
+            );
+            let _ = set_string(
+                session,
+                kVTCompressionPropertyKey_TransferFunction,
+                kCVImageBufferTransferFunction_ITU_R_709_2,
+            );
+            let _ = set_string(
+                session,
+                kVTCompressionPropertyKey_YCbCrMatrix,
+                kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+            );
             set_i32(
                 session,
                 kVTCompressionPropertyKey_AverageBitRate,
                 bitrate_bps as i32,
             )?;
-            // Keyframe interval. RDP runs over reliable TLS/TCP, so periodic
-            // IDRs (a lossy-transport recovery mechanism) aren't needed — they
-            // just emit a large frame that hitches an otherwise smooth P-frame
-            // stream (very visible while typing) and can trip backpressure. Set
-            // a long interval (~30s) as a light safety net; the real first
-            // keyframe is forced explicitly on connect via encode_bgra().
+            // Keyframe (IDR) interval — a heal-vs-smoothness knob. The transport
+            // is reliable TLS/TCP, so this isn't for packet loss; it's so a
+            // client that hits a transient *decode* glitch can resync without
+            // reconnecting. mstsc in particular shows lingering macroblock
+            // garbage (very visible on text) until the next IDR, because over a
+            // long GOP a single bad P-frame is never corrected — the symptom
+            // that "heals on redraw / after a while". An IDR does cost a brief
+            // hitch (a large intra frame can trip EGFX backpressure), so lower =
+            // faster recovery, higher = smoother typing. Default ~5s; override
+            // live (no rebuild) via MACRDP_H264_KEYFRAME_SECS. The session's
+            // first keyframe is still forced explicitly in encode_bgra(); this
+            // governs only the periodic safety net. (Was fps*30 ≈ 30s, which let
+            // mstsc corruption persist for half a minute.)
+            let keyframe_secs = std::env::var("MACRDP_H264_KEYFRAME_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .filter(|&s| s > 0)
+                .unwrap_or(5);
             set_i32(
                 session,
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                (fps * 30) as i32,
+                fps.saturating_mul(keyframe_secs) as i32,
             )?;
         }
 
@@ -512,6 +585,64 @@ mod ffi {
         Ok(())
     }
 
+    /// Convert a BGRA frame to **full-range** (luma 0-255) BT.709 NV12, writing
+    /// into the caller-provided Y plane and interleaved-CbCr plane. Full-range
+    /// because mstsc reads AVC420 luma as full-range regardless of the
+    /// bitstream's VUI range flag, so video-range output shows washed/raised
+    /// blacks there; FreeRDP honors the flag and is correct either way. BGRA
+    /// byte order is (B, G, R, A). Chroma is 4:2:0, averaged over each 2x2 block.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bgra_to_nv12_full_range(
+        bgra: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        y_plane: &mut [u8],
+        y_stride: usize,
+        cbcr_plane: &mut [u8],
+        cbcr_stride: usize,
+    ) {
+        const KR: f32 = 0.2126;
+        const KG: f32 = 0.7152;
+        const KB: f32 = 0.0722;
+        // Luma: one sample per pixel.
+        for y in 0..height {
+            let src = &bgra[y * src_stride..];
+            let yrow = &mut y_plane[y * y_stride..];
+            for x in 0..width {
+                let p = &src[x * 4..];
+                let (b, g, r) = (f32::from(p[0]), f32::from(p[1]), f32::from(p[2]));
+                let luma = KR * r + KG * g + KB * b; // 0..255, full range
+                yrow[x] = luma.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        // Chroma: average each 2x2 block, store interleaved Cb then Cr.
+        let cw = width / 2;
+        let ch = height / 2;
+        for cy in 0..ch {
+            let crow = &mut cbcr_plane[cy * cbcr_stride..];
+            for cx in 0..cw {
+                let (mut rs, mut gs, mut bs) = (0.0f32, 0.0f32, 0.0f32);
+                for dy in 0..2 {
+                    let src = &bgra[(cy * 2 + dy) * src_stride..];
+                    for dx in 0..2 {
+                        let p = &src[(cx * 2 + dx) * 4..];
+                        bs += f32::from(p[0]);
+                        gs += f32::from(p[1]);
+                        rs += f32::from(p[2]);
+                    }
+                }
+                let (r, g, b) = (rs / 4.0, gs / 4.0, bs / 4.0);
+                let luma = KR * r + KG * g + KB * b;
+                // Full-range Cb/Cr: deviation / 2*(1-Kb|Kr), bias 128.
+                let cb = (b - luma) / 1.8556 + 128.0;
+                let cr = (r - luma) / 1.5748 + 128.0;
+                crow[cx * 2] = cb.round().clamp(0.0, 255.0) as u8;
+                crow[cx * 2 + 1] = cr.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)] // internal FFI helper; grouping into a struct adds no clarity
     pub(super) fn encode_frame(
         guard: &SessionGuard,
@@ -522,14 +653,22 @@ mod ffi {
         pts: i64,
         fps: u32,
         force_keyframe: bool,
+        full_range: bool,
     ) -> Result<()> {
+        // Full-range path feeds VT a `420f` (full-range NV12) buffer we fill
+        // ourselves; otherwise hand VT BGRA and let it produce video-range YUV.
+        let pixel_format = if full_range {
+            K_CV_PIXEL_FORMAT_TYPE_420F
+        } else {
+            K_CV_PIXEL_FORMAT_TYPE_32_BGRA
+        };
         let mut pbuf: CVPixelBufferRef = ptr::null();
         let status = unsafe {
             CVPixelBufferCreate(
                 ptr::null(),
                 width.into(),
                 height.into(),
-                K_CV_PIXEL_FORMAT_TYPE_32_BGRA,
+                pixel_format,
                 ptr::null(),
                 &mut pbuf,
             )
@@ -545,19 +684,42 @@ mod ffi {
         // success/failure so we don't leak on errors.
         let result = unsafe {
             CVPixelBufferLockBaseAddress(pbuf, 0);
-            let dst = CVPixelBufferGetBaseAddress(pbuf) as *mut u8;
-            let dst_stride = CVPixelBufferGetBytesPerRow(pbuf);
-            let row_bytes = usize::from(width) * 4;
-            // CVPixelBuffer may have a different stride than the source
-            // (alignment to 64 bytes is common). Copy row by row.
-            for row in 0..usize::from(height) {
-                let src_offset = row * stride;
-                let dst_offset = row * dst_stride;
-                ptr::copy_nonoverlapping(
-                    bgra.as_ptr().add(src_offset),
-                    dst.add(dst_offset),
-                    row_bytes,
+            if full_range {
+                // Two planes: Y (full size) + interleaved CbCr (half size).
+                let y_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 0) as *mut u8;
+                let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 0);
+                let cbcr_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 1) as *mut u8;
+                let cbcr_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 1);
+                let y_plane = std::slice::from_raw_parts_mut(y_base, y_stride * usize::from(height));
+                let cbcr_plane = std::slice::from_raw_parts_mut(
+                    cbcr_base,
+                    cbcr_stride * (usize::from(height) / 2),
                 );
+                bgra_to_nv12_full_range(
+                    bgra,
+                    stride,
+                    width.into(),
+                    height.into(),
+                    y_plane,
+                    y_stride,
+                    cbcr_plane,
+                    cbcr_stride,
+                );
+            } else {
+                let dst = CVPixelBufferGetBaseAddress(pbuf) as *mut u8;
+                let dst_stride = CVPixelBufferGetBytesPerRow(pbuf);
+                let row_bytes = usize::from(width) * 4;
+                // CVPixelBuffer may have a different stride than the source
+                // (alignment to 64 bytes is common). Copy row by row.
+                for row in 0..usize::from(height) {
+                    let src_offset = row * stride;
+                    let dst_offset = row * dst_stride;
+                    ptr::copy_nonoverlapping(
+                        bgra.as_ptr().add(src_offset),
+                        dst.add(dst_offset),
+                        row_bytes,
+                    );
+                }
             }
             CVPixelBufferUnlockBaseAddress(pbuf, 0);
 
@@ -739,6 +901,32 @@ mod tests {
     /// the first emitted frame is a keyframe carrying SPS+PPS. Doesn't
     /// validate the bitstream content beyond "non-empty" — that needs
     /// a real H.264 decoder, which is overkill for the scaffold.
+    #[test]
+    fn nv12_full_range_black_and_white() {
+        use super::ffi::bgra_to_nv12_full_range;
+        // 2x2 frame; fill solid black, then solid white. Full-range luma should
+        // hit the extremes (0 / 255) — the whole point of full-range vs the
+        // 16/235 video-range floors/ceilings that wash out on mstsc.
+        let w = 2usize;
+        let h = 2usize;
+        let stride = w * 4;
+        let mut y = vec![0u8; w * h];
+        let mut cbcr = vec![0u8; w]; // one 2x2 chroma sample = 2 bytes
+        // Black (B=G=R=0).
+        let black = vec![0u8; stride * h];
+        bgra_to_nv12_full_range(&black, stride, w, h, &mut y, w, &mut cbcr, w);
+        assert!(y.iter().all(|&v| v == 0), "full-range black luma should be 0");
+        assert_eq!((cbcr[0], cbcr[1]), (128, 128), "neutral chroma");
+        // White (B=G=R=255).
+        let white = vec![0xFFu8; stride * h];
+        bgra_to_nv12_full_range(&white, stride, w, h, &mut y, w, &mut cbcr, w);
+        assert!(
+            y.iter().all(|&v| v == 255),
+            "full-range white luma should be 255 (video-range would cap at 235)"
+        );
+        assert_eq!((cbcr[0], cbcr[1]), (128, 128), "neutral chroma");
+    }
+
     #[test]
     fn encodes_a_keyframe() -> Result<()> {
         let w: u16 = 320;

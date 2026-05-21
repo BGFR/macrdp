@@ -55,15 +55,16 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
                           hardware-encoded via VideoToolbox, instead of legacy
                           bitmaps. Falls back to legacy automatically for
                           clients that don't negotiate H.264. See "Video".
---bitrate N               Target H.264 bitrate in Mbps (default 12; only with
-                          --enable-h264). Lower it (4–8) if audio lags on Wi-Fi.
+--bitrate N               Target H.264 bitrate in Mbps (default 6; only with
+                          --enable-h264). Raise it (8–12) for sharper detail if
+                          you have bandwidth headroom.
 --keyframe-interval SECS  H.264 periodic keyframe (IDR) interval in seconds
-                          (default 2; only with --enable-h264). Safety net for
+                          (default 5; only with --enable-h264). Safety net for
                           transient decode glitches; fractional values OK.
---keyframe-on-change      Force an H.264 keyframe when a lot of the screen
-                          changes at once (window-to-front, scroll, app launch),
-                          and briefly after a mouse click, instead of waiting for
-                          --keyframe-interval. Off by default. See "Video".
+--no-keyframe-on-change   Disable on-change H.264 keyframes (ON by default): an
+                          IDR is otherwise forced on large changes (window-to-
+                          front, scroll, app launch) and briefly after a click,
+                          so big updates render at once. See "Video".
 --cert-dir PATH           Persisted TLS cert (default ~/Library/Application Support/macrdp)
 --virtual-display         Serve a headless virtual display at --width × --height
                           instead of mirroring the primary panel — local screen
@@ -140,9 +141,9 @@ How it behaves:
 
 - **Automatic fallback.** Clients that don't advertise H.264 (AVC420) decode — e.g. a FreeRDP build without an H.264 decoder, or Microsoft Remote Desktop on macOS (NSCodec only) — transparently fall back to legacy bitmaps. No need to match the flag to the client.
 - **Wire format.** The AVC420 payload is Annex-B framed (what Microsoft's decoder expects). The bitstream is verified rendering on `mstsc` and on FreeRDP built with H.264 (e.g. the [Thincast client]).
-- **Bitrate.** `--bitrate N` sets the target encoder bitrate in megabits/sec (default `12`, only meaningful with `--enable-h264`). Lowering it shrinks each frame, so the big per-frame writes are less likely to fill the socket buffer and delay audio on a constrained link — try `4`–`8` if audio lags over Wi-Fi.
+- **Bitrate.** `--bitrate N` sets the target encoder bitrate in megabits/sec (default `6`, only meaningful with `--enable-h264`). Raising it sharpens detail but grows each frame, so the big per-frame writes are more likely to fill the socket buffer and delay audio on a constrained link — `6` is a good balance; try `8`–`12` if you have headroom.
 - **Color.** The stream is encoded as full-range BT.709. This matters for `mstsc`, which reads AVC420 luma as full-range regardless of the bitstream flag — video-range output otherwise renders washed-out / lighter there. FreeRDP honors the flag and is correct either way.
-- **Keyframes.** A keyframe (IDR) is forced on the first frame, then periodically every `--keyframe-interval` seconds (default `2`) as a safety net — some clients (mstsc) only fully recover a transient decode glitch on the next IDR, so a long interval leaves garbled regions (notably text) lingering. Lower it for faster recovery at the cost of bandwidth/quality; raise it for smoother typing. Optionally add **`--keyframe-on-change`** to also force an IDR whenever a large area changes at once (window-to-front, scroll, app launch) and briefly after a mouse click, so big updates land immediately instead of waiting for the periodic interval. It's off by default because the extra IDRs cost bandwidth/quality.
+- **Keyframes.** A keyframe (IDR) is forced on the first frame, then periodically every `--keyframe-interval` seconds (default `5`) as a safety net — some clients (mstsc) only fully recover a transient decode glitch on the next IDR, so a long interval leaves garbled regions (notably text) lingering. Lower it for faster recovery at the cost of bandwidth/quality; raise it for smoother typing. On top of that, an IDR is forced **on demand** whenever a large area changes at once (window-to-front, scroll, app launch) and briefly after a mouse click, so big updates land immediately instead of waiting for the periodic interval (rising-edge detection keeps sustained churn like video from forcing an IDR every frame). Pass **`--no-keyframe-on-change`** to disable that and rely on the periodic interval alone.
 
 ### Known limitations
 

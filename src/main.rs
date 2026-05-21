@@ -240,31 +240,38 @@ struct Args {
     enable_h264: bool,
 
     /// Target H.264 bitrate in megabits/sec (only with --enable-h264).
-    /// Default 12. Lowering it shrinks each frame, so the big per-frame writes
-    /// are less likely to fill the socket buffer and delay audio on a
-    /// constrained link (e.g. Wi-Fi) — try 4–8 if audio lags under H.264.
-    #[arg(long, default_value_t = 12)]
+    /// Default 6. Raising it sharpens detail at the cost of bigger per-frame
+    /// writes, which can fill the socket buffer and delay audio on a
+    /// constrained link (e.g. Wi-Fi); try 8–12 if you have headroom.
+    #[arg(long, default_value_t = 6)]
     bitrate: u32,
 
     /// H.264 periodic keyframe (IDR) interval in seconds (only with
-    /// --enable-h264). Default 2. This is a safety net for transient decode
+    /// --enable-h264). Default 5. This is a safety net for transient decode
     /// glitches on small changes (e.g. mstsc's lingering garbled text while
     /// typing); large changes (window-to-front, scroll) already force an
-    /// immediate IDR on their own. Lower self-heals faster but frequent IDRs
-    /// cost bandwidth/quality at a fixed bitrate and can stutter. Fractional
-    /// values are allowed (e.g. 0.25). The session's first frame is a keyframe.
-    #[arg(long, default_value_t = 2.0)]
+    /// immediate IDR on their own (see --keyframe-on-change). Lower self-heals
+    /// faster but frequent IDRs cost bandwidth/quality at a fixed bitrate and
+    /// can stutter. Fractional values are allowed. First frame is a keyframe.
+    #[arg(long, default_value_t = 5.0)]
     keyframe_interval: f32,
 
-    /// Force an H.264 keyframe when a lot of the screen changes at once — a
-    /// window raised to front, a scroll, an app launch — instead of waiting for
-    /// the periodic --keyframe-interval (only with --enable-h264). Off by
-    /// default. Also briefly lowers the change threshold after a mouse click.
-    /// Helps large updates render immediately on clients (e.g. mstsc) that apply
-    /// big P-frames cleanly only on a keyframe, at the cost of occasional extra
-    /// IDRs (bandwidth/quality).
-    #[arg(long)]
-    keyframe_on_change: bool,
+    /// Disable on-change H.264 keyframes (only with --enable-h264). On-change
+    /// keyframes are ON by default: a keyframe is forced when a lot of the
+    /// screen changes at once — a window raised to front, a scroll, an app
+    /// launch — and briefly after a mouse click, so large updates render
+    /// immediately on clients (e.g. mstsc) that apply big P-frames cleanly only
+    /// on a keyframe. Pass this to turn it off (relies on --keyframe-interval
+    /// alone) to minimize IDRs on a very constrained link.
+    #[arg(long = "no-keyframe-on-change", action = clap::ArgAction::SetTrue)]
+    no_keyframe_on_change: bool,
+
+    /// Deprecated/no-op: on-change keyframes are now the default. Accepted so
+    /// existing command lines that pass --keyframe-on-change keep working; use
+    /// --no-keyframe-on-change to disable.
+    #[arg(long = "keyframe-on-change", action = clap::ArgAction::SetTrue, hide = true)]
+    #[allow(dead_code)]
+    keyframe_on_change_compat: bool,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -845,11 +852,14 @@ async fn main() -> Result<()> {
         )
     });
 
+    // On-change keyframes are on by default; --no-keyframe-on-change opts out.
+    let keyframe_on_change = !args.no_keyframe_on_change;
+
     // Mouse-click hint shared by the input handler (which records clicks) and
     // the H.264 capture path (which lowers its keyframe threshold briefly after
     // a click). Only allocated when the on-demand-keyframe feature is enabled.
     let click_signal =
-        (args.enable_h264 && args.keyframe_on_change).then(crate::capture::ClickSignal::new);
+        (args.enable_h264 && keyframe_on_change).then(crate::capture::ClickSignal::new);
 
     let display = CaptureDisplay {
         width,
@@ -863,7 +873,7 @@ async fn main() -> Result<()> {
             .then(|| session_tracker.clone()),
         #[cfg(target_os = "macos")]
         gfx: gfx.clone(),
-        keyframe_on_change: args.keyframe_on_change,
+        keyframe_on_change,
         click_signal: click_signal.clone(),
     };
 

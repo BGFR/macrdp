@@ -154,7 +154,7 @@ How it behaves:
 
 ### Known limitations
 
-- **Reconnecting `mstsc` to a still-running macrdp can show a black screen** (with a live cursor). This is an mstsc-specific quirk: it retains EGFX surfaces for the lifetime of its process and mis-composites on reconnect. It is *not* a server bug — FreeRDP reconnects cleanly over the same stream. **Reliable workaround:** quit macrdp and relaunch it before reconnecting — a fresh macrdp run hands mstsc a never-cached surface id, so the desktop renders every time, with no Windows reboot needed. (Reopening the mstsc window also works; fresh connections always render fine.)
+- **Reconnecting `mstsc` to a still-running macrdp can show a black screen** (with a live cursor). This is an mstsc-specific quirk: it retains EGFX surfaces for the lifetime of its process and mis-composites on reconnect. It is *not* a server bug — FreeRDP reconnects cleanly over the same stream. **Reliable workaround:** fully close the mstsc window and open a new connection — quitting the client clears its surface cache, so the desktop renders every time, with no Windows reboot needed. (A server-side fresh-surface-id workaround was tried but only mitigated this unreliably on mstsc, so it was dropped in favor of this documented recovery.)
 - H.264 is **macOS-only** (VideoToolbox) and still maturing — bitrate and keyframe behavior are tunable (above), but dirty-region *encoding* is not yet done: every frame is a full encode (dirty rects are used only to time on-demand keyframes, not to encode sub-regions). H.264's own inter-prediction keeps unchanged regions cheap regardless.
 
 ### Color conversion: scalar vs vImage

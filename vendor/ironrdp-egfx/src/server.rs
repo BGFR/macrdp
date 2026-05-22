@@ -1017,64 +1017,6 @@ impl GraphicsPipelineServer {
         Some(surface_id)
     }
 
-    /// Create a surface at a caller-chosen id.
-    ///
-    /// Unlike `create_surface*` (which auto-allocates an incrementing id reset
-    /// to 0 on every new server), this takes an explicit `surface_id` so the
-    /// caller can drive ids from an external monotonic counter and use a
-    /// never-before-seen id for each RDP session.
-    ///
-    /// Why this matters: mstsc retains EGFX surfaces by id for the lifetime of
-    /// its process — across RDP reconnects and even server restarts — and
-    /// treats a `CreateSurface` for an id it already holds as a no-op, so
-    /// frames decode into the stale surface and nothing repaints (black screen
-    /// with a live cursor on reconnect). Using a fresh id sidesteps that.
-    ///
-    /// Deliberately does NOT emit a leading `DeleteSurface`: deleting an id the
-    /// client doesn't currently hold breaks the GFX channel on mstsc (it stops
-    /// sending frame-acks, then disconnects), so the fresh-id approach is the
-    /// safe one.
-    ///
-    /// Returns `false` if the server isn't ready to create surfaces.
-    pub fn create_surface_with_id(
-        &mut self,
-        surface_id: u16,
-        width: u16,
-        height: u16,
-        pixel_format: PixelFormat,
-    ) -> bool {
-        if self.state != ServerState::Ready && self.state != ServerState::Resizing {
-            return false;
-        }
-
-        // ResetGraphics MUST precede any CreateSurface (mirrors create_surface).
-        if !self.reset_graphics_sent {
-            let desktop_width = if self.output_width > 0 { self.output_width } else { width };
-            let desktop_height = if self.output_height > 0 { self.output_height } else { height };
-            self.output_queue.push_back(GfxPdu::ResetGraphics(ResetGraphicsPdu {
-                width: u32::from(desktop_width),
-                height: u32::from(desktop_height),
-                monitors: Vec::new(),
-            }));
-            self.output_width = desktop_width;
-            self.output_height = desktop_height;
-            self.reset_graphics_sent = true;
-        }
-
-        let surface = Surface::new(surface_id, width, height, pixel_format);
-        self.output_queue.push_back(GfxPdu::CreateSurface(CreateSurfacePdu {
-            surface_id,
-            width,
-            height,
-            pixel_format,
-        }));
-        self.handler.on_surface_created(&surface);
-        self.surfaces.insert(surface);
-
-        debug!(surface_id, width, height, ?pixel_format, "Created surface at explicit id");
-        true
-    }
-
     /// Delete a surface
     ///
     /// Queues DeleteSurface PDU. Returns `false` if surface doesn't exist.

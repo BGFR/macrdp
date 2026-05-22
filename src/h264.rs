@@ -48,7 +48,7 @@
 
 #![cfg(target_os = "macos")]
 
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -152,31 +152,6 @@ pub struct Gfx {
     /// so encoded frames are never dropped, which would break the H.264 chain).
     max_in_flight: u32,
     wire_format: WireFormat,
-    /// Monotonic EGFX surface-id source. Each connection claims the next value
-    /// and creates its surface at that never-before-seen id, so mstsc — which
-    /// retains surfaces by id for its whole process lifetime and no-ops a
-    /// CreateSurface for an id it already holds — always paints (the
-    /// reconnect-blank cause). Seeded from / written through to a temp file so
-    /// the counter keeps climbing across macrdp restarts instead of resetting
-    /// into mstsc's already-cached id range. See [[h264-reconnect-blank]].
-    surface_seq: Arc<AtomicU16>,
-}
-
-/// Temp-file path holding the next EGFX surface id, so the monotonic counter
-/// survives macrdp restarts (mstsc keeps its surface cache across them).
-fn surface_seq_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("macrdp-egfx-next-surface-id")
-}
-
-/// First-run surface-id base (when the temp file is absent): the low 16 bits of
-/// the wall-clock seconds. Starts the counter well above the small ids any
-/// prior build/session is likely to have left in mstsc's surface cache, and
-/// differs across restarts on its own even before the temp file is written.
-fn initial_surface_seq() -> u16 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u16)
-        .unwrap_or(0)
 }
 
 impl Gfx {
@@ -203,15 +178,6 @@ impl Gfx {
             keyframe_secs,
             max_in_flight,
             wire_format,
-            // Resume the surface-id counter from the temp file (or a wall-clock
-            // seed on first run) so a macrdp restart against a still-open mstsc
-            // keeps using fresh, never-cached ids.
-            surface_seq: Arc::new(AtomicU16::new(
-                std::fs::read_to_string(surface_seq_path())
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u16>().ok())
-                    .unwrap_or_else(initial_surface_seq),
-            )),
         }
     }
 
@@ -334,18 +300,19 @@ impl Gfx {
                 flags: MonitorFlags::PRIMARY,
             };
             server.resize_with_monitors(self.width, self.height, vec![monitor]);
-            // Claim a fresh, never-before-seen surface id for this session and
-            // create the surface at it (no DeleteSurface — deleting an id the
-            // client doesn't hold breaks the GFX channel on mstsc). Because the
-            // id is new, mstsc can't no-op the CreateSurface against a retained
-            // copy, so it always paints. The counter is persisted across
-            // restarts (see `surface_seq`). (CONFIRMED reconnect-blank fix
-            // 2026-05-20 — see vendor/ironrdp-egfx::create_surface_with_id.)
-            let sid = self.surface_seq.fetch_add(1, Ordering::Relaxed);
-            let _ = std::fs::write(surface_seq_path(), sid.wrapping_add(1).to_string());
-            if !server.create_surface_with_id(sid, self.width, self.height, PixelFormat::XRgb) {
-                return Err(anyhow!("EGFX: create_surface_with_id failed (not ready?)"));
-            }
+            // Create the surface with upstream's auto-allocated id. mstsc retains
+            // EGFX surfaces by id for its whole process lifetime and no-ops a
+            // CreateSurface for an id it already holds, so a reconnect to the
+            // same mstsc process can land on a stale surface and paint blank.
+            // A fresh per-session id (the old vendored `create_surface_with_id`)
+            // only mitigated this *unreliably* on mstsc — sometimes the desktop
+            // drew, sometimes it didn't — for the cost of a permanent upstream
+            // divergence. Since the reliable recovery is the same either way
+            // (close + reopen mstsc, which clears its surface cache), we use the
+            // stock API and document the quirk instead. See [[h264-reconnect-blank]].
+            let sid = server
+                .create_surface_with_format(self.width, self.height, PixelFormat::XRgb)
+                .ok_or_else(|| anyhow!("EGFX: create_surface failed (not ready?)"))?;
             if !server.map_surface_to_output(sid, 0, 0) {
                 return Err(anyhow!("EGFX: map_surface_to_output failed"));
             }

@@ -191,6 +191,9 @@ pub struct CaptureDisplay {
     /// the H.264 path lower its keyframe threshold briefly after a click — see
     /// [`ClickSignal`].
     pub click_signal: Option<ClickSignal>,
+    /// Trailing flush frames re-sent after the last change to drain mstsc's
+    /// presentation buffer (`--flush-frames`; EGFX/H.264 path only). 0 disables.
+    pub flush_frames: u32,
 }
 
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
@@ -241,6 +244,7 @@ impl RdpServerDisplay for CaptureDisplay {
                 self.gfx.clone(),
                 self.keyframe_on_change,
                 self.click_signal.clone(),
+                self.flush_frames,
             )
             .await?,
         );
@@ -294,6 +298,27 @@ mod macos {
         /// Mouse-click hint for the post-click keyframe-threshold drop. Only
         /// consulted when `keyframe_on_change.enabled`.
         click_signal: Option<ClickSignal>,
+        /// Interval between SCK frames (1/fps). Doubles as the flush-burst
+        /// timeout: when SCK goes idle we wait at most this long before
+        /// re-submitting the last frame to drain mstsc's presentation buffer.
+        frame_interval: Duration,
+        /// How many trailing flush frames to re-send after each change
+        /// (`--flush-frames`). Each is a tiny skip-P-frame; mstsc needs ≥2 to
+        /// display a frame, default 4 gives margin. 0 disables the burst.
+        flush_frames: u32,
+        /// Trailing flush re-submits remaining after the last real change
+        /// (EGFX/H.264 path only). SCK stops delivering frames on a static
+        /// screen, so the last change before a pause (e.g. the final keystroke)
+        /// would otherwise sit in mstsc's ~2-frame AVC420 presentation buffer
+        /// until the next on-screen change or the periodic keyframe — that's
+        /// the "typing follows the keyframe" lag. We re-submit the last frame
+        /// `flush_frames` times to push it through within a couple of frame
+        /// intervals. Stays 0 (no-op) on the legacy bitmap path.
+        flush_remaining: u32,
+        /// Last BGRA frame submitted to EGFX, reused across frames (no per-frame
+        /// realloc) and re-encoded as cheap skip-P-frames during a flush burst.
+        last_frame: Vec<u8>,
+        last_stride: usize,
     }
 
     impl ScreenCaptureUpdates {
@@ -307,6 +332,7 @@ mod macos {
             gfx: Option<crate::h264::Gfx>,
             keyframe_on_change: KeyframeOnChange,
             click_signal: Option<ClickSignal>,
+            flush_frames: u32,
         ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
                 .await
@@ -387,6 +413,7 @@ mod macos {
                 .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
 
             let cursor = CursorState::new(width, height, screen_size_pts)?;
+            let frame_interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
             Ok(Self {
                 stream,
                 pending: std::collections::VecDeque::new(),
@@ -397,6 +424,11 @@ mod macos {
                 keyframe_on_change,
                 kf_armed: true,
                 click_signal,
+                frame_interval,
+                flush_frames,
+                flush_remaining: 0,
+                last_frame: Vec::new(),
+                last_stride: 0,
             })
         }
     }
@@ -458,8 +490,36 @@ mod macos {
                     return Ok(Some(update));
                 }
 
-                let Some(sample) = self.stream.next().await else {
-                    return Ok(None);
+                // While a flush burst is pending, don't block indefinitely on
+                // SCK: it stops delivering frames on a static screen, so wait at
+                // most one frame interval and, on timeout, re-submit the last
+                // frame as a cheap skip-P-frame. That keeps mstsc's presentation
+                // buffer advancing so the last change before a pause appears
+                // promptly instead of stranding until the next periodic keyframe.
+                // (No flush pending — the common idle case — blocks normally.)
+                let sample = if self.flush_remaining > 0 {
+                    match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
+                        Ok(Some(sample)) => sample,
+                        Ok(None) => return Ok(None),
+                        Err(_) => {
+                            self.flush_remaining -= 1;
+                            if let Some(gfx) = self.gfx.as_ref() {
+                                if !self.last_frame.is_empty() {
+                                    if let Err(e) =
+                                        gfx.submit_bgra(&self.last_frame, self.last_stride, false)
+                                    {
+                                        tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    match self.stream.next().await {
+                        Some(sample) => sample,
+                        None => return Ok(None),
+                    }
                 };
 
                 // Skip non-renderable frames (Idle, Blank, Suspended, Stopped).
@@ -551,6 +611,15 @@ mod macos {
                     match gfx.submit_bgra(src, stride_bytes, big_change) {
                         Ok(true) => {
                             self.seeded = true;
+                            // Stash this frame and arm the flush burst so that,
+                            // once SCK goes idle after this change, we re-submit
+                            // it enough times to drain mstsc's presentation
+                            // buffer. Reuse the buffer to avoid a per-frame
+                            // realloc; clear keeps the capacity.
+                            self.last_frame.clear();
+                            self.last_frame.extend_from_slice(src);
+                            self.last_stride = stride_bytes;
+                            self.flush_remaining = self.flush_frames;
                             continue;
                         }
                         Ok(false) => {}

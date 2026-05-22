@@ -251,13 +251,13 @@ struct Args {
     bitrate: u32,
 
     /// H.264 periodic keyframe (IDR) interval in seconds (only with
-    /// --enable-h264). Default 5. This is a safety net for transient decode
+    /// --enable-h264). Default 2. This is a safety net for transient decode
     /// glitches on small changes (e.g. mstsc's lingering garbled text while
     /// typing); large changes (window-to-front, scroll) already force an
     /// immediate IDR on their own (see --keyframe-on-change). Lower self-heals
     /// faster but frequent IDRs cost bandwidth/quality at a fixed bitrate and
     /// can stutter. Fractional values are allowed. First frame is a keyframe.
-    #[arg(long, default_value_t = 5.0)]
+    #[arg(long, default_value_t = 2.0)]
     keyframe_interval: f32,
 
     /// Disable on-change H.264 keyframes (only with --enable-h264). On-change
@@ -303,6 +303,18 @@ struct Args {
     /// video looks too skippy under heavy motion.
     #[arg(long, default_value_t = 2)]
     h264_frames_in_flight: u32,
+
+    /// Number of trailing "flush" frames re-sent after the last on-screen change
+    /// (only with --enable-h264). ScreenCaptureKit stops delivering frames on a
+    /// static screen, so the last change before a pause (e.g. the final
+    /// keystroke) would otherwise sit in mstsc's ~2-frame AVC420 presentation
+    /// buffer until the next change or periodic keyframe — the "typing follows
+    /// the keyframe" lag. After each change we re-submit the last frame this many
+    /// times as cheap skip-P-frames to drain that buffer so the change appears
+    /// promptly. mstsc needs ≥2; default 4 gives margin. Raise if a slight
+    /// trailing lag remains; set 0 to disable the flush burst entirely.
+    #[arg(long, default_value_t = 4)]
+    flush_frames: u32,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -917,6 +929,7 @@ async fn main() -> Result<()> {
         gfx: gfx.clone(),
         keyframe_on_change,
         click_signal: click_signal.clone(),
+        flush_frames: args.flush_frames,
     };
 
     let input_handler = MacInputHandler::new(width, height, capture_display_id, click_signal)?;

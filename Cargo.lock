@@ -1535,7 +1535,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-cliprdr"
 version = "0.5.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?rev=0282d1821cdb87926a4fd9ebc80342b79102e9ce#0282d1821cdb87926a4fd9ebc80342b79102e9ce"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",

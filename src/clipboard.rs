@@ -182,6 +182,23 @@ fn dib_to_png(dib: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(png)
 }
 
+/// Shared state coordinating the Mac-side advertise poller with the cliprdr
+/// backend's `on_format_list_response` hook. Lets us retry on Fail while
+/// guaranteeing we STOP re-advertising the instant the remote accepts an
+/// advertise — a later rejected re-advertise would wipe `local_file_list`
+/// inside cliprdr and silently break a paste that was about to work.
+#[derive(Debug, Default)]
+struct AdvertiseState {
+    /// Bumped each time the Mac pasteboard changes; identifies the current
+    /// wave of (possibly retried) advertises.
+    generation: std::sync::atomic::AtomicU64,
+    /// When the remote responds with Ok to one of our format lists, the hook
+    /// stores the current `generation` here. The retry loop compares against
+    /// its own `my_gen` and stops the moment they match — meaning "this
+    /// wave's advertise was accepted, don't send another one."
+    locked_gen: std::sync::atomic::AtomicU64,
+}
+
 #[derive(Debug)]
 pub struct MacCliprdr {
     sender: Sender,
@@ -208,6 +225,9 @@ pub struct MacCliprdr {
     /// our own write and bounce it back to Windows.
     #[cfg(target_os = "macos")]
     self_change_count: crate::file_promise::SelfChangeCount,
+    /// Coordinates the advertise retry loop with the cliprdr backend's
+    /// `on_format_list_response` hook. See [`AdvertiseState`].
+    advertise_state: Arc<AdvertiseState>,
 }
 
 impl MacCliprdr {
@@ -221,6 +241,7 @@ impl MacCliprdr {
             paste_temp_dir: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "macos")]
             self_change_count: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+            advertise_state: Arc::new(AdvertiseState::default()),
         }
     }
 }
@@ -235,6 +256,7 @@ impl ServerEventSender for MacCliprdr {
         let paths_arc = self.file_paths.clone();
         #[cfg(target_os = "macos")]
         let self_cc = self.self_change_count.clone();
+        let advertise_state = self.advertise_state.clone();
         tokio::spawn(async move {
             // NSPasteboard.changeCount is monotonic; record the starting
             // value so we don't fire an event for whatever was already on
@@ -255,8 +277,47 @@ impl ServerEventSender for MacCliprdr {
                     debug!(current, "skipping pasteboard tick (self-write)");
                     continue;
                 }
+                // Start a new advertise wave. `my_gen` identifies it for the
+                // retry loop and for the cliprdr backend's
+                // `on_format_list_response` hook, which stamps `locked_gen` with
+                // the current generation on `Ok` so we can stop re-advertising.
+                use std::sync::atomic::Ordering;
+                let my_gen = advertise_state.generation.fetch_add(1, Ordering::Relaxed) + 1;
+
                 if !advertise_pasteboard(&sender_arc, &paths_arc) {
                     break;
+                }
+
+                // Retry on Fail, STOP on Ok. mstsc commonly rejects the first
+                // advertise right after an in-session Cmd-C (it's still
+                // processing the input) and accepts one ~0.5–1 s later. We
+                // MUST stop re-advertising the instant the remote accepts —
+                // otherwise a later re-advertise that gets rejected wipes
+                // `local_file_list` inside cliprdr and silently breaks an
+                // otherwise-working paste. The delays are sized to give each
+                // response time to arrive before the next retry decision.
+                // Supersede check handles a newer copy starting mid-wave.
+                for delay in [
+                    std::time::Duration::from_millis(1000),
+                    std::time::Duration::from_millis(2500),
+                    std::time::Duration::from_millis(5000),
+                ] {
+                    tokio::time::sleep(delay).await;
+                    if advertise_state.generation.load(Ordering::Relaxed) != my_gen {
+                        // A newer Mac-side copy started a new wave; let the
+                        // main loop handle it on its next tick.
+                        break;
+                    }
+                    if advertise_state.locked_gen.load(Ordering::Relaxed) == my_gen {
+                        // Remote acknowledged our advertise. Do NOT send
+                        // another format list — a rejection of that one would
+                        // wipe the accepted state.
+                        debug!(my_gen, "format list accepted; retry loop done");
+                        break;
+                    }
+                    if !advertise_pasteboard(&sender_arc, &paths_arc) {
+                        return;
+                    }
                 }
             }
         });
@@ -275,6 +336,7 @@ impl CliprdrBackendFactory for MacCliprdr {
             paste_temp_dir: self.paste_temp_dir.clone(),
             #[cfg(target_os = "macos")]
             self_change_count: self.self_change_count.clone(),
+            advertise_state: self.advertise_state.clone(),
         })
     }
 }
@@ -303,6 +365,9 @@ struct MacCliprdrBackend {
     // so the poller can skip its own write. See `MacCliprdr::self_change_count`.
     #[cfg(target_os = "macos")]
     self_change_count: crate::file_promise::SelfChangeCount,
+    // Lets the `on_format_list_response` hook tell the poller's retry loop
+    // that the current advertise wave was accepted, so it stops re-advertising.
+    advertise_state: Arc<AdvertiseState>,
 }
 
 impl ironrdp_core::AsAny for MacCliprdrBackend {
@@ -494,6 +559,25 @@ impl CliprdrBackend for MacCliprdrBackend {
 
     fn on_request_format_list(&mut self) {
         advertise_pasteboard(&self.sender, &self.file_paths);
+    }
+
+    fn on_format_list_response(&mut self, ok: bool) {
+        // mstsc commonly rejects an advertise sent right after an in-session
+        // Cmd-C (it's still processing the keystroke), then accepts one a
+        // moment later. The poller retries on Fail; we ONLY mark the wave
+        // locked on Ok so a subsequent retry that would otherwise wipe an
+        // accepted state is suppressed. Stamping with the *current*
+        // generation matches what the retry loop checks against.
+        use std::sync::atomic::Ordering;
+        if ok {
+            let gen = self.advertise_state.generation.load(Ordering::Relaxed);
+            self.advertise_state
+                .locked_gen
+                .store(gen, Ordering::Relaxed);
+            debug!(gen, "remote accepted our format list");
+        } else {
+            debug!("remote rejected our format list (will be retried by poller)");
+        }
     }
 
     fn on_process_negotiated_capabilities(

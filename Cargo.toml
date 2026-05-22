@@ -79,7 +79,7 @@ ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git",
 ironrdp-acceptor         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
 ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
 ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
-ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
+ironrdp-cliprdr          = { path = "vendor/ironrdp-cliprdr" }  # vendored: adds on_format_list_response hook (see vendor/ironrdp-cliprdr/Cargo.toml)
 ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
 ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }
 ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "0282d1821cdb87926a4fd9ebc80342b79102e9ce" }

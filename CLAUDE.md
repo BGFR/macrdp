@@ -120,6 +120,23 @@ vendor/ironrdp-egfx/      Local fork of ironrdp-egfx (same upstream rev as the
                           ids, was removed — it only unreliably mitigated mstsc's
                           reconnect-blank, so we use the stock auto-allocated id
                           and document the close+reopen recovery instead.)
+
+vendor/ironrdp-cliprdr/   Local fork of ironrdp-cliprdr (same upstream rev as
+                          the git-pinned siblings), pulled in via
+                          [patch.crates-io]. ONE divergence: adds
+                          CliprdrBackend::on_format_list_response(ok: bool) with
+                          a default no-op (non-breaking) and calls it from
+                          handle_format_list_response on both Ok and Fail.
+                          Without this hook there is no backend signal for
+                          whether an outbound format-list advertise was accepted
+                          — the rejection (FormatListResponse::Fail) silently
+                          wipes local_file_list inside cliprdr, and blind timed
+                          retries can clobber an Ok with a later Fail. macrdp's
+                          poller uses the hook to STOP re-advertising on Ok
+                          while still retrying on Fail (see
+                          src/clipboard.rs AdvertiseState). Submitted upstream;
+                          drop this vendor dir once it lands in a released
+                          ironrdp-cliprdr.
 ```
 
 Cross-cutting:

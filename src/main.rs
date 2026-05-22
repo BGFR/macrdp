@@ -292,6 +292,17 @@ struct Args {
     /// applies. Default 400.
     #[arg(long, default_value_t = 400)]
     keyframe_click_window_ms: u64,
+
+    /// Max H.264 frames in the encode/ship pipeline before the capture loop
+    /// drops to the latest frame (only with --enable-h264). Bounds interactive
+    /// latency under sustained load: lower drops-to-latest sooner (snappier
+    /// typing/window-switching during bursts) at the cost of more frame-skips;
+    /// higher buffers more (smoother video) but lets a backlog build up. This
+    /// throttles at capture, before encoding — encoded frames are never dropped
+    /// (that would break the H.264 reference chain). Default 2; raise to 3–4 if
+    /// video looks too skippy under heavy motion.
+    #[arg(long, default_value_t = 2)]
+    h264_frames_in_flight: u32,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -874,6 +885,7 @@ async fn main() -> Result<()> {
             fps,
             args.bitrate.max(1).saturating_mul(1_000_000),
             args.keyframe_interval,
+            args.h264_frames_in_flight.max(1),
         )
     });
 

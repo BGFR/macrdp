@@ -5,18 +5,35 @@
 //! `src/videotoolbox.rs`; this module bridges it to upstream's
 //! `GraphicsPipelineServer` via the vendored `GfxServerFactory` hooks.
 //!
-//! Flow per captured frame, all on the capture thread (no spawned tasks):
-//!   1. `capture.rs` calls `submit_bgra(bgra, stride)` once per SCK frame.
-//!   2. First call lazily creates the EGFX surface + VT encoder (we must NOT
-//!      do this in `on_ready`, which runs while the server mutex is held).
-//!   3. `Encoder::encode_bgra` submits to VideoToolbox; output is async.
-//!   4. `Encoder::drain()` (NON-blocking — no per-frame `flush()`, which was
-//!      attempt-1's ~8 fps cap) collects whatever NALs VT has finished.
-//!   5. Ready frames are framed (see `WireFormat`) and handed to
-//!      `GraphicsPipelineServer::send_avc420_frame`, which queues
-//!      StartFrame / WireToSurface1 / EndFrame.
-//!   6. `drain_output()` collects those as `DvcMessage`s, wrapped through
-//!      DRDYNVC and shipped via `ServerEvent::Egfx(SendMessages)`.
+//! Flow — two decoupled threads (the "push model"):
+//!
+//!   Capture thread (`submit_bgra`, once per SCK frame):
+//!     1. First call lazily creates the EGFX surface + VT encoder AND spawns the
+//!        ship thread (not in `on_ready`, which holds the server mutex).
+//!     2. Drop-to-latest throttle: if `submitted - shipped` ≥
+//!        `--h264-frames-in-flight`, skip this capture. Bounds latency under
+//!        load without relying on frame acks (clients commonly suspend them).
+//!        Skipping a capture *before* encode doesn't break the reference chain.
+//!     3. Otherwise `Encoder::encode_bgra` submits to VideoToolbox (async) and
+//!        returns immediately — the capture thread never blocks on the encoder,
+//!        so it keeps pace with ScreenCaptureKit instead of falling behind under
+//!        heavy frames (which would queue stale frames → growing latency).
+//!
+//!   Ship thread (`ship_loop`):
+//!     4. Blocks on VT's output channel; for each encoded frame, frames it (see
+//!        `WireFormat`), hands it to `GraphicsPipelineServer::send_avc420_frame`
+//!        (StartFrame / WireToSurface1 / EndFrame), then ships the resulting
+//!        `DvcMessage`s through DRDYNVC via `ServerEvent::Egfx(SendMessages)`,
+//!        and bumps `shipped`.
+//!
+//!   The EGFX send window is `u32::MAX` (see `GfxHandler::max_frames_in_flight`)
+//!   so `send_avc420_frame` NEVER drops an encoded frame — dropping one (a
+//!   P-frame, or worse a keyframe) breaks the H.264 reference chain and causes
+//!   client-side artifacts. All throttling is the capture-side drop above.
+//!
+//!   (Earlier this was single-threaded with a blocking `drain_wait`; that
+//!   serialized capture with encode and fell behind under load. See memory
+//!   h264-latency-tuning.)
 //!
 //! ## The bitstream-format question (see memory: avc420-bitstream-format-trap)
 //!
@@ -31,7 +48,7 @@
 
 #![cfg(target_os = "macos")]
 
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -98,6 +115,18 @@ struct ConnectionContext {
     /// AVC420 to a client that can't decode it (which it rejects with
     /// ERROR_NOT_SUPPORTED and a dead graphics channel).
     client_supports_avc: bool,
+    /// Drop-to-latest throttle counters for the push pipeline. `submitted` is
+    /// bumped by `submit_bgra` (capture thread) per frame handed to VT;
+    /// `shipped` is bumped by the ship thread per frame pulled back out and
+    /// sent. `submitted - shipped` is how many frames are in the VT/ship
+    /// pipeline; when it reaches `max_in_flight` the capture thread skips
+    /// (drops to latest) — an ack-INDEPENDENT throttle, since clients commonly
+    /// suspend frame acks (queue_depth=0xFFFFFFFF) which disables the EGFX
+    /// ack-based backpressure entirely. Per-connection (fresh each context) so
+    /// counts don't leak across reconnects; `Arc` so the ship thread shares
+    /// `shipped`.
+    submitted: Arc<AtomicU64>,
+    shipped: Arc<AtomicU64>,
 }
 
 /// Cloneable factory + frame-submit handle. One clone is boxed into
@@ -114,6 +143,14 @@ pub struct Gfx {
     /// Periodic keyframe (IDR) interval in seconds (from `--keyframe-interval`).
     /// Heal-vs-smoothness knob; converted to a frame count by `Encoder::new`.
     keyframe_secs: f32,
+    /// Capture-side drop-to-latest depth (from `--h264-frames-in-flight`): the
+    /// max frames allowed in the VT/ship pipeline (`submitted - shipped`) before
+    /// `submit_bgra` skips a capture. Bounds interactive latency under load: a
+    /// deeper window buffers more (smoother video) but lets a backlog build; a
+    /// shallow one drops-to-latest sooner (snappier) at the cost of more skips.
+    /// Read in `submit_bgra` — NOT the EGFX send-side window (that's `u32::MAX`,
+    /// so encoded frames are never dropped, which would break the H.264 chain).
+    max_in_flight: u32,
     wire_format: WireFormat,
     /// Monotonic EGFX surface-id source. Each connection claims the next value
     /// and creates its surface at that never-before-seen id, so mstsc — which
@@ -143,11 +180,18 @@ fn initial_surface_seq() -> u16 {
 }
 
 impl Gfx {
-    pub fn new(width: u16, height: u16, fps: u32, bitrate_bps: u32, keyframe_secs: f32) -> Self {
+    pub fn new(
+        width: u16,
+        height: u16,
+        fps: u32,
+        bitrate_bps: u32,
+        keyframe_secs: f32,
+        max_in_flight: u32,
+    ) -> Self {
         let wire_format = WireFormat::from_env();
         info!(
             ?wire_format,
-            width, height, fps, keyframe_secs, "EGFX/H.264 pipeline configured"
+            width, height, fps, keyframe_secs, max_in_flight, "EGFX/H.264 pipeline configured"
         );
         Self {
             sender: Arc::new(Mutex::new(None)),
@@ -157,6 +201,7 @@ impl Gfx {
             fps,
             bitrate_bps,
             keyframe_secs,
+            max_in_flight,
             wire_format,
             // Resume the surface-id counter from the temp file (or a wall-clock
             // seed on first run) so a macrdp restart against a still-open mstsc
@@ -184,8 +229,12 @@ impl Gfx {
     /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
     /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
     pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
-        // Decide whether to encode this frame, and whether it must be a
-        // keyframe. Scoped lock so we don't hold `ctx` across the encode.
+        // Push pipeline: this (capture) thread only converts + submits to VT and
+        // returns immediately; a dedicated ship thread (spawned in setup_locked)
+        // pulls each encoded frame off VT's output channel and ships it the
+        // instant it's ready. The capture thread never blocks on the encoder, so
+        // it keeps pace with ScreenCaptureKit instead of falling behind under
+        // heavy frames (which would queue stale frames → growing latency).
         let force_keyframe = {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
@@ -194,41 +243,41 @@ impl Gfx {
             if !ctx.is_ready {
                 return Ok(false); // channel not negotiated yet (or non-EGFX client)
             }
-            // Arm the keyframe BEFORE the backpressure check so a large change
-            // that lands on a skipped frame still forces the IDR on the next
-            // encoded frame (the change is still on screen by then).
+            // Arm the keyframe BEFORE the throttle check so a large change that
+            // lands on a dropped frame still forces the IDR on the next encoded
+            // frame (the change is still on screen by then).
             if request_keyframe {
                 ctx.need_keyframe = true;
             }
-            // Lazy one-time setup on the first ready frame.
+            // Lazy one-time setup on the first ready frame (creates the encoder
+            // and spawns the ship thread).
             if ctx.surface_id.is_none() || ctx.encoder.is_none() {
                 self.setup_locked(ctx)?;
             }
-            // Backpressure: if the client hasn't acked enough in-flight frames,
-            // skip this capture entirely. We do NOT arm a keyframe *because of*
-            // the skip: skipping a *capture* (before it's encoded) doesn't break
-            // the reference chain — the next encoded frame is still a valid
-            // P-frame against the last *encoded* frame, which was already handed
-            // to the reliable (TLS/TCP) transport. Forcing an IDR on resume just
-            // emits a large frame that re-trips backpressure → a keyframe cascade
-            // / periodic stutter. Forced keyframes come only from the first frame
-            // of the connection or an explicit `request_keyframe` (armed above,
-            // so it persists across this skip).
-            if ctx.server_handle.lock().unwrap().should_backpressure() {
-                trace!("EGFX backpressured; skipping frame");
+            // Drop-to-latest throttle: if too many frames are still in the
+            // VT/ship pipeline, skip this capture entirely. This bounds latency
+            // under load WITHOUT relying on frame acks (clients commonly suspend
+            // them, which disables the EGFX ack-based backpressure). Skipping a
+            // capture before encode doesn't break the reference chain — the next
+            // encoded frame is a valid P-frame against the last encoded one — and
+            // an armed `need_keyframe` persists across the skip.
+            let outstanding = ctx
+                .submitted
+                .load(Ordering::Relaxed)
+                .saturating_sub(ctx.shipped.load(Ordering::Relaxed));
+            if outstanding >= u64::from(self.max_in_flight) {
+                trace!(
+                    outstanding,
+                    "EGFX pipeline full; dropping capture to latest"
+                );
                 return Ok(true); // still the active path; just dropped this frame
             }
             std::mem::replace(&mut ctx.need_keyframe, false)
         };
 
-        // Encode (async output), then drain — waiting briefly for THIS frame
-        // to finish so a single change (keystroke, caret) ships now instead of
-        // sitting in VT until the next captured frame drains it (which, on a
-        // static screen, may not arrive). Budget is ~half a frame interval: long
-        // enough to catch the just-encoded frame (VT RealTime emits in a few ms),
-        // short enough not to throttle the capture cadence.
-        let budget = std::time::Duration::from_millis((1000 / u64::from(self.fps.max(1))).max(4));
-        let frames = {
+        // Submit to VideoToolbox (async). The ship thread delivers + ships the
+        // output; we just count the submission for the drop-to-latest throttle.
+        {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
                 return Ok(true);
@@ -237,13 +286,30 @@ impl Gfx {
                 return Ok(true);
             };
             encoder.encode_bgra(bgra, stride, force_keyframe)?;
-            encoder.drain_wait(budget)
-        };
-
-        if !frames.is_empty() {
-            self.ship_frames(&frames)?; // VT may not have finished earlier frames yet
+            ctx.submitted.fetch_add(1, Ordering::Relaxed);
         }
         Ok(true)
+    }
+
+    /// Ship loop for the push pipeline: owns VideoToolbox's output receiver and
+    /// ships each encoded frame the instant it arrives, fully decoupled from the
+    /// capture tick. Bumps `shipped` per frame so the capture thread's
+    /// drop-to-latest throttle can bound the pipeline depth. Exits when the
+    /// channel closes (encoder dropped on connection teardown).
+    fn ship_loop(&self, rx: std::sync::mpsc::Receiver<EncodedFrame>, shipped: Arc<AtomicU64>) {
+        while let Ok(frame) = rx.recv() {
+            // Sweep up any others VT delivered alongside it (keeps order).
+            let mut frames = vec![frame];
+            while let Ok(f) = rx.try_recv() {
+                frames.push(f);
+            }
+            let n = frames.len() as u64;
+            if let Err(e) = self.ship_frames(&frames) {
+                warn!(error = ?e, "EGFX ship_frames failed");
+            }
+            shipped.fetch_add(n, Ordering::Relaxed);
+        }
+        debug!("EGFX ship loop exiting (output channel closed)");
     }
 
     /// One-time per-connection surface + encoder setup. Caller holds `ctx`.
@@ -295,14 +361,31 @@ impl Gfx {
             // Pass actual dims; VideoToolbox pads to 16-px macroblocks
             // internally and encodes the crop in the SPS, so the client
             // decodes back to actual dims.
-            ctx.encoder = Some(Encoder::new(
+            let mut encoder = Encoder::new(
                 self.width,
                 self.height,
                 self.fps,
                 self.bitrate_bps,
                 self.keyframe_secs,
-            )?);
-            info!("EGFX VideoToolbox encoder initialized");
+            )?;
+            // Hand VT's output channel to a dedicated ship thread (push model),
+            // so encoded frames are sent the instant they're ready, off the
+            // capture thread. The thread exits when the encoder is dropped (on
+            // connection teardown) and its sender closes.
+            let rx = encoder
+                .take_receiver()
+                .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
+            ctx.encoder = Some(encoder);
+            // Fresh throttle counters for this connection.
+            ctx.submitted.store(0, Ordering::Relaxed);
+            ctx.shipped.store(0, Ordering::Relaxed);
+            let gfx = self.clone();
+            let shipped = ctx.shipped.clone();
+            std::thread::Builder::new()
+                .name("egfx-ship".into())
+                .spawn(move || gfx.ship_loop(rx, shipped))
+                .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
+            info!("EGFX VideoToolbox encoder initialized + ship thread started");
         }
         Ok(())
     }
@@ -456,6 +539,8 @@ impl GfxServerFactory for Gfx {
             epoch: Instant::now(),
             need_keyframe: true,
             client_supports_avc: false,
+            submitted: Arc::new(AtomicU64::new(0)),
+            shipped: Arc::new(AtomicU64::new(0)),
         });
         Some((GfxDvcBridge::new(handle.clone()), handle))
     }
@@ -496,13 +581,15 @@ struct GfxHandler {
 }
 
 impl GraphicsPipelineHandler for GfxHandler {
-    /// Allow more frames in flight than the upstream default of 3. A larger
-    /// window means a single larger frame (e.g. an occasional keyframe) doesn't
-    /// immediately starve the pipeline and force capture skips. On a healthy
-    /// link `in_flight` stays low regardless (frames ack quickly), so this only
-    /// trades a little buffering for smoothness when a burst is in flight.
+    /// Effectively unlimited, so the vendored `send_avc420_frame` NEVER drops an
+    /// encoded frame on its ack-based backpressure. Dropping an encoded H.264
+    /// frame — a P-frame, or worse a keyframe — breaks the decode reference
+    /// chain and produces persistent artifacts on the client (observed:
+    /// `send_avc420_frame returned None` dropped a 209 KB IDR mid-stream).
+    /// Throttling belongs at *capture* (drop-to-latest BEFORE encode, gated by
+    /// `--h264-frames-in-flight` in `submit_bgra`), never after encode.
     fn max_frames_in_flight(&self) -> u32 {
-        6
+        u32::MAX
     }
 
     fn capabilities_advertise(&mut self, pdu: &CapabilitiesAdvertisePdu) {

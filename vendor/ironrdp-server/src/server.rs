@@ -762,9 +762,42 @@ impl RdpServer {
         const WAVE_MS: f64 = 1024.0 / 48.0; // ≈ 21.33 ms
         const MAX_LAG_MS: f64 = 200.0;
 
+        // Largest gap between wall-clock and shipped audio we tolerate before
+        // declaring lost sync. In steady state we ship ~one wave's worth of
+        // audio per wave-interval, so `audio_shipped_ms` leads wall-clock by
+        // the (positive) buffer depth and this deficit stays at or below zero.
+        // It only goes meaningfully positive when the writer stalled and shipped
+        // nothing for a stretch — the classic trigger is mstsc freezing the
+        // socket during a window resize/move/fullscreen-toggle. With
+        // --enable-h264 that stall blocks on the large EGFX video frames queued
+        // ahead of the waves on this *same* channel, so the gap is whole
+        // seconds; the legacy bitmap path coalesces through dispatch_display and
+        // never piles up here, which is why this drift is H.264-only.
+        const RESYNC_DEFICIT_MS: f64 = 300.0;
+
         let now = Instant::now();
         let start = *self.audio_clock_start.get_or_insert(now);
         let real_elapsed_ms = (now - start).as_secs_f64() * 1000.0;
+
+        // If wall-clock has run this far ahead of what we actually shipped, the
+        // queued waves are stale: they describe a moment that has already
+        // passed. The earlier model read this same condition as "client
+        // starving" and shipped the whole backlog late, bloating the client's
+        // playback buffer permanently — and each subsequent stall pushed the
+        // deficit further negative, disabling the drop logic for good (audio
+        // got progressively more delayed the more you resized). For a live
+        // stream the right move is never to replay stale audio late: resync the
+        // clock to "now" so the projection below trims the backlog down to one
+        // buffer-target of the *freshest* waves and drops the rest.
+        let deficit_ms = real_elapsed_ms - self.audio_shipped_ms;
+        if deficit_ms > RESYNC_DEFICIT_MS {
+            debug!(
+                target: "audio_backlog",
+                deficit_ms,
+                "writer stalled (likely client window resize); resyncing audio clock to live"
+            );
+            self.audio_shipped_ms = real_elapsed_ms;
+        }
 
         let wave_total = events
             .iter()

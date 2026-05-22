@@ -77,13 +77,36 @@ src/videotoolbox.rs  VideoToolbox H.264 encoder (AVCC NALs + SPS/PPS).
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
 vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in
-                          via [patch.crates-io] in Cargo.toml. Single
-                          targeted fix in dispatch_server_events: keep the
-                          NEWEST queued waves on per-batch overflow instead
-                          of the oldest (upstream 0.10.0 keeps oldest, which
-                          bakes any dispatch stall into a permanent audio
-                          offset). Submitted upstream — delete this vendor
-                          dir once it lands in a released version.
+                          via [patch.crates-io] in Cargo.toml. The audio-lag
+                          control in dispatch_server_events is the live
+                          divergence:
+                          (1) The original "keep newest queued waves on
+                              per-batch overflow" direction-flip LANDED upstream
+                              (PR #1276, merged 2026-05-21) — do NOT treat that
+                              as the reason this fork exists; it's superseded
+                              locally by (2).
+                          (2) Cross-batch audio-lag tracker (NOT upstreamed):
+                              replaces the per-batch cap with a cumulative
+                              buffer-depth model (audio_shipped_ms vs wall-clock
+                              audio_clock_start on RdpServer) so slow drift from
+                              many small client pauses is caught, not just one
+                              big stall. Drops oldest waves when the projected
+                              client buffer would exceed MAX_LAG_MS (200).
+                          (3) Resize-stall resync (NOT upstreamed): when the
+                              writer stalls (mstsc freezing the socket during a
+                              window resize/move/fullscreen-toggle blocks on the
+                              EGFX video frames queued ahead of the waves on the
+                              SAME ServerEvent channel — H.264-only, legacy
+                              bitmaps coalesce through dispatch_display), wall-
+                              clock outruns audio_shipped_ms and the (2) model
+                              would read it as "client starving" and ship the
+                              whole stale backlog late, bloating the buffer and
+                              compounding each stall. Fix: if deficit
+                              (real_elapsed - audio_shipped) > 300 ms, resync
+                              audio_shipped_ms to live so the backlog is dropped
+                              to one MAX_LAG_MS of the freshest waves.
+                          Keep this vendor dir until (2) and (3) are upstreamed
+                          AND released — #1276 landing is NOT sufficient.
 
 vendor/ironrdp-egfx/      Local fork of ironrdp-egfx (same upstream rev as the
                           git-pinned siblings), pulled in via [patch.crates-io].
@@ -127,6 +150,8 @@ When adding a feature, locate it in one of those modules first; if it spans them
 - **Legacy codec mismatch with the macOS client (only without `--enable-h264`).** In the legacy bitmap path, Microsoft Remote Desktop / Windows App on macOS offers only NSCodec while the server advertises RemoteFx/QOI, so they fall back to raw/RLE BitmapUpdate — works, but bandwidth-heavy. With `--enable-h264` that same client negotiates AVC420 over EGFX and renders H.264 (verified), which is far better — prefer it for the macOS client.
 - **EGFX capability parsing must tolerate unknown versions (Windows App fix).** Windows App for Mac (`com.microsoft.rdc.macos`) advertises an EGFX capset version the pinned ironrdp_egfx didn't recognize; upstream's `CapabilityVersion::try_from` returned `Err` on it, which the CapabilitiesAdvertise decode propagated as a *fatal* error — killing the whole connection during negotiation, before the AVC-vs-legacy fallback could run. So `--enable-h264` made Windows App unable to connect at all (it connects fine without). Fix: `vendor/ironrdp-egfx` `CapabilitySet::decode` now keeps an unrecognized version as `CapabilitySet::Unknown(raw)` instead of erroring. This is the SECOND vendor-egfx divergence (alongside `create_surface_with_id`) and a clean upstream candidate.
 - **H.264 wire format must be Annex-B, and mstsc retains EGFX surfaces.** Two hard-won facts behind `src/h264.rs` (`--enable-h264`): (1) the AVC420 payload must be **Annex-B** (start codes + in-band SPS/PPS) — Microsoft's decoder gives zero frame-acks for length-prefixed AVCC, so the default is Annex-B (`MACRDP_H264_LENGTH_PREFIXED=1` flips it for ironrdp-decoder interop). (2) **mstsc retains EGFX surfaces by id for its whole process lifetime** (across reconnects and even macrdp restarts) and no-ops a `CreateSurface` for an id it already holds → frames decode into a stale surface → black screen + live cursor on reconnect. We work around it by using a fresh, monotonic, temp-file-persisted surface id per session (so the id is never one mstsc cached). **Do NOT try to fix this with `DeleteSurface`** — deleting a surface mstsc doesn't currently hold (or one mapped to the output) breaks its GFX channel entirely (no acks, then disconnect). This was confirmed twice; the fresh-unique-id approach is the only safe lever. FreeRDP (with H.264) has none of these quirks — it renders and reconnects cleanly, which is how we proved the server output is spec-correct. The residual mstsc reconnect blank is therefore a documented client limitation, not a server bug.
+- **mstsc holds a ~2-frame AVC420 presentation buffer; the last change before a pause needs trailing "flush" frames (`--flush-frames`, in `capture.rs`).** mstsc only *presents* an H.264 frame once ~2 more frames arrive behind it, so on a static screen the last change (the final keystroke before you pause, a window-to-front) strands in that buffer until something else moves or the periodic keyframe lands — the "typing follows the keyframe" lag. The trap: **ScreenCaptureKit stops delivering frames when nothing on screen changes** (idle samples have no content and are skipped at `capture.rs`), so there is no continuous stream to push the buffer through — raising `--fps` alone does *not* fix it (it only shrinks the per-frame interval). The fix is a **bounded flush-burst**: after each EGFX-accepted frame, `next_update` stashes the BGRA (reused buffer) and arms a counter; its SCK stream-wait is wrapped in `tokio::time::timeout(frame_interval, …)`, so when SCK goes idle the timeout fires and we re-submit the stored frame as a cheap skip-P-frame, `--flush-frames` times (default 4; mstsc needs ≥2; **0 disables**). That drains the buffer within ~2 frame intervals (~33 ms at 60fps), then the stream goes quiet — no always-on cost, and the legacy bitmap path is untouched (the counter only arms on the EGFX path). **Do NOT "fix" this by reinstating idle-frame suppression or relying on a continuous always-on stream** — SCK won't feed one, and suppression strands the trailing frame again (tried and reverted). FreeRDP/Thincast present each frame immediately and need none of this. Verified on M1; periodic `--keyframe-interval` default is 2 s (it self-heals garbled frames but, with the flush-burst, no longer governs typing latency).
+- **Resizing/moving the mstsc window drifts audio late — H.264-only (`--enable-h264`).** With H.264, EGFX video frames ride the *same* `ServerEvent` channel and socket writer as the RDPSND audio waves (legacy bitmaps don't — they coalesce through `dispatch_display`, which is why the legacy path is immune). When mstsc freezes the socket during a window resize/move/fullscreen-toggle, `write_all` blocks on the large queued video frames; wall-clock keeps advancing while no audio ships, so the cross-batch audio-lag model in `vendor/ironrdp-server` (`audio_shipped_ms` vs `audio_clock_start`) sees its buffer projection go *negative*, reads it as "client starving," and ships the entire stale backlog late — bloating the client's playback buffer. Each stall adds more negative credit, so without intervention the wave-drop logic stops firing and audio gets *progressively* more delayed the more you resize. Fix (in `dispatch_server_events`): when `real_elapsed - audio_shipped > 300 ms` the writer clearly stalled and the queued waves are stale, so resync `audio_shipped_ms` to live; the existing drop-oldest cap then trims the backlog to one `MAX_LAG_MS` (200 ms) of the freshest waves. For a live stream, dropping stale audio is always right — never replay it late. EGFX frames themselves are *not* dropped in dispatch (H.264 inter-frame coding forbids it; they're bounded capture-side by frames-in-flight). FreeRDP/Thincast don't freeze the socket on resize and never showed this. See the `vendor/ironrdp-server` note for the divergence layering (this resync is local-only, distinct from the merged keep-newest PR #1276).
 - **Cursor sprite shape is process-global on macOS, not per-display.** `NSCursor::currentSystemCursor()` reflects whatever the foreground application set in *this process*'s perspective, not "the cursor on display X." When `--virtual-display` is active, the RDP client sees the cursor shape that whatever app is foreground locally has set (typically the arrow), regardless of what an app on the virtual display might want. Probably fine in practice — the cursor *position* on the virtual display is correct because `input.rs` translates RDP coords by the vdisplay's origin in global space; only the visual shape is shared. Fixing this properly needs a per-display NSCursor query, which AppKit doesn't expose.
 - **mstsc gates Win-combos by full-screen by default.** mstsc → Local Resources → Keyboard → "Apply Windows key combinations" defaults to "Only when using the full screen", so a windowed mstsc session eats `Win+Tab` (the Cmd+Tab we want to forward) locally as Task View — macrdp never sees the press. The #1 false-positive when debugging "Cmd+Tab doesn't work" is the user being windowed. Set it to "On the remote computer" or go full-screen. `xfreerdp` is more permissive by default and a useful cross-check.
 - **Symbolic-hotkey dispatcher needs kernel HID; CGEventPost can't wake it.** WindowServer's internal Cmd+Tab / Cmd+Space / Cmd+Shift+3/4/5 / Mission Control dispatcher only fires on kernel-injected HID events. User-space CGEventPost cannot trigger it regardless of source state or tap location. A `src/virtual_hid.rs` module that registered a virtual USB-style HID keyboard via `IOHIDUserDeviceCreate` was tried for this and reverted — didn't unblock the dispatcher (likely needs entitlements / signing we don't have) and added a parallel scancode-mapping table to maintain. The current design instead reimplements each symbolic combo in user space (`cycle_apps` via AX, `invoke_spotlight` via osascript, `screencapture` via the binary). Do not resurrect IOHIDUserDevice without new evidence.
@@ -152,8 +177,11 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
 --password PASS           # avoid the interactive prompt (logs are warned)
 --skip-auth               # bypass PAM (also skips password validation)
 --width  / --height       # override autodetected display size
---fps N                   # default 15
+--fps N                   # default 60 with --enable-h264, else 15
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
+--keyframe-interval SECS  # periodic IDR safety net (default 2; only with --enable-h264)
+--flush-frames N          # trailing skip-P-frames re-sent after each change to drain
+                          #   mstsc's presentation buffer (default 4; 0 disables; --enable-h264)
 --cert-dir PATH           # default ~/Library/Application Support/macrdp
 ```
 

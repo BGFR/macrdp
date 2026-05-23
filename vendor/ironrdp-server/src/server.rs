@@ -824,37 +824,52 @@ impl RdpServer {
                 "dropping oldest waves"
             );
         }
-        // Reorder this batch so non-EGFX events (clipboard, audio, control)
-        // are written BEFORE the EGFX video frames queued behind them. With
-        // --enable-h264, EGFX frames flow continuously and dominate the
-        // event channel, and the underlying socket writer is shared across
-        // all channels; without this reordering, a small CLIPRDR
-        // FileContentsResponse can sit behind dozens of large video frames
-        // every batch, which throttles a clipboard file copy to a crawl
-        // and freezes Windows Explorer's synchronous paste read (the
-        // "large Mac→Windows file copy hangs under --enable-h264" bug).
-        // The partition is STABLE: relative order within the non-EGFX group
-        // and within the EGFX group is preserved, so:
-        //   - the audio wave-drop logic below (which targets the OLDEST
-        //     queued waves) still sees them in arrival order, and
-        //   - H.264 frames stay in their original sequential order, which
-        //     is required by the inter-frame codec chain.
-        // Clipboard and video are independent channels on the wire, so
-        // moving clipboard ahead of video within a batch does NOT violate
-        // any ordering invariant on either channel.
+        // Reorder this batch so CLIPRDR events are written BEFORE any
+        // EGFX video frames queued behind them. With --enable-h264, EGFX
+        // frames flow continuously and dominate the event channel, and
+        // the underlying socket writer is shared across all channels;
+        // without this reordering, a small CLIPRDR FileContentsResponse
+        // can sit behind dozens of large video frames every batch, which
+        // throttles a clipboard file copy to a crawl and freezes Windows
+        // Explorer's synchronous paste read (the "large Mac→Windows file
+        // copy hangs under --enable-h264" bug).
+        //
+        // IMPORTANT: audio is intentionally NOT moved with clipboard.
+        // An earlier version of this patch lumped audio in with clipboard
+        // as "non-EGFX" and shipped all of them before any video. That
+        // burst-shipped each batch's worth of audio in a clump every
+        // ~100–170 ms (one batch interval) instead of the natural ~21 ms
+        // per-wave cadence; the client's adaptive jitter buffer extended
+        // to absorb the new burstiness and added ~150–300 ms of steady-
+        // state playback latency. Leaving audio in arrival order keeps
+        // packets arriving at the client at a steady cadence so the
+        // jitter buffer doesn't grow.
+        //
+        // The partition is STABLE: relative order within each group is
+        // preserved, so H.264 frames stay in their original sequential
+        // order (required by the inter-frame codec chain), and the
+        // audio wave-drop logic below (which targets the OLDEST queued
+        // waves) still sees them in arrival order. Clipboard and video
+        // are independent channels on the wire, so moving clipboard
+        // ahead of video within a batch does NOT violate any ordering
+        // invariant on either channel.
         #[cfg(feature = "egfx")]
-        if events.iter().any(|e| matches!(e, ServerEvent::Egfx(_))) {
-            let mut non_egfx: Vec<ServerEvent> = Vec::with_capacity(events.len());
-            let mut egfx: Vec<ServerEvent> = Vec::new();
+        if events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Clipboard(_) | ServerEvent::ClipboardFileCopy(_)))
+            && events.iter().any(|e| matches!(e, ServerEvent::Egfx(_)))
+        {
+            let mut clipboard: Vec<ServerEvent> = Vec::new();
+            let mut rest: Vec<ServerEvent> = Vec::with_capacity(events.len());
             for ev in events.drain(..) {
-                if matches!(ev, ServerEvent::Egfx(_)) {
-                    egfx.push(ev);
+                if matches!(ev, ServerEvent::Clipboard(_) | ServerEvent::ClipboardFileCopy(_)) {
+                    clipboard.push(ev);
                 } else {
-                    non_egfx.push(ev);
+                    rest.push(ev);
                 }
             }
-            events.extend(non_egfx);
-            events.extend(egfx);
+            events.extend(clipboard);
+            events.extend(rest);
         }
         for event in events.drain(..) {
             trace!(?event, "Dispatching");

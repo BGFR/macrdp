@@ -107,17 +107,23 @@ vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in
                               to one MAX_LAG_MS of the freshest waves.
                           (4) Per-batch dispatch priority (NOT upstreamed): in
                               dispatch_server_events, stably partition the
-                              drained batch so non-EGFX events (clipboard,
-                              audio, control) are written BEFORE any EGFX
-                              video frames in that batch. Without this, with
-                              --enable-h264 a CLIPRDR FileContentsResponse
-                              queues behind dozens of large video frames every
-                              batch, throttling clipboard file copies to a
-                              crawl and freezing Windows Explorer's synchronous
-                              paste read. Partition is stable so audio
-                              wave-drop ordering and H.264 inter-frame
-                              sequence are preserved. Gated on the egfx
-                              feature.
+                              drained batch so CLIPRDR events are written
+                              BEFORE any EGFX video frames in that batch.
+                              Without this, with --enable-h264 a CLIPRDR
+                              FileContentsResponse queues behind dozens of
+                              large video frames every batch, throttling
+                              clipboard file copies to a crawl and freezing
+                              Windows Explorer's synchronous paste read.
+                              Audio is intentionally LEFT in arrival order
+                              (interleaved with EGFX) — an earlier version
+                              of this patch lumped audio in with clipboard
+                              as "non-EGFX" and burst-shipped each batch's
+                              waves in a clump, which made the client's
+                              adaptive jitter buffer extend and added a few
+                              hundred ms of steady-state playback latency.
+                              Partition is stable: H.264 inter-frame
+                              sequence and audio wave-drop ordering are
+                              both preserved. Gated on the egfx feature.
                           Keep this vendor dir until (2)/(3)/(4) are upstreamed
                           AND released — #1276 landing is NOT sufficient.
 

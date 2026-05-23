@@ -105,7 +105,20 @@ vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in
                               (real_elapsed - audio_shipped) > 300 ms, resync
                               audio_shipped_ms to live so the backlog is dropped
                               to one MAX_LAG_MS of the freshest waves.
-                          Keep this vendor dir until (2) and (3) are upstreamed
+                          (4) Per-batch dispatch priority (NOT upstreamed): in
+                              dispatch_server_events, stably partition the
+                              drained batch so non-EGFX events (clipboard,
+                              audio, control) are written BEFORE any EGFX
+                              video frames in that batch. Without this, with
+                              --enable-h264 a CLIPRDR FileContentsResponse
+                              queues behind dozens of large video frames every
+                              batch, throttling clipboard file copies to a
+                              crawl and freezing Windows Explorer's synchronous
+                              paste read. Partition is stable so audio
+                              wave-drop ordering and H.264 inter-frame
+                              sequence are preserved. Gated on the egfx
+                              feature.
+                          Keep this vendor dir until (2)/(3)/(4) are upstreamed
                           AND released — #1276 landing is NOT sufficient.
 
 vendor/ironrdp-egfx/      Local fork of ironrdp-egfx (same upstream rev as the
@@ -123,20 +136,38 @@ vendor/ironrdp-egfx/      Local fork of ironrdp-egfx (same upstream rev as the
 
 vendor/ironrdp-cliprdr/   Local fork of ironrdp-cliprdr (same upstream rev as
                           the git-pinned siblings), pulled in via
-                          [patch.crates-io]. ONE divergence: adds
-                          CliprdrBackend::on_format_list_response(ok: bool) with
-                          a default no-op (non-breaking) and calls it from
-                          handle_format_list_response on both Ok and Fail.
-                          Without this hook there is no backend signal for
-                          whether an outbound format-list advertise was accepted
-                          — the rejection (FormatListResponse::Fail) silently
-                          wipes local_file_list inside cliprdr, and blind timed
-                          retries can clobber an Ok with a later Fail. macrdp's
-                          poller uses the hook to STOP re-advertising on Ok
-                          while still retrying on Fail (see
-                          src/clipboard.rs AdvertiseState). Submitted upstream;
-                          drop this vendor dir once it lands in a released
-                          ironrdp-cliprdr.
+                          [patch.crates-io]. THREE divergences:
+                          (1) Adds CliprdrBackend::on_format_list_response(ok)
+                              with a default no-op (non-breaking) and calls it
+                              from handle_format_list_response on both Ok and
+                              Fail. Without this hook there is no backend
+                              signal for whether an outbound format-list
+                              advertise was accepted — the rejection silently
+                              wipes local_file_list inside cliprdr, and blind
+                              timed retries can clobber an Ok with a later
+                              Fail. macrdp's poller uses the hook to STOP
+                              re-advertising on Ok while still retrying on
+                              Fail (see src/clipboard.rs AdvertiseState).
+                          (2) initiate_file_copy now also advertises
+                              `Preferred DropEffect`
+                              (CFSTR_PREFERREDDROPEFFECT, format name added as
+                              ClipboardFormatName::PREFERRED_DROP_EFFECT) and
+                              handle_format_data_request short-circuits a
+                              request for it with DROPEFFECT_COPY
+                              (4-byte u32 LE = 0x00000001). Standards-correct
+                              labeling of the operation as a copy; no backend
+                              change required.
+                          (3) FileDescriptor::encode always sets
+                              ClipboardFileFlags::SHOW_PROGRESS_UI (FD_PROGRESSUI
+                              = 0x4000) on the dwFlags field of every emitted
+                              FILEDESCRIPTORW. This is the ACTUAL trigger that
+                              makes Windows Explorer show its native "Copying…"
+                              progress dialog for Mac→Windows clipboard file
+                              paste — without it the paste completes correctly
+                              but with only a busy cursor (no dialog).
+                              VERIFIED on real mstsc.
+                          All three submitted upstream; drop this vendor dir
+                          once they land in a released ironrdp-cliprdr.
 ```
 
 Cross-cutting:

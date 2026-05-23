@@ -151,7 +151,13 @@ impl Encode for FileDescriptor {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_fixed_part_size!(in: dst);
 
-        let mut flags = ClipboardFileFlags::empty();
+        // Always set FD_PROGRESSUI (SHOW_PROGRESS_UI = 0x4000): hint to the
+        // remote that a progress indicator should be shown for the copy.
+        // The flag is documented as a drag-and-drop signal; whether Windows
+        // Explorer honors it for clipboard paste is uncertain, but setting
+        // it is harmless if ignored. (macrdp vendor divergence — candidate
+        // for upstreaming.)
+        let mut flags = ClipboardFileFlags::SHOW_PROGRESS_UI;
         if self.attributes.is_some() {
             flags |= ClipboardFileFlags::ATTRIBUTES;
         }

@@ -824,6 +824,38 @@ impl RdpServer {
                 "dropping oldest waves"
             );
         }
+        // Reorder this batch so non-EGFX events (clipboard, audio, control)
+        // are written BEFORE the EGFX video frames queued behind them. With
+        // --enable-h264, EGFX frames flow continuously and dominate the
+        // event channel, and the underlying socket writer is shared across
+        // all channels; without this reordering, a small CLIPRDR
+        // FileContentsResponse can sit behind dozens of large video frames
+        // every batch, which throttles a clipboard file copy to a crawl
+        // and freezes Windows Explorer's synchronous paste read (the
+        // "large Mac→Windows file copy hangs under --enable-h264" bug).
+        // The partition is STABLE: relative order within the non-EGFX group
+        // and within the EGFX group is preserved, so:
+        //   - the audio wave-drop logic below (which targets the OLDEST
+        //     queued waves) still sees them in arrival order, and
+        //   - H.264 frames stay in their original sequential order, which
+        //     is required by the inter-frame codec chain.
+        // Clipboard and video are independent channels on the wire, so
+        // moving clipboard ahead of video within a batch does NOT violate
+        // any ordering invariant on either channel.
+        #[cfg(feature = "egfx")]
+        if events.iter().any(|e| matches!(e, ServerEvent::Egfx(_))) {
+            let mut non_egfx: Vec<ServerEvent> = Vec::with_capacity(events.len());
+            let mut egfx: Vec<ServerEvent> = Vec::new();
+            for ev in events.drain(..) {
+                if matches!(ev, ServerEvent::Egfx(_)) {
+                    egfx.push(ev);
+                } else {
+                    non_egfx.push(ev);
+                }
+            }
+            events.extend(non_egfx);
+            events.extend(egfx);
+        }
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
             match event {

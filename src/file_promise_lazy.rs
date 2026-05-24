@@ -194,6 +194,7 @@ declare_class!(
                     &state.router,
                     &state.sender,
                     crate::file_promise::LAZY_PARALLEL_CHUNKS,
+                    crate::file_promise::LAZY_CHUNK_SIZE,
                 ));
                 match res {
                     Ok(()) => {

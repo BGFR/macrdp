@@ -40,23 +40,44 @@ use objc2_foundation::{NSArray, NSString, NSURL};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-/// Per-RANGE request size. 1 MiB matches what mstsc itself asks for when
-/// fetching files from us in the Mac→Windows direction. Larger chunks
-/// (we tried 4 MiB) appeared to flood the SVC channel and starve the
-/// display/audio path — the connection felt unresponsive while a big
-/// download ran.
-const CHUNK_SIZE: u32 = 1024 * 1024;
+/// Per-RANGE request size for the eager path. 1 MiB matches what mstsc
+/// itself asks for when fetching files from us in the Mac→Windows
+/// direction. Larger chunks (we tried 4 MiB) appeared to flood the SVC
+/// channel and starve the display/audio path — the connection felt
+/// unresponsive while a big download ran.
+pub const EAGER_CHUNK_SIZE: u32 = 1024 * 1024;
 
-/// Default number of in-flight `FileContentsRequest` PDUs for the eager
-/// flow. 8 × 1 MiB = 8 MiB of pending response data is enough to keep
-/// the cliprdr round-trip pipelined on a LAN without head-of-line-
-/// blocking other static virtual channels. The lazy path
-/// (`file_promise_lazy`) deliberately uses a much smaller value because
-/// it runs *while the user is interacting* (paste-time), and the higher
-/// inbound socket pressure was visibly degrading mouse/keyboard
-/// responsiveness during multi-GB downloads.
+/// Per-RANGE request size for the lazy path. Aggressively smaller
+/// (64 KiB) than the eager 1 MiB so the cliprdr inbound dispatch loop
+/// returns to audio / EGFX / input servicing more often between chunks
+/// during a paste. Progressive halvings from 1 MiB → 256 → 128 → 64
+/// each cut worst-case `audio_backlog` resync deficit roughly
+/// proportionally during sustained pastes — the underlying issue is
+/// that vendor/ironrdp-server holds a single `Mutex<Self>` across
+/// `dispatch_pdu`, `dispatch_display`, and `dispatch_events`, so a busy
+/// inbound chunk stream effectively blocks audio dispatch. Smaller
+/// chunks shorten each `dispatch_pdu` lock-held interval, giving
+/// `dispatch_events` more windows to grab the lock and ship queued
+/// audio. The proper fix is splitting that vendor-server Mutex, but
+/// that's a much larger refactor.
+pub const LAZY_CHUNK_SIZE: u32 = 64 * 1024;
+
+/// Number of in-flight `FileContentsRequest` PDUs for the eager flow.
+/// 8 × `EAGER_CHUNK_SIZE` of pending response data is enough to keep the
+/// cliprdr round-trip pipelined on a LAN without head-of-line-blocking
+/// other static virtual channels.
 pub const EAGER_PARALLEL_CHUNKS: usize = 8;
-pub const LAZY_PARALLEL_CHUNKS: usize = 2;
+
+/// Number of in-flight `FileContentsRequest` PDUs for the lazy flow.
+/// Strictly serial (1) — the lazy path runs *while the user is
+/// interacting* (paste-time), and the vendor server's
+/// single-Mutex-across-dispatch-loops architecture means that even with
+/// small chunks, having multiple responses in flight produces enough
+/// inbound-PDU lock churn to starve audio dispatch (verified
+/// empirically: parallelism=2 with 128 KiB chunks still produced ~1.6 s
+/// of audible cut-out during a multi-hundred-MB paste). Serial fetch
+/// halves throughput but keeps per-chunk inbound bursts isolated.
+pub const LAZY_PARALLEL_CHUNKS: usize = 1;
 
 /// Shared event sender used by both the cliprdr backend (for ack PDUs) and
 /// any eager-download task.
@@ -210,6 +231,7 @@ pub fn spawn_remote_paste(
                 &router,
                 &sender,
                 EAGER_PARALLEL_CHUNKS,
+                EAGER_CHUNK_SIZE,
             )
             .await
             {
@@ -403,6 +425,7 @@ pub async fn fetch_one_file(
     router: &DownloadRouter,
     sender: &EventSender,
     max_parallel_chunks: usize,
+    chunk_size: u32,
 ) -> Result<(), String> {
     let total = match size_hint {
         Some(s) => s,
@@ -430,7 +453,7 @@ pub async fn fetch_one_file(
     let mut plan: Vec<(u64, u32)> = Vec::new();
     let mut pos = 0u64;
     while pos < total {
-        let req = (total - pos).min(u64::from(CHUNK_SIZE)) as u32;
+        let req = (total - pos).min(u64::from(chunk_size)) as u32;
         plan.push((pos, req));
         pos += u64::from(req);
     }

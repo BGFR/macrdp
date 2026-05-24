@@ -224,6 +224,25 @@ async fn capture_loop(
     let start_instant = std::time::Instant::now();
     let mut format_logged = false;
 
+    // SCK delivery-rate measurement. The vendor server's audio-lag model
+    // assumes one Wave = `WAVE_MS = 1024/48 = 21.33 ms` of real audio,
+    // which is only true if SCK actually delivers at 48 kHz. Some
+    // configurations (system audio rate ≠ requested capture rate) cause
+    // SCK to deliver samples at a different effective rate while still
+    // *reporting* 48 kHz in the format description, which manifests as
+    // a steady-state audio-shipped-vs-wall-clock deficit that the resync
+    // mechanism papers over every few seconds. Logging measured arrival
+    // rate over a wall-clock window tells us empirically whether that's
+    // the bug. Enable with `RUST_LOG=macrdp::audio=debug`.
+    let mut samples_received: u64 = 0;
+    let mut last_rate_log = std::time::Instant::now();
+    // Output-side counters. If output samples don't match 44.1 kHz × elapsed
+    // (after warm-up), the resampler is producing less audio than it should.
+    // If output samples match but wave count is below 46.875/sec, average
+    // wave size is bigger than the server's hardcoded WAVE_MS expects.
+    let mut output_samples: u64 = 0;
+    let mut waves_emitted: u64 = 0;
+
     loop {
         if generation.load(Ordering::SeqCst) != my_gen {
             debug!(my_gen, "audio capture loop superseded; exiting");
@@ -269,6 +288,48 @@ async fn capture_loop(
         input_buf[0].extend_from_slice(&in_left);
         input_buf[1].extend_from_slice(&in_right);
 
+        // Track actual delivery rate. One sample = one frame (per channel),
+        // so left-channel count is what we compare against SCK_SAMPLE_RATE.
+        samples_received += in_left.len() as u64;
+        if last_rate_log.elapsed() >= std::time::Duration::from_secs(5) {
+            let elapsed = last_rate_log.elapsed().as_secs_f64();
+            let measured_in = samples_received as f64 / elapsed;
+            let measured_out = output_samples as f64 / elapsed;
+            let measured_waves = waves_emitted as f64 / elapsed;
+            let expected_in = f64::from(SCK_SAMPLE_RATE);
+            let expected_out = f64::from(SAMPLE_RATE);
+            let expected_waves = expected_in / RESAMPLE_CHUNK as f64;
+            let avg_wave_samples = if waves_emitted > 0 {
+                output_samples as f64 / waves_emitted as f64
+            } else {
+                0.0
+            };
+            // Server's vendored audio-lag model assumes each wave is exactly
+            // 1024/48 = 21.33 ms. If avg_wave_samples / SAMPLE_RATE * 1000
+            // differs from that, the model drifts.
+            let avg_wave_ms = if waves_emitted > 0 {
+                avg_wave_samples / f64::from(SAMPLE_RATE) * 1000.0
+            } else {
+                0.0
+            };
+            debug!(
+                in_rate = measured_in,
+                in_expected = expected_in,
+                out_rate = measured_out,
+                out_expected = expected_out,
+                waves_per_sec = measured_waves,
+                waves_expected = expected_waves,
+                avg_wave_samples,
+                avg_wave_ms,
+                model_wave_ms = 1024.0 / 48.0,
+                "audio capture rates"
+            );
+            samples_received = 0;
+            output_samples = 0;
+            waves_emitted = 0;
+            last_rate_log = std::time::Instant::now();
+        }
+
         while input_buf[0].len() >= RESAMPLE_CHUNK && input_buf[1].len() >= RESAMPLE_CHUNK {
             chunk[0].copy_from_slice(&input_buf[0][..RESAMPLE_CHUNK]);
             chunk[1].copy_from_slice(&input_buf[1][..RESAMPLE_CHUNK]);
@@ -277,10 +338,15 @@ async fn capture_loop(
                 .map_err(|e| anyhow!("rubato resample: {e}"))?;
             input_buf[0].drain(..RESAMPLE_CHUNK);
             input_buf[1].drain(..RESAMPLE_CHUNK);
+            // Per-call output sample count (one channel; planar so all
+            // channels have the same len). Counted before pcm.is_empty so
+            // we capture empties too.
+            output_samples += resampled[0].len() as u64;
             let pcm = planar_f32_to_interleaved_i16(&resampled);
             if pcm.is_empty() {
                 continue;
             }
+            waves_emitted += 1;
 
             let ts_ms = start_instant.elapsed().as_millis() as u32;
 

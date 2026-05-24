@@ -320,18 +320,26 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     flush_frames: u32,
 
-    /// POC: serve Windows→Mac file paste lazily via `NSFilePresenter` /
-    /// `NSFileCoordinator` instead of eagerly downloading every file on
-    /// copy. Temp files are pre-sized but empty when the Windows copy
-    /// lands; bytes stream only when the user actually pastes in Finder
+    /// Disable lazy Windows→Mac file paste. Lazy paste is ON by default:
+    /// temp files are pre-sized but empty when the Windows copy lands,
+    /// and bytes stream only when the user actually pastes in Finder
     /// (macOS shows its native "Preparing to paste" progress dialog).
     /// Handles single files AND folder trees. Uses fewer parallel chunk
     /// requests than the eager path so the RDP session stays responsive
-    /// during the on-paste download. Files without a declared size still
-    /// fall back to eager.
+    /// during the on-paste download. Pass this to fall back to the eager
+    /// path (downloads every file the moment Windows announces the copy,
+    /// then auto-fires Cmd-V into Finder).
     #[cfg(target_os = "macos")]
-    #[arg(long, default_value_t = false)]
-    lazy_paste: bool,
+    #[arg(long = "no-lazy-paste", action = clap::ArgAction::SetTrue)]
+    no_lazy_paste: bool,
+
+    /// Deprecated/no-op: lazy paste is now the default. Accepted so
+    /// existing command lines that pass --lazy-paste keep working; use
+    /// --no-lazy-paste to disable.
+    #[cfg(target_os = "macos")]
+    #[arg(long = "lazy-paste", action = clap::ArgAction::SetTrue, hide = true)]
+    #[allow(dead_code)]
+    lazy_paste_compat: bool,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -959,7 +967,7 @@ async fn main() -> Result<()> {
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> = {
         #[cfg(target_os = "macos")]
         {
-            Box::new(clipboard::MacCliprdr::new(args.lazy_paste))
+            Box::new(clipboard::MacCliprdr::new(!args.no_lazy_paste))
         }
         #[cfg(not(target_os = "macos"))]
         {

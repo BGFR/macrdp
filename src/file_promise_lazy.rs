@@ -1,8 +1,7 @@
-//! Lazy Windows→Mac file paste POC via `NSFilePresenter` /
-//! `NSFileCoordinator`.
-//!
-//! Counterpart to `src/file_promise.rs` (eager: downloads every file the
-//! moment Windows announces the descriptor, then auto-fires Cmd-V).
+//! Lazy Windows→Mac file paste via `NSFilePresenter` / `NSFileCoordinator`.
+//! Default path; opt out with `--no-lazy-paste` to fall back to the
+//! eager path in `src/file_promise.rs` (downloads every file the moment
+//! Windows announces the descriptor, then auto-fires Cmd-V).
 //! This module instead:
 //!
 //! 1. Creates a **pre-sized empty** temp file per remote entry. Pre-sizing

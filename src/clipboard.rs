@@ -228,9 +228,10 @@ pub struct MacCliprdr {
     /// Coordinates the advertise retry loop with the cliprdr backend's
     /// `on_format_list_response` hook. See [`AdvertiseState`].
     advertise_state: Arc<AdvertiseState>,
-    /// POC switch: when true, on_remote_file_list dispatches to
-    /// `file_promise_lazy::spawn_lazy_paste` instead of the eager path.
-    /// Lazy currently handles single-file copies only; folder copies
+    /// When true (default), on_remote_file_list dispatches to
+    /// `file_promise_lazy::spawn_lazy_paste`. Set false via
+    /// `--no-lazy-paste` to use the eager path instead. Single-file and
+    /// folder copies both work in lazy; entries without a size hint
     /// fall back to eager automatically.
     #[cfg(target_os = "macos")]
     lazy_paste: bool,
@@ -395,8 +396,8 @@ struct MacCliprdrBackend {
     // Lets the `on_format_list_response` hook tell the poller's retry loop
     // that the current advertise wave was accepted, so it stops re-advertising.
     advertise_state: Arc<AdvertiseState>,
-    // POC: routes on_remote_file_list to the lazy NSFilePresenter path
-    // when true. See MacCliprdr::lazy_paste.
+    // Routes on_remote_file_list to the lazy NSFilePresenter path when
+    // true (the default; --no-lazy-paste flips it). See MacCliprdr::lazy_paste.
     #[cfg(target_os = "macos")]
     lazy_paste: bool,
 }

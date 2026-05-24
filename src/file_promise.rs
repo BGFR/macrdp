@@ -25,7 +25,6 @@
 #![cfg(target_os = "macos")]
 
 use std::collections::HashMap;
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,11 +47,16 @@ use tracing::{debug, info, warn};
 /// download ran.
 const CHUNK_SIZE: u32 = 1024 * 1024;
 
-/// Maximum number of in-flight `FileContentsRequest` PDUs for a single
-/// file. 8 × 1 MiB = 8 MiB of pending response data is enough to keep
+/// Default number of in-flight `FileContentsRequest` PDUs for the eager
+/// flow. 8 × 1 MiB = 8 MiB of pending response data is enough to keep
 /// the cliprdr round-trip pipelined on a LAN without head-of-line-
-/// blocking other static virtual channels.
-const MAX_PARALLEL_CHUNKS: usize = 8;
+/// blocking other static virtual channels. The lazy path
+/// (`file_promise_lazy`) deliberately uses a much smaller value because
+/// it runs *while the user is interacting* (paste-time), and the higher
+/// inbound socket pressure was visibly degrading mouse/keyboard
+/// responsiveness during multi-GB downloads.
+pub const EAGER_PARALLEL_CHUNKS: usize = 8;
+pub const LAZY_PARALLEL_CHUNKS: usize = 2;
 
 /// Shared event sender used by both the cliprdr backend (for ack PDUs) and
 /// any eager-download task.
@@ -199,7 +203,16 @@ pub fn spawn_remote_paste(
                     return;
                 }
             }
-            match fetch_file_inner(e.index, e.size, dst, &router, &sender).await {
+            match fetch_one_file(
+                e.index,
+                e.size,
+                dst,
+                &router,
+                &sender,
+                EAGER_PARALLEL_CHUNKS,
+            )
+            .await
+            {
                 Ok(()) => {
                     debug!(name = %e.name, dest = ?dst, "downloaded remote file");
                 }
@@ -224,7 +237,11 @@ pub fn spawn_remote_paste(
 /// `relative_path` components under `root` while rejecting any
 /// path-traversal attempts. Returns `None` on unsafe input so the caller
 /// can abort the whole paste.
-fn resolve_dest(root: &Path, entry: &RemoteEntry) -> Option<PathBuf> {
+///
+/// Shared with `file_promise_lazy` so both paths apply the same
+/// `..`/forward-slash rejection rules — a malicious remote could
+/// otherwise craft a `relative_path` that writes outside the temp dir.
+pub fn resolve_dest(root: &Path, entry: &RemoteEntry) -> Option<PathBuf> {
     let mut p = root.to_path_buf();
     if let Some(rp) = &entry.relative_path {
         for component in rp.split('\\') {
@@ -358,7 +375,7 @@ fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount)
 }
 
 /// Download a single file as a fan-out of RANGE chunks. Up to
-/// `MAX_PARALLEL_CHUNKS` requests are in flight at once; each completes
+/// `max_parallel_chunks` requests are in flight at once; each completes
 /// independently and writes its slice into the pre-allocated destination
 /// at the matching offset. Returns `Ok(())` once every chunk has been
 /// written.
@@ -368,26 +385,42 @@ fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount)
 /// its own offset, and `pwrite`-like behavior via `seek+write` works as
 /// long as no two tasks write the same byte range (which by construction
 /// they don't — chunks are disjoint by `position`).
-async fn fetch_file_inner(
+/// Download a single remote file's bytes into `dst`, parallelized as a
+/// fan-out of RANGE requests. The destination is pre-allocated to the
+/// final size so concurrent chunk writers don't race on extending it,
+/// and all chunks share a single `Arc<File>` and write via `pwrite`
+/// (`FileExt::write_at`) — race-free because the offset is per-call,
+/// not per-fd, and it avoids the open+seek+close-per-chunk syscall
+/// overhead of the earlier seek+write_all design.
+///
+/// Used by the eager paste flow (sequential per file, parallel chunks
+/// internally) and by `file_promise_lazy::LazyPresenter` (one call per
+/// file on the read-coordination block).
+pub async fn fetch_one_file(
     index: i32,
     size_hint: Option<u64>,
     dst: &Path,
     router: &DownloadRouter,
     sender: &EventSender,
+    max_parallel_chunks: usize,
 ) -> Result<(), String> {
     let total = match size_hint {
         Some(s) => s,
         None => fetch_size(index, router, sender).await?,
     };
 
-    // Pre-allocate the file to its final size so concurrent writers don't
-    // race on extending it. `set_len` writes a sparse hole on APFS; the
-    // actual blocks materialize as chunks land.
-    {
-        let f = std::fs::File::create(dst).map_err(|e| format!("create {dst:?}: {e}"))?;
-        f.set_len(total)
-            .map_err(|e| format!("set_len {dst:?}: {e}"))?;
-    }
+    // Open + pre-allocate the file to its final size once, then share
+    // the handle across all chunk tasks. `set_len` writes a sparse hole
+    // on APFS; the actual blocks materialize as chunks land.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dst)
+        .map_err(|e| format!("create {dst:?}: {e}"))?;
+    file.set_len(total)
+        .map_err(|e| format!("set_len {dst:?}: {e}"))?;
+    let file = Arc::new(file);
 
     if total == 0 {
         return Ok(());
@@ -404,10 +437,9 @@ async fn fetch_file_inner(
 
     let mut set: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
     let mut next = 0usize;
-    let dst_owned = dst.to_path_buf();
 
     // Prime the in-flight window.
-    while next < plan.len() && set.len() < MAX_PARALLEL_CHUNKS {
+    while next < plan.len() && set.len() < max_parallel_chunks {
         let (p, sz) = plan[next];
         set.spawn(chunk_task(
             index,
@@ -415,7 +447,7 @@ async fn fetch_file_inner(
             sz,
             router.clone(),
             sender.clone(),
-            dst_owned.clone(),
+            file.clone(),
         ));
         next += 1;
     }
@@ -442,7 +474,7 @@ async fn fetch_file_inner(
                 sz,
                 router.clone(),
                 sender.clone(),
-                dst_owned.clone(),
+                file.clone(),
             ));
             next += 1;
         }
@@ -456,25 +488,32 @@ async fn chunk_task(
     requested_size: u32,
     router: DownloadRouter,
     sender: EventSender,
-    dst: PathBuf,
+    file: Arc<std::fs::File>,
 ) -> Result<(), String> {
+    use std::os::unix::fs::FileExt;
     let bytes = fetch_range(index, position, requested_size, &router, &sender).await?;
     if bytes.is_empty() {
         return Err(format!(
             "short read at {position}; expected {requested_size} bytes, got 0"
         ));
     }
-    // std::fs is fine here; writes are small, infrequent per task, and
-    // tokio's blocking-thread pool absorbs the cost. Wrapping in
-    // spawn_blocking would add more overhead than the save.
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&dst)
-        .map_err(|e| format!("open {dst:?}: {e}"))?;
-    f.seek(SeekFrom::Start(position))
-        .map_err(|e| format!("seek {dst:?} @ {position}: {e}"))?;
-    f.write_all(&bytes)
-        .map_err(|e| format!("write {dst:?} @ {position}: {e}"))?;
+    // pwrite (write_at) is positional — no shared offset on the fd, so
+    // concurrent chunk tasks writing to disjoint byte ranges are safe
+    // on the same Arc<File>. A short write here means the underlying
+    // pwrite returned fewer bytes than requested; loop until done.
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let n = file
+            .write_at(&bytes[written..], position + written as u64)
+            .map_err(|e| format!("write_at @ {}: {e}", position + written as u64))?;
+        if n == 0 {
+            return Err(format!(
+                "write_at @ {} returned 0 bytes",
+                position + written as u64
+            ));
+        }
+        written += n;
+    }
     Ok(())
 }
 

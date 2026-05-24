@@ -56,7 +56,8 @@ core-foundation = "0.10"
 # ScreenCaptureKit bindings — verify the crate name/version against crates.io;
 # alternatives: `screencapturekit`, or direct `objc2`/`objc2-screen-capture-kit`.
 objc2 = "0.5"
-objc2-foundation = "0.2"
+objc2-foundation = { version = "0.2", features = ["NSURL", "NSString", "NSError", "NSDictionary", "NSFileCoordinator", "NSFilePresenter", "NSOperation", "block2"] }
+block2 = "0.5"
 objc2-app-kit = { version = "0.2", features = ["NSCursor", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics", "NSGraphicsContext", "NSPasteboard", "NSPasteboardItem", "NSWorkspace", "NSRunningApplication", "libc"] }
 screencapturekit = { version = "2.1", features = ["async"] }
 

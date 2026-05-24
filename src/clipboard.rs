@@ -228,19 +228,44 @@ pub struct MacCliprdr {
     /// Coordinates the advertise retry loop with the cliprdr backend's
     /// `on_format_list_response` hook. See [`AdvertiseState`].
     advertise_state: Arc<AdvertiseState>,
+    /// POC switch: when true, on_remote_file_list dispatches to
+    /// `file_promise_lazy::spawn_lazy_paste` instead of the eager path.
+    /// Lazy currently handles single-file copies only; folder copies
+    /// fall back to eager automatically.
+    #[cfg(target_os = "macos")]
+    lazy_paste: bool,
 }
 
+#[cfg(target_os = "macos")]
+impl MacCliprdr {
+    pub fn new(lazy_paste: bool) -> Self {
+        let paste_temp_dir = Arc::new(Mutex::new(None));
+        let self_change_count = Arc::new(std::sync::atomic::AtomicI64::new(-1));
+        // Publish to the process-global so the signal-exit watcher in
+        // main.rs can call cleanup_on_disconnect before
+        // std::process::exit(0) (which bypasses Drop).
+        crate::file_promise_lazy::register_shutdown_cleanup(
+            paste_temp_dir.clone(),
+            self_change_count.clone(),
+        );
+        Self {
+            sender: Arc::new(Mutex::new(None)),
+            file_paths: Arc::new(Mutex::new(Vec::new())),
+            download_router: crate::file_promise::DownloadRouter::default(),
+            paste_temp_dir,
+            self_change_count,
+            advertise_state: Arc::new(AdvertiseState::default()),
+            lazy_paste,
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 impl MacCliprdr {
     pub fn new() -> Self {
         Self {
             sender: Arc::new(Mutex::new(None)),
             file_paths: Arc::new(Mutex::new(Vec::new())),
-            #[cfg(target_os = "macos")]
-            download_router: crate::file_promise::DownloadRouter::default(),
-            #[cfg(target_os = "macos")]
-            paste_temp_dir: Arc::new(Mutex::new(None)),
-            #[cfg(target_os = "macos")]
-            self_change_count: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
             advertise_state: Arc::new(AdvertiseState::default()),
         }
     }
@@ -337,6 +362,8 @@ impl CliprdrBackendFactory for MacCliprdr {
             #[cfg(target_os = "macos")]
             self_change_count: self.self_change_count.clone(),
             advertise_state: self.advertise_state.clone(),
+            #[cfg(target_os = "macos")]
+            lazy_paste: self.lazy_paste,
         })
     }
 }
@@ -368,6 +395,32 @@ struct MacCliprdrBackend {
     // Lets the `on_format_list_response` hook tell the poller's retry loop
     // that the current advertise wave was accepted, so it stops re-advertising.
     advertise_state: Arc<AdvertiseState>,
+    // POC: routes on_remote_file_list to the lazy NSFilePresenter path
+    // when true. See MacCliprdr::lazy_paste.
+    #[cfg(target_os = "macos")]
+    lazy_paste: bool,
+}
+
+/// Drop runs when the RDP connection ends and ironrdp_server releases
+/// the per-session backend box. macrdp serves one client at a time, so
+/// this also doubles as our "client disconnected" hook: tear down lazy
+/// paste presenters, blow away the per-paste temp dir, and clear the
+/// pasteboard if our URLs are still on it (otherwise NSPasteboard would
+/// be holding `file:///tmp/macrdp-lazy-paste-…/foo` URLs whose backing
+/// files we just deleted — Finder paste would error out for the user).
+///
+/// Best-effort: presenter removal is async (hops to the runloop thread),
+/// and temp-dir removal is std::fs blocking — we do NOT wait on either,
+/// because Drop runs synchronously on the ironrdp_server task thread
+/// and we don't want to stall the disconnect path.
+#[cfg(target_os = "macos")]
+impl Drop for MacCliprdrBackend {
+    fn drop(&mut self) {
+        crate::file_promise_lazy::cleanup_on_disconnect(
+            &self.paste_temp_dir,
+            &self.self_change_count,
+        );
+    }
 }
 
 impl ironrdp_core::AsAny for MacCliprdrBackend {
@@ -550,7 +603,21 @@ impl CliprdrBackend for MacCliprdrBackend {
         // STREAM_FILECLIP_ENABLED is the gate that lets either side use
         // FileGroupDescriptorW + FileContents{Request,Response}. Without
         // it, clients won't advertise file paste at all.
+        //
+        // CAN_LOCK_CLIPDATA enables cliprdr's automatic Lock/Unlock cycle
+        // around incoming file-list pastes ([MS-RDPECLIP] 1.3.2.3 / Figure
+        // 3). Without it, the upstream `send_lock` short-circuits (see
+        // vendor/ironrdp-cliprdr/src/lib.rs:929) and Windows Explorer is
+        // never told when we're "done" with a FileGroupDescriptorW it
+        // gave us. Symptom on mstsc: after a successful file paste, a
+        // rapid follow-up Ctrl-C in Windows is silently dropped (no
+        // FormatList reaches the Mac), and very large downloads can be
+        // released mid-stream (CB_RESPONSE_FAIL) when the source app
+        // decides the descriptor isn't being held. Advertising the cap
+        // lets cliprdr issue LockData on the incoming format list and
+        // UnlockData on supersession/timeout automatically.
         ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+            | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA
     }
 
     fn on_ready(&mut self) {
@@ -637,7 +704,7 @@ impl CliprdrBackend for MacCliprdrBackend {
     fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
         debug!(
             file_count = files.len(),
-            clip_data_id, "remote file list received; eagerly downloading"
+            clip_data_id, "remote file list received"
         );
         #[cfg(target_os = "macos")]
         {
@@ -658,14 +725,32 @@ impl CliprdrBackend for MacCliprdrBackend {
                     }
                 })
                 .collect();
-            crate::file_promise::spawn_remote_paste(
-                entries,
-                self.download_router.clone(),
-                self.sender.clone(),
-                self.paste_temp_dir.clone(),
-                self.self_change_count.clone(),
-                tokio::runtime::Handle::current(),
-            );
+            let rt = tokio::runtime::Handle::current();
+            // Try lazy first if enabled; it returns false for folder
+            // copies (Phase 1 scope) and we fall through to eager.
+            let mut handled = false;
+            if self.lazy_paste {
+                debug!("attempting lazy paste path");
+                handled = crate::file_promise_lazy::spawn_lazy_paste(
+                    entries.clone(),
+                    self.download_router.clone(),
+                    self.sender.clone(),
+                    self.paste_temp_dir.clone(),
+                    self.self_change_count.clone(),
+                    rt.clone(),
+                );
+            }
+            if !handled {
+                debug!("dispatching eager paste path");
+                crate::file_promise::spawn_remote_paste(
+                    entries,
+                    self.download_router.clone(),
+                    self.sender.clone(),
+                    self.paste_temp_dir.clone(),
+                    self.self_change_count.clone(),
+                    rt,
+                );
+            }
         }
         #[cfg(not(target_os = "macos"))]
         let _ = (files, clip_data_id);
@@ -787,6 +872,23 @@ impl CliprdrBackend for MacCliprdrBackend {
     }
     fn on_lock(&mut self, _data_id: LockDataId) {}
     fn on_unlock(&mut self, _data_id: LockDataId) {}
+
+    /// Fires once per Windows clipboard transition, with the lock IDs
+    /// that just expired. This is our "Windows clipboard changed"
+    /// signal regardless of whether the new content carries
+    /// `FileGroupDescriptorW`. We use it to clear the Mac pasteboard
+    /// if our previously-published URLs are still on it — so when a
+    /// shell extension (e.g. for `.zip`/`.gz`/`.7z` archives) swallows
+    /// the file representation on the Windows side, Cmd-V in Finder
+    /// beeps clearly instead of silently pasting the previous file.
+    /// In-flight downloads from the prior paste are not disturbed:
+    /// they hold strong refs into REGISTRY and can complete on their
+    /// own; presenters tied to URLs that just left the pasteboard are
+    /// effectively zombies that get reaped on the next supersede.
+    #[cfg(target_os = "macos")]
+    fn on_outgoing_locks_expired(&mut self, _clip_data_ids: &[LockDataId]) {
+        crate::file_promise_lazy::clear_pasteboard_if_stale(&self.self_change_count);
+    }
 }
 
 #[cfg(target_os = "macos")]

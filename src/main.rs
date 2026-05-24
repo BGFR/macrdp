@@ -6,8 +6,12 @@ mod cursor;
 #[cfg(target_os = "macos")]
 mod file_promise;
 #[cfg(target_os = "macos")]
+mod file_promise_lazy;
+#[cfg(target_os = "macos")]
 mod h264;
 mod input;
+#[cfg(target_os = "macos")]
+mod runloop_thread;
 mod videotoolbox;
 mod virtual_display;
 
@@ -315,6 +319,19 @@ struct Args {
     /// trailing lag remains; set 0 to disable the flush burst entirely.
     #[arg(long, default_value_t = 4)]
     flush_frames: u32,
+
+    /// POC: serve Windows→Mac file paste lazily via `NSFilePresenter` /
+    /// `NSFileCoordinator` instead of eagerly downloading every file on
+    /// copy. Temp files are pre-sized but empty when the Windows copy
+    /// lands; bytes stream only when the user actually pastes in Finder
+    /// (macOS shows its native "Preparing to paste" progress dialog).
+    /// Handles single files AND folder trees. Uses fewer parallel chunk
+    /// requests than the eager path so the RDP session stays responsive
+    /// during the on-paste download. Files without a declared size still
+    /// fall back to eager.
+    #[cfg(target_os = "macos")]
+    #[arg(long, default_value_t = false)]
+    lazy_paste: bool,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -676,6 +693,12 @@ async fn main() -> Result<()> {
         {
             drop(ovr); // restores display arrangement
         }
+        // Lazy paste leaves NSFilePresenters registered + a temp dir on
+        // disk + URLs on NSPasteboard. Process::exit skips Drop on the
+        // cliprdr backend, so flush that state explicitly. No-op if
+        // MacCliprdr was never constructed.
+        #[cfg(target_os = "macos")]
+        file_promise_lazy::shutdown_cleanup();
         std::process::exit(0);
     });
 
@@ -933,8 +956,16 @@ async fn main() -> Result<()> {
     };
 
     let input_handler = MacInputHandler::new(width, height, capture_display_id, click_signal)?;
-    let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> =
-        Box::new(clipboard::MacCliprdr::new());
+    let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> = {
+        #[cfg(target_os = "macos")]
+        {
+            Box::new(clipboard::MacCliprdr::new(args.lazy_paste))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Box::new(clipboard::MacCliprdr::new())
+        }
+    };
     let sound: Box<dyn ironrdp_server::SoundServerFactory> = Box::new(audio::MacRdpsnd::new());
 
     // with_hybrid advertises HYBRID | HYBRID_EX so clients run CredSSP/NLA

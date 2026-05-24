@@ -70,6 +70,13 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
                           mstsc's presentation buffer (default 4; only with
                           --enable-h264). Stops the last keystroke before a pause
                           lagging until the next keyframe. 0 disables. See "Video".
+--no-lazy-paste           Opt out of lazy Windows→Mac file paste (default ON).
+                          With lazy, temp files are pre-sized but empty when the
+                          copy lands and stream bytes only on Cmd-V, with macOS's
+                          native "Preparing to paste" progress dialog. Pass this
+                          to fall back to the eager path (downloads everything
+                          on copy, auto-fires Cmd-V into Finder when done).
+                          See "Windows → Mac file copy" below.
 --cert-dir PATH           Persisted TLS cert (default ~/Library/Application Support/macrdp)
 --virtual-display         Serve a headless virtual display at --width × --height
                           instead of mirroring the primary panel — local screen
@@ -136,6 +143,9 @@ Both restore the original layout when the last client disconnects, and both auto
 
 # Quick dev test on loopback — skips PAM, accepts --password verbatim.
 ./macrdp --skip-auth --password test
+
+# Use the eager Windows→Mac file paste path (default is lazy / on-demand).
+./macrdp --no-lazy-paste
 ```
 
 ## Video (H.264)
@@ -180,16 +190,22 @@ At 60fps the frame budget is 16.67 ms. The scalar path is fine at 1080p (~30% of
 
 System audio rides over the RDPSND virtual channel as 16-bit stereo PCM at **44.1 kHz**. ScreenCaptureKit only supports 8 / 16 / 24 / 48 kHz, so the capture loop captures at 48 kHz and resamples to 44.1 with [`rubato`](https://github.com/HEnquist/rubato) before sending. 44.1 matches the native rate of most Windows audio endpoints, which avoids the client-side resampling drift that otherwise accumulates into multi-second audio backlogs. A generation counter on the audio factory keeps a client reconnect from leaving a second capture loop feeding the channel. The vendored `ironrdp-server` carries a single patch that makes `dispatch_server_events` keep the *newest* queued waves on per-batch overflow instead of the oldest — without it, a one-off video-encode stall would bake a permanent audio-latency offset into the session.
 
+## File copy
+
+Bidirectional via MS-RDPECLIP. Both directions support single files and folder trees.
+
+**Mac → Windows.** `Cmd-C` a file or folder in Finder, `Ctrl-V` in Windows Explorer. The pasteboard walk recurses into directories (skipping symlinks, capped at 10 000 descriptors per copy) and emits the right `relative_path` so Explorer reconstructs the tree. Bytes stream on demand via `FileContentsRequest` chunks (4 MiB per chunk). Windows shows its native "Copying…" progress dialog.
+
+**Windows → Mac (lazy, default).** `Ctrl-C` in Explorer, `Cmd-V` in Finder. The server pre-allocates an empty temp file per leaf at its declared size and registers each one with `NSFileCoordinator` via `NSFilePresenter`. Bytes only start streaming when Finder asks for them on `Cmd-V`, and macOS shows its **native "Preparing to paste" progress dialog** during the wait. Folder trees and multi-file selections both work. Lower chunk parallelism is used than the eager path so the RDP session stays responsive (mouse / keyboard / video) while a multi-hundred-MB paste is in flight. If you'd rather have files downloaded eagerly the moment Windows announces a copy (and `Cmd-V` auto-fired into Finder when ready, with an audible Glass-chime cue), pass `--no-lazy-paste`.
+
+### Known limitations
+
+- **`Ctrl-C` on a *folder* in Windows Explorer doesn't reach the Mac.** Explorer puts only the Shell IDList format on the clipboard and delay-renders `FileGroupDescriptorW`, which `mstsc` doesn't request — so nothing is forwarded over the RDP clipboard channel and you'll hear a beep on `Cmd-V`. Windows + mstsc behavior, not fixable server-side. **Workaround:** open the folder in Explorer, `Ctrl-A` to select its contents, then `Ctrl-C` — that path uses `FileGroupDescriptorW` directly and folder structure is preserved.
+- **Some Windows shell extensions silently swallow specific files from the clipboard.** Archive tools (7-Zip, WinRAR, built-in Compressed Folders) commonly hook extensions like `.zip`, `.gz`, `.7z`, `.bz`, `.bz2`, `.rar`, `.tar` and intercept Explorer's clipboard so `Ctrl-C` either sends no `FileGroupDescriptorW` to mstsc or sends none at all. The Mac side detects the clipboard transition and clears the pasteboard, so `Cmd-V` in Finder beeps clearly instead of silently re-pasting the previous file. **Workaround:** rename the file to a neutral extension (e.g. `.bin`) and Windows will publish it normally.
+
 ## Reason why this was made
-This was done to scratch an itch.  There are practically no active open source RDP servers for MacOS.  The closest project that does this functionality is xrdp; however this program only runs on Linux/Unix machines, and has no homebrew equivalent on Macs. Done in a few hours with the help of Claude and runs pretty well.
 
-Multi-monitor support is on the list when I'm bored or need a distraction from real life. File copy is now bidirectional: Mac→Windows streams real bytes via the standard MS-RDPECLIP path; Windows→Mac eagerly downloads to `/tmp` the moment Windows announces a copy, publishes the file URLs to NSPasteboard, plays a Glass chime when ready, and automatically fires `Cmd-V` if Finder is the frontmost app so the paste completes without a second keystroke.
-
-### Windows → Mac file copy: known limitation
-
-`Ctrl-C` on a *folder* in Windows Explorer doesn't reach the Mac side. Explorer puts only the Shell IDList format on the clipboard and delay-renders `FileGroupDescriptorW`, which `mstsc` doesn't request — so nothing is forwarded over the RDP clipboard channel and you'll hear a beep on `Cmd-V`. This is a Windows + mstsc behavior we can't work around server-side.
-
-**Workaround:** open the folder in Explorer, `Ctrl-A` to select its contents (files and any subfolders), `Ctrl-C`, then `Cmd-V` in Finder. That path produces a real file group descriptor and folder structure is preserved via `relative_path`. For copying entire arbitrary folder trees rooted at a folder you don't want to enter, RDP drive redirection is a more appropriate feature (not currently implemented).
+This was done to scratch an itch.  There are practically no active open source RDP servers for MacOS.  The closest project that does this functionality is xrdp; however this program only runs on Linux/Unix machines, and has no homebrew equivalent on Macs. Done in a few hours with the help of Claude and runs pretty well. Multi-monitor support is on the list when I'm bored or need a distraction from real life.
 
 ## License
 

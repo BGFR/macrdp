@@ -13,7 +13,7 @@ use std::sync::{
 
 use ironrdp_rdpsnd::pdu::{AudioFormat, ClientAudioFormatPdu, WaveFormat};
 use ironrdp_rdpsnd::server::{RdpsndServerHandler, RdpsndServerMessage};
-use ironrdp_server::{ServerEvent, ServerEventSender, SoundServerFactory};
+use ironrdp_server::{AudioWave, ServerEvent, ServerEventSender, SoundServerFactory};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -29,10 +29,20 @@ const CHANNELS: u16 = 2;
 const BITS_PER_SAMPLE: u16 = 16;
 
 type Sender = Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>;
+type AudioSender = Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>;
 
 #[derive(Debug)]
 pub struct MacRdpsnd {
     sender: Sender,
+    /// Dedicated bounded channel for Wave PDUs. Set by ironrdp-server
+    /// via `set_audio_sender`. When present, the capture loop sends
+    /// every Wave directly here, bypassing the unified `ServerEvent`
+    /// stream. The server's `dispatch_audio` task is the sole consumer,
+    /// independent of the inbound-PDU and outbound-event dispatch
+    /// branches that share `Mutex<Self>` — so a sustained inbound
+    /// cliprdr stream (e.g., large `--lazy-paste` Windows→Mac transfer)
+    /// no longer starves audio output.
+    audio_sender: AudioSender,
     // Monotonic capture-loop generation, shared with every backend this
     // factory builds. mstsc's cert-prompt reconnect makes ironrdp build a
     // second backend (and thus a second capture loop) while the first may
@@ -46,6 +56,7 @@ impl MacRdpsnd {
     pub fn new() -> Self {
         Self {
             sender: Arc::new(Mutex::new(None)),
+            audio_sender: Arc::new(Mutex::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -61,10 +72,15 @@ impl SoundServerFactory for MacRdpsnd {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
         Box::new(MacRdpsndBackend {
             sender: self.sender.clone(),
+            audio_sender: self.audio_sender.clone(),
             generation: self.generation.clone(),
             my_gen: 0,
             formats: vec![pcm_format()],
         })
+    }
+
+    fn set_audio_sender(&mut self, audio_sender: mpsc::Sender<AudioWave>) {
+        *self.audio_sender.lock().unwrap() = Some(audio_sender);
     }
 }
 
@@ -84,6 +100,7 @@ fn pcm_format() -> AudioFormat {
 #[derive(Debug)]
 struct MacRdpsndBackend {
     sender: Sender,
+    audio_sender: AudioSender,
     generation: Arc<AtomicU64>,
     // Generation claimed by this backend's capture loop, 0 until `start()`.
     my_gen: u64,
@@ -131,10 +148,11 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         self.my_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
 
         let sender = self.sender.clone();
+        let audio_sender = self.audio_sender.clone();
         let generation = self.generation.clone();
         let my_gen = self.my_gen;
         tokio::spawn(async move {
-            if let Err(e) = capture_loop(sender, generation, my_gen).await {
+            if let Err(e) = capture_loop(sender, audio_sender, generation, my_gen).await {
                 warn!("audio capture loop ended: {e}");
             }
         });
@@ -156,6 +174,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
 #[cfg(target_os = "macos")]
 async fn capture_loop(
     sender: Sender,
+    audio_sender: AudioSender,
     generation: Arc<AtomicU64>,
     my_gen: u64,
 ) -> anyhow::Result<()> {
@@ -210,6 +229,7 @@ async fn capture_loop(
     // window for set_sender to populate the Mutex. Lazy-resolve here gives
     // the same robustness without paying for a lock on every wave.
     let mut s: Option<mpsc::UnboundedSender<ServerEvent>> = None;
+    let mut audio_s: Option<mpsc::Sender<AudioWave>> = None;
 
     // Shallow queue: SCK's async buffer is a drop-oldest ring of this depth.
     // Each slot is ~20 ms of audio, so 2 caps capture-side staleness at ~40 ms
@@ -350,18 +370,40 @@ async fn capture_loop(
 
             let ts_ms = start_instant.elapsed().as_millis() as u32;
 
-            // Lazy resolve the sender on first need. If set_sender hasn't
-            // populated the Mutex yet, retry next iteration — at 48 kHz / 1024
-            // samples this is ~21 ms later.
-            if s.is_none() {
-                s = sender.lock().unwrap().clone();
+            // Lazy resolve both senders on first need. If set_sender /
+            // set_audio_sender haven't populated their Mutexes yet, retry
+            // next iteration — at 48 kHz / 1024 samples this is ~21 ms
+            // later.
+            if audio_s.is_none() {
+                audio_s = audio_sender.lock().unwrap().clone();
             }
-            let Some(s_ref) = s.as_ref() else { continue };
-            if s_ref
-                .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(pcm, ts_ms)))
-                .is_err()
-            {
-                return Ok(());
+            if let Some(audio_ref) = audio_s.as_ref() {
+                // Bounded channel: send().await applies backpressure if
+                // the dispatch_audio task is behind, but if we're at
+                // capacity we'd rather drop this wave at the SCK level
+                // than block the capture loop (which would back up the
+                // SCK ring buffer and lose newer audio anyway). Use
+                // try_send: on Full, log+drop; on Closed, exit.
+                match audio_ref.try_send((pcm, ts_ms)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        debug!("audio channel full; dropping wave (dispatch_audio behind)");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                }
+            } else {
+                // Audio sender not wired (older server build / non-macrdp
+                // host). Fall back to the unified ServerEvent channel.
+                if s.is_none() {
+                    s = sender.lock().unwrap().clone();
+                }
+                let Some(s_ref) = s.as_ref() else { continue };
+                if s_ref
+                    .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(pcm, ts_ms)))
+                    .is_err()
+                {
+                    return Ok(());
+                }
             }
         }
     }

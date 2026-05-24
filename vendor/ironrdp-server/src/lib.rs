@@ -36,7 +36,7 @@ pub use server::{
     ConnectionHandler, Credentials, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
     ServerEventSender,
 };
-pub use sound::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
+pub use sound::{AudioWave, RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
 
 #[cfg(feature = "__bench")]
 pub mod bench {

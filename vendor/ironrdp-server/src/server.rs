@@ -288,20 +288,20 @@ pub struct RdpServer {
     gfx_handle: Option<crate::gfx::GfxServerHandle>,
     ev_sender: mpsc::UnboundedSender<ServerEvent>,
     ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
+    /// Dedicated bounded channel for outbound `Wave` PDUs. Audio
+    /// dispatch (the `dispatch_audio` task spawned in `client_loop`)
+    /// reads from this receiver independently of the unified
+    /// `ServerEvent` stream, so inbound cliprdr/PDU pressure on the
+    /// per-connection `Mutex<Self>` doesn't starve audio output. The
+    /// audio backend (e.g., `MacRdpsnd`) gets the sender via
+    /// `SoundServerFactory::set_audio_sender`. Bounded capacity caps
+    /// the queue at ~1 s of audio so capture-side backpressure kicks
+    /// in before the queue grows unbounded if dispatch ever stalls.
+    audio_receiver: Arc<Mutex<mpsc::Receiver<crate::AudioWave>>>,
     creds: Option<Credentials>,
     local_addr: Option<SocketAddr>,
     autodetect: Option<AutoDetectManager>,
     connection_handler: Option<Box<dyn ConnectionHandler>>,
-    /// Total real-audio duration shipped to the client so far. Compared
-    /// against wall-clock elapsed time to estimate the client's playback
-    /// buffer depth and drop waves before that buffer drifts unboundedly
-    /// (typical trigger: bursts of small client window move/resize pauses
-    /// each leaking a sub-WAVE_KEEP-batch amount of latency).
-    audio_shipped_ms: f64,
-    /// Wall-clock origin for the audio-lag calculation. Lazily set on the
-    /// first dispatch so the model starts at "zero buffer" instead of
-    /// pretending audio is in flight from server boot.
-    audio_clock_start: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -353,11 +353,18 @@ impl RdpServer {
         #[cfg(feature = "egfx")] mut gfx_factory: Option<Box<dyn GfxServerFactory>>,
     ) -> Self {
         let (ev_sender, ev_receiver) = ServerEvent::create_channel();
+        // Bounded channel sized to ~1 s of audio at our steady-state
+        // 42.78 waves/s (1029 samples/wave at 44.1 kHz). Backpressures
+        // the capture loop's `send().await` rather than queuing
+        // indefinitely if dispatch ever stalls — losses then happen at
+        // the SCK ring buffer instead of server-side.
+        let (audio_sender, audio_receiver) = mpsc::channel::<crate::AudioWave>(50);
         if let Some(cliprdr) = cliprdr_factory.as_mut() {
             cliprdr.set_sender(ev_sender.clone());
         }
         if let Some(snd) = sound_factory.as_mut() {
             snd.set_sender(ev_sender.clone());
+            snd.set_audio_sender(audio_sender);
         }
         #[cfg(feature = "egfx")]
         if let Some(gfx) = gfx_factory.as_mut() {
@@ -377,12 +384,11 @@ impl RdpServer {
             gfx_handle: None,
             ev_sender,
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
+            audio_receiver: Arc::new(Mutex::new(audio_receiver)),
             creds: None,
             local_addr: None,
             autodetect: None,
             connection_handler,
-            audio_shipped_ms: 0.0,
-            audio_clock_start: None,
         }
     }
 
@@ -480,16 +486,10 @@ impl RdpServer {
     where
         S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
     {
-        // Per-connection reset of audio-lag tracking. The capture loop in
-        // src/audio.rs spawns a fresh `start_instant` on every backend
-        // `start()` call, so leaving these set from a previous connection
-        // would leave us with a stale audio_shipped_ms vs. real_elapsed_ms
-        // ratio (typically `audio_shipped_ms` lagging by however long the
-        // disconnect lasted), which disables drop protection until the
-        // counters re-converge over real time. Reset here so the model
-        // starts each session with "zero buffer, zero elapsed."
-        self.audio_shipped_ms = 0.0;
-        self.audio_clock_start = None;
+        // Audio-lag state was previously on Self and reset here; it now
+        // lives task-local to `dispatch_audio`, which is spawned fresh in
+        // `client_loop` for each connection, so no reset is needed at
+        // this layer anymore.
 
         let framed = TokioFramed::new(stream);
 
@@ -732,98 +732,17 @@ impl RdpServer {
         io_channel_id: u16,
         user_channel_id: u16,
     ) -> Result<RunState> {
-        // Cross-batch audio-lag control.
-        //
-        // The earlier per-batch WAVE_KEEP = 64 cap caught a single multi-second
-        // stall in one big batch, but slow drift from many small client pauses
-        // (e.g. repeated mstsc window move/resize, each blocking writes for
-        // ~50–200 ms) never tripped the cap — every batch stayed under 64 —
-        // yet the client's playback buffer filled across batches and audio
-        // ended up seconds behind real-time.
-        //
-        // The fix tracks two scalars across calls:
-        //   audio_shipped_ms — total real-audio duration we have *sent* the
-        //                      client (incremented per wave actually shipped)
-        //   audio_clock_start — wall-clock origin set on first dispatch
-        //
-        // Their difference, `audio_shipped_ms - (now - start) * 1000`, is the
-        // estimated client-side buffer depth in milliseconds (i.e. how much
-        // future audio the client already holds). When that would exceed
-        // MAX_LAG_MS after shipping this batch, we drop the *oldest* waves
-        // until the post-batch projection sits at MAX_LAG_MS. The projection
-        // can go negative during quiet periods (real time elapses without
-        // new waves); that's harmless — the `if projected > MAX_LAG_MS`
-        // guard simply doesn't fire, and the next active stretch ships at
-        // normal rate until the diff returns to ~zero.
-        //
-        // WAVE_MS is the *real-audio duration* of one wave, which is the
-        // input chunk size 1024 samples at 48 kHz capture rate — the resample
-        // to 44.1 kHz changes sample count but not the represented duration.
-        const WAVE_MS: f64 = 1024.0 / 48.0; // ≈ 21.33 ms
-        const MAX_LAG_MS: f64 = 200.0;
-
-        // Largest gap between wall-clock and shipped audio we tolerate before
-        // declaring lost sync. In steady state we ship ~one wave's worth of
-        // audio per wave-interval, so `audio_shipped_ms` leads wall-clock by
-        // the (positive) buffer depth and this deficit stays at or below zero.
-        // It only goes meaningfully positive when the writer stalled and shipped
-        // nothing for a stretch — the classic trigger is mstsc freezing the
-        // socket during a window resize/move/fullscreen-toggle. With
-        // --enable-h264 that stall blocks on the large EGFX video frames queued
-        // ahead of the waves on this *same* channel, so the gap is whole
-        // seconds; the legacy bitmap path coalesces through dispatch_display and
-        // never piles up here, which is why this drift is H.264-only.
-        const RESYNC_DEFICIT_MS: f64 = 300.0;
-
-        let now = Instant::now();
-        let start = *self.audio_clock_start.get_or_insert(now);
-        let real_elapsed_ms = (now - start).as_secs_f64() * 1000.0;
-
-        // If wall-clock has run this far ahead of what we actually shipped, the
-        // queued waves are stale: they describe a moment that has already
-        // passed. The earlier model read this same condition as "client
-        // starving" and shipped the whole backlog late, bloating the client's
-        // playback buffer permanently — and each subsequent stall pushed the
-        // deficit further negative, disabling the drop logic for good (audio
-        // got progressively more delayed the more you resized). For a live
-        // stream the right move is never to replay stale audio late: resync the
-        // clock to "now" so the projection below trims the backlog down to one
-        // buffer-target of the *freshest* waves and drops the rest.
-        let deficit_ms = real_elapsed_ms - self.audio_shipped_ms;
-        if deficit_ms > RESYNC_DEFICIT_MS {
-            debug!(
-                target: "audio_backlog",
-                deficit_ms,
-                "writer stalled (likely client window resize); resyncing audio clock to live"
-            );
-            self.audio_shipped_ms = real_elapsed_ms;
-        }
-
-        let wave_total = events
-            .iter()
-            .filter(|e| matches!(e, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(..))))
-            .count();
-        let projected_buffer_ms =
-            self.audio_shipped_ms + wave_total as f64 * WAVE_MS - real_elapsed_ms;
-        let mut wave_skip = if projected_buffer_ms > MAX_LAG_MS {
-            let excess = projected_buffer_ms - MAX_LAG_MS;
-            ((excess / WAVE_MS).ceil() as usize).min(wave_total)
-        } else {
-            0
-        };
-        if wave_skip > 0 {
-            // Dedicated target so callers can filter for *just* this line
-            // without lifting the whole `ironrdp_server::server` module to
-            // debug (which would surface a lot of unrelated noise).
-            // Enable with: RUST_LOG=audio_backlog=debug
-            debug!(
-                target: "audio_backlog",
-                wave_total,
-                dropped = wave_skip,
-                projected_buffer_ms,
-                "dropping oldest waves"
-            );
-        }
+        // Audio dispatch (`RdpsndServerMessage::Wave`) was carved out of
+        // this function into the dedicated `dispatch_audio` task in
+        // `client_loop`, with task-local audio-lag tracking (resync +
+        // drop-oldest cap, same MAX_LAG_MS = 200 / RESYNC_DEFICIT_MS =
+        // 300 model). Wave events arrive on a separate bounded mpsc
+        // channel (`AudioWave` / `SoundServerFactory::set_audio_sender`)
+        // and never reach this function. If a Wave event DOES somehow
+        // land in the unified `ServerEvent` queue (e.g., an audio
+        // backend that hasn't overridden `set_audio_sender`), the match
+        // arm below logs and drops it — the lag model isn't in this
+        // function anymore so we couldn't service it correctly anyway.
         // Reorder this batch so CLIPRDR events are written BEFORE any
         // EGFX video frames queued behind them. With --enable-h264, EGFX
         // frames flow continuously and dominate the event channel, and
@@ -889,45 +808,16 @@ impl RdpServer {
                         warn!("No rdpsnd channel, dropping event");
                         continue;
                     };
-                    // Set inside the wave arm; applied after `rdpsnd` is dropped
-                    // (the &mut self borrow extends across the whole match) so
-                    // we can mutate self.audio_shipped_ms without a conflict.
-                    let mut shipped_wave_ms: f64 = 0.0;
                     let msgs = match s {
-                        RdpsndServerMessage::Wave(data, ts) => {
-                            if wave_skip > 0 {
-                                wave_skip -= 1;
-                                continue;
-                            }
-                            // Account for the wave we're about to ship so the
-                            // next dispatch's buffer-depth projection is right.
-                            // Skipped waves intentionally do NOT advance this —
-                            // those bytes never reach the client.
-                            //
-                            // Compute duration from the wave's actual byte
-                            // count rather than the WAVE_MS constant. The
-                            // constant assumes each emitted wave is the input
-                            // chunk size at the capture rate (1024 samples @
-                            // 48 kHz = 21.33 ms). That holds ONLY if the
-                            // resampler emits exactly `input_chunk * out/in`
-                            // samples per call. rubato's `FftFixedIn` aligns
-                            // to its internal FFT block (1120 input → 1029
-                            // output for 48→44.1 kHz), so each wave is
-                            // actually 23.33 ms — an 8.6 %/sec audio_shipped
-                            // undercount, manifesting as `audio_backlog`
-                            // resync firing every ~3.5 s with no actual
-                            // network stall in sight. Using `data.len()` is
-                            // resampler-config-agnostic.
-                            //
-                            // Constants assume PCM 16-bit stereo at 44.1 kHz,
-                            // which is what `src/audio.rs::our_format()`
-                            // advertises. If the macrdp audio backend's
-                            // format ever changes, update here too. 16 bits
-                            // × 2 channels × 44100 Hz / 8 bits/byte
-                            // = 176 400 bytes/sec → 176.4 bytes/ms.
-                            const BYTES_PER_MS: f64 = 176.4;
-                            shipped_wave_ms = data.len() as f64 / BYTES_PER_MS;
-                            rdpsnd.wave(data, ts)
+                        RdpsndServerMessage::Wave(_, _) => {
+                            // Wave events should reach `dispatch_audio` via
+                            // the dedicated audio channel, not this unified
+                            // path. If we got one here, the audio backend
+                            // hasn't overridden `set_audio_sender` — drop
+                            // gracefully and warn once so the maintainer
+                            // notices.
+                            warn!("Wave event on unified ServerEvent channel; backend should override set_audio_sender");
+                            continue;
                         }
                         RdpsndServerMessage::SetVolume { left, right } => rdpsnd.set_volume(left, right),
                         RdpsndServerMessage::Close => rdpsnd.close(),
@@ -937,8 +827,6 @@ impl RdpServer {
                         }
                     }
                     .context("failed to send rdpsnd event")?;
-                    // rdpsnd's &mut self borrow is dropped here — safe to mutate.
-                    self.audio_shipped_ms += shipped_wave_ms;
                     let channel_id = self
                         .get_channel_id_by_type::<RdpsndServer>()
                         .context("SVC channel not found")?;
@@ -1072,7 +960,9 @@ impl RdpServer {
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
+        let mut audio_writer = writer.clone();
         let ev_receiver = Arc::clone(&self.ev_receiver);
+        let audio_receiver = Arc::clone(&self.audio_receiver);
         let s = Rc::new(Mutex::new(self));
 
         let this = Rc::clone(&s);
@@ -1125,6 +1015,113 @@ impl RdpServer {
             }
         };
 
+        // Audio dispatch carved out from `dispatch_events` so a sustained
+        // inbound cliprdr stream (e.g., large `--lazy-paste` Windows→Mac
+        // transfer) can't starve audio output for seconds at a time.
+        //
+        // The audio backend (e.g., `MacRdpsnd`) sends `Wave` PDUs over a
+        // dedicated bounded `mpsc::channel` (see `SoundServerFactory::
+        // set_audio_sender`) instead of the unified `ServerEvent` channel.
+        // This loop consumes that channel and writes each wave to the
+        // socket independently of dispatch_pdu/events.
+        //
+        // The Self lock is held BRIEFLY (microseconds) per wave — just
+        // long enough to call `rdpsnd.wave(data, ts)` and look up the
+        // SVC channel id. The actual `writer.write_all` happens outside
+        // the Self lock, on the shared writer (which still serializes
+        // with display/event writes, but that's a much shorter critical
+        // section than dispatch_events's lock-then-drain-batch pattern).
+        //
+        // Audio-lag tracking (resync + drop-oldest) is now task-local —
+        // moved out of `RdpServer::{audio_shipped_ms, audio_clock_start}`
+        // which become dead state. Per-wave duration is derived from the
+        // byte count, not a hardcoded constant, so the model stays
+        // accurate regardless of resampler chunk size.
+        let this = Rc::clone(&s);
+        let mut audio_receiver = audio_receiver.lock().await;
+        let dispatch_audio = async move {
+            // Task-local audio-lag state. Reset per connection because the
+            // task is spawned fresh inside client_loop.
+            let mut audio_shipped_ms = 0.0_f64;
+            let mut audio_clock_start: Option<Instant> = None;
+
+            // Same constants as the prior on-Self model. See the
+            // "Cross-batch audio-lag control" comment block (formerly in
+            // dispatch_server_events) for the rationale.
+            const MAX_LAG_MS: f64 = 200.0;
+            const RESYNC_DEFICIT_MS: f64 = 300.0;
+            // 16-bit stereo PCM at 44.1 kHz = 4 bytes/frame × 44 100 = 176 400 B/s,
+            // i.e. 176.4 bytes per ms of audio. Matches `src/audio.rs::our_format()`
+            // in the macrdp tree. Update if the audio backend's format changes.
+            const BYTES_PER_MS: f64 = 176.4;
+
+            loop {
+                let (data, ts) = match audio_receiver.recv().await {
+                    Some(wave) => wave,
+                    None => {
+                        debug!("audio channel closed; stopping audio dispatch");
+                        break Ok(RunState::Disconnect);
+                    }
+                };
+
+                let wave_ms = data.len() as f64 / BYTES_PER_MS;
+
+                // Cross-batch audio-lag control. Identical model to the
+                // formerly-on-Self version. Drop stale waves and resync
+                // the clock if the writer fell behind.
+                let now = Instant::now();
+                let start = *audio_clock_start.get_or_insert(now);
+                let real_elapsed_ms = (now - start).as_secs_f64() * 1000.0;
+                let deficit_ms = real_elapsed_ms - audio_shipped_ms;
+                if deficit_ms > RESYNC_DEFICIT_MS {
+                    debug!(
+                        target: "audio_backlog",
+                        deficit_ms,
+                        "writer stalled; resyncing audio clock to live"
+                    );
+                    audio_shipped_ms = real_elapsed_ms;
+                }
+                let projected_buffer_ms = audio_shipped_ms + wave_ms - real_elapsed_ms;
+                if projected_buffer_ms > MAX_LAG_MS {
+                    debug!(
+                        target: "audio_backlog",
+                        projected_buffer_ms,
+                        wave_ms,
+                        "dropping wave (projected buffer over MAX_LAG_MS)"
+                    );
+                    continue;
+                }
+
+                // Briefly lock Self to build the Wave PDU and look up the
+                // rdpsnd channel id. RdpsndServer::wave() bumps a private
+                // block_no and produces SVC messages — microseconds of
+                // work. Lock released before the (potentially long)
+                // socket write.
+                let encoded = {
+                    let mut this = this.lock().await;
+                    let Some(rdpsnd) = this.get_svc_processor::<RdpsndServer>() else {
+                        warn!("No rdpsnd channel, dropping wave");
+                        continue;
+                    };
+                    let msgs = match rdpsnd.wave(data, ts) {
+                        Ok(m) => m,
+                        Err(err) => {
+                            warn!(?err, "rdpsnd.wave failed");
+                            continue;
+                        }
+                    };
+                    let Some(channel_id) = this.get_channel_id_by_type::<RdpsndServer>() else {
+                        warn!("rdpsnd SVC channel id missing");
+                        continue;
+                    };
+                    server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?
+                };
+
+                audio_writer.write_all(&encoded).await?;
+                audio_shipped_ms += wave_ms;
+            }
+        };
+
         let this = Rc::clone(&s);
         let mut ev_receiver = ev_receiver.lock().await;
         let dispatch_events = async move {
@@ -1153,6 +1150,7 @@ impl RdpServer {
             state = dispatch_pdu => state,
             state = dispatch_display => state,
             state = dispatch_events => state,
+            state = dispatch_audio => state,
         );
 
         debug!("End of client loop: {state:?}");

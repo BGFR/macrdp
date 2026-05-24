@@ -47,20 +47,20 @@ use tracing::{debug, info, warn};
 /// unresponsive while a big download ran.
 pub const EAGER_CHUNK_SIZE: u32 = 1024 * 1024;
 
-/// Per-RANGE request size for the lazy path. Aggressively smaller
-/// (64 KiB) than the eager 1 MiB so the cliprdr inbound dispatch loop
-/// returns to audio / EGFX / input servicing more often between chunks
-/// during a paste. Progressive halvings from 1 MiB → 256 → 128 → 64
-/// each cut worst-case `audio_backlog` resync deficit roughly
-/// proportionally during sustained pastes — the underlying issue is
-/// that vendor/ironrdp-server holds a single `Mutex<Self>` across
-/// `dispatch_pdu`, `dispatch_display`, and `dispatch_events`, so a busy
-/// inbound chunk stream effectively blocks audio dispatch. Smaller
-/// chunks shorten each `dispatch_pdu` lock-held interval, giving
-/// `dispatch_events` more windows to grab the lock and ship queued
-/// audio. The proper fix is splitting that vendor-server Mutex, but
-/// that's a much larger refactor.
-pub const LAZY_CHUNK_SIZE: u32 = 64 * 1024;
+/// Per-RANGE request size for the lazy path. 128 KiB combined with
+/// `LAZY_PARALLEL_CHUNKS = 1` (serial fetch) keeps peak inbound
+/// in-flight at 128 KiB. We tried bumping back to 256 KiB / 2 (peak
+/// 512 KiB) after the `dispatch_audio` carve-out — paste was faster
+/// (~73 s vs ~89 s for 500 MB) but TCP send-buffer pressure at that
+/// in-flight level introduced a ~10 s audio/video stall near the end
+/// of large pastes. The carve-out fixed the per-connection `Mutex<Self>`
+/// contention, but at higher inbound bandwidth the bottleneck moved
+/// down to the shared `SharedWriter` / kernel TCP send buffer itself.
+/// Throughput tradeoff (~16 s slower for a 500 MB paste) is small
+/// compared to the audio quality gain. If you want to revisit, see
+/// option D in the audio-sync notes — splitting display writes from
+/// audio at the SharedWriter level, or kernel send-buffer tuning.
+pub const LAZY_CHUNK_SIZE: u32 = 128 * 1024;
 
 /// Number of in-flight `FileContentsRequest` PDUs for the eager flow.
 /// 8 × `EAGER_CHUNK_SIZE` of pending response data is enough to keep the
@@ -69,14 +69,14 @@ pub const LAZY_CHUNK_SIZE: u32 = 64 * 1024;
 pub const EAGER_PARALLEL_CHUNKS: usize = 8;
 
 /// Number of in-flight `FileContentsRequest` PDUs for the lazy flow.
-/// Strictly serial (1) — the lazy path runs *while the user is
-/// interacting* (paste-time), and the vendor server's
-/// single-Mutex-across-dispatch-loops architecture means that even with
-/// small chunks, having multiple responses in flight produces enough
-/// inbound-PDU lock churn to starve audio dispatch (verified
-/// empirically: parallelism=2 with 128 KiB chunks still produced ~1.6 s
-/// of audible cut-out during a multi-hundred-MB paste). Serial fetch
-/// halves throughput but keeps per-chunk inbound bursts isolated.
+/// Serial (1) — the lazy path runs *while the user is interacting*
+/// (paste-time). Combined with `LAZY_CHUNK_SIZE = 128 KiB`, peak
+/// inbound in-flight is 128 KiB. The `dispatch_audio` carve-out in
+/// vendor/ironrdp-server fixed the per-connection `Mutex<Self>`
+/// contention; at 2-in-flight 256 KiB we found TCP send-buffer
+/// pressure introduces audio/video stalls. Serial fetch keeps inbound
+/// pressure low enough that the shared writer / kernel buffer isn't
+/// the bottleneck.
 pub const LAZY_PARALLEL_CHUNKS: usize = 1;
 
 /// Shared event sender used by both the cliprdr backend (for ack PDUs) and

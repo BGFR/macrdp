@@ -903,7 +903,30 @@ impl RdpServer {
                             // next dispatch's buffer-depth projection is right.
                             // Skipped waves intentionally do NOT advance this —
                             // those bytes never reach the client.
-                            shipped_wave_ms = WAVE_MS;
+                            //
+                            // Compute duration from the wave's actual byte
+                            // count rather than the WAVE_MS constant. The
+                            // constant assumes each emitted wave is the input
+                            // chunk size at the capture rate (1024 samples @
+                            // 48 kHz = 21.33 ms). That holds ONLY if the
+                            // resampler emits exactly `input_chunk * out/in`
+                            // samples per call. rubato's `FftFixedIn` aligns
+                            // to its internal FFT block (1120 input → 1029
+                            // output for 48→44.1 kHz), so each wave is
+                            // actually 23.33 ms — an 8.6 %/sec audio_shipped
+                            // undercount, manifesting as `audio_backlog`
+                            // resync firing every ~3.5 s with no actual
+                            // network stall in sight. Using `data.len()` is
+                            // resampler-config-agnostic.
+                            //
+                            // Constants assume PCM 16-bit stereo at 44.1 kHz,
+                            // which is what `src/audio.rs::our_format()`
+                            // advertises. If the macrdp audio backend's
+                            // format ever changes, update here too. 16 bits
+                            // × 2 channels × 44100 Hz / 8 bits/byte
+                            // = 176 400 bytes/sec → 176.4 bytes/ms.
+                            const BYTES_PER_MS: f64 = 176.4;
+                            shipped_wave_ms = data.len() as f64 / BYTES_PER_MS;
                             rdpsnd.wave(data, ts)
                         }
                         RdpsndServerMessage::SetVolume { left, right } => rdpsnd.set_volume(left, right),

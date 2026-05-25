@@ -416,6 +416,7 @@ async fn capture_loop(
 #[cfg(not(target_os = "macos"))]
 async fn capture_loop(
     _sender: Sender,
+    _audio_sender: AudioSender,
     _generation: Arc<AtomicU64>,
     _my_gen: u64,
 ) -> anyhow::Result<()> {

@@ -151,11 +151,36 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         let audio_sender = self.audio_sender.clone();
         let generation = self.generation.clone();
         let my_gen = self.my_gen;
-        tokio::spawn(async move {
-            if let Err(e) = capture_loop(sender, audio_sender, generation, my_gen).await {
-                warn!("audio capture loop ended: {e}");
-            }
-        });
+        // Dedicated OS thread at USER_INTERACTIVE QoS for the entire
+        // capture / resample / channel-send pipeline. Tokio workers ride
+        // USER_INITIATED (see main.rs::boost_thread_qos) which a cargo
+        // build can preempt for hundreds of ms; that starved capture and
+        // produced multi-second audio gaps. A dedicated OS thread at the
+        // highest QoS class keeps the SCK pump and rubato resample running
+        // even under heavy local CPU load. One thread per connection;
+        // the generation counter retires stale loops on reconnect.
+        std::thread::Builder::new()
+            .name(format!("macrdp-audio-{my_gen}"))
+            .spawn(move || {
+                #[cfg(target_os = "macos")]
+                boost_audio_qos();
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        warn!("audio: failed to build dedicated runtime: {e}");
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    if let Err(e) = capture_loop(sender, audio_sender, generation, my_gen).await {
+                        warn!("audio capture loop ended: {e}");
+                    }
+                });
+            })
+            .expect("spawn audio capture thread");
         Some(format_no as u16)
     }
 
@@ -168,6 +193,24 @@ impl RdpsndServerHandler for MacRdpsndBackend {
             Ordering::SeqCst,
             Ordering::SeqCst,
         );
+    }
+}
+
+/// Promote the calling thread to `QOS_CLASS_USER_INTERACTIVE` (0x21).
+/// Reserved for the audio capture thread spawned in `MacRdpsndBackend::start`.
+/// USER_INTERACTIVE is the same class WindowServer uses for its event loop,
+/// so the scheduler keeps us runnable even when a parallel cargo build pins
+/// every other thread; the audio pipeline then never starves long enough
+/// for the vendor-server lag tracker to declare a writer stall.
+#[cfg(target_os = "macos")]
+fn boost_audio_qos() {
+    use std::os::raw::{c_int, c_uint};
+    const QOS_CLASS_USER_INTERACTIVE: c_uint = 0x21;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: c_uint, relative_priority: c_int) -> c_int;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     }
 }
 

@@ -606,8 +606,65 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
     });
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Boost the calling pthread to `QOS_CLASS_USER_INITIATED` so the macOS
+/// scheduler keeps macrdp's worker threads ahead of background work
+/// (rustc, Spotlight indexer, Time Machine, etc.) under CPU contention.
+/// Without this, running a heavy compile on the same host produces
+/// audible audio glitches on the RDP session because tokio's
+/// default-QoS workers lose CPU time to nice-0 background processes.
+///
+/// USER_INITIATED is the right level here, not USER_INTERACTIVE —
+/// macrdp is an interactive server the user is actively engaged with,
+/// but USER_INTERACTIVE is reserved for UI animation / hard real-time
+/// (e.g. WindowServer) and would starve the OS itself under contention.
+///
+/// **Important:** this is applied to tokio worker threads ONLY, not to
+/// the main thread. An earlier attempt boosted the main thread too;
+/// `CGVirtualDisplay initWithDescriptor:` runs on that thread, and
+/// boosting it broke SCK's display enumeration — SCK couldn't see the
+/// freshly-registered virtual display for up to a minute on mstsc
+/// connection attempts. Workers-only works because the actual async
+/// work happens on workers; main thread just sits in
+/// `Runtime::block_on`.
+///
+/// `pthread_set_qos_class_self_np` has been stable since macOS 10.10
+/// (2014). Best-effort: errors are silently ignored — losing the boost
+/// is degraded behavior, not a failure.
+#[cfg(target_os = "macos")]
+fn boost_thread_qos() {
+    use std::os::raw::{c_int, c_uint};
+    // From <sys/qos.h>:
+    //   QOS_CLASS_USER_INTERACTIVE = 0x21
+    //   QOS_CLASS_USER_INITIATED   = 0x19
+    //   QOS_CLASS_DEFAULT          = 0x15
+    //   QOS_CLASS_UTILITY          = 0x11
+    //   QOS_CLASS_BACKGROUND       = 0x09
+    const QOS_CLASS_USER_INITIATED: c_uint = 0x19;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: c_uint, relative_priority: c_int) -> c_int;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+    }
+}
+
+fn main() -> Result<()> {
+    // Build the tokio runtime explicitly so every worker thread starts
+    // at boosted QoS (see `boost_thread_qos`). `#[tokio::main]`'s
+    // generated runtime gives us no hook for this. Crucially: the main
+    // thread itself is NOT boosted — see the warning in
+    // `boost_thread_qos` about CGVirtualDisplay + SCK enumeration.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(|| {
+            #[cfg(target_os = "macos")]
+            boost_thread_qos();
+        })
+        .build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let mut args = Args::parse();
 
     // RUST_LOG (if set) always wins. Otherwise: --verbose turns on debug

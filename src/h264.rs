@@ -535,9 +535,8 @@ fn caps_indicate_avc(caps: &[CapabilitySet]) -> bool {
         | CapabilitySet::V10_6 { flags }
         | CapabilitySet::V10_6Err { flags } => !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
         CapabilitySet::V10_7 { flags } => !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+        // Bare V8 / V10_1 carry no AVC flag — no positive AVC signal.
         CapabilitySet::V8 { .. } | CapabilitySet::V10_1 => false,
-        // Bare V8 / V10_1 / anything unrecognized: no positive AVC signal.
-        _ => false,
     })
 }
 
@@ -560,11 +559,22 @@ impl GraphicsPipelineHandler for GfxHandler {
     }
 
     fn capabilities_advertise(&mut self, pdu: &CapabilitiesAdvertisePdu) {
-        let supports_avc = caps_indicate_avc(&pdu.0);
+        // Upstream split `Vec<CapabilitySet>` into a wire-level
+        // `Vec<RawCapabilitySet>` in IronRDP#1305 — typed lookup now
+        // requires `.parsed()` per entry. Decode errors or
+        // unrecognized versions yield `None` and are filtered out;
+        // they carry no positive AVC signal anyway.
+        let typed: Vec<CapabilitySet> = pdu
+            .0
+            .iter()
+            .filter_map(|raw| raw.parsed().ok().flatten())
+            .collect();
+        let supports_avc = caps_indicate_avc(&typed);
         info!(
             count = pdu.0.len(),
+            parsed_count = typed.len(),
             supports_avc,
-            caps = ?pdu.0,
+            caps = ?typed,
             "EGFX: client advertised capabilities"
         );
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {

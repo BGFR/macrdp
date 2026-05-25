@@ -162,40 +162,15 @@ vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in
                           comment in a stale checkout — the dir is not
                           missing, it just stopped existing.)
 
-vendor/ironrdp-cliprdr/   Local fork of ironrdp-cliprdr (same upstream rev as
-                          the git-pinned siblings), pulled in via
-                          [patch.crates-io]. THREE divergences:
-                          (1) Adds CliprdrBackend::on_format_list_response(ok)
-                              with a default no-op (non-breaking) and calls it
-                              from handle_format_list_response on both Ok and
-                              Fail. Without this hook there is no backend
-                              signal for whether an outbound format-list
-                              advertise was accepted — the rejection silently
-                              wipes local_file_list inside cliprdr, and blind
-                              timed retries can clobber an Ok with a later
-                              Fail. macrdp's poller uses the hook to STOP
-                              re-advertising on Ok while still retrying on
-                              Fail (see src/clipboard.rs AdvertiseState).
-                          (2) initiate_file_copy now also advertises
-                              `Preferred DropEffect`
-                              (CFSTR_PREFERREDDROPEFFECT, format name added as
-                              ClipboardFormatName::PREFERRED_DROP_EFFECT) and
-                              handle_format_data_request short-circuits a
-                              request for it with DROPEFFECT_COPY
-                              (4-byte u32 LE = 0x00000001). Standards-correct
-                              labeling of the operation as a copy; no backend
-                              change required.
-                          (3) FileDescriptor::encode always sets
-                              ClipboardFileFlags::SHOW_PROGRESS_UI (FD_PROGRESSUI
-                              = 0x4000) on the dwFlags field of every emitted
-                              FILEDESCRIPTORW. This is the ACTUAL trigger that
-                              makes Windows Explorer show its native "Copying…"
-                              progress dialog for Mac→Windows clipboard file
-                              paste — without it the paste completes correctly
-                              but with only a busy cursor (no dialog).
-                              VERIFIED on real mstsc.
-                          All three submitted upstream; drop this vendor dir
-                          once they land in a released ironrdp-cliprdr.
+(vendor/ironrdp-cliprdr/  DELETED 2026-05-25. All THREE divergences
+                          (on_format_list_response hook #1300,
+                          Preferred DropEffect advertise+inline-response
+                          #1301, always-SHOW_PROGRESS_UI FD flag #1299)
+                          merged upstream the same day. Ironrdp pinned
+                          at-or-after Devolutions/IronRDP@879ffed8 has
+                          all three; vendor dir gone. If you're seeing
+                          this comment in a stale checkout — the dir is
+                          not missing, it just stopped existing.)
 ```
 
 Cross-cutting:
@@ -232,7 +207,7 @@ When adding a feature, locate it in one of those modules first; if it spans them
 - **Cursor sprite shape is process-global on macOS, not per-display.** `NSCursor::currentSystemCursor()` reflects whatever the foreground application set in *this process*'s perspective, not "the cursor on display X." When `--virtual-display` is active, the RDP client sees the cursor shape that whatever app is foreground locally has set (typically the arrow), regardless of what an app on the virtual display might want. Probably fine in practice — the cursor *position* on the virtual display is correct because `input.rs` translates RDP coords by the vdisplay's origin in global space; only the visual shape is shared. Fixing this properly needs a per-display NSCursor query, which AppKit doesn't expose.
 - **mstsc gates Win-combos by full-screen by default.** mstsc → Local Resources → Keyboard → "Apply Windows key combinations" defaults to "Only when using the full screen", so a windowed mstsc session eats `Win+Tab` (the Cmd+Tab we want to forward) locally as Task View — macrdp never sees the press. The #1 false-positive when debugging "Cmd+Tab doesn't work" is the user being windowed. Set it to "On the remote computer" or go full-screen. `xfreerdp` is more permissive by default and a useful cross-check.
 - **Symbolic-hotkey dispatcher needs kernel HID; CGEventPost can't wake it.** WindowServer's internal Cmd+Tab / Cmd+Space / Cmd+Shift+3/4/5 / Mission Control dispatcher only fires on kernel-injected HID events. User-space CGEventPost cannot trigger it regardless of source state or tap location. A `src/virtual_hid.rs` module that registered a virtual USB-style HID keyboard via `IOHIDUserDeviceCreate` was tried for this and reverted — didn't unblock the dispatcher (likely needs entitlements / signing we don't have) and added a parallel scancode-mapping table to maintain. The current design instead reimplements each symbolic combo in user space (`cycle_apps` via AX, `invoke_spotlight` via osascript, `screencapture` via the binary). Do not resurrect IOHIDUserDevice without new evidence.
-- **`CAN_LOCK_CLIPDATA` is required for reliable Windows→Mac file paste.** Without it advertised in `MacCliprdrBackend::client_capabilities`, the upstream cliprdr crate's `send_lock` short-circuits (`vendor/ironrdp-cliprdr/src/lib.rs::send_lock` returns None) and Windows Explorer is never told when we're done with a `FileGroupDescriptorW` it gave us. Two visible symptoms on mstsc, both caused by the same missing protocol contract: (1) a rapid follow-up Ctrl-C in Windows after a successful paste is silently dropped — no new FormatList reaches the Mac, so the pasteboard keeps the previous file's URL and Cmd-V re-pastes the prior file. (2) Large downloads (multi-hundred MB) get `CB_RESPONSE_FAIL` partway because the source app decides the descriptor isn't being held and releases it mid-stream. Adding `CAN_LOCK_CLIPDATA` lets cliprdr auto-issue LockData on incoming file-list FormatList and UnlockData on supersession/timeout — verified to fix both symptoms. Cap is essentially free; mstsc/freerdp both negotiate it. *Do not* remove the cap without a compelling reason.
+- **`CAN_LOCK_CLIPDATA` is required for reliable Windows→Mac file paste.** Without it advertised in `MacCliprdrBackend::client_capabilities`, the upstream cliprdr crate's `send_lock` short-circuits (returns None) and Windows Explorer is never told when we're done with a `FileGroupDescriptorW` it gave us. Two visible symptoms on mstsc, both caused by the same missing protocol contract: (1) a rapid follow-up Ctrl-C in Windows after a successful paste is silently dropped — no new FormatList reaches the Mac, so the pasteboard keeps the previous file's URL and Cmd-V re-pastes the prior file. (2) Large downloads (multi-hundred MB) get `CB_RESPONSE_FAIL` partway because the source app decides the descriptor isn't being held and releases it mid-stream. Adding `CAN_LOCK_CLIPDATA` lets cliprdr auto-issue LockData on incoming file-list FormatList and UnlockData on supersession/timeout — verified to fix both symptoms. Cap is essentially free; mstsc/freerdp both negotiate it. *Do not* remove the cap without a compelling reason.
 - **Lazy paste (default; `--no-lazy-paste` to opt out) runs the byte fetch on the user's Cmd-V; the fetch competes with the RDP session for the same socket.** The lazy path's `relinquishPresentedItemToReader:` callback runs during interactive use (the user is staring at the screen, expecting responsiveness), and the `FileContentsRequest` chunks ride the same TCP connection as EGFX video + input. We cap parallelism at `LAZY_PARALLEL_CHUNKS = 2` (vs eager's 8) so the inbound socket pressure stays low and mouse/keyboard remain usable during a multi-hundred-MB paste. Raising it would speed downloads but visibly stutter input — verified on real mstsc. The trailing edge of a large paste can also stutter briefly while Finder finalizes (APFS sparse-block materialization + Finder post-validation); not currently mitigated and probably not worth chasing.
 - **Windows shell extensions can silently block specific files from CLIPRDR.** When a file has an extension owned by a shell extension (commonly archive tools — 7-Zip / WinRAR / built-in Compressed Folders for `.zip`, `.gz`, `.bz`, `.bz2`, `.7z`, `.rar`, `.tar`), the extension can intercept Explorer's clipboard handling so the FormatList that mstsc forwards either has no `FileGroupDescriptorW` at all (the more common case — `cliprdr=debug` shows `Expiring active locks due to clipboard change (new FormatList received)` with no following `Received FileGroupDescriptorW` line) or never gets sent. To mitigate the surprising-paste UX (Mac pasteboard would otherwise retain the previously-pasted Windows file's URL and Cmd-V in Finder would silently paste the wrong file), `MacCliprdrBackend::on_outgoing_locks_expired` clears NSPasteboard whenever Windows transitions clipboard state without sending a file descriptor — Cmd-V then beeps clearly. Renaming the file to a neutral extension (`.bin`) bypasses the shell handler and copies fine. Not fixable server-side beyond the auto-clear.
 

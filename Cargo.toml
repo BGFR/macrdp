@@ -76,21 +76,21 @@ screencapturekit = { version = "2.1", features = ["async"] }
 # git pin list below.
 [patch.crates-io]
 ironrdp-server = { path = "vendor/ironrdp-server" }
-ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
-ironrdp-acceptor         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
-ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
-ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
-ironrdp-cliprdr          = { path = "vendor/ironrdp-cliprdr" }  # vendored: adds on_format_list_response hook (see vendor/ironrdp-cliprdr/Cargo.toml)
-ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
-ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
-ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
-ironrdp-dvc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
-ironrdp-egfx             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
-ironrdp-graphics         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
-ironrdp-pdu              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
-ironrdp-rdpsnd           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
-ironrdp-svc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
-ironrdp-tokio            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "67f3c635734d3cf23527fdc3fbff0dd8be0a3193" }
+ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-acceptor         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-dvc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-egfx             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-graphics         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-pdu              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-rdpsnd           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-svc              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+ironrdp-tokio            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 
 [profile.release]
 lto = "thin"

@@ -2,6 +2,7 @@ use core::net::SocketAddr;
 use core::time::Duration;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
@@ -302,6 +303,16 @@ pub struct RdpServer {
     local_addr: Option<SocketAddr>,
     autodetect: Option<AutoDetectManager>,
     connection_handler: Option<Box<dyn ConnectionHandler>>,
+    /// True when the client has sent `SuppressOutput { desktop_rect: None }`
+    /// — the standard RDP "I am minimized / don't need display updates"
+    /// signal (e.g., mstsc on window-minimize). Cleared on
+    /// `SuppressOutput { Some(rect) }` or `RefreshRectangle` (sent on
+    /// refocus). Exposed via [`Self::display_suppressed_handle`] so the
+    /// display backend (capture / H.264 encode pipeline) can skip frame
+    /// emission while it's set — without this, mstsc accumulates EGFX
+    /// frames during a long minimize and the refocus chew-through locks
+    /// up its input dispatch for several seconds.
+    display_suppressed: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -389,6 +400,7 @@ impl RdpServer {
             local_addr: None,
             autodetect: None,
             connection_handler,
+            display_suppressed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -398,6 +410,29 @@ impl RdpServer {
 
     pub fn event_sender(&self) -> &mpsc::UnboundedSender<ServerEvent> {
         &self.ev_sender
+    }
+
+    /// Returns the shared "display suppressed" flag — true while the
+    /// connected client has sent `SuppressOutput { desktop_rect: None }`
+    /// (e.g., mstsc minimized). Display backends should hold a clone
+    /// of this `Arc` and skip frame emission while it is set, so the
+    /// client doesn't accumulate a backlog of EGFX frames it can't
+    /// present until refocus. Cleared on `SuppressOutput { Some(rect) }`
+    /// or `RefreshRectangle`.
+    pub fn display_suppressed_handle(&self) -> Arc<AtomicBool> {
+        self.display_suppressed.clone()
+    }
+
+    /// Replace the internally-created display-suppressed flag with one
+    /// the caller already shared with the display backend before
+    /// constructing the server. Use this when the display backend
+    /// (e.g., `macrdp`'s `CaptureDisplay`) needs to read the same flag
+    /// that the per-connection PDU handler writes to: create one
+    /// `Arc<AtomicBool>`, hand a clone to the display, then call this
+    /// to swap the server's internal default for that shared instance.
+    /// Must be called before any client connects.
+    pub fn set_display_suppressed_handle(&mut self, handle: Arc<AtomicBool>) {
+        self.display_suppressed = handle;
     }
 
     /// Returns the shared ECHO server handle for runtime probe requests and RTT measurements.
@@ -1365,6 +1400,34 @@ impl RdpServer {
                         } else {
                             trace!(seq = response.sequence_number(), "Unmatched auto-detect response");
                         }
+                    }
+                }
+
+                // Client requests the server stop or resume sending display
+                // updates. mstsc sends `desktop_rect: None` on minimize and
+                // `desktop_rect: Some(rect)` on refocus. Without honoring
+                // this, the server keeps streaming H.264/EGFX frames into a
+                // minimized client; on refocus the client must chew through
+                // the accumulated backlog before it can present the current
+                // frame, locking up its input dispatch for seconds. Flagging
+                // the shared `display_suppressed` lets the display backend
+                // skip frame emission while it's set.
+                rdp::headers::ShareDataPdu::SuppressOutput(pdu) => {
+                    let suppress = pdu.desktop_rect.is_none();
+                    self.display_suppressed.store(suppress, Ordering::Relaxed);
+                    debug!(suppress, "client suppress-output state changed");
+                }
+
+                // Client asks the server to redraw a rectangle — typical on
+                // refocus after a minimize. Clear the suppress flag so the
+                // backend resumes emission and treat this as "client wants
+                // updates again." (The flag would also be cleared by the
+                // `SuppressOutput { Some(rect) }` that usually accompanies
+                // this; clearing here is belt-and-braces against clients
+                // that send only one of the two.)
+                rdp::headers::ShareDataPdu::RefreshRectangle(_) => {
+                    if self.display_suppressed.swap(false, Ordering::Relaxed) {
+                        debug!("client RefreshRectangle cleared suppress-output state");
                     }
                 }
 

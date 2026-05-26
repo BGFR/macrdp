@@ -5,7 +5,7 @@
 //! exercised on Linux CI.
 
 use std::num::{NonZeroU16, NonZeroUsize};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -194,6 +194,15 @@ pub struct CaptureDisplay {
     /// Trailing flush frames re-sent after the last change to drain mstsc's
     /// presentation buffer (`--flush-frames`; EGFX/H.264 path only). 0 disables.
     pub flush_frames: u32,
+    /// Shared "client minimized" flag from the vendor server's
+    /// `SuppressOutput` handler. When set, `next_update` short-circuits
+    /// (no SCK pull, no encode, no ship) and waits on a short timer
+    /// until the flag clears, at which point the H.264 path forces an
+    /// IDR keyframe so the client can resume from a clean reference
+    /// frame. `None` disables the gate entirely (single-binary builds
+    /// where the server doesn't expose the handle — e.g., the non-macOS
+    /// stub).
+    pub display_suppressed: Option<Arc<AtomicBool>>,
 }
 
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
@@ -245,6 +254,7 @@ impl RdpServerDisplay for CaptureDisplay {
                 self.keyframe_on_change,
                 self.click_signal.clone(),
                 self.flush_frames,
+                self.display_suppressed.clone(),
             )
             .await?,
         );
@@ -319,6 +329,28 @@ mod macos {
         /// realloc) and re-encoded as cheap skip-P-frames during a flush burst.
         last_frame: Vec<u8>,
         last_stride: usize,
+        /// Shared "client minimized" flag — see [`super::CaptureDisplay::display_suppressed`].
+        /// `None` disables the gate.
+        display_suppressed: Option<Arc<AtomicBool>>,
+        /// Last observed value of `display_suppressed`, used to detect the
+        /// false→true→false transition. On the un-suppress edge we force an
+        /// IDR keyframe so the client resumes from a fresh reference frame
+        /// (the P-frames we would have sent during the suppress depend on a
+        /// state mstsc no longer has).
+        was_suppressed: bool,
+        /// True once the EGFX/H.264 encoder has accepted at least one
+        /// frame for this session (i.e., `gfx.submit_bgra` returned
+        /// `Ok(true)`). The suppress gate is a no-op until this is set —
+        /// mstsc's normal connect handshake includes a
+        /// `SuppressOutput { None }` *before* its display surface is
+        /// fully initialized, and stopping the first EGFX frame from
+        /// going through leaves mstsc with nothing to display + a
+        /// half-initialized surface that doesn't recover when we
+        /// un-suppress. FreeRDP doesn't do this. Tracking
+        /// "we've delivered the first frame" gives us a clean
+        /// "client is fully wired up" signal that's stricter than just
+        /// "connected" but cheap to maintain.
+        first_egfx_frame_sent: bool,
     }
 
     impl ScreenCaptureUpdates {
@@ -333,6 +365,7 @@ mod macos {
             keyframe_on_change: KeyframeOnChange,
             click_signal: Option<ClickSignal>,
             flush_frames: u32,
+            display_suppressed: Option<Arc<AtomicBool>>,
         ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
                 .await
@@ -414,6 +447,18 @@ mod macos {
 
             let cursor = CursorState::new(width, height, screen_size_pts)?;
             let frame_interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
+
+            // Reset the cross-connection suppress flag — the `Arc<AtomicBool>`
+            // is owned by the server and survives disconnect/reconnect, so a
+            // value left set `true` at the previous session's teardown would
+            // freeze the new session the moment the gate arms (first EGFX
+            // frame ships). Fresh state per connection is the only safe
+            // default; the gate then trips correctly when the new client's
+            // own SuppressOutput PDU lands.
+            if let Some(flag) = display_suppressed.as_ref() {
+                flag.store(false, Ordering::Relaxed);
+            }
+
             Ok(Self {
                 stream,
                 pending: std::collections::VecDeque::new(),
@@ -429,6 +474,9 @@ mod macos {
                 flush_remaining: 0,
                 last_frame: Vec::new(),
                 last_stride: 0,
+                display_suppressed,
+                was_suppressed: false,
+                first_egfx_frame_sent: false,
             })
         }
     }
@@ -488,6 +536,36 @@ mod macos {
 
                 if let Some(update) = self.pending.pop_front() {
                     return Ok(Some(update));
+                }
+
+                // Client minimized (sent `SuppressOutput { desktop_rect: None }`)
+                // — stop pulling SCK samples and stop encoding/shipping. Without
+                // this, mstsc accumulates EGFX frames during a long minimize and
+                // the refocus chew-through locks up its input dispatch for
+                // seconds (typing/clicks queue behind decode-and-paint of every
+                // buffered frame). Also tear down any in-flight flush burst —
+                // re-submitting stale frames during a minimize is pointless.
+                // Cursor + pending bitmap branches above still flow (they're
+                // tiny and harmless to buffer at the client). Re-check the flag
+                // every ~100 ms so resume is responsive.
+                //
+                // **Only honor suppress after the first EGFX frame has shipped.**
+                // mstsc's normal connect handshake includes a
+                // `SuppressOutput { None }` *before* its display surface is
+                // ready; blocking the first frame leaves it with a half-init'd
+                // surface that doesn't recover when we un-suppress (mstsc
+                // freezes on the connection). FreeRDP doesn't issue suppress
+                // during connect, so it was never affected. Gate the gate on
+                // `first_egfx_frame_sent` so the handshake completes normally.
+                if self.first_egfx_frame_sent {
+                    if let Some(flag) = self.display_suppressed.as_ref() {
+                        if flag.load(Ordering::Relaxed) {
+                            self.was_suppressed = true;
+                            self.flush_remaining = 0;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    }
                 }
 
                 // While a flush burst is pending, don't block indefinitely on
@@ -608,9 +686,30 @@ mod macos {
                     } else {
                         false
                     };
-                    match gfx.submit_bgra(src, stride_bytes, big_change) {
+                    // Force an IDR on the first frame after un-suppress: the
+                    // P-frames we would have sent during the minimize depend
+                    // on a reference frame mstsc may no longer hold (or its
+                    // decoder state may have been torn down). Without a fresh
+                    // keyframe the resume frame would decode against missing
+                    // state and render garbled.
+                    let resume_keyframe = if self.was_suppressed {
+                        self.was_suppressed = false;
+                        tracing::debug!("client un-suppress edge — forcing IDR on next encode");
+                        true
+                    } else {
+                        false
+                    };
+                    match gfx.submit_bgra(src, stride_bytes, big_change || resume_keyframe) {
                         Ok(true) => {
                             self.seeded = true;
+                            // First-EGFX-frame milestone: arms the suppress
+                            // gate (see `first_egfx_frame_sent` in the struct).
+                            if !self.first_egfx_frame_sent {
+                                self.first_egfx_frame_sent = true;
+                                tracing::debug!(
+                                    "first EGFX frame shipped — suppress gate now armed"
+                                );
+                            }
                             // Stash this frame and arm the flush burst so that,
                             // once SCK goes idle after this change, we re-submit
                             // it enough times to drain mstsc's presentation

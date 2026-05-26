@@ -1003,6 +1003,13 @@ async fn async_main() -> Result<()> {
     let click_signal =
         (args.enable_h264 && keyframe_on_change.enabled).then(crate::capture::ClickSignal::new);
 
+    // Shared "client minimized / SuppressOutput" flag — created here so
+    // the same `Arc<AtomicBool>` can be handed to both the capture
+    // backend (which reads it to gate frame emission) and the vendor
+    // server (whose per-connection PDU handler writes it). See
+    // `vendor/ironrdp-server` `display_suppressed` plumbing.
+    let display_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let display = CaptureDisplay {
         width,
         height,
@@ -1018,6 +1025,7 @@ async fn async_main() -> Result<()> {
         keyframe_on_change,
         click_signal: click_signal.clone(),
         flush_frames: args.flush_frames,
+        display_suppressed: Some(display_suppressed.clone()),
     };
 
     let input_handler = MacInputHandler::new(width, height, capture_display_id, click_signal)?;
@@ -1052,6 +1060,12 @@ async fn async_main() -> Result<()> {
         .with_bitmap_codecs(bitmap_codecs())
         .with_gfx_factory(gfx_factory)
         .build();
+
+    // Hand the shared suppress flag to the server so its per-connection
+    // PDU handler writes to the same `AtomicBool` the capture backend
+    // reads from. Without this, the server uses an internally-created
+    // flag the display never sees.
+    server.set_display_suppressed_handle(display_suppressed);
 
     // ironrdp_server::Credentials holds a plain String, so this copy is
     // outside our control and won't be zeroed when the server shuts down.

@@ -279,6 +279,12 @@ mod macos {
         PixelFormat as SckPixelFormat, SCContentFilter, SCStreamConfiguration, SCStreamOutputType,
     };
 
+    /// How long the shared SuppressOutput flag must remain `true` before
+    /// the gate engages. A real minimize lasts seconds-to-minutes and
+    /// trips easily; backpressure flaps under heavy local CPU/IO last
+    /// tens of ms and are filtered out. 1 second is comfortably between.
+    const SUPPRESS_DEBOUNCE: Duration = Duration::from_secs(1);
+
     pub struct ScreenCaptureUpdates {
         stream: AsyncSCStream,
         pending: std::collections::VecDeque<DisplayUpdate>,
@@ -338,6 +344,17 @@ mod macos {
         /// (the P-frames we would have sent during the suppress depend on a
         /// state mstsc no longer has).
         was_suppressed: bool,
+        /// Local "first observed suppress=true" timestamp for debouncing.
+        /// `None` while the shared flag reads `false`; set to `Some(Instant::now())`
+        /// the first iteration we read `true`. The suppress gate only fires
+        /// after `elapsed >= SUPPRESS_DEBOUNCE` — so a real multi-second
+        /// minimize trips it normally, but transient flaps under wire
+        /// pressure (mstsc backs off for tens of ms when the encoded backlog
+        /// is too large, then resumes) don't. Without this, those flaps
+        /// stop/start the video pipeline rapidly under heavy local CPU/IO
+        /// (cargo build) and the audio mute thrashes — both audible as
+        /// stutter even though no real minimize happened.
+        suppressed_since: Option<Instant>,
         /// True once the EGFX/H.264 encoder has accepted at least one
         /// frame for this session (i.e., `gfx.submit_bgra` returned
         /// `Ok(true)`). The suppress gate is a no-op until this is set —
@@ -476,6 +493,7 @@ mod macos {
                 last_stride: 0,
                 display_suppressed,
                 was_suppressed: false,
+                suppressed_since: None,
                 first_egfx_frame_sent: false,
             })
         }
@@ -557,13 +575,29 @@ mod macos {
                 // freezes on the connection). FreeRDP doesn't issue suppress
                 // during connect, so it was never affected. Gate the gate on
                 // `first_egfx_frame_sent` so the handshake completes normally.
+                //
+                // **Debounce so transient flaps don't oscillate the pipeline.**
+                // Under heavy local CPU/IO (cargo build) mstsc backs off
+                // briefly when the encoded backlog grows, sending a quick
+                // `SuppressOutput { None }` → `RefreshRectangle` pair (tens of
+                // ms). Reacting to those rapid flaps stops/starts the video
+                // pipeline and toggles the audio mute, both audible as
+                // stutter. Track "first observed suppress" locally and only
+                // engage the gate once the flag has been steady-`true` for
+                // `SUPPRESS_DEBOUNCE`. Real multi-second minimizes still trip
+                // normally.
                 if self.first_egfx_frame_sent {
                     if let Some(flag) = self.display_suppressed.as_ref() {
                         if flag.load(Ordering::Relaxed) {
-                            self.was_suppressed = true;
-                            self.flush_remaining = 0;
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            continue;
+                            let started = *self.suppressed_since.get_or_insert_with(Instant::now);
+                            if started.elapsed() >= SUPPRESS_DEBOUNCE {
+                                self.was_suppressed = true;
+                                self.flush_remaining = 0;
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                continue;
+                            }
+                        } else {
+                            self.suppressed_since = None;
                         }
                     }
                 }

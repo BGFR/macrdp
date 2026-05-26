@@ -340,6 +340,18 @@ struct Args {
     #[arg(long = "lazy-paste", action = clap::ArgAction::SetTrue, hide = true)]
     #[allow(dead_code)]
     lazy_paste_compat: bool,
+
+    /// Default-on. While the client has sent `SuppressOutput { None }`
+    /// (i.e., mstsc is minimized), stop emitting RDPSND wave PDUs at the
+    /// server so the client's audio renderer drains naturally. Without
+    /// this, mstsc keeps queueing waves into `audiodg.exe`'s buffer
+    /// during the minimize; on refocus that buffer plays out late and
+    /// audio drifts by however many seconds were spent minimized. Pass
+    /// `--no-mute-on-minimize` to keep audio flowing through a minimize
+    /// (preserves "minimized YouTube keeps playing on the Mac speakers")
+    /// at the cost of accepting that drift on refocus.
+    #[arg(long = "no-mute-on-minimize", action = clap::ArgAction::SetTrue)]
+    no_mute_on_minimize: bool,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -1039,7 +1051,10 @@ async fn async_main() -> Result<()> {
             Box::new(clipboard::MacCliprdr::new())
         }
     };
-    let sound: Box<dyn ironrdp_server::SoundServerFactory> = Box::new(audio::MacRdpsnd::new());
+    let sound: Box<dyn ironrdp_server::SoundServerFactory> = Box::new(audio::MacRdpsnd::new(
+        Some(display_suppressed.clone()),
+        !args.no_mute_on_minimize,
+    ));
 
     // with_hybrid advertises HYBRID | HYBRID_EX so clients run CredSSP/NLA
     // over TLS. ironrdp_acceptor's accept_credssp reads our set_credentials

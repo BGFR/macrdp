@@ -7,7 +7,7 @@
 //! ship via `RdpsndServerMessage::Wave`.
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -50,14 +50,25 @@ pub struct MacRdpsnd {
     // would receive ~2x the audio. Each `start()` claims a new generation;
     // older capture loops observe the bump and exit, so at most one runs.
     generation: Arc<AtomicU64>,
+    /// Shared "client minimized / SuppressOutput" flag, same Arc the
+    /// vendor server flips and capture.rs reads. `None` disables the
+    /// audio mute (e.g., test/Linux-stub builds without server plumbing).
+    display_suppressed: Option<Arc<AtomicBool>>,
+    /// When true (default) and `display_suppressed` is set, the capture
+    /// loop stops emitting Wave PDUs while the client is minimized so
+    /// the client's audio renderer drains naturally. Pass
+    /// `--no-mute-on-minimize` on the CLI to flip this off.
+    mute_on_minimize: bool,
 }
 
 impl MacRdpsnd {
-    pub fn new() -> Self {
+    pub fn new(display_suppressed: Option<Arc<AtomicBool>>, mute_on_minimize: bool) -> Self {
         Self {
             sender: Arc::new(Mutex::new(None)),
             audio_sender: Arc::new(Mutex::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
+            display_suppressed,
+            mute_on_minimize,
         }
     }
 }
@@ -76,6 +87,8 @@ impl SoundServerFactory for MacRdpsnd {
             generation: self.generation.clone(),
             my_gen: 0,
             formats: vec![pcm_format()],
+            display_suppressed: self.display_suppressed.clone(),
+            mute_on_minimize: self.mute_on_minimize,
         })
     }
 
@@ -105,6 +118,11 @@ struct MacRdpsndBackend {
     // Generation claimed by this backend's capture loop, 0 until `start()`.
     my_gen: u64,
     formats: Vec<AudioFormat>,
+    /// Shared with the vendor server's SuppressOutput handler — see
+    /// [`MacRdpsnd::display_suppressed`].
+    display_suppressed: Option<Arc<AtomicBool>>,
+    /// Default-on opt-out via `--no-mute-on-minimize`.
+    mute_on_minimize: bool,
 }
 
 impl RdpsndServerHandler for MacRdpsndBackend {
@@ -151,6 +169,8 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         let audio_sender = self.audio_sender.clone();
         let generation = self.generation.clone();
         let my_gen = self.my_gen;
+        let display_suppressed = self.display_suppressed.clone();
+        let mute_on_minimize = self.mute_on_minimize;
         // Dedicated OS thread at USER_INTERACTIVE QoS for the entire
         // capture / resample / channel-send pipeline. Tokio workers ride
         // USER_INITIATED (see main.rs::boost_thread_qos) which a cargo
@@ -175,7 +195,16 @@ impl RdpsndServerHandler for MacRdpsndBackend {
                     }
                 };
                 rt.block_on(async move {
-                    if let Err(e) = capture_loop(sender, audio_sender, generation, my_gen).await {
+                    if let Err(e) = capture_loop(
+                        sender,
+                        audio_sender,
+                        generation,
+                        my_gen,
+                        display_suppressed,
+                        mute_on_minimize,
+                    )
+                    .await
+                    {
                         warn!("audio capture loop ended: {e}");
                     }
                 });
@@ -220,6 +249,8 @@ async fn capture_loop(
     audio_sender: AudioSender,
     generation: Arc<AtomicU64>,
     my_gen: u64,
+    display_suppressed: Option<Arc<AtomicBool>>,
+    mute_on_minimize: bool,
 ) -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
     use rubato::Resampler;
@@ -286,6 +317,16 @@ async fn capture_loop(
 
     let start_instant = std::time::Instant::now();
     let mut format_logged = false;
+
+    // Per-reader debounce for the mute-on-minimize gate (mirrors
+    // `capture.rs`'s `suppressed_since`). `None` while the shared
+    // SuppressOutput flag is `false`; set to `Some(Instant::now())` the
+    // first chunk we read `true`. The gate only engages once that's
+    // been stable for `SUPPRESS_DEBOUNCE` (1 s) so brief flaps under
+    // heavy CPU/IO (e.g., mstsc backing off to drain backlog during a
+    // cargo build) don't oscillate the mute and cause stutter.
+    const SUPPRESS_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+    let mut suppressed_since: Option<std::time::Instant> = None;
 
     // SCK delivery-rate measurement. The vendor server's audio-lag model
     // assumes one Wave = `WAVE_MS = 1024/48 = 21.33 ms` of real audio,
@@ -394,6 +435,39 @@ async fn capture_loop(
         }
 
         while input_buf[0].len() >= RESAMPLE_CHUNK && input_buf[1].len() >= RESAMPLE_CHUNK {
+            // Mute-on-minimize gate (default-on; opt out with
+            // `--no-mute-on-minimize`). When the client has sent
+            // `SuppressOutput { None }` (mstsc is minimized), drop incoming
+            // audio at the source — mstsc's audio renderer drains naturally,
+            // and on refocus fresh waves resume in sync with the freshly
+            // IDR'd video. Without this, audio kept flowing during minimize
+            // accumulates in audiodg.exe's buffer (invisible to the server)
+            // and plays out late on refocus, leaving audio drifted by however
+            // long was spent minimized. We drain the input buffer here so it
+            // doesn't grow unbounded across a long minimize; the cheap drain
+            // also avoids the rubato resample + channel send below.
+            //
+            // **Debounced** (see `SUPPRESS_DEBOUNCE` and the matching gate
+            // in `capture.rs`): mstsc emits transient
+            // `SuppressOutput`→`RefreshRectangle` pairs under wire pressure
+            // (tens of ms each), and reacting to them thrashes the mute and
+            // causes audible stutter. Only honor the flag after it's been
+            // steady-`true` for >= 1 s.
+            if mute_on_minimize {
+                if let Some(flag) = display_suppressed.as_ref() {
+                    if flag.load(Ordering::Relaxed) {
+                        let started = *suppressed_since.get_or_insert_with(std::time::Instant::now);
+                        if started.elapsed() >= SUPPRESS_DEBOUNCE {
+                            input_buf[0].drain(..RESAMPLE_CHUNK);
+                            input_buf[1].drain(..RESAMPLE_CHUNK);
+                            continue;
+                        }
+                    } else {
+                        suppressed_since = None;
+                    }
+                }
+            }
+
             chunk[0].copy_from_slice(&input_buf[0][..RESAMPLE_CHUNK]);
             chunk[1].copy_from_slice(&input_buf[1][..RESAMPLE_CHUNK]);
             let resampled = resampler
@@ -462,6 +536,8 @@ async fn capture_loop(
     _audio_sender: AudioSender,
     _generation: Arc<AtomicU64>,
     _my_gen: u64,
+    _display_suppressed: Option<Arc<AtomicBool>>,
+    _mute_on_minimize: bool,
 ) -> anyhow::Result<()> {
     Ok(())
 }

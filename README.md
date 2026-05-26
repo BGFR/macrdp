@@ -77,6 +77,16 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
                           to fall back to the eager path (downloads everything
                           on copy, auto-fires Cmd-V into Finder when done).
                           See "Windows → Mac file copy" below.
+--no-mute-on-minimize     Opt out of muting audio while the client window is
+                          minimized (default ON). When the client sends the
+                          standard `SuppressOutput` PDU on minimize, the server
+                          stops emitting Wave PDUs so the client's audio queue
+                          drains naturally; on refocus, audio resumes in sync
+                          with the freshly IDR'd video. Pass this to keep audio
+                          flowing through a minimize (preserves "minimized
+                          YouTube keeps playing on the Mac speakers") at the
+                          cost of accepting that drift on refocus. See "Audio"
+                          below.
 --cert-dir PATH           Persisted TLS cert (default ~/Library/Application Support/macrdp)
 --virtual-display         Serve a headless virtual display at --width × --height
                           instead of mirroring the primary panel — local screen
@@ -189,6 +199,8 @@ At 60fps the frame budget is 16.67 ms. The scalar path is fine at 1080p (~30% of
 ## Audio
 
 System audio rides over the RDPSND virtual channel as 16-bit stereo PCM at **44.1 kHz**. ScreenCaptureKit only supports 8 / 16 / 24 / 48 kHz, so the capture loop captures at 48 kHz and resamples to 44.1 with [`rubato`](https://github.com/HEnquist/rubato) before sending. 44.1 matches the native rate of most Windows audio endpoints, which avoids the client-side resampling drift that otherwise accumulates into multi-second audio backlogs. A generation counter on the audio factory keeps a client reconnect from leaving a second capture loop feeding the channel. The vendored `ironrdp-server` carries a single patch that makes `dispatch_server_events` keep the *newest* queued waves on per-batch overflow instead of the oldest — without it, a one-off video-encode stall would bake a permanent audio-latency offset into the session.
+
+**Mute on minimize** (default-on, opt out with `--no-mute-on-minimize`). When the client minimizes its window it sends the standard `SuppressOutput { None }` PDU; the server stops emitting both EGFX video frames and RDPSND waves until the client refocuses (`RefreshRectangle` / `SuppressOutput { Some(rect) }`). Without this, mstsc accumulates a backlog of video frames + audio waves during a long minimize that has to chew through on refocus, producing several seconds of input lockout, audio drift, and a video catch-up storm. With it, you get a brief audio gap on refocus and audio + video resume in sync. Both gates are debounced (1 s) so transient `SuppressOutput` flaps mstsc emits under wire pressure (e.g., during a heavy local `cargo build`) don't oscillate the mute and cause stutter. Pass `--no-mute-on-minimize` if you specifically want audio to keep playing while the client window is minimized — accepting that audio will drift by however long was spent minimized.
 
 ## File copy
 

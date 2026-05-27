@@ -151,10 +151,11 @@ vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in
                               Partition is stable: H.264 inter-frame
                               sequence and audio wave-drop ordering are
                               both preserved. Gated on the egfx feature.
-                          (5) SuppressOutput / RefreshRectangle handling (NOT
-                              upstreamed): in handle_io_channel_data, pattern-
-                              match the two PDUs instead of warn-and-drop, and
-                              flip a shared `Arc<AtomicBool> display_suppressed`
+                          (5) SuppressOutput / RefreshRectangle handling
+                              (upstream PR #1319, awaiting review): in
+                              handle_io_channel_data, pattern-match the two
+                              PDUs instead of warn-and-drop, and flip a
+                              shared `Arc<AtomicBool> display_suppressed`
                               (exposed via `display_suppressed_handle()` and
                               overridable via `set_display_suppressed_handle()`
                               so macrdp can share one flag with capture.rs's
@@ -165,8 +166,44 @@ vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in
                               quirk in Known behavioural quirks for the
                               client-side trap (first-frame arming gate + per-
                               connection reset).
-                          Keep this vendor dir until (2)/(3)/(4)/(5) are upstreamed
-                          AND released — #1276 landing is NOT sufficient.
+                          (6) NSCodec encoder + selection (upstream PR #1332,
+                              awaiting review): adds `mod nscodec;` in
+                              encoder/mod.rs (the file was previously dead
+                              code, never wired up), an `NsCodecHandler` that
+                              calls `nscodec::encode(bitmap, color_loss_level)`,
+                              a `nscodec: Option<(u8, u8)>` slot on
+                              `UpdateEncoderCodecs` with a matching
+                              `set_nscodec`, a `BitmapUpdater::NsCodec`
+                              dispatch variant, a selection arm below RemoteFX
+                              in `UpdateEncoder::new`, a `has_nscodec()` on
+                              `RdpServerOptions`, and an active
+                              `CodecProperty::NsCodec` server-side match arm
+                              that re-uses the client's confirmed CLL. Verified
+                              against the macOS Microsoft Remote Desktop /
+                              Windows App client — that client's legacy
+                              codec list contains only NSCodec, so before
+                              this wiring it silently fell through to raw
+                              BitmapUpdate at much higher bandwidth. The new
+                              `NsCodecHandler::new` emits a `debug!` line
+                              ("NSCodec encoder selected for this session")
+                              so codec selection is visible at
+                              `RUST_LOG=...ironrdp_server::encoder=debug`.
+                              Modern FreeRDP loads the NSCodec decoder
+                              module at connect but doesn't advertise the
+                              codec back in `ClientConfirmActive`, so
+                              xfreerdp/sfreerdp don't exercise this path —
+                              only the macOS Microsoft Remote Desktop /
+                              Windows App does today. Upstream PR shape:
+                              same wiring but the encoder lives in a new
+                              `ironrdp-nscodec` peer crate (CBenoit's
+                              architecture preference), gated by a new
+                              `nscodec` feature on `ironrdp-server`; here
+                              the vendor uses the in-tree
+                              `vendor/ironrdp-server/src/encoder/nscodec.rs`
+                              directly with no feature gate.
+                          Keep this vendor dir until (2)/(3)/(4)/(5)/(6) are
+                          upstreamed AND released — #1276 landing is NOT
+                          sufficient.
 
 (vendor/ironrdp-egfx/     DELETED 2026-05-25. The CapabilitySet::decode
                           tolerance fix was merged upstream as PR #1298

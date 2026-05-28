@@ -201,9 +201,28 @@ vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in
                               the vendor uses the in-tree
                               `vendor/ironrdp-server/src/encoder/nscodec.rs`
                               directly with no feature gate.
-                          Keep this vendor dir until (2)/(3)/(4)/(5)/(6) are
-                          upstreamed AND released — #1276 landing is NOT
-                          sufficient.
+                          (7) QOI encoder emits RGB-channel output for
+                              opaque captures (upstream PR #1335, awaiting
+                              review): `qoi_encode` mapped 4-byte `*A32`
+                              `PixelFormat` variants to the matching `*a`
+                              `qoi::RawChannels`, which produces a QOI
+                              header with `channels = Rgba`. The decoder
+                              in `ironrdp-session/src/fast_path.rs::qoi_apply`
+                              only supports `Channels::Rgb` — the `Rgba`
+                              arm is `warn!("Unsupported RGBA QOI data")`
+                              and drops the frame. So any IronRDP-based
+                              client connecting to macrdp would have
+                              negotiated QOI, gotten a header it refused,
+                              and rendered nothing (412 RGBA-warn lines in
+                              ~12s on the loopback repro). Fix: map all
+                              four `*A32` variants to their `*x` siblings
+                              so QOI emits 3-channel output that the
+                              decoder accepts. Screen-capture alpha is
+                              meaningless anyway. Verified 0 warnings +
+                              normal render against ironrdp-viewer.
+                          Keep this vendor dir until (2)/(3)/(4)/(5)/(6)/(7)
+                          are upstreamed AND released — #1276 landing is
+                          NOT sufficient.
 
 (vendor/ironrdp-egfx/     DELETED 2026-05-25. The CapabilitySet::decode
                           tolerance fix was merged upstream as PR #1298

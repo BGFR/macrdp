@@ -700,15 +700,18 @@ impl BitmapUpdateHandler for NsCodecHandler {
 #[cfg(feature = "qoi")]
 fn qoi_encode(bitmap: &BitmapUpdate) -> Result<Vec<u8>> {
     use ironrdp_graphics::image_processing::PixelFormat::*;
+    // Force every 4-byte input to its `*x` RawChannels sibling so QOI
+    // emits a 3-channel (`Channels::Rgb`) header. The `*a` variants
+    // produce `Channels::Rgba`, which `ironrdp-session`'s decoder
+    // (`fast_path.rs::qoi_apply`) explicitly drops with
+    // `WARN: Unsupported RGBA QOI data` — every QOI frame would render
+    // as blank. Screen captures are functionally opaque so discarding
+    // the alpha byte is fine. Upstreamed as PR #1335.
     let raw_channels = match bitmap.format {
-        ARgb32 => qoi::RawChannels::Argb,
-        XRgb32 => qoi::RawChannels::Xrgb,
-        ABgr32 => qoi::RawChannels::Abgr,
-        XBgr32 => qoi::RawChannels::Xbgr,
-        BgrA32 => qoi::RawChannels::Bgra,
-        BgrX32 => qoi::RawChannels::Bgrx,
-        RgbA32 => qoi::RawChannels::Rgba,
-        RgbX32 => qoi::RawChannels::Rgbx,
+        ARgb32 | XRgb32 => qoi::RawChannels::Xrgb,
+        ABgr32 | XBgr32 => qoi::RawChannels::Xbgr,
+        BgrA32 | BgrX32 => qoi::RawChannels::Bgrx,
+        RgbA32 | RgbX32 => qoi::RawChannels::Rgbx,
     };
     let enc = qoi::EncoderBuilder::new(&bitmap.data, bitmap.width.get().into(), bitmap.height.get().into())
         .stride(bitmap.stride.get())

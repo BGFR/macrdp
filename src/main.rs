@@ -1,5 +1,6 @@
 mod audio;
 mod auth;
+mod avc444;
 mod capture;
 mod clipboard;
 mod cursor;

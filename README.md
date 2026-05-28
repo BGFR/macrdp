@@ -87,6 +87,17 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
                           YouTube keeps playing on the Mac speakers") at the
                           cost of accepting that drift on refocus. See "Audio"
                           below.
+--qoi-force-rgb           Force QOI BitmapUpdates to emit `Channels::Rgb` instead
+                          of the natural `Channels::Rgba` mapping from a *A32
+                          capture. Default OFF (matches upstream ironrdp-server).
+                          Only matters if you connect with an IronRDP-based viewer
+                          built against ironrdp-session WITHOUT the RGBA decode
+                          patch (currently every published release, until
+                          Devolutions/IronRDP#1341 lands) — without this flag those
+                          viewers will render blank with one "Unsupported RGBA QOI
+                          data" warning per frame. mstsc / Microsoft Remote Desktop
+                          / Windows App / FreeRDP don't advertise QOI and are
+                          unaffected either way.
 --cert-dir PATH           Persisted TLS cert (default ~/Library/Application Support/macrdp)
 --virtual-display         Serve a headless virtual display at --width × --height
                           instead of mirroring the primary panel — local screen

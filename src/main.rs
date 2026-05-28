@@ -352,6 +352,18 @@ struct Args {
     /// at the cost of accepting that drift on refocus.
     #[arg(long = "no-mute-on-minimize", action = clap::ArgAction::SetTrue)]
     no_mute_on_minimize: bool,
+
+    /// Force QOI BitmapUpdates to be encoded with `Channels::Rgb` instead of
+    /// `Channels::Rgba`. The default (off) emits RGBA per the underlying
+    /// PixelFormat, matching upstream `ironrdp-server`. Upstream
+    /// `ironrdp-session` (every published `ironrdp-viewer` to date) drops
+    /// RGBA QOI frames with `WARN: Unsupported RGBA QOI data` — so pass this
+    /// flag when you're serving an IronRDP-based client that hasn't picked
+    /// up the RGBA-decode patch yet, or your viewer will render blank.
+    /// mstsc / Microsoft Remote Desktop / Windows App / FreeRDP don't
+    /// advertise QOI and are unaffected either way.
+    #[arg(long)]
+    qoi_force_rgb: bool,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -985,6 +997,8 @@ async fn async_main() -> Result<()> {
     // ~2-frame presentation buffer, so 60fps keeps typing latency low) or 15 for
     // the legacy bitmap path (which has no such buffer and is bandwidth-heavier).
     let fps = args.fps.unwrap_or(if args.enable_h264 { 60 } else { 15 });
+
+    ironrdp_server::set_qoi_force_rgb(args.qoi_force_rgb);
 
     // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
     // clone drives the builder's GfxServerFactory (protocol side); another

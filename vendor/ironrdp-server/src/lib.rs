@@ -22,6 +22,8 @@ mod server;
 mod sound;
 
 pub use clipboard::CliprdrServerFactory;
+#[cfg(feature = "qoi")]
+pub use encoder::set_qoi_force_rgb;
 pub use display::{
     BitmapUpdate, ColorPointer, DesktopSize, DisplayUpdate, Framebuffer, PixelFormat, RGBAPointer, RdpServerDisplay,
     RdpServerDisplayUpdates,

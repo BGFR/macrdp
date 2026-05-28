@@ -1,5 +1,7 @@
 use core::fmt;
 use core::num::NonZeroU16;
+#[cfg(feature = "qoi")]
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context as _, Result, anyhow};
 use ironrdp_acceptor::DesktopSize;
@@ -697,21 +699,59 @@ impl BitmapUpdateHandler for NsCodecHandler {
     }
 }
 
+/// Opt-in QOI Rgb-only workaround for pre-PR-#1335 `ironrdp-session` clients.
+/// When `true`, every `*A32` capture format is encoded as its `*x` sibling so
+/// the QOI header advertises `Channels::Rgb` — the only variant the upstream
+/// client decoder accepts today (the `Rgba` arm in `fast_path.rs::qoi_apply`
+/// is `warn!("Unsupported RGBA QOI data")` and drops the frame). Default
+/// `false` so we emit RGBA naturally (matching upstream), which is correct
+/// against clients carrying the matching RGBA decode patch.
+#[cfg(feature = "qoi")]
+static QOI_FORCE_RGB: AtomicBool = AtomicBool::new(false);
+
+/// Toggle the opt-in QOI Rgb-only workaround. See [`QOI_FORCE_RGB`].
+#[cfg(feature = "qoi")]
+pub fn set_qoi_force_rgb(enabled: bool) {
+    QOI_FORCE_RGB.store(enabled, Ordering::Relaxed);
+}
+
 #[cfg(feature = "qoi")]
 fn qoi_encode(bitmap: &BitmapUpdate) -> Result<Vec<u8>> {
     use ironrdp_graphics::image_processing::PixelFormat::*;
-    // Force every 4-byte input to its `*x` RawChannels sibling so QOI
-    // emits a 3-channel (`Channels::Rgb`) header. The `*a` variants
-    // produce `Channels::Rgba`, which `ironrdp-session`'s decoder
-    // (`fast_path.rs::qoi_apply`) explicitly drops with
-    // `WARN: Unsupported RGBA QOI data` — every QOI frame would render
-    // as blank. Screen captures are functionally opaque so discarding
-    // the alpha byte is fine. Upstreamed as PR #1335.
+    let force_rgb = QOI_FORCE_RGB.load(Ordering::Relaxed);
     let raw_channels = match bitmap.format {
-        ARgb32 | XRgb32 => qoi::RawChannels::Xrgb,
-        ABgr32 | XBgr32 => qoi::RawChannels::Xbgr,
-        BgrA32 | BgrX32 => qoi::RawChannels::Bgrx,
-        RgbA32 | RgbX32 => qoi::RawChannels::Rgbx,
+        ARgb32 => {
+            if force_rgb {
+                qoi::RawChannels::Xrgb
+            } else {
+                qoi::RawChannels::Argb
+            }
+        }
+        XRgb32 => qoi::RawChannels::Xrgb,
+        ABgr32 => {
+            if force_rgb {
+                qoi::RawChannels::Xbgr
+            } else {
+                qoi::RawChannels::Abgr
+            }
+        }
+        XBgr32 => qoi::RawChannels::Xbgr,
+        BgrA32 => {
+            if force_rgb {
+                qoi::RawChannels::Bgrx
+            } else {
+                qoi::RawChannels::Bgra
+            }
+        }
+        BgrX32 => qoi::RawChannels::Bgrx,
+        RgbA32 => {
+            if force_rgb {
+                qoi::RawChannels::Rgbx
+            } else {
+                qoi::RawChannels::Rgba
+            }
+        }
+        RgbX32 => qoi::RawChannels::Rgbx,
     };
     let enc = qoi::EncoderBuilder::new(&bitmap.data, bitmap.width.get().into(), bitmap.height.get().into())
         .stride(bitmap.stride.get())

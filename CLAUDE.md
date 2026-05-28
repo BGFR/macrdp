@@ -201,25 +201,35 @@ vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in
                               the vendor uses the in-tree
                               `vendor/ironrdp-server/src/encoder/nscodec.rs`
                               directly with no feature gate.
-                          (7) QOI encoder emits RGB-channel output for
-                              opaque captures (upstream PR #1335, awaiting
-                              review): `qoi_encode` mapped 4-byte `*A32`
-                              `PixelFormat` variants to the matching `*a`
-                              `qoi::RawChannels`, which produces a QOI
-                              header with `channels = Rgba`. The decoder
-                              in `ironrdp-session/src/fast_path.rs::qoi_apply`
-                              only supports `Channels::Rgb` — the `Rgba`
-                              arm is `warn!("Unsupported RGBA QOI data")`
-                              and drops the frame. So any IronRDP-based
-                              client connecting to macrdp would have
-                              negotiated QOI, gotten a header it refused,
-                              and rendered nothing (412 RGBA-warn lines in
-                              ~12s on the loopback repro). Fix: map all
-                              four `*A32` variants to their `*x` siblings
-                              so QOI emits 3-channel output that the
-                              decoder accepts. Screen-capture alpha is
-                              meaningless anyway. Verified 0 warnings +
-                              normal render against ironrdp-viewer.
+                          (7) Opt-in QOI Rgb-only workaround for pre-PR-#1335
+                              `ironrdp-session` clients (process-global
+                              `QOI_FORCE_RGB: AtomicBool`, public setter
+                              `set_qoi_force_rgb`, wired through macrdp's
+                              `--qoi-force-rgb` CLI flag — default OFF, so
+                              `qoi_encode` emits the natural `*a`
+                              `qoi::RawChannels` matching the source
+                              PixelFormat, identical to upstream). When
+                              the flag is set, every 4-byte input maps to
+                              its `*x` sibling so the QOI header advertises
+                              `Channels::Rgb` instead of `Channels::Rgba`.
+                              Context: upstream `ironrdp-session`'s
+                              `fast_path.rs::qoi_apply` Rgba arm is
+                              `warn!("Unsupported RGBA QOI data")` and
+                              drops the frame, so any client carrying that
+                              code negotiates QOI, gets `Rgba`, and renders
+                              blank (412 RGBA-warn lines in ~12s on the
+                              loopback repro). PR #1335 upstreams the Rgb
+                              behaviour as the default; a companion
+                              client-side patch (separate branch
+                              `feat-client-rgba-qoi` on the clintcan fork,
+                              not yet PR'd) adds Rgba decode to
+                              `ironrdp-session`. Once the client patch
+                              lands and a release ships, the workaround +
+                              `--qoi-force-rgb` can be deleted. Until then,
+                              users pointing `ironrdp-viewer` at macrdp
+                              should pass `--qoi-force-rgb`; mstsc / MS
+                              Remote Desktop / Windows App / FreeRDP don't
+                              advertise QOI and are unaffected.
                           Keep this vendor dir until (2)/(3)/(4)/(5)/(6)/(7)
                           are upstreamed AND released — #1276 landing is
                           NOT sufficient.

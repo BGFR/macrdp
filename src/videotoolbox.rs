@@ -798,6 +798,152 @@ mod ffi {
         Ok(())
     }
 
+    // --- BGRA -> full-range YUV444 planar (AVC444 scoping benchmark) ---------
+    //
+    // Two reference implementations of full-resolution chroma conversion, kept
+    // side-by-side for an A/B perf decision before committing to AVC444's
+    // 2-encoder pipeline. Same BT.709 full-range matrix as the NV12 path.
+    // Neither is wired into encode_frame; they exist for the bench in
+    // videotoolbox::tests::bench_yuv444_full_range.
+    //
+    // Gated behind cfg(test) until AVC444 is actually wired up — they're
+    // dead code in a production build today.
+
+    /// Scalar BGRA -> three full-resolution planar Y/Cb/Cr buffers. The matrix
+    /// matches `bgra_to_nv12_full_range` exactly — the only difference is no
+    /// 2x2 averaging.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bgra_to_yuv444_planar_scalar(
+        bgra: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        y_plane: &mut [u8],
+        y_stride: usize,
+        cb_plane: &mut [u8],
+        cb_stride: usize,
+        cr_plane: &mut [u8],
+        cr_stride: usize,
+    ) {
+        const KR: f32 = 0.2126;
+        const KG: f32 = 0.7152;
+        const KB: f32 = 0.0722;
+        for y in 0..height {
+            let src = &bgra[y * src_stride..];
+            let yrow = &mut y_plane[y * y_stride..];
+            let cbrow = &mut cb_plane[y * cb_stride..];
+            let crrow = &mut cr_plane[y * cr_stride..];
+            for x in 0..width {
+                let p = &src[x * 4..];
+                let (b, g, r) = (f32::from(p[0]), f32::from(p[1]), f32::from(p[2]));
+                let luma = KR * r + KG * g + KB * b;
+                yrow[x] = luma.round().clamp(0.0, 255.0) as u8;
+                // Full-range Cb/Cr: deviation / 2*(1-Kb|Kr), bias 128.
+                let cb = (b - luma) / 1.8556 + 128.0;
+                let cr = (r - luma) / 1.5748 + 128.0;
+                cbrow[x] = cb.round().clamp(0.0, 255.0) as u8;
+                crrow[x] = cr.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    extern "C" {
+        /// `vImageMatrixMultiply_ARGB8888ToPlanar8` (vImage Transform.h). One call
+        /// per output plane. The matrix is `int16_t[4]` in source byte order; we
+        /// give BGRA bytes (B=byte0, G=byte1, R=byte2, A=byte3) so each
+        /// coefficient is placed accordingly.
+        fn vImageMatrixMultiply_ARGB8888ToPlanar8(
+            src: *const VImageBuffer,
+            dest: *const VImageBuffer,
+            matrix: *const i16, // length 4
+            divisor: i32,
+            pre_bias: *const i16, // null = no pre-bias
+            post_bias: i32,
+            flags: u32,
+        ) -> isize;
+    }
+
+    /// BT.709 full-range matrix in Q14 fixed-point, indexed by source BGRA byte
+    /// order (matrix[0] = B, [1] = G, [2] = R, [3] = A=0).
+    ///
+    /// Derived from the scalar reference:
+    /// - Y  =  0.2126 R + 0.7152 G + 0.0722 B
+    /// - Cb = -0.114572 R - 0.385428 G + 0.500000 B + 128
+    /// - Cr =  0.500000 R - 0.454153 G - 0.045847 B + 128
+    #[cfg(test)]
+    const DIVISOR: i32 = 16384; // 2^14
+
+    // Y plane coefficients: [B, G, R, A] * Q14, no post-bias.
+    #[cfg(test)]
+    const Y_MATRIX: [i16; 4] = [1183, 11718, 3483, 0]; // 0.0722, 0.7152, 0.2126, 0
+    #[cfg(test)]
+    const Y_POST_BIAS: i32 = DIVISOR / 2; // rounding offset
+
+    // Cb plane coefficients + 128*Q14 bias to recenter.
+    #[cfg(test)]
+    const CB_MATRIX: [i16; 4] = [8192, -6315, -1877, 0]; // 0.5, -0.385428, -0.114572, 0
+    #[cfg(test)]
+    const CB_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
+
+    // Cr plane.
+    #[cfg(test)]
+    const CR_MATRIX: [i16; 4] = [-751, -7440, 8192, 0]; // -0.045847, -0.454153, 0.5, 0
+    #[cfg(test)]
+    const CR_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
+
+    /// vImage BGRA -> three full-resolution planar Y/Cb/Cr buffers via three
+    /// `vImageMatrixMultiply_ARGB8888ToPlanar8` calls (one per plane).
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bgra_to_yuv444_planar_vimage(
+        bgra: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        y_plane: &mut [u8],
+        y_stride: usize,
+        cb_plane: &mut [u8],
+        cb_stride: usize,
+        cr_plane: &mut [u8],
+        cr_stride: usize,
+    ) -> Result<()> {
+        let src = VImageBuffer {
+            data: bgra.as_ptr() as *mut c_void,
+            height,
+            width,
+            row_bytes: src_stride,
+        };
+        for (plane, stride, matrix, post_bias) in [
+            (&mut *y_plane, y_stride, &Y_MATRIX, Y_POST_BIAS),
+            (&mut *cb_plane, cb_stride, &CB_MATRIX, CB_POST_BIAS),
+            (&mut *cr_plane, cr_stride, &CR_MATRIX, CR_POST_BIAS),
+        ] {
+            let dest = VImageBuffer {
+                data: plane.as_mut_ptr() as *mut c_void,
+                height,
+                width,
+                row_bytes: stride,
+            };
+            let err = unsafe {
+                vImageMatrixMultiply_ARGB8888ToPlanar8(
+                    &src,
+                    &dest,
+                    matrix.as_ptr(),
+                    DIVISOR,
+                    std::ptr::null(),
+                    post_bias,
+                    K_VIMAGE_NO_FLAGS,
+                )
+            };
+            if err != 0 {
+                bail!("vImageMatrixMultiply_ARGB8888ToPlanar8 failed: {err}");
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)] // internal FFI helper; grouping into a struct adds no clarity
     pub(super) fn encode_frame(
         guard: &SessionGuard,
@@ -1213,6 +1359,259 @@ mod tests {
             println!(
                 "{label:>26}  {scalar_ms:12.3}  {vimage_ms:12.3}  {:7.1}x",
                 scalar_ms / vimage_ms
+            );
+        }
+    }
+
+    /// Microbenchmark for AVC444 scoping: BGRA -> full-resolution YUV444 planar
+    /// (Option A's per-frame conversion). Compares scalar reference, the
+    /// 3 x vImageMatrixMultiply_ARGB8888ToPlanar8 path, AND the current
+    /// production NV12 vImage path so the AVC444 overhead is directly visible.
+    /// Ignored by default; run in RELEASE:
+    ///   cargo test --release bench_yuv444_full_range -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_yuv444_full_range() {
+        use super::ffi::{
+            bgra_to_nv12_full_range_vimage, bgra_to_yuv444_planar_scalar,
+            bgra_to_yuv444_planar_vimage,
+        };
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        fn time_ms(mut f: impl FnMut()) -> f64 {
+            for _ in 0..5 {
+                f();
+            }
+            let mut iters = 0u64;
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_millis(400) {
+                f();
+                iters += 1;
+            }
+            t.elapsed().as_secs_f64() * 1000.0 / iters as f64
+        }
+
+        println!("\nBGRA conversion ms/frame, single thread (lower = better)");
+        println!(
+            "{:>26}  {:>10}  {:>10}  {:>10}  {:>10}",
+            "resolution", "NV12 vIm", "Y444 vIm", "Y444 scal", "v444/NV12"
+        );
+        for &(w, h, label) in &[
+            (1470usize, 956usize, "1470x956 (Air native)"),
+            (1920, 1080, "1920x1080"),
+            (1920, 1088, "1920x1088 (16-pad)"),
+            (2560, 1440, "2560x1440"),
+            (3840, 2160, "3840x2160 (4K)"),
+        ] {
+            let stride = w * 4;
+            let bgra = vec![0x80u8; stride * h];
+            let mut y = vec![0u8; w * h];
+            let mut cb = vec![0u8; w * h];
+            let mut cr = vec![0u8; w * h];
+            let mut cbcr = vec![0u8; w * (h / 2)];
+
+            let nv12_vim_ms = time_ms(|| {
+                let _ = bgra_to_nv12_full_range_vimage(
+                    black_box(&bgra),
+                    stride,
+                    w,
+                    h,
+                    &mut y,
+                    w,
+                    &mut cbcr,
+                    w,
+                );
+            });
+            let y444_vim_ms = time_ms(|| {
+                let _ = bgra_to_yuv444_planar_vimage(
+                    black_box(&bgra),
+                    stride,
+                    w,
+                    h,
+                    &mut y,
+                    w,
+                    &mut cb,
+                    w,
+                    &mut cr,
+                    w,
+                );
+            });
+            let y444_scal_ms = time_ms(|| {
+                bgra_to_yuv444_planar_scalar(
+                    black_box(&bgra),
+                    stride,
+                    w,
+                    h,
+                    &mut y,
+                    w,
+                    &mut cb,
+                    w,
+                    &mut cr,
+                    w,
+                );
+            });
+            black_box(y[0]);
+            black_box(cb[0]);
+            black_box(cr[0]);
+            black_box(cbcr[0]);
+            println!(
+                "{label:>26}  {nv12_vim_ms:10.3}  {y444_vim_ms:10.3}  {y444_scal_ms:10.3}  {:9.2}x",
+                y444_vim_ms / nv12_vim_ms
+            );
+        }
+    }
+
+    /// AVC444 scoping: does VideoToolbox actually run two concurrent
+    /// `VTCompressionSession`s in parallel on the dedicated hardware encoder,
+    /// or does it serialize them at the hardware-block level? Submits N frames
+    /// to one session as a baseline, then N frames to each of two sessions
+    /// concurrently. Reports throughput ratio.
+    ///
+    /// Interpretation:
+    ///   ratio ≈ 1.0  → VT serializes (AVC444 effectively doubles encode time
+    ///                  per output frame; total per-frame budget tightens)
+    ///   ratio ≈ 2.0  → VT parallelizes (AVC444 has no extra encode latency
+    ///                  beyond the conversion overhead measured above)
+    ///   1.0 < x < 2.0 → partial overlap (some pipeline stages share)
+    ///
+    /// Ignored by default; run in RELEASE:
+    ///   cargo test --release bench_dual_vt_sessions -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_dual_vt_sessions() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const W: u16 = 1920;
+        const H: u16 = 1088;
+        const FPS: u32 = 60;
+        const BITRATE_BPS: u32 = 6_000_000;
+        const KEYFRAME_S: f32 = 2.0;
+        const N_FRAMES: usize = 60;
+
+        let stride = usize::from(W) * 4;
+        // Diagonal gradient — non-uniform content so the encoder actually does
+        // motion-estimation work instead of short-circuiting on flat samples.
+        let mut frame = vec![0u8; stride * usize::from(H)];
+        for y in 0..usize::from(H) {
+            for x in 0..usize::from(W) {
+                let p = &mut frame[y * stride + x * 4..][..4];
+                p[0] = ((x + y) & 0xff) as u8; // B
+                p[1] = ((x ^ y) & 0xff) as u8; // G
+                p[2] = ((x.wrapping_mul(7) + y) & 0xff) as u8; // R
+                p[3] = 0xff;
+            }
+        }
+
+        let drive_one = |enc: &mut Encoder| {
+            for i in 0..N_FRAMES {
+                enc.encode_bgra(black_box(&frame), stride, i == 0).unwrap();
+            }
+            let _ = enc.flush().unwrap();
+        };
+
+        // Warm up VT (first session boot is expensive; we don't want it skewing
+        // the baseline).
+        {
+            let mut warm = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S).unwrap();
+            drive_one(&mut warm);
+        }
+
+        // Baseline: single session, N frames.
+        let mut e1 = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S).unwrap();
+        let t = Instant::now();
+        drive_one(&mut e1);
+        let t_single = t.elapsed();
+
+        // Dual: two sessions, N frames each, submissions interleaved, then both
+        // flushed. If VT parallelizes, e_b's frames overlap with e_a's flush
+        // wait and the second flush returns nearly instantly.
+        let mut e_a = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S).unwrap();
+        let mut e_b = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S).unwrap();
+        let t = Instant::now();
+        for i in 0..N_FRAMES {
+            e_a.encode_bgra(black_box(&frame), stride, i == 0).unwrap();
+            e_b.encode_bgra(black_box(&frame), stride, i == 0).unwrap();
+        }
+        let _ = e_a.flush().unwrap();
+        let _ = e_b.flush().unwrap();
+        let t_dual = t.elapsed();
+
+        let single_fps = N_FRAMES as f64 / t_single.as_secs_f64();
+        let dual_fps = (2 * N_FRAMES) as f64 / t_dual.as_secs_f64();
+        let ratio = dual_fps / single_fps;
+
+        println!("\nDual VTCompressionSession parallelism ({W}x{H}, {N_FRAMES} frames, {FPS}fps target, {} Mbps):", BITRATE_BPS / 1_000_000);
+        println!(
+            "  single session:  {:7.1} ms total → {:6.1} fps ({:5.2} ms/frame)",
+            t_single.as_secs_f64() * 1000.0,
+            single_fps,
+            t_single.as_secs_f64() * 1000.0 / N_FRAMES as f64,
+        );
+        println!(
+            "  dual sessions:   {:7.1} ms total → {:6.1} fps ({:5.2} ms/frame each, 2x frames)",
+            t_dual.as_secs_f64() * 1000.0,
+            dual_fps,
+            t_dual.as_secs_f64() * 1000.0 / (2 * N_FRAMES) as f64,
+        );
+        println!(
+            "  parallelism ratio: {ratio:.2}x  (1.0 = VT serializes; 2.0 = perfect parallelism)",
+        );
+    }
+
+    /// Sanity check: vImage YUV444 matrix output must match the scalar
+    /// reference on solid-color frames. Validates the Q14 matrix coefficients
+    /// and BGRA byte-order assumption before we trust the benchmark numbers.
+    #[test]
+    fn vimage_yuv444_matches_scalar() {
+        use super::ffi::{bgra_to_yuv444_planar_scalar, bgra_to_yuv444_planar_vimage};
+        let colors: [[u8; 4]; 6] = [
+            [0, 0, 0, 255],
+            [255, 255, 255, 255],
+            [0, 0, 255, 255],
+            [0, 255, 0, 255],
+            [255, 0, 0, 255],
+            [128, 128, 128, 255],
+        ];
+        let (w, h) = (4usize, 4usize);
+        let stride = w * 4;
+        for c in colors {
+            let mut bgra = vec![0u8; stride * h];
+            for px in bgra.chunks_exact_mut(4) {
+                px.copy_from_slice(&c);
+            }
+            let mut y_s = vec![0u8; w * h];
+            let mut cb_s = vec![0u8; w * h];
+            let mut cr_s = vec![0u8; w * h];
+            let mut y_v = vec![0u8; w * h];
+            let mut cb_v = vec![0u8; w * h];
+            let mut cr_v = vec![0u8; w * h];
+            bgra_to_yuv444_planar_scalar(
+                &bgra, stride, w, h, &mut y_s, w, &mut cb_s, w, &mut cr_s, w,
+            );
+            bgra_to_yuv444_planar_vimage(
+                &bgra, stride, w, h, &mut y_v, w, &mut cb_v, w, &mut cr_v, w,
+            )
+            .expect("vImage YUV444 conversion should succeed");
+            let near = |a: u8, b: u8| (i32::from(a) - i32::from(b)).abs() <= 3;
+            assert!(
+                near(y_s[0], y_v[0]),
+                "Y mismatch {c:?}: {} vs {}",
+                y_s[0],
+                y_v[0]
+            );
+            assert!(
+                near(cb_s[0], cb_v[0]),
+                "Cb mismatch {c:?}: {} vs {}",
+                cb_s[0],
+                cb_v[0]
+            );
+            assert!(
+                near(cr_s[0], cr_v[0]),
+                "Cr mismatch {c:?}: {} vs {}",
+                cr_s[0],
+                cr_v[0]
             );
         }
     }

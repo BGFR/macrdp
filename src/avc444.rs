@@ -291,7 +291,10 @@ fn split_two_rows_mut(
         return (&mut plane[top_off..top_off + row_len], None);
     }
     let (lo, hi) = plane.split_at_mut(bot_off);
-    (&mut lo[top_off..top_off + row_len], Some(&mut hi[..row_len]))
+    (
+        &mut lo[top_off..top_off + row_len],
+        Some(&mut hi[..row_len]),
+    )
 }
 
 #[cfg(test)]
@@ -306,7 +309,9 @@ mod tests {
         let mut u = vec![0u8; width * height];
         let mut v = vec![0u8; width * height];
         let lcg = |seed: u64, n: usize| -> u8 {
-            let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(n as u64);
+            let mut s = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(n as u64);
             s ^= s >> 33;
             (s & 0xff) as u8
         };
@@ -340,8 +345,25 @@ mod tests {
         let mut aux_v = vec![0u8; half_w * half_h];
 
         split_yuv444_to_yuv420_v1(
-            &src_y, &src_u, &src_v, width, width, width, &mut main_y, &mut main_u, &mut main_v,
-            width, half_w, half_w, &mut aux_y, &mut aux_u, &mut aux_v, width, half_w, half_w, width,
+            &src_y,
+            &src_u,
+            &src_v,
+            width,
+            width,
+            width,
+            &mut main_y,
+            &mut main_u,
+            &mut main_v,
+            width,
+            half_w,
+            half_w,
+            &mut aux_y,
+            &mut aux_u,
+            &mut aux_v,
+            width,
+            half_w,
+            half_w,
+            width,
             height,
         );
 

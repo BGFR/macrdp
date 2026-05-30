@@ -2,7 +2,7 @@
 
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in `dispatch_server_events` is the live
-divergence. Keep this vendor dir until (2)/(3)/(4)/(5)/(6)/(7) below are
+divergence. Keep this vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8) below are
 upstreamed AND released — #1276 landing is NOT sufficient.
 
 (1) The original "keep newest queued waves on per-batch overflow"
@@ -88,3 +88,16 @@ upstreamed AND released — #1276 landing is NOT sufficient.
     workaround + `--qoi-force-rgb` can be deleted. Until then, users pointing
     `ironrdp-viewer` at macrdp should pass `--qoi-force-rgb`; mstsc / MS Remote
     Desktop / Windows App / FreeRDP don't advertise QOI and are unaffected.
+
+(8) AudioWave carries an explicit per-wave duration (NOT upstreamed): the
+    `AudioWave` tuple in `src/sound.rs` gained a third field
+    `Option<f64> duration_ms`, and `dispatch_server_events` now uses
+    `duration_ms.unwrap_or_else(|| data.len() as f64 / BYTES_PER_MS)` for
+    `wave_ms` instead of always deriving it from byte length. Required for the
+    `--enable-aac` path in macrdp: a compressed AAC access unit is ~120 bytes
+    for ~23 ms of audio, so the hardcoded PCM `BYTES_PER_MS = 176.4` would read
+    the projected client buffer as near-empty and silently disable the
+    drop-oldest / resync lag control (divergences (2)/(3)). The PCM path passes
+    `None` and is byte-for-byte unchanged. Small and upstreamable (generalizes a
+    PCM-only constant to any advertised codec); offer it upstream alongside the
+    SuppressOutput work. Until then it rides with this fork.

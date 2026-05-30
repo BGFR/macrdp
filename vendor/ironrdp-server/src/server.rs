@@ -1098,7 +1098,7 @@ impl RdpServer {
             const BYTES_PER_MS: f64 = 176.4;
 
             loop {
-                let (data, ts) = match audio_receiver.recv().await {
+                let (data, ts, duration_ms) = match audio_receiver.recv().await {
                     Some(wave) => wave,
                     None => {
                         debug!("audio channel closed; stopping audio dispatch");
@@ -1106,7 +1106,13 @@ impl RdpServer {
                     }
                 };
 
-                let wave_ms = data.len() as f64 / BYTES_PER_MS;
+                // PCM waves leave `duration_ms` None and we derive the
+                // playback time from byte length (BYTES_PER_MS). A compressed
+                // codec (AAC) carries its own duration because its byte length
+                // is unrelated to playback time — a ~120-byte AU is ~23 ms, so
+                // the bytes-to-ms assumption would otherwise read the buffer as
+                // near-empty and disable the drop/resync lag control entirely.
+                let wave_ms = duration_ms.unwrap_or_else(|| data.len() as f64 / BYTES_PER_MS);
 
                 // Cross-batch audio-lag control. Identical model to the
                 // formerly-on-Self version. Drop stale waves and resync

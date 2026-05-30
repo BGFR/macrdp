@@ -59,16 +59,30 @@ pub struct MacRdpsnd {
     /// the client's audio renderer drains naturally. Pass
     /// `--no-mute-on-minimize` on the CLI to flip this off.
     mute_on_minimize: bool,
+    /// When true (`--enable-aac`), advertise AAC-LC ahead of PCM so clients
+    /// that decode it negotiate compressed audio (~11x smaller than PCM).
+    /// PCM stays in the list as the automatic fallback.
+    enable_aac: bool,
+    /// Target AAC bitrate in bits/sec (`--aac-bitrate`, default 128_000).
+    /// Used both to size the advertised format and to configure the encoder.
+    aac_bitrate: u32,
 }
 
 impl MacRdpsnd {
-    pub fn new(display_suppressed: Option<Arc<AtomicBool>>, mute_on_minimize: bool) -> Self {
+    pub fn new(
+        display_suppressed: Option<Arc<AtomicBool>>,
+        mute_on_minimize: bool,
+        enable_aac: bool,
+        aac_bitrate: u32,
+    ) -> Self {
         Self {
             sender: Arc::new(Mutex::new(None)),
             audio_sender: Arc::new(Mutex::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
             display_suppressed,
             mute_on_minimize,
+            enable_aac,
+            aac_bitrate,
         }
     }
 }
@@ -81,14 +95,23 @@ impl ServerEventSender for MacRdpsnd {
 
 impl SoundServerFactory for MacRdpsnd {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
+        // AAC first so the negotiation in `start()` (first server format the
+        // client also accepts) prefers it; PCM stays as the fallback for
+        // clients without AAC decode.
+        let formats = if self.enable_aac {
+            vec![aac_format(self.aac_bitrate), pcm_format()]
+        } else {
+            vec![pcm_format()]
+        };
         Box::new(MacRdpsndBackend {
             sender: self.sender.clone(),
             audio_sender: self.audio_sender.clone(),
             generation: self.generation.clone(),
             my_gen: 0,
-            formats: vec![pcm_format()],
+            formats,
             display_suppressed: self.display_suppressed.clone(),
             mute_on_minimize: self.mute_on_minimize,
+            aac_bitrate: self.aac_bitrate,
         })
     }
 
@@ -110,6 +133,26 @@ fn pcm_format() -> AudioFormat {
     }
 }
 
+/// AAC-LC `AUDIO_FORMAT` for `WAVE_FORMAT_AAC_MS` (0xA106).
+///
+/// Mirrors what FreeRDP's server advertises: `cbSize = 0` (no HEAACWAVEINFO /
+/// AudioSpecificConfig blob — `data: None`), `n_block_align = 4`,
+/// `bits_per_sample = 16`, with `n_avg_bytes_per_sec` set to the target
+/// bitrate/8 so the client sizes its buffers. The wire payload is raw AAC-LC
+/// access units (see `src/aac.rs`). `bitrate` is bits/sec.
+fn aac_format(bitrate: u32) -> AudioFormat {
+    let block_align = (CHANNELS as u32) * (BITS_PER_SAMPLE as u32 / 8);
+    AudioFormat {
+        format: WaveFormat::AAC_MS,
+        n_channels: CHANNELS,
+        n_samples_per_sec: SAMPLE_RATE,
+        n_avg_bytes_per_sec: bitrate / 8,
+        n_block_align: block_align as u16,
+        bits_per_sample: BITS_PER_SAMPLE,
+        data: None,
+    }
+}
+
 #[derive(Debug)]
 struct MacRdpsndBackend {
     sender: Sender,
@@ -123,6 +166,9 @@ struct MacRdpsndBackend {
     display_suppressed: Option<Arc<AtomicBool>>,
     /// Default-on opt-out via `--no-mute-on-minimize`.
     mute_on_minimize: bool,
+    /// Target AAC bitrate (bits/sec); only consulted when the negotiated
+    /// format is `WAVE_FORMAT_AAC_MS`.
+    aac_bitrate: u32,
 }
 
 impl RdpsndServerHandler for MacRdpsndBackend {
@@ -131,30 +177,53 @@ impl RdpsndServerHandler for MacRdpsndBackend {
     }
 
     fn start(&mut self, client_format: &ClientAudioFormatPdu) -> Option<u16> {
-        // wFormatNo in the Wave/Wave2 PDU indexes the *server's* format list
-        // (what we sent in the Server Audio Formats PDU), not the client's
-        // reply list. Returning a client-list index here makes the client
-        // decode our audio with whatever format sits at that index in the
-        // server list — audible as wrong pitch and progressive drift when the
-        // two lists don't line up. So find the first server format the client
-        // echoed back as accepted and return *its* index into our list.
-        let format_no = self.formats.iter().position(|server_fmt| {
-            client_format.formats.iter().any(|client_fmt| {
-                client_fmt.format == server_fmt.format
-                    && client_fmt.n_channels == server_fmt.n_channels
-                    && client_fmt.n_samples_per_sec == server_fmt.n_samples_per_sec
-                    && client_fmt.bits_per_sample == server_fmt.bits_per_sample
-            })
-        });
-        let Some(format_no) = format_no else {
+        let fmt_eq = |a: &AudioFormat, b: &AudioFormat| {
+            a.format == b.format
+                && a.n_channels == b.n_channels
+                && a.n_samples_per_sec == b.n_samples_per_sec
+                && a.bits_per_sample == b.bits_per_sample
+        };
+
+        // Choose which format to send: walk OUR list (AAC ahead of PCM) and
+        // take the first one the client also advertised. This drives the
+        // AAC-vs-PCM preference and tells the capture loop what to encode.
+        let Some(server_idx) = self
+            .formats
+            .iter()
+            .position(|sf| client_format.formats.iter().any(|cf| fmt_eq(cf, sf)))
+        else {
             warn!(
                 client_formats = client_format.formats.len(),
                 "client accepted none of the server audio formats; no audio"
             );
             return None;
         };
+        let chosen = &self.formats[server_idx];
+        let use_aac = chosen.format == WaveFormat::AAC_MS;
+
+        // wFormatNo on the wire must index the CLIENT's own format list (the
+        // Client Audio Formats PDU it sent back), NOT our server list. The
+        // client resolves the wave's format as `ClientFormats[wFormatNo]` and
+        // FreeRDP/Thincast hard-reject `wFormatNo >= NumberOfClientFormats`
+        // (verified in rdpsnd_recv_wave2_pdu) — so a PCM-only client (1
+        // format) silently dropped every wave when we sent PCM's *server*
+        // index (1, once AAC took slot 0). mstsc tolerated the server index
+        // only because the lists coincided while we advertised a single
+        // format. Translate the chosen format to its position in the client's
+        // list. (Defensive None: can't actually fail — server_idx was found by
+        // matching against this very list.)
+        let Some(format_no) = client_format
+            .formats
+            .iter()
+            .position(|cf| fmt_eq(cf, chosen))
+        else {
+            warn!("negotiated format not found in client list; no audio");
+            return None;
+        };
         debug!(
             format_no,
+            server_idx,
+            use_aac,
             client_formats = client_format.formats.len(),
             version = ?client_format.version,
             "rdpsnd audio format negotiated"
@@ -171,6 +240,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         let my_gen = self.my_gen;
         let display_suppressed = self.display_suppressed.clone();
         let mute_on_minimize = self.mute_on_minimize;
+        let aac_bitrate = self.aac_bitrate;
         // Dedicated OS thread at USER_INTERACTIVE QoS for the entire
         // capture / resample / channel-send pipeline. Tokio workers ride
         // USER_INITIATED (see main.rs::boost_thread_qos) which a cargo
@@ -202,6 +272,8 @@ impl RdpsndServerHandler for MacRdpsndBackend {
                         my_gen,
                         display_suppressed,
                         mute_on_minimize,
+                        use_aac,
+                        aac_bitrate,
                     )
                     .await
                     {
@@ -244,6 +316,7 @@ fn boost_audio_qos() {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 async fn capture_loop(
     sender: Sender,
     audio_sender: AudioSender,
@@ -251,6 +324,8 @@ async fn capture_loop(
     my_gen: u64,
     display_suppressed: Option<Arc<AtomicBool>>,
     mute_on_minimize: bool,
+    use_aac: bool,
+    aac_bitrate: u32,
 ) -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
     use rubato::Resampler;
@@ -305,6 +380,23 @@ async fn capture_loop(
     let mut s: Option<mpsc::UnboundedSender<ServerEvent>> = None;
     let mut audio_s: Option<mpsc::Sender<AudioWave>> = None;
 
+    // AAC encoder, present only when the client negotiated WAVE_FORMAT_AAC_MS
+    // (`--enable-aac` and the client advertised AAC decode). Built up front so
+    // a failure surfaces immediately rather than mid-stream; if the encoder
+    // can't be created we end the loop (no audio) instead of shipping raw PCM
+    // bytes the client would try to decode as AAC.
+    let mut aac_encoder = if use_aac {
+        Some(
+            crate::aac::AacEncoder::new(SAMPLE_RATE, CHANNELS, aac_bitrate)
+                .context("init AAC encoder")?,
+        )
+    } else {
+        None
+    };
+    if use_aac {
+        info!(bitrate = aac_bitrate, "AAC-LC audio encoding enabled");
+    }
+
     // Shallow queue: SCK's async buffer is a drop-oldest ring of this depth.
     // Each slot is ~20 ms of audio, so 2 caps capture-side staleness at ~40 ms
     // while leaving one slot of headroom against scheduler jitter. Lower would
@@ -346,6 +438,11 @@ async fn capture_loop(
     // wave size is bigger than the server's hardcoded WAVE_MS expects.
     let mut output_samples: u64 = 0;
     let mut waves_emitted: u64 = 0;
+    // Encoded bytes actually shipped per window. Logged as `wire_kbps` so the
+    // compression is directly visible: raw PCM sits at ~1411 kbps, AAC-LC at
+    // roughly `--aac-bitrate` (~128). The clearest in-log proof `--enable-aac`
+    // is doing what it claims.
+    let mut bytes_emitted: u64 = 0;
 
     loop {
         if generation.load(Ordering::SeqCst) != my_gen {
@@ -402,7 +499,16 @@ async fn capture_loop(
             let measured_waves = waves_emitted as f64 / elapsed;
             let expected_in = f64::from(SCK_SAMPLE_RATE);
             let expected_out = f64::from(SAMPLE_RATE);
-            let expected_waves = expected_in / RESAMPLE_CHUNK as f64;
+            // PCM emits one wave per resampled chunk (RESAMPLE_CHUNK input
+            // samples at the SCK rate → ~46.875/s). AAC emits one wave per
+            // 1024-frame access unit at the *output* rate → ~43.07/s. Pick the
+            // right baseline so `waves_per_sec` vs `waves_expected` is a real
+            // health check for the active codec, not always the PCM number.
+            let expected_waves = if use_aac {
+                expected_out / crate::aac::FRAMES_PER_PACKET as f64
+            } else {
+                expected_in / RESAMPLE_CHUNK as f64
+            };
             let avg_wave_samples = if waves_emitted > 0 {
                 output_samples as f64 / waves_emitted as f64
             } else {
@@ -416,6 +522,7 @@ async fn capture_loop(
             } else {
                 0.0
             };
+            let wire_kbps = bytes_emitted as f64 * 8.0 / elapsed / 1000.0;
             debug!(
                 in_rate = measured_in,
                 in_expected = expected_in,
@@ -425,12 +532,15 @@ async fn capture_loop(
                 waves_expected = expected_waves,
                 avg_wave_samples,
                 avg_wave_ms,
+                wire_kbps,
+                codec = if use_aac { "aac" } else { "pcm" },
                 model_wave_ms = 1024.0 / 48.0,
                 "audio capture rates"
             );
             samples_received = 0;
             output_samples = 0;
             waves_emitted = 0;
+            bytes_emitted = 0;
             last_rate_log = std::time::Instant::now();
         }
 
@@ -483,43 +593,70 @@ async fn capture_loop(
             if pcm.is_empty() {
                 continue;
             }
-            waves_emitted += 1;
 
-            let ts_ms = start_instant.elapsed().as_millis() as u32;
-
-            // Lazy resolve both senders on first need. If set_sender /
-            // set_audio_sender haven't populated their Mutexes yet, retry
-            // next iteration — at 48 kHz / 1024 samples this is ~21 ms
-            // later.
-            if audio_s.is_none() {
-                audio_s = audio_sender.lock().unwrap().clone();
-            }
-            if let Some(audio_ref) = audio_s.as_ref() {
-                // Bounded channel: send().await applies backpressure if
-                // the dispatch_audio task is behind, but if we're at
-                // capacity we'd rather drop this wave at the SCK level
-                // than block the capture loop (which would back up the
-                // SCK ring buffer and lose newer audio anyway). Use
-                // try_send: on Full, log+drop; on Closed, exit.
-                match audio_ref.try_send((pcm, ts_ms)) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        debug!("audio channel full; dropping wave (dispatch_audio behind)");
+            // The wave(s) to ship for this resampled chunk. PCM emits exactly
+            // one wave with the bytes as-is (`None` duration → the dispatcher
+            // derives playback time from byte length). AAC feeds the chunk to
+            // the encoder, which returns zero or more raw access units (it
+            // buffers internally to 1024-frame packets, with a one-time
+            // priming delay at stream start); each AU carries an explicit
+            // duration so the vendored audio-lag model gets a real playback
+            // time instead of dividing the compressed byte count by 176.4.
+            let waves: Vec<(Vec<u8>, Option<f64>)> = if let Some(enc) = aac_encoder.as_mut() {
+                let dur = crate::aac::packet_duration_ms(enc.sample_rate());
+                match enc.encode(&pcm) {
+                    Ok(aus) => aus.into_iter().map(|au| (au, Some(dur))).collect(),
+                    Err(e) => {
+                        warn!("AAC encode failed: {e}");
+                        Vec::new()
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                 }
             } else {
-                // Audio sender not wired (older server build / non-macrdp
-                // host). Fall back to the unified ServerEvent channel.
-                if s.is_none() {
-                    s = sender.lock().unwrap().clone();
+                vec![(pcm, None)]
+            };
+
+            for (data, duration_ms) in waves {
+                waves_emitted += 1;
+                bytes_emitted += data.len() as u64;
+                let ts_ms = start_instant.elapsed().as_millis() as u32;
+
+                // Lazy resolve both senders on first need. If set_sender /
+                // set_audio_sender haven't populated their Mutexes yet, retry
+                // next iteration — at 48 kHz / 1024 samples this is ~21 ms
+                // later.
+                if audio_s.is_none() {
+                    audio_s = audio_sender.lock().unwrap().clone();
                 }
-                let Some(s_ref) = s.as_ref() else { continue };
-                if s_ref
-                    .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(pcm, ts_ms)))
-                    .is_err()
-                {
-                    return Ok(());
+                if let Some(audio_ref) = audio_s.as_ref() {
+                    // Bounded channel: send().await applies backpressure if
+                    // the dispatch_audio task is behind, but if we're at
+                    // capacity we'd rather drop this wave at the SCK level
+                    // than block the capture loop (which would back up the
+                    // SCK ring buffer and lose newer audio anyway). Use
+                    // try_send: on Full, log+drop; on Closed, exit.
+                    match audio_ref.try_send((data, ts_ms, duration_ms)) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            debug!("audio channel full; dropping wave (dispatch_audio behind)");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                    }
+                } else {
+                    // Audio sender not wired (older server build / non-macrdp
+                    // host). Fall back to the unified ServerEvent channel.
+                    // Note: this path can't carry an explicit duration, so AAC
+                    // over it would mistime — but our vendored server always
+                    // wires the audio sender, so AAC never takes this branch.
+                    if s.is_none() {
+                        s = sender.lock().unwrap().clone();
+                    }
+                    let Some(s_ref) = s.as_ref() else { continue };
+                    if s_ref
+                        .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, ts_ms)))
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -531,6 +668,7 @@ async fn capture_loop(
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 async fn capture_loop(
     _sender: Sender,
     _audio_sender: AudioSender,
@@ -538,6 +676,8 @@ async fn capture_loop(
     _my_gen: u64,
     _display_suppressed: Option<Arc<AtomicBool>>,
     _mute_on_minimize: bool,
+    _use_aac: bool,
+    _aac_bitrate: u32,
 ) -> anyhow::Result<()> {
     Ok(())
 }

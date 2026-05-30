@@ -1,3 +1,4 @@
+mod aac;
 mod audio;
 mod auth;
 mod avc444;
@@ -353,6 +354,22 @@ struct Args {
     /// at the cost of accepting that drift on refocus.
     #[arg(long = "no-mute-on-minimize", action = clap::ArgAction::SetTrue)]
     no_mute_on_minimize: bool,
+
+    /// Compress forwarded audio as AAC-LC over RDPSND (MS-RDPEA
+    /// WAVE_FORMAT_AAC_MS) instead of raw 16-bit PCM — ~11x less audio
+    /// bandwidth (~128 kbps vs ~1.4 Mbps). Off by default: AAC adds ~40–50 ms
+    /// of encoder priming latency, so PCM stays the zero-latency LAN default.
+    /// Clients that don't advertise AAC decode fall back to PCM automatically.
+    /// AudioToolbox-encoded; macOS-only.
+    #[arg(long)]
+    enable_aac: bool,
+
+    /// Target AAC bitrate in bits/sec (only with --enable-aac). Default
+    /// 128000. 96000 maximizes savings (audible artifacts on music); 192000
+    /// is near-transparent. Advertised to the client and used to configure
+    /// the encoder.
+    #[arg(long, default_value_t = 128_000)]
+    aac_bitrate: u32,
 
     /// Force QOI BitmapUpdates to be encoded with `Channels::Rgb` instead of
     /// `Channels::Rgba`. The default (off) emits RGBA per the underlying
@@ -1069,6 +1086,8 @@ async fn async_main() -> Result<()> {
     let sound: Box<dyn ironrdp_server::SoundServerFactory> = Box::new(audio::MacRdpsnd::new(
         Some(display_suppressed.clone()),
         !args.no_mute_on_minimize,
+        args.enable_aac,
+        args.aac_bitrate,
     ));
 
     // with_hybrid advertises HYBRID | HYBRID_EX so clients run CredSSP/NLA

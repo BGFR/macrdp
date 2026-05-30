@@ -41,7 +41,11 @@ src/runloop_thread.rs  Dedicated CFRunLoop-hosting std::thread with a
                        CFRunLoopSource; one shared thread for the process
                        lifetime, started lazily on first submit().
 src/audio.rs      RDPSND ← second SCK stream with system-audio capture,
-                  rubato 48→44.1 kHz resample, latency-bounded
+                  rubato 48→44.1 kHz resample, latency-bounded. Ships raw
+                  PCM by default, or AAC-LC via src/aac.rs (--enable-aac).
+src/aac.rs        AudioToolbox AAC-LC encoder (--enable-aac). AudioConverter
+                  FFI: interleaved i16 PCM → raw AAC access units for the
+                  WAVE_FORMAT_AAC_MS RDPSND path. macOS-only.
 src/virtual_display/    Opt-in headless display via undocumented
   mod.rs                CGVirtualDisplay* private API. Public Rust
   private_api.rs        surface is `VirtualDisplay::new(w,h,hz)` +

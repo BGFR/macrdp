@@ -28,7 +28,7 @@ Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
   - Both paths use the same `resolve_dest` for `relative_path` sanitization (rejects `.`, `..`, embedded `/`) so a malicious remote can't escape the temp sandbox; both share the same `fetch_one_file` chunk fan-out (pwrite via `FileExt::write_at` over an `Arc<File>`, no per-chunk open+seek+close); both rely on `CAN_LOCK_CLIPDATA` being negotiated (see clipboard.rs `client_capabilities`) so cliprdr auto-issues Lock/Unlock around the descriptor — without that cap, Windows treated the descriptor as ephemeral and would silently drop rapid follow-up Ctrl-C *and* release file data mid-stream on large downloads (CB_RESPONSE_FAIL). A `SelfChangeCount` atomic stops our own NSPasteboard write from being rebroadcast to Windows by the change-count poller.
 
   **Ctrl-C on a folder in Windows Explorer is a known no-op** — not our bug, and not fixable from the server side. Explorer puts `CFSTR_SHELLIDLIST` (Shell IDList Array) on the clipboard as the primary format and delay-renders `FileGroupDescriptorW` only when a shell-aware receiver asks. mstsc doesn't request the delayed format, so it never forwards anything via CLIPRDR — `cliprdr=debug` shows zero PDUs for the folder copy attempt. Workaround for the user: enter the folder in Explorer, `Ctrl-A` then `Ctrl-C` to copy the contents (with directory descriptors for any subfolders) — that path uses `FileGroupDescriptorW` directly and forwards correctly. True drag-from-Windows folder copy would need drive redirection (a different RDP feature, not clipboard).
-- Forward macOS system audio to the remote (RDPSND, 44.1 kHz stereo 16-bit PCM; SCK captures at 48 kHz and the capture loop resamples via `rubato`).
+- Forward macOS system audio to the remote (RDPSND, 44.1 kHz stereo 16-bit PCM; SCK captures at 48 kHz and the capture loop resamples via `rubato`). Optionally compress it as **AAC-LC** (`--enable-aac`, `WAVE_FORMAT_AAC_MS` over RDPSND, ~128 kbps vs PCM's ~1.4 Mbit/s) — AudioToolbox-encoded (`src/aac.rs`), raw access units, advertised ahead of PCM so clients that decode AAC negotiate it while everyone else falls back to PCM automatically. Opt-in because AAC adds ~40–50 ms of encoder priming latency, so PCM stays the zero-latency LAN default. See the AAC quirk note below.
 - NLA / CredSSP authentication — no more "type username before Connect" mstsc workaround.
 - Optionally attach a **headless virtual display** (`--virtual-display --width W --height H`) and serve that to the client instead of mirroring the primary panel — behaves like plugging in an external monitor, so the local Mac screen stays available while the remote session has its own desktop at any requested resolution. Backed by undocumented `CGVirtualDisplay*` private API; see the maintenance note below.
 - Optionally go **fully headless while a client is connected** via one of two mechanisms (mutually exclusive):
@@ -76,6 +76,11 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
 --keyframe-interval SECS  # periodic IDR safety net (default 2; only with --enable-h264)
 --flush-frames N          # trailing skip-P-frames re-sent after each change to drain
                           #   mstsc's presentation buffer (default 4; 0 disables; --enable-h264)
+--enable-aac              # Compress RDPSND audio as AAC-LC (WAVE_FORMAT_AAC_MS)
+                          #   instead of raw PCM; ~11x less bandwidth. PCM fallback is
+                          #   automatic for clients without AAC decode. Adds ~40-50 ms
+                          #   latency, so off by default.
+--aac-bitrate BPS         # AAC target bitrate (default 128000; only with --enable-aac)
 --no-lazy-paste           # Opt out of lazy Windows→Mac file paste (default ON).
                           #   Lazy streams bytes on Cmd-V (NSFilePresenter) with native
                           #   "Preparing to paste" progress and lower chunk parallelism;

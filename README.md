@@ -70,6 +70,14 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
                           mstsc's presentation buffer (default 4; only with
                           --enable-h264). Stops the last keystroke before a pause
                           lagging until the next keyframe. 0 disables. See "Video".
+--enable-aac              Compress system audio as AAC-LC over RDPSND
+                          (WAVE_FORMAT_AAC_MS) instead of raw PCM — ~11x less
+                          audio bandwidth. Clients that don't decode AAC fall
+                          back to PCM automatically. Off by default (adds
+                          ~40–50 ms latency). macOS-only. See "Audio".
+--aac-bitrate BPS         AAC target bitrate in bits/sec (default 128000; only
+                          with --enable-aac). 96000 saves the most bandwidth,
+                          192000 is near-transparent.
 --no-lazy-paste           Opt out of lazy Windows→Mac file paste (default ON).
                           With lazy, temp files are pre-sized but empty when the
                           copy lands and stream bytes only on Cmd-V, with macOS's
@@ -210,6 +218,8 @@ At 60fps the frame budget is 16.67 ms. The scalar path is fine at 1080p (~30% of
 ## Audio
 
 System audio rides over the RDPSND virtual channel as 16-bit stereo PCM at **44.1 kHz**. ScreenCaptureKit only supports 8 / 16 / 24 / 48 kHz, so the capture loop captures at 48 kHz and resamples to 44.1 with [`rubato`](https://github.com/HEnquist/rubato) before sending. 44.1 matches the native rate of most Windows audio endpoints, which avoids the client-side resampling drift that otherwise accumulates into multi-second audio backlogs. A generation counter on the audio factory keeps a client reconnect from leaving a second capture loop feeding the channel. The vendored `ironrdp-server` carries a single patch that makes `dispatch_server_events` keep the *newest* queued waves on per-batch overflow instead of the oldest — without it, a one-off video-encode stall would bake a permanent audio-latency offset into the session.
+
+**AAC compression** (opt-in, `--enable-aac`). By default audio is uncompressed PCM (~1.4 Mbit/s). Pass `--enable-aac` to encode it as **AAC-LC** over RDPSND (`WAVE_FORMAT_AAC_MS`, ~128 kbps by default — about 11x smaller), which matters over WAN or constrained links. The encoder is AudioToolbox (software AAC-LC); the wire payload is raw AAC access units. The server advertises AAC ahead of PCM, so clients that decode it (mstsc, Microsoft Remote Desktop / Windows App, FreeRDP built with AAC support) negotiate AAC automatically while clients without it fall back to PCM transparently. It's off by default because AAC adds ~40–50 ms of encoder priming latency — on a LAN, PCM's zero added latency is the better default. Tune the bitrate with `--aac-bitrate` (default `128000`; `96000` saves the most bandwidth, `192000` is near-transparent for music).
 
 **Mute on minimize** (default-on, opt out with `--no-mute-on-minimize`). When the client minimizes its window it sends the standard `SuppressOutput { None }` PDU; the server stops emitting both EGFX video frames and RDPSND waves until the client refocuses (`RefreshRectangle` / `SuppressOutput { Some(rect) }`). Without this, mstsc accumulates a backlog of video frames + audio waves during a long minimize that has to chew through on refocus, producing several seconds of input lockout, audio drift, and a video catch-up storm. With it, you get a brief audio gap on refocus and audio + video resume in sync. Both gates are debounced (1 s) so transient `SuppressOutput` flaps mstsc emits under wire pressure (e.g., during a heavy local `cargo build`) don't oscillate the mute and cause stutter. Pass `--no-mute-on-minimize` if you specifically want audio to keep playing while the client window is minimized — accepting that audio will drift by however long was spent minimized.
 

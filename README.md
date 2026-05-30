@@ -50,6 +50,11 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
                           is to spawn `caffeinate` so an idle Mac doesn't
                           drop the connection mid-session)
 --width / --height        Override autodetected display size
+--hidpi                   Capture the primary display at backing (Retina) pixel
+                          resolution instead of logical points (e.g. 3024×1964
+                          vs 1512×982) for crisp native pixels. ~4× the pixels;
+                          best with --enable-h264. Ignored with --width/--height
+                          or --virtual-display. See "Display". macOS-only.
 --fps N                   Frame rate cap (default 15, or 60 with --enable-h264
                           — see "Video" for why H.264 wants the higher rate)
 --enable-h264             Stream the display as H.264 over EGFX (AVC420),
@@ -176,6 +181,18 @@ Both restore the original layout when the last client disconnects, and both auto
 # Use the eager Windows→Mac file paste path (default is lazy / on-demand).
 ./macrdp --no-lazy-paste
 ```
+
+## Display resolution (`--hidpi`)
+
+By default macrdp captures and advertises the Mac's **logical** resolution — the points it reports in System Settings (e.g. 1512×982 on a default-scaled 14" MacBook). On a Retina panel that's half the physical pixels, so any client whose window is larger upscales it and text looks soft.
+
+Pass **`--hidpi`** to capture at the display's **backing (Retina) pixel resolution** instead (e.g. 3024×1964) — clients then render crisp native pixels. It's **opt-in** because it's ~4× the pixels:
+
+- **Pair it with `--enable-h264`.** H.264 compresses the higher resolution cleanly and the client downscales it sharply — that's the real "Retina remote desktop" experience. On the legacy bitmap path it just means 4× the bandwidth.
+- **mstsc feels laggy at HiDPI.** mstsc decodes 4× the pixels every frame and its ~2-frame presentation buffer now holds 4×-bigger frames, so responsiveness drops. **Thincast / FreeRDP stay snappy** — their H.264 decoders keep up. The server itself isn't the bottleneck (it encodes a 3024×1964 frame in ~10 ms, well inside the 60fps budget); the cost is client-side decode. Prefer a capable client if you want HiDPI.
+- Ignored when you pass explicit `--width`/`--height` (you've chosen the size) or with `--virtual-display` (already an explicit resolution).
+
+Input and cursor are resolution-correct at any setting — clicks land precisely and the pointer stays normal-sized.
 
 ## Video (H.264)
 

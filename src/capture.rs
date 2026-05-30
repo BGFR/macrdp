@@ -415,15 +415,38 @@ mod macos {
 
             let native_w = u16::try_from(display.width()).context("display width > u16")?;
             let native_h = u16::try_from(display.height()).context("display height > u16")?;
-            let force_full_frame = native_w != width || native_h != height;
+            // Backing (Retina) pixel size of this display. Capturing at EITHER
+            // the logical point size (native_w/h) or the backing pixel size
+            // (the `--hidpi` path) is a 1:1 native capture — SCK delivers the
+            // panel's own pixels and its dirty-rects line up with our
+            // framebuffer. Only a size matching neither (explicit
+            // --width/--height that asks SCK to scale) forces full frames,
+            // because then dirty-rects arrive in source coords and misalign.
+            let (backing_w, backing_h) = {
+                use core_graphics::display::CGDisplay;
+                CGDisplay::new(display.display_id())
+                    .display_mode()
+                    .and_then(|m| {
+                        Some((
+                            u16::try_from(m.pixel_width()).ok()?,
+                            u16::try_from(m.pixel_height()).ok()?,
+                        ))
+                    })
+                    .unwrap_or((native_w, native_h))
+            };
+            let force_full_frame = !((native_w == width && native_h == height)
+                || (backing_w == width && backing_h == height));
             if force_full_frame {
                 tracing::warn!(
                     requested_w = width,
                     requested_h = height,
                     native_w,
                     native_h,
-                    "configured size != native; SCK dirty rects are in source coords \
-                     and would misalign — sending full frames every tick (higher bandwidth)"
+                    backing_w,
+                    backing_h,
+                    "configured size != native points or backing; SCK dirty rects are in \
+                     source coords and would misalign — sending full frames every tick \
+                     (higher bandwidth)"
                 );
             }
 
@@ -654,6 +677,21 @@ mod macos {
                     u16::try_from(guard.height()).context("pixel buffer height > u16")?;
                 let stride_bytes = guard.bytes_per_row();
                 let src = guard.as_slice();
+
+                // Log the dimensions SCK actually delivers, once per session.
+                // `pb_width`/`pb_height` are the real captured buffer size — at
+                // backing (Retina) pixels with `--hidpi`, at logical points
+                // otherwise. Confirms `--hidpi` took effect and that SCK didn't
+                // silently downscale.
+                if !self.seeded {
+                    tracing::debug!(
+                        pb_width,
+                        pb_height,
+                        stride_bytes,
+                        force_full_frame = self.force_full_frame,
+                        "capture: first frame delivered"
+                    );
+                }
 
                 // EGFX/H.264 path: submit the full frame to the encoder. Once
                 // EGFX has negotiated (`Ok(true)`), it owns the display — skip

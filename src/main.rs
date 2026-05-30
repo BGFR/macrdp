@@ -90,11 +90,28 @@ fn bitmap_codecs() -> BitmapCodecs {
 #[cfg(target_os = "macos")]
 fn primary_screen_geometry() -> ((f64, f64), (f64, f64)) {
     use core_graphics::display::CGDisplay;
-    let main = CGDisplay::main();
-    (
-        (0.0, 0.0),
-        (main.pixels_wide() as f64, main.pixels_high() as f64),
-    )
+    // Size in *logical points* (e.g. 1512×982), matching the virtual-display
+    // path and the `CGDisplay::bounds()` scaling in input.rs. The cursor's
+    // HiDPI scale factor is derived as framebuffer_pixels / these points, so
+    // this MUST be points — NOT `pixels_wide/high` (backing pixels), which
+    // would make the ratio 1.0 even at Retina and leave the cursor half-size.
+    let b = CGDisplay::main().bounds();
+    ((b.origin.x, b.origin.y), (b.size.width, b.size.height))
+}
+
+/// Backing (Retina) pixel resolution of the main display, for the HiDPI
+/// capture path. `CGDisplayMode::pixel_width/height` is the true backing size
+/// (e.g. 3024×1964 on a 14" MBP), distinct from the logical point size
+/// (`mode.width/height`, ~1512×982) and from `CGDisplay::pixels_wide/high`
+/// (the canonical mode, which equals points on many configs). Returns `None`
+/// if the mode can't be read or the size doesn't fit u16.
+#[cfg(target_os = "macos")]
+fn primary_backing_size() -> Option<(u16, u16)> {
+    use core_graphics::display::CGDisplay;
+    let mode = CGDisplay::main().display_mode()?;
+    let w = u16::try_from(mode.pixel_width()).ok()?;
+    let h = u16::try_from(mode.pixel_height()).ok()?;
+    Some((w, h))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -140,6 +157,16 @@ struct Args {
     /// Same trade-off as --width when overridden.
     #[arg(long)]
     height: Option<u16>,
+
+    /// Capture the primary display at its backing (Retina) pixel resolution
+    /// instead of logical points — e.g. 3024×1964 instead of 1512×982 — so
+    /// clients render crisp native pixels instead of upscaling a point-density
+    /// frame. Off by default: it's ~4× the pixels (heavier on legacy/slow
+    /// links), and the win is biggest with --enable-h264 (compresses cleanly,
+    /// the client downscales sharply). Ignored when --width/--height are set or
+    /// with --virtual-display (already an explicit resolution). macOS-only.
+    #[arg(long)]
+    hidpi: bool,
 
     /// Frame rate cap. Defaults to 15 for the legacy bitmap path, or 60 with
     /// --enable-h264 (H.264 over mstsc holds a ~2-frame presentation buffer, so
@@ -988,14 +1015,33 @@ async fn async_main() -> Result<()> {
         (w, h, Some(vd.display_id()), size)
     } else {
         let detected = primary_display_size().await?;
-        let w = args
+        let mut w = args
             .width
             .or(detected.map(|(w, _)| w))
             .unwrap_or(FALLBACK_WIDTH);
-        let h = args
+        let mut h = args
             .height
             .or(detected.map(|(_, h)| h))
             .unwrap_or(FALLBACK_HEIGHT);
+        // --hidpi: capture at the display's backing (Retina) pixel resolution
+        // instead of logical points, unless the user pinned an explicit
+        // --width/--height (in which case they've chosen the size themselves).
+        #[cfg(target_os = "macos")]
+        if args.hidpi && args.width.is_none() && args.height.is_none() {
+            if let Some((bw, bh)) = primary_backing_size() {
+                info!(
+                    points_w = w,
+                    points_h = h,
+                    backing_w = bw,
+                    backing_h = bh,
+                    "--hidpi: capturing at backing pixel resolution"
+                );
+                w = bw;
+                h = bh;
+            } else {
+                warn!("--hidpi: could not read backing pixel size; staying at logical points");
+            }
+        }
         if let Some((dw, dh)) = detected {
             info!(
                 width = w,

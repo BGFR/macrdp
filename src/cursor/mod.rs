@@ -167,6 +167,12 @@ mod macos {
                 return;
             }
             self.last_hash = hash;
+            // No HiDPI scaling: SkyLight's `SLSGetGlobalCursorData` already
+            // returns the cursor at the display's backing (physical) pixels,
+            // and RDP clients render pointer bitmaps at 1:1 device pixels
+            // regardless of the session's framebuffer resolution — so the same
+            // bitmap is correct whether we capture at points or `--hidpi`
+            // backing pixels. (Scaling it up here made the pointer 2× too big.)
             trace!(w, h, hot_x, hot_y, "cursor shape changed");
             out.push(DisplayUpdate::RGBAPointer(RGBAPointer {
                 // macrdp doesn't maintain a client-side pointer cache; every

@@ -16,6 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
 - Connect over TLS to the Mac on port 3390 with a local Mac username/password.
 - See the primary display at native resolution with incremental damage-region updates.
+- Optionally capture the primary display at its **backing (Retina) pixel resolution** (`--hidpi`, e.g. 3024×1964 instead of 1512×982 logical points) so clients render crisp native pixels instead of upscaling a point-density frame. Opt-in (it's ~4× the pixels); the win is biggest with `--enable-h264`. Verified crisp; input/cursor are resolution-correct. **Caveat:** mstsc decodes 4× the pixels per frame and feels laggy at HiDPI — Thincast/FreeRDP stay snappy. See the HiDPI quirk note below.
 - Optionally stream the display as **H.264 over EGFX** (`--enable-h264`, AVC420, Annex-B framing, VideoToolbox-encoded) — far less bandwidth than legacy bitmaps. Verified rendering on mstsc, on FreeRDP built with H.264 decode, and on the macOS Windows App / Microsoft Remote Desktop client (it decodes AVC420 over EGFX — only its *legacy* bitmap-codec list is NSCodec-only). Clients that genuinely don't advertise AVC420 decode (e.g. a decoder-less FreeRDP build) fall back to legacy BitmapUpdate automatically. **Caveat:** reconnecting *mstsc* to a still-running macrdp can show a blank screen (mstsc-specific EGFX surface-handling quirk — confirmed not a server bug, since FreeRDP reconnects cleanly); reliable workaround is to fully close and reopen the mstsc window (clears its surface cache). See the H.264 quirk note below.
 - Drive keyboard and mouse, including modifier keys (per-side L/R tracking with NX_DEVICE bits, Caps Lock as a toggle, MS-RDPBCGR Synchronize lock-state reconciliation), mouse buttons, and wheel.
 - Forward macOS symbolic hotkeys that WindowServer's dispatcher refuses to fire for user-space CGEventPost: Cmd+Tab / Cmd+Shift+Tab cycle apps via Accessibility API (per-bundle dedup with MRU, dead-pid filtering via `kill(pid, 0)`), Cmd+\` / Cmd+Shift+\` cycle windows of the current app (AXRaise + window AXMain + app AXMainWindow for Electron compatibility), Cmd+Space invokes Spotlight via AppleScript, Cmd+Shift+3/4/5 shell out to `/usr/sbin/screencapture` or open Screenshot.app.
@@ -71,6 +72,10 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
 --password PASS           # avoid the interactive prompt (logs are warned)
 --skip-auth               # bypass PAM (also skips password validation)
 --width  / --height       # override autodetected display size
+--hidpi                   # capture the primary display at backing (Retina) pixels
+                          #   instead of logical points (~4x pixels; crisp; best
+                          #   with --enable-h264). Ignored with --width/--height
+                          #   or --virtual-display. macOS-only.
 --fps N                   # default 60 with --enable-h264, else 15
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
 --keyframe-interval SECS  # periodic IDR safety net (default 2; only with --enable-h264)

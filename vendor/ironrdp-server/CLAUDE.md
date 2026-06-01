@@ -48,8 +48,9 @@ released — #1276 landing is NOT sufficient.
     inter-frame sequence preserved); the audio wave-drop ordering is preserved
     independently in `dispatch_audio`. Gated on the egfx feature.
 
-(5) SuppressOutput / RefreshRectangle handling (upstream PR #1319, awaiting
-    review): in `handle_io_channel_data`, pattern-match the two PDUs instead of
+(5) SuppressOutput / RefreshRectangle handling (upstream PR #1319 ✅ MERGED
+    2026-05-27, commit `aa7ff679` — not yet released; vendor stays until a
+    published release carries it): in `handle_io_channel_data`, pattern-match the two PDUs instead of
     warn-and-drop, and flip a shared `Arc<AtomicBool> display_suppressed`
     (exposed via `display_suppressed_handle()` and overridable via
     `set_display_suppressed_handle()` so macrdp can share one flag with
@@ -59,7 +60,9 @@ released — #1276 landing is NOT sufficient.
     docs/known-quirks.md for the client-side trap (first-frame arming gate +
     per-connection reset).
 
-(6) NSCodec encoder + selection (upstream PR #1332, awaiting review): adds
+(6) NSCodec encoder + selection (upstream PR #1332 ✅ MERGED 2026-06-01, commit
+    `54af8f67` — but NOT yet released; this vendor copy stays until a published
+    `ironrdp-server` + `ironrdp-nscodec` release carries it): adds
     `mod nscodec;` in `encoder/mod.rs` (the file was previously dead code,
     never wired up), an `NsCodecHandler` that calls
     `nscodec::encode(bitmap, color_loss_level)`, a `nscodec: Option<(u8, u8)>`
@@ -75,11 +78,14 @@ released — #1276 landing is NOT sufficient.
     at `RUST_LOG=...ironrdp_server::encoder=debug`. Modern FreeRDP loads the
     NSCodec decoder module at connect but doesn't advertise the codec back in
     `ClientConfirmActive`, so xfreerdp/sfreerdp don't exercise this path — only
-    the macOS Microsoft Remote Desktop / Windows App does today. Upstream PR
-    shape: same wiring but the encoder lives in a new `ironrdp-nscodec` peer
-    crate (CBenoit's architecture preference), gated by a new `nscodec` feature
-    on `ironrdp-server`; here the vendor uses the in-tree
-    `vendor/ironrdp-server/src/encoder/nscodec.rs` directly with no feature gate.
+    the macOS Microsoft Remote Desktop / Windows App does today. Upstream shape
+    (as merged): same wiring but the encoder lives in a dedicated `ironrdp-nscodec`
+    peer crate (CBenoit's architecture preference, confirmed in discussion #1322),
+    gated by a new `nscodec` feature on `ironrdp-server`; here the vendor uses the
+    in-tree `vendor/ironrdp-server/src/encoder/nscodec.rs` directly with no feature
+    gate. **Post-release migration:** drop this in-tree wiring and depend on the
+    published `ironrdp-nscodec` crate + enable the `nscodec` feature on
+    `ironrdp-server`.
 
 (7) Opt-in QOI Rgb-only workaround for pre-PR-#1335 `ironrdp-session` clients
     (process-global `QOI_FORCE_RGB: AtomicBool`, public setter
@@ -91,17 +97,19 @@ released — #1276 landing is NOT sufficient.
     `ironrdp-session`'s `fast_path.rs::qoi_apply` Rgba arm is
     `warn!("Unsupported RGBA QOI data")` and drops the frame, so any client
     carrying that code negotiates QOI, gets `Rgba`, and renders blank (412
-    RGBA-warn lines in ~12s on the loopback repro). PR #1335 upstreams the Rgb
-    behaviour as the default; a companion client-side patch (separate branch
-    `feat-client-rgba-qoi` on the clintcan fork, not yet PR'd) adds Rgba decode
-    to `ironrdp-session`. Once the client patch lands and a release ships, the
-    workaround + `--qoi-force-rgb` can be deleted. Until then, users pointing
+    RGBA-warn lines in ~12s on the loopback repro). PR #1335 ✅ MERGED 2026-06-01
+    (commit `8a9ee626`) upstreams the Rgb behaviour as the default; the companion
+    client-side patch landed as PR #1341 ✅ MERGED 2026-06-01 (commit `ef20ea4e`,
+    branch `feat-client-rgba-qoi`) adding Rgba decode to `ironrdp-session` (plus a
+    size-guard in `qoi_apply` against oversized payloads). Both are MERGED but NOT
+    yet released — once a release ships them, the workaround + `--qoi-force-rgb`
+    flag (commit `e22a617`) can be deleted. Until then, users pointing
     `ironrdp-viewer` at macrdp should pass `--qoi-force-rgb`; mstsc / MS Remote
     Desktop / Windows App / FreeRDP don't advertise QOI and are unaffected.
 
 (8) AudioWave carries an explicit per-wave duration (NOT upstreamed): the
     `AudioWave` tuple in `src/sound.rs` gained a third field
-    `Option<f64> duration_ms`, and `dispatch_server_events` now uses
+    `Option<f64> duration_ms`, and the `dispatch_audio` task now uses
     `duration_ms.unwrap_or_else(|| data.len() as f64 / BYTES_PER_MS)` for
     `wave_ms` instead of always deriving it from byte length. Required for the
     `--enable-aac` path in macrdp: a compressed AAC access unit is ~120 bytes

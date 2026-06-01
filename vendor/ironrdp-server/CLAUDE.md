@@ -1,9 +1,10 @@
 # vendor/ironrdp-server — divergence log
 
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
-`Cargo.toml`. The audio-lag control in `dispatch_server_events` is the live
-divergence. Keep this vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8) below are
-upstreamed AND released — #1276 landing is NOT sufficient.
+`Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
+(carved out of `dispatch_server_events`) is the live divergence. Keep this
+vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8) below are upstreamed AND
+released — #1276 landing is NOT sufficient.
 
 (1) The original "keep newest queued waves on per-batch overflow"
     direction-flip LANDED upstream (PR #1276, merged 2026-05-21) — do NOT
@@ -11,14 +12,21 @@ upstreamed AND released — #1276 landing is NOT sufficient.
 
 (2) Cross-batch audio-lag tracker (NOT upstreamed): replaces the per-batch cap
     with a cumulative buffer-depth model (`audio_shipped_ms` vs wall-clock
-    `audio_clock_start` on `RdpServer`) so slow drift from many small client
-    pauses is caught, not just one big stall. Drops oldest waves when the
-    projected client buffer would exceed `MAX_LAG_MS` (200).
+    `audio_clock_start`) so slow drift from many small client pauses is caught,
+    not just one big stall. Drops oldest waves when the projected client buffer
+    would exceed `MAX_LAG_MS` (200). The model + the Wave dispatch itself now
+    live task-local in the dedicated `dispatch_audio` task in `client_loop`
+    (audio was carved out of `dispatch_server_events` onto its own bounded
+    `mpsc` channel via `SoundServerFactory::set_audio_sender`); the former
+    `RdpServer::{audio_shipped_ms, audio_clock_start}` fields are dead state.
 
 (3) Resize-stall resync (NOT upstreamed): when the writer stalls (mstsc
-    freezing the socket during a window resize/move/fullscreen-toggle blocks on
-    the EGFX video frames queued ahead of the waves on the SAME ServerEvent
-    channel — H.264-only, legacy bitmaps coalesce through `dispatch_display`),
+    freezing the socket during a window resize/move/fullscreen-toggle blocks an
+    EGFX video `write_all` while it holds the shared socket-writer mutex; audio
+    rides its own channel + `dispatch_audio` task but every `audio_writer.
+    write_all` serializes on that SAME socket lock — H.264-only, legacy bitmaps
+    don't contend the same way: dirty-rect + intermittent, coalesced through
+    `dispatch_display`),
     wall-clock outruns `audio_shipped_ms` and the (2) model would read it as
     "client starving" and ship the whole stale backlog late, bloating the
     buffer and compounding each stall. Fix: if deficit
@@ -30,13 +38,15 @@ upstreamed AND released — #1276 landing is NOT sufficient.
     EGFX video frames in that batch. Without this, with `--enable-h264` a
     CLIPRDR FileContentsResponse queues behind dozens of large video frames
     every batch, throttling clipboard file copies to a crawl and freezing
-    Windows Explorer's synchronous paste read. Audio is intentionally LEFT in
-    arrival order (interleaved with EGFX) — an earlier version of this patch
-    lumped audio in with clipboard as "non-EGFX" and burst-shipped each batch's
-    waves in a clump, which made the client's adaptive jitter buffer extend and
-    added a few hundred ms of steady-state playback latency. Partition is
-    stable: H.264 inter-frame sequence and audio wave-drop ordering are both
-    preserved. Gated on the egfx feature.
+    Windows Explorer's synchronous paste read. Audio is deliberately NOT part of
+    this batch at all — it ships per-wave in arrival order from the dedicated
+    `dispatch_audio` task (its own channel), preserving the natural ~21 ms
+    cadence; an earlier version of this patch lumped audio in with clipboard as
+    "non-EGFX" and burst-shipped each batch's waves in a clump, which made the
+    client's adaptive jitter buffer extend and added a few hundred ms of
+    steady-state playback latency. The clipboard/EGFX partition is stable (H.264
+    inter-frame sequence preserved); the audio wave-drop ordering is preserved
+    independently in `dispatch_audio`. Gated on the egfx feature.
 
 (5) SuppressOutput / RefreshRectangle handling (upstream PR #1319, awaiting
     review): in `handle_io_channel_data`, pattern-match the two PDUs instead of

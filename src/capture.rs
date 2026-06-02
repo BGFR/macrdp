@@ -599,6 +599,37 @@ mod macos {
         }))
     }
 
+    /// Max pixels per emitted legacy `BitmapUpdate`. The bitmap encoder packs a
+    /// whole rect into one update PDU (one RLE rectangle per ~`65535/(w*4)`
+    /// rows); mstsc renders a single ~1280×720 (≈0.9 MP) update but DROPS a
+    /// 1920×1080 (≈2.1 MP) one — a per-update size/rectangle-count limit — so
+    /// the big initial full-frame paint of a virtual display never shows
+    /// (only the small ticking-clock dirty-rects render). Splitting tall rects
+    /// into strips at or below this proven-good size keeps every update
+    /// renderable. FreeRDP accepts either; it just sees more, smaller updates.
+    const MAX_BITMAP_UPDATE_PIXELS: u32 = 1280 * 720;
+
+    /// Split a rect into horizontal strips each ≤ [`MAX_BITMAP_UPDATE_PIXELS`].
+    /// Returns the rect unchanged when it already fits.
+    fn split_strips(x: u16, y: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
+        if w == 0 || h == 0 {
+            return Vec::new();
+        }
+        if u32::from(w) * u32::from(h) <= MAX_BITMAP_UPDATE_PIXELS {
+            return vec![(x, y, w, h)];
+        }
+        let strip_rows =
+            u16::try_from((MAX_BITMAP_UPDATE_PIXELS / u32::from(w)).max(1)).unwrap_or(u16::MAX);
+        let mut out = Vec::new();
+        let mut row = 0u16;
+        while row < h {
+            let sh = strip_rows.min(h - row);
+            out.push((x, y + row, w, sh));
+            row += sh;
+        }
+        out
+    }
+
     impl Drop for ScreenCaptureUpdates {
         fn drop(&mut self) {
             let _ = self.stream.stop_capture();
@@ -905,9 +936,14 @@ mod macos {
                     _ => vec![(0, 0, pb_width, pb_height)],
                 };
 
+                // Split oversized rects into strips so each BitmapUpdate stays
+                // within the size mstsc will render (see split_strips). No-op
+                // for already-small rects.
                 for (x, y, w, h) in rects {
-                    if let Some(update) = rect_update(src, stride_bytes, x, y, w, h) {
-                        self.pending.push_back(update);
+                    for (sx, sy, sw, sh) in split_strips(x, y, w, h) {
+                        if let Some(update) = rect_update(src, stride_bytes, sx, sy, sw, sh) {
+                            self.pending.push_back(update);
+                        }
                     }
                 }
                 self.seeded = true;

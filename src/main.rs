@@ -175,6 +175,15 @@ struct Args {
     #[arg(long)]
     fps: Option<u32>,
 
+    /// Cursor size multiplier (default 1.0). At 1.0 the pointer is forwarded at
+    /// its native macOS size, matching the cursor on the Mac's own screen with
+    /// an exact hotspot. Some RDP clients draw the pointer at 1:1 device pixels
+    /// while upscaling the desktop image to their window, which can make the
+    /// native-size pointer look small; bump this (e.g. 1.5 or 2.0) to enlarge
+    /// it for comfort. The hotspot stays accurate at any value.
+    #[arg(long, default_value_t = 1.0)]
+    cursor_scale: f64,
+
     /// Mac account the client authenticates as. Defaults to $USER. The
     /// password is validated against the local account via PAM (checkpw
     /// service) at startup, so this must be a real Mac user.
@@ -1106,6 +1115,7 @@ async fn async_main() -> Result<()> {
         fps,
         display_id: capture_display_id,
         screen_size_pts,
+        cursor_scale: args.cursor_scale,
         // Only attach the tracker when the watchdog needs it. Saves
         // a useless atomic increment/decrement per session otherwise.
         session_tracker: (args.detach_primary || args.capture_primary)

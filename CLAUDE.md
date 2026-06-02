@@ -77,6 +77,10 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   with --enable-h264). Ignored with --width/--height
                           #   or --virtual-display. macOS-only.
 --fps N                   # default 60 with --enable-h264, else 15
+--cursor-scale MULT       # pointer size multiplier (default 1.0 = native macOS
+                          #   size, hotspot-exact). Bump (e.g. 1.5/2.0) if your
+                          #   client upscales the desktop but draws the pointer
+                          #   at native pixels, making it look small.
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
 --keyframe-interval SECS  # periodic IDR safety net (default 2; only with --enable-h264)
 --flush-frames N          # trailing skip-P-frames re-sent after each change to drain

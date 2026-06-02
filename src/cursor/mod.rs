@@ -31,15 +31,23 @@ impl CursorState {
     /// `screen_size_pts` is the target display's logical size in
     /// points; only consumed by the (currently-disabled) position
     /// polling path, but parameterized for symmetry with input.rs.
+    ///
+    /// `cursor_scale` is the user-facing comfort multiplier (`--cursor-scale`,
+    /// default `1.0`). At `1.0` the SkyLight cursor passes through at its
+    /// native size (matching the Mac's own screen, hotspot exact); higher
+    /// values enlarge the pointer for clients that upscale the desktop image
+    /// but draw the pointer at native pixels. The hotspot scales with the
+    /// bitmap, so it stays accurate at any value.
     pub fn new(
         desktop_w: u16,
         desktop_h: u16,
         screen_size_pts: (f64, f64),
+        cursor_scale: f64,
     ) -> anyhow::Result<Self> {
         #[cfg(target_os = "macos")]
-        let inner = macos::Inner::new(desktop_w, desktop_h, screen_size_pts)?;
+        let inner = macos::Inner::new(desktop_w, desktop_h, screen_size_pts, cursor_scale)?;
         #[cfg(not(target_os = "macos"))]
-        let _ = (desktop_w, desktop_h, screen_size_pts);
+        let _ = (desktop_w, desktop_h, screen_size_pts, cursor_scale);
         Ok(Self {
             #[cfg(target_os = "macos")]
             inner,
@@ -89,6 +97,10 @@ mod macos {
         desktop_h: u16,
         screen_w_pts: f64,
         screen_h_pts: f64,
+        /// session-framebuffer-px ÷ display-backing-px; see `CursorState::new`.
+        cursor_scale: f64,
+        /// one-shot guard for the cursor-size diagnostic log.
+        diag_logged: bool,
     }
 
     // CGEventSource is a CF type — thread-safe by Apple convention, single-
@@ -96,9 +108,21 @@ mod macos {
     unsafe impl Send for Inner {}
 
     impl Inner {
-        pub fn new(desktop_w: u16, desktop_h: u16, screen_size_pts: (f64, f64)) -> Result<Self> {
+        pub fn new(
+            desktop_w: u16,
+            desktop_h: u16,
+            screen_size_pts: (f64, f64),
+            cursor_scale: f64,
+        ) -> Result<Self> {
             let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                 .map_err(|_| anyhow!("CGEventSource::new failed"))?;
+            // Guard against a zero/negative/NaN ratio (missing backing size,
+            // virtual display, etc.) — fall back to 1.0 (pass-through).
+            let cursor_scale = if cursor_scale.is_finite() && cursor_scale > 0.0 {
+                cursor_scale
+            } else {
+                1.0
+            };
             Ok(Self {
                 source,
                 last_hash: 0,
@@ -107,6 +131,8 @@ mod macos {
                 desktop_h,
                 screen_w_pts: screen_size_pts.0,
                 screen_h_pts: screen_size_pts.1,
+                cursor_scale,
+                diag_logged: false,
             })
         }
 
@@ -167,13 +193,38 @@ mod macos {
                 return;
             }
             self.last_hash = hash;
-            // No HiDPI scaling: SkyLight's `SLSGetGlobalCursorData` already
-            // returns the cursor at the display's backing (physical) pixels,
-            // and RDP clients render pointer bitmaps at 1:1 device pixels
-            // regardless of the session's framebuffer resolution — so the same
-            // bitmap is correct whether we capture at points or `--hidpi`
-            // backing pixels. (Scaling it up here made the pointer 2× too big.)
-            trace!(w, h, hot_x, hot_y, "cursor shape changed");
+            let (raw_w, raw_h) = (w, h);
+            // Default (`cursor_scale == 1.0`): pass the SkyLight cursor through
+            // at its native size — correct on 1× panels, Retina, and `--hidpi`
+            // alike, with an exact hotspot. A non-1.0 `--cursor-scale` resizes
+            // the bitmap (and hotspot, which tracks it) purely for comfort.
+            let (data, w, h, hot_x, hot_y) =
+                scale_cursor(data, w, h, hot_x, hot_y, self.cursor_scale);
+            // One-shot diagnostic: the raw SkyLight size vs. the scaled output,
+            // handy when tuning --cursor-scale against the local cursor.
+            if !self.diag_logged {
+                self.diag_logged = true;
+                tracing::debug!(
+                    raw_w,
+                    raw_h,
+                    scaled_w = w,
+                    scaled_h = h,
+                    hot_x,
+                    hot_y,
+                    scale = self.cursor_scale,
+                    "cursor first shape: SkyLight raw size -> scaled size"
+                );
+            }
+            trace!(
+                raw_w,
+                raw_h,
+                w,
+                h,
+                hot_x,
+                hot_y,
+                scale = self.cursor_scale,
+                "cursor shape changed"
+            );
             out.push(DisplayUpdate::RGBAPointer(RGBAPointer {
                 // macrdp doesn't maintain a client-side pointer cache; every
                 // shape change re-sends the full bitmap to slot 0 (the encoder
@@ -277,5 +328,144 @@ mod macos {
             hot.x.round().max(0.0).min(f64::from(u16::MAX)) as u16,
             hot.y.round().max(0.0).min(f64::from(u16::MAX)) as u16,
         ))
+    }
+
+    /// Resample a tightly-packed top-down RGBA cursor bitmap (and its hotspot)
+    /// by `scale`. Returns the input untouched when no resize is needed
+    /// (`scale` ≈ 1, or rounding lands on the same dimensions), so the 1× and
+    /// `--hidpi` cases stay byte-identical. Output dims are clamped to the RDP
+    /// pointer limit (1..=256).
+    fn scale_cursor(
+        data: Vec<u8>,
+        w: u16,
+        h: u16,
+        hot_x: u16,
+        hot_y: u16,
+        scale: f64,
+    ) -> (Vec<u8>, u16, u16, u16, u16) {
+        let new_w = ((f64::from(w) * scale).round() as i64).clamp(1, 256) as u16;
+        let new_h = ((f64::from(h) * scale).round() as i64).clamp(1, 256) as u16;
+        if new_w == w && new_h == h {
+            return (data, w, h, hot_x, hot_y);
+        }
+        let resized = resample_rgba(
+            &data,
+            w as usize,
+            h as usize,
+            new_w as usize,
+            new_h as usize,
+        );
+        // Scale the hotspot by the actual per-axis resize ratio so it tracks
+        // the resampled bitmap exactly (w/h are guaranteed >= 1 upstream).
+        let hot_x = ((f64::from(hot_x) * f64::from(new_w) / f64::from(w)).round() as i64)
+            .clamp(0, i64::from(new_w - 1)) as u16;
+        let hot_y = ((f64::from(hot_y) * f64::from(new_h) / f64::from(h)).round() as i64)
+            .clamp(0, i64::from(new_h - 1)) as u16;
+        (resized, new_w, new_h, hot_x, hot_y)
+    }
+
+    /// Area-average resample of a tightly-packed top-down RGBA buffer. RGB is
+    /// averaged weighted by alpha (premultiplied) so the cursor's transparent
+    /// edges don't bleed dark/light fringes; alpha is area-averaged. Fine for
+    /// the small down-scales we do here (e.g. 2:1 on Retina).
+    fn resample_rgba(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+        let mut out = vec![0u8; dw * dh * 4];
+        if sw == 0 || sh == 0 {
+            return out;
+        }
+        let fx = sw as f64 / dw as f64;
+        let fy = sh as f64 / dh as f64;
+        for dy in 0..dh {
+            let sy0 = dy as f64 * fy;
+            let sy1 = sy0 + fy;
+            let iy0 = sy0.floor() as usize;
+            let iy1 = (sy1.ceil() as usize).min(sh);
+            for dx in 0..dw {
+                let sx0 = dx as f64 * fx;
+                let sx1 = sx0 + fx;
+                let ix0 = sx0.floor() as usize;
+                let ix1 = (sx1.ceil() as usize).min(sw);
+
+                let mut acc_r = 0.0;
+                let mut acc_g = 0.0;
+                let mut acc_b = 0.0;
+                let mut acc_a = 0.0; // Σ alpha·coverage — normalizes premultiplied RGB
+                let mut cov_sum = 0.0; // Σ coverage — area-averages alpha
+
+                for sy in iy0..iy1 {
+                    let cy = (sy1.min((sy + 1) as f64) - sy0.max(sy as f64)).max(0.0);
+                    if cy <= 0.0 {
+                        continue;
+                    }
+                    for sx in ix0..ix1 {
+                        let cx = (sx1.min((sx + 1) as f64) - sx0.max(sx as f64)).max(0.0);
+                        if cx <= 0.0 {
+                            continue;
+                        }
+                        let cov = cx * cy;
+                        let idx = (sy * sw + sx) * 4;
+                        let a = f64::from(src[idx + 3]) / 255.0;
+                        acc_r += f64::from(src[idx]) * a * cov;
+                        acc_g += f64::from(src[idx + 1]) * a * cov;
+                        acc_b += f64::from(src[idx + 2]) * a * cov;
+                        acc_a += a * cov;
+                        cov_sum += cov;
+                    }
+                }
+
+                let oidx = (dy * dw + dx) * 4;
+                let alpha = if cov_sum > 0.0 { acc_a / cov_sum } else { 0.0 };
+                let (r, g, b) = if acc_a > 0.0 {
+                    (acc_r / acc_a, acc_g / acc_a, acc_b / acc_a)
+                } else {
+                    (0.0, 0.0, 0.0)
+                };
+                out[oidx] = r.round().clamp(0.0, 255.0) as u8;
+                out[oidx + 1] = g.round().clamp(0.0, 255.0) as u8;
+                out[oidx + 2] = b.round().clamp(0.0, 255.0) as u8;
+                out[oidx + 3] = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{resample_rgba, scale_cursor};
+
+        #[test]
+        fn scale_one_is_passthrough() {
+            let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let (out, w, h, hx, hy) = scale_cursor(data.clone(), 2, 1, 1, 0, 1.0);
+            assert_eq!((w, h, hx, hy), (2, 1, 1, 0));
+            assert_eq!(out, data);
+        }
+
+        #[test]
+        fn half_scale_halves_dims_and_hotspot() {
+            // 32×32 opaque red, hotspot near center.
+            let data = vec![0u8; 32 * 32 * 4]
+                .chunks(4)
+                .flat_map(|_| [255, 0, 0, 255])
+                .collect::<Vec<_>>();
+            let (out, w, h, hx, hy) = scale_cursor(data, 32, 32, 16, 16, 0.5);
+            assert_eq!((w, h), (16, 16));
+            assert_eq!((hx, hy), (8, 8));
+            // Solid opaque red must survive the downscale on every pixel.
+            assert!(out.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+        }
+
+        #[test]
+        fn downscale_averages_alpha_without_colour_fringe() {
+            // 2×1: one opaque red pixel, one fully transparent pixel.
+            // Area-averaging to 1×1 should give red at half alpha — NOT a
+            // darkened/blended colour (the premultiplied-weight guarantee).
+            let src = [255, 0, 0, 255, 0, 0, 0, 0];
+            let out = resample_rgba(&src, 2, 1, 1, 1);
+            assert_eq!(out[0], 255, "red preserved");
+            assert_eq!(out[1], 0);
+            assert_eq!(out[2], 0);
+            assert_eq!(out[3], 128, "alpha area-averaged (255+0)/2 rounded");
+        }
     }
 }

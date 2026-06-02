@@ -172,6 +172,10 @@ pub struct CaptureDisplay {
     /// path. Caller queries it from `CGDisplay::main()` for the
     /// primary path, or from `VirtualDisplay::size_pts()`.
     pub screen_size_pts: (f64, f64),
+    /// User-facing cursor size multiplier (`--cursor-scale`, default 1.0).
+    /// Multiplies the automatic backing→session pointer downscale; lets the
+    /// user enlarge the pointer for comfort without affecting hotspot accuracy.
+    pub cursor_scale: f64,
     /// Optional session tracker — when `Some`, the returned
     /// `RdpServerDisplayUpdates` is wrapped so its lifetime bumps the
     /// counter that drives the `--detach-primary` session-transition
@@ -250,6 +254,7 @@ impl RdpServerDisplay for CaptureDisplay {
                 self.fps,
                 self.display_id,
                 self.screen_size_pts,
+                self.cursor_scale,
                 self.gfx.clone(),
                 self.keyframe_on_change,
                 self.click_signal.clone(),
@@ -378,6 +383,7 @@ mod macos {
             fps: u32,
             target_display_id: Option<u32>,
             screen_size_pts: (f64, f64),
+            cursor_scale_multiplier: f64,
             gfx: Option<crate::h264::Gfx>,
             keyframe_on_change: KeyframeOnChange,
             click_signal: Option<ClickSignal>,
@@ -485,7 +491,32 @@ mod macos {
                 .start_capture()
                 .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
 
-            let cursor = CursorState::new(width, height, screen_size_pts)?;
+            // Cursor scale = session framebuffer px ÷ display backing px.
+            // SkyLight hands the cursor back at the display's backing pixels;
+            // the client draws the pointer 1:1 against our framebuffer, so on
+            // a Retina panel running at logical points (default, no --hidpi)
+            // the raw cursor is 2× oversized with a 2×-off hotspot. This ratio
+            // is 1.0 when they match (1× displays, and --hidpi on Retina).
+            // The pointer is forwarded at its native macOS size — the raw
+            // SkyLight backing-pixel bitmap — which matches the cursor on the
+            // Mac's own screen and keeps the hotspot exact, on 1× panels,
+            // Retina, and `--hidpi` alike. `--cursor-scale` (default 1.0) is a
+            // pure comfort multiplier on top: some clients draw the pointer at
+            // native pixels while upscaling the desktop image to their window,
+            // which can make a native-size pointer look small. Clamped to a
+            // sane band; the hotspot stays accurate at any value.
+            let cursor_scale = cursor_scale_multiplier.clamp(0.1, 8.0);
+            tracing::debug!(
+                native_w,
+                native_h,
+                backing_w,
+                backing_h,
+                session_w = width,
+                session_h = height,
+                cursor_scale,
+                "cursor pointer scaling"
+            );
+            let cursor = CursorState::new(width, height, screen_size_pts, cursor_scale)?;
             let frame_interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
 
             // Reset the cross-connection suppress flag — the `Arc<AtomicBool>`

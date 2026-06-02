@@ -172,6 +172,10 @@ pub struct CaptureDisplay {
     /// path. Caller queries it from `CGDisplay::main()` for the
     /// primary path, or from `VirtualDisplay::size_pts()`.
     pub screen_size_pts: (f64, f64),
+    /// True when serving a `--virtual-display`. On disconnect the capture
+    /// session warps the cursor back onto the primary physical display, so it
+    /// isn't left stranded in the (off-panel) virtual-display coordinate region.
+    pub warp_cursor_home: bool,
     /// User-facing cursor size multiplier (`--cursor-scale`, default 1.0).
     /// Multiplies the automatic backing→session pointer downscale; lets the
     /// user enlarge the pointer for comfort without affecting hotspot accuracy.
@@ -255,6 +259,7 @@ impl RdpServerDisplay for CaptureDisplay {
                 self.display_id,
                 self.screen_size_pts,
                 self.cursor_scale,
+                self.warp_cursor_home,
                 self.gfx.clone(),
                 self.keyframe_on_change,
                 self.click_signal.clone(),
@@ -373,6 +378,14 @@ mod macos {
         /// "client is fully wired up" signal that's stricter than just
         /// "connected" but cheap to maintain.
         first_egfx_frame_sent: bool,
+        /// When capturing a virtual display, the RDP session drives the cursor
+        /// into that display's slot of the global coordinate space (to the
+        /// right of / beyond the physical panels). On disconnect the cursor is
+        /// stranded there — off every physical screen — until the virtual
+        /// display is removed. When set, `Drop` warps the cursor back onto the
+        /// primary physical display so the local Mac stays usable. Only set on
+        /// the `--virtual-display` path.
+        warp_cursor_home: bool,
     }
 
     impl ScreenCaptureUpdates {
@@ -384,6 +397,7 @@ mod macos {
             target_display_id: Option<u32>,
             screen_size_pts: (f64, f64),
             cursor_scale_multiplier: f64,
+            warp_cursor_home: bool,
             gfx: Option<crate::h264::Gfx>,
             keyframe_on_change: KeyframeOnChange,
             click_signal: Option<ClickSignal>,
@@ -549,6 +563,7 @@ mod macos {
                 was_suppressed: false,
                 suppressed_since: None,
                 first_egfx_frame_sent: false,
+                warp_cursor_home,
             })
         }
     }
@@ -587,6 +602,30 @@ mod macos {
     impl Drop for ScreenCaptureUpdates {
         fn drop(&mut self) {
             let _ = self.stream.stop_capture();
+            // On a virtual-display session the cursor was last posted into the
+            // virtual display's region of the global coordinate space, which is
+            // off every physical panel. The virtual display outlives this
+            // per-connection object (the server keeps running for the next
+            // client), so without intervention the local cursor is stranded and
+            // invisible after disconnect. Warp it back to the center of the
+            // primary physical display so the Mac stays usable. Best-effort.
+            if self.warp_cursor_home {
+                use core_graphics::display::CGDisplay;
+                use core_graphics::geometry::CGPoint;
+                let b = CGDisplay::main().bounds();
+                let center = CGPoint::new(
+                    b.origin.x + b.size.width / 2.0,
+                    b.origin.y + b.size.height / 2.0,
+                );
+                match CGDisplay::warp_mouse_cursor_position(center) {
+                    Ok(()) => tracing::debug!(
+                        x = center.x,
+                        y = center.y,
+                        "warped cursor to primary on disconnect"
+                    ),
+                    Err(e) => tracing::warn!(?e, "failed to warp cursor home on disconnect"),
+                }
+            }
         }
     }
 

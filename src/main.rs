@@ -1115,6 +1115,10 @@ async fn async_main() -> Result<()> {
         fps,
         display_id: capture_display_id,
         screen_size_pts,
+        // Virtual-display sessions drive the cursor into the virtual display's
+        // off-panel coordinate region; warp it back to the primary on
+        // disconnect so the local Mac mouse isn't stranded.
+        warp_cursor_home: virtual_display.is_some(),
         cursor_scale: args.cursor_scale,
         // Only attach the tracker when the watchdog needs it. Saves
         // a useless atomic increment/decrement per session otherwise.

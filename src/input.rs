@@ -9,10 +9,11 @@ use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use tracing::trace;
 
 pub struct MacInputHandler {
+    /// Live session desktop size, shared with `CaptureDisplay`. Read per
+    /// mouse event (not copied at construction) so coordinate scaling stays
+    /// correct when the client-resolution auto-adopt resizes the session.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    desktop_width: u16,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    desktop_height: u16,
+    desktop_size: crate::capture::SharedDesktopSize,
     /// Records mouse-button-down timestamps so the H.264 path can lower its
     /// keyframe threshold briefly after a click. `None` unless `--enable-h264`.
     click_signal: Option<crate::capture::ClickSignal>,
@@ -29,8 +30,7 @@ impl MacInputHandler {
     /// `--detach-primary` disables the built-in panel mid-session,
     /// which shifts the virtual display to `(0, 0)`.
     pub fn new(
-        desktop_width: u16,
-        desktop_height: u16,
+        desktop_size: crate::capture::SharedDesktopSize,
         target_display_id: Option<u32>,
         click_signal: Option<crate::capture::ClickSignal>,
     ) -> anyhow::Result<Self> {
@@ -39,8 +39,7 @@ impl MacInputHandler {
         #[cfg(not(target_os = "macos"))]
         let _ = target_display_id;
         Ok(Self {
-            desktop_width,
-            desktop_height,
+            desktop_size,
             click_signal,
             #[cfg(target_os = "macos")]
             inner,
@@ -69,8 +68,10 @@ impl RdpServerInputHandler for MacInputHandler {
             }
         }
         #[cfg(target_os = "macos")]
-        self.inner
-            .mouse(event, self.desktop_width, self.desktop_height);
+        {
+            let (width, height) = self.desktop_size.get();
+            self.inner.mouse(event, width, height);
+        }
         #[cfg(not(target_os = "macos"))]
         trace!(?event, "mouse event (stub)");
     }

@@ -8,14 +8,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - `@docs/macos-gotchas.md` — TCC, CGVirtualDisplay, QoS, activation
 > - `@docs/known-quirks.md` — hard-won client/codec/audio behavioural notes
 >
-> The `vendor/ironrdp-server/` fork has its own nested `CLAUDE.md` (the
-> divergence log) that loads only when you work inside that directory.
+> The `vendor/ironrdp-server/` and `vendor/ironrdp-acceptor/` forks each have
+> their own nested `CLAUDE.md` (the divergence logs) that load only when you
+> work inside those directories.
 
 ## Status
 
 Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
 - Connect over TLS to the Mac on port 3390 with a local Mac username/password.
 - See the primary display at native resolution with incremental damage-region updates.
+- **Get the session served at the resolution the client asks for, by default** (client-resolution auto-adopt; `--no-client-resolution` opts out). The vendored acceptor reads the client's requested desktop size from its GCC Client Core Data and negotiates the session at that size from the very first Demand Active — e.g. mstsc full-screen on a 1920×1080 monitor gets a 1920×1080 session instead of the Mac's 1512×982, so the client presents 1:1 with no client-side rescale (mstsc's rescale costs typing latency and, with `--enable-h264`, audio drift). Applies only on the mirror-primary path with no explicit `--width`/`--height`/`--hidpi`/`--virtual-display`. The usual non-native-capture trade-offs apply (full-frame legacy updates, aspect stretch on mismatch — see the scaling quirk note). Verified live on FreeRDP (legacy + H.264, incl. reconnect at a different size); see the quirk note below for why this *must* live in the acceptor.
 - Optionally capture the primary display at its **backing (Retina) pixel resolution** (`--hidpi`, e.g. 3024×1964 instead of 1512×982 logical points) so clients render crisp native pixels instead of upscaling a point-density frame. Opt-in (it's ~4× the pixels); the win is biggest with `--enable-h264`. Verified crisp; input/cursor are resolution-correct. **Caveat:** mstsc decodes 4× the pixels per frame and feels laggy at HiDPI — Thincast/FreeRDP stay snappy. See the HiDPI quirk note below.
 - Optionally stream the display as **H.264 over EGFX** (`--enable-h264`, AVC420, Annex-B framing, VideoToolbox-encoded) — far less bandwidth than legacy bitmaps. Verified rendering on mstsc, on FreeRDP built with H.264 decode, and on the macOS Windows App / Microsoft Remote Desktop client (it decodes AVC420 over EGFX — only its *legacy* bitmap-codec list is NSCodec-only). Clients that genuinely don't advertise AVC420 decode (e.g. a decoder-less FreeRDP build) fall back to legacy BitmapUpdate automatically. **Caveat:** reconnecting *mstsc* to a still-running macrdp can show a blank screen (mstsc-specific EGFX surface-handling quirk — confirmed not a server bug, since FreeRDP reconnects cleanly); reliable workaround is to fully close and reopen the mstsc window (clears its surface cache). See the H.264 quirk note below.
 - Drive keyboard and mouse, including modifier keys (per-side L/R tracking with NX_DEVICE bits, Caps Lock as a toggle, MS-RDPBCGR Synchronize lock-state reconciliation), mouse buttons, and wheel.
@@ -81,6 +83,10 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   size, hotspot-exact). Bump (e.g. 1.5/2.0) if your
                           #   client upscales the desktop but draws the pointer
                           #   at native pixels, making it look small.
+--no-client-resolution    # Serve the Mac display's native size instead of the
+                          #   resolution the client requests at connect (the
+                          #   auto-adopt default when no --width/--height/
+                          #   --hidpi/--virtual-display is given).
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
 --keyframe-interval SECS  # periodic IDR safety net (default 2; only with --enable-h264)
 --flush-frames N          # trailing skip-P-frames re-sent after each change to drain

@@ -119,3 +119,21 @@ released — #1276 landing is NOT sufficient.
     `None` and is byte-for-byte unchanged. Small and upstreamable (generalizes a
     PCM-only constant to any advertised codec); offer it upstream alongside the
     SuppressOutput work. Until then it rides with this fork.
+
+(9) Honor-client-desktop-size plumbing (NOT upstreamed; pairs with the
+    `vendor/ironrdp-acceptor` divergence (1)): `RdpServer` gains a
+    `honor_client_desktop_size: bool` (default false) + setter
+    `set_honor_client_desktop_size`, forwarded in `run_connection` to each
+    connection's `Acceptor` via the vendored
+    `Acceptor::set_honor_client_desktop_size`. With it set, the acceptor
+    adopts the desktop size the client requests in its GCC Client Core Data
+    BEFORE Demand Active is sent, so the session is negotiated at the
+    client's resolution from the start (no deactivation-reactivation
+    resize). The display handler observes the adopted size through the
+    existing `request_initial_size` call — conformant clients echo the
+    Demand Active size in their Confirm Active bitmap capset, which is also
+    why the confirm-active capset alone could never reveal the client's own
+    request (verified empirically with sdl-freerdp `/size:1024x768`:
+    confirm-active echoed the server's 1512×982). macrdp wires this from
+    its default-on client-resolution auto-adopt (`--no-client-resolution`
+    opts out). Offer upstream together with the acceptor change.

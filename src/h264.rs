@@ -127,6 +127,12 @@ struct ConnectionContext {
     /// `shipped`.
     submitted: Arc<AtomicU64>,
     shipped: Arc<AtomicU64>,
+    /// Dimensions the surface + encoder were created with (in
+    /// `setup_locked`, from the live `SharedDesktopSize`). `ship_frames`
+    /// builds its AVC420 regions from these — not from a fresh
+    /// `SharedDesktopSize` read — so a size adoption between setup and ship
+    /// can't tear the region away from the surface.
+    dims: (u16, u16),
 }
 
 /// Cloneable factory + frame-submit handle. One clone is boxed into
@@ -136,8 +142,11 @@ struct ConnectionContext {
 pub struct Gfx {
     sender: Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>,
     ctx: Arc<Mutex<Option<ConnectionContext>>>,
-    width: u16,
-    height: u16,
+    /// Live session desktop size, shared with `CaptureDisplay` /
+    /// `MacInputHandler`. Read in `setup_locked` when the per-connection
+    /// surface + encoder are created, so the H.264 pipeline tracks the
+    /// client-resolution auto-adopt without rebuilding the factory.
+    desktop_size: crate::capture::SharedDesktopSize,
     fps: u32,
     bitrate_bps: u32,
     /// Periodic keyframe (IDR) interval in seconds (from `--keyframe-interval`).
@@ -156,14 +165,14 @@ pub struct Gfx {
 
 impl Gfx {
     pub fn new(
-        width: u16,
-        height: u16,
+        desktop_size: crate::capture::SharedDesktopSize,
         fps: u32,
         bitrate_bps: u32,
         keyframe_secs: f32,
         max_in_flight: u32,
     ) -> Self {
         let wire_format = WireFormat::from_env();
+        let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
             width, height, fps, keyframe_secs, max_in_flight, "EGFX/H.264 pipeline configured"
@@ -171,8 +180,7 @@ impl Gfx {
         Self {
             sender: Arc::new(Mutex::new(None)),
             ctx: Arc::new(Mutex::new(None)),
-            width,
-            height,
+            desktop_size,
             fps,
             bitrate_bps,
             keyframe_secs,
@@ -280,9 +288,13 @@ impl Gfx {
 
     /// One-time per-connection surface + encoder setup. Caller holds `ctx`.
     fn setup_locked(&self, ctx: &mut ConnectionContext) -> Result<()> {
+        // Read the live session size once and pin it for this connection's
+        // surface + encoder + ship-side regions.
+        let (width, height) = self.desktop_size.get();
         if ctx.surface_id.is_none() {
+            ctx.dims = (width, height);
             let mut server = ctx.server_handle.lock().unwrap();
-            server.set_output_dimensions(self.width, self.height);
+            server.set_output_dimensions(width, height);
             // Emit RESET_GRAPHICS with an explicit single-monitor layout
             // covering the full desktop, BEFORE create_surface. The auto-reset
             // path inside create_surface sends an EMPTY monitor array; mstsc
@@ -295,11 +307,11 @@ impl Gfx {
             let monitor = Monitor {
                 left: 0,
                 top: 0,
-                right: i32::from(self.width).saturating_sub(1),
-                bottom: i32::from(self.height).saturating_sub(1),
+                right: i32::from(width).saturating_sub(1),
+                bottom: i32::from(height).saturating_sub(1),
                 flags: MonitorFlags::PRIMARY,
             };
-            server.resize_with_monitors(self.width, self.height, vec![monitor]);
+            server.resize_with_monitors(width, height, vec![monitor]);
             // Create the surface with upstream's auto-allocated id. mstsc retains
             // EGFX surfaces by id for its whole process lifetime and no-ops a
             // CreateSurface for an id it already holds, so a reconnect to the
@@ -311,7 +323,7 @@ impl Gfx {
             // (close + reopen mstsc, which clears its surface cache), we use the
             // stock API and document the quirk instead. See [[h264-reconnect-blank]].
             let sid = server
-                .create_surface_with_format(self.width, self.height, PixelFormat::XRgb)
+                .create_surface_with_format(width, height, PixelFormat::XRgb)
                 .ok_or_else(|| anyhow!("EGFX: create_surface failed (not ready?)"))?;
             if !server.map_surface_to_output(sid, 0, 0) {
                 return Err(anyhow!("EGFX: map_surface_to_output failed"));
@@ -319,18 +331,21 @@ impl Gfx {
             ctx.surface_id = Some(sid);
             info!(
                 surface_id = sid,
-                w = self.width,
-                h = self.height,
+                w = width,
+                h = height,
                 "EGFX surface created + mapped"
             );
         }
+        // Encoder dims always follow the surface's creation dims, so an
+        // encoder (re)build can never disagree with an existing surface.
+        let (width, height) = ctx.dims;
         if ctx.encoder.is_none() {
             // Pass actual dims; VideoToolbox pads to 16-px macroblocks
             // internally and encodes the crop in the SPS, so the client
             // decodes back to actual dims.
             let mut encoder = Encoder::new(
-                self.width,
-                self.height,
+                width,
+                height,
                 self.fps,
                 self.bitrate_bps,
                 self.keyframe_secs,
@@ -366,6 +381,7 @@ impl Gfx {
             let surface_id = ctx
                 .surface_id
                 .ok_or_else(|| anyhow!("EGFX: no surface_id"))?;
+            let (width, height) = ctx.dims;
             let epoch = ctx.epoch;
             let mut server = ctx.server_handle.lock().unwrap();
             let egfx_channel_id = server
@@ -379,8 +395,8 @@ impl Gfx {
                 let region = Avc420Region {
                     left: 0,
                     top: 0,
-                    right: self.width.saturating_sub(1),
-                    bottom: self.height.saturating_sub(1),
+                    right: width.saturating_sub(1),
+                    bottom: height.saturating_sub(1),
                     quantization_parameter: 22,
                     quality: 100,
                 };
@@ -469,9 +485,10 @@ impl Gfx {
 
 impl core::fmt::Debug for Gfx {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (width, height) = self.desktop_size.get();
         f.debug_struct("Gfx")
-            .field("w", &self.width)
-            .field("h", &self.height)
+            .field("w", &width)
+            .field("h", &height)
             .field("fps", &self.fps)
             .field("bitrate", &self.bitrate_bps)
             .field("keyframe_secs", &self.keyframe_secs)
@@ -508,6 +525,7 @@ impl GfxServerFactory for Gfx {
             client_supports_avc: false,
             submitted: Arc::new(AtomicU64::new(0)),
             shipped: Arc::new(AtomicU64::new(0)),
+            dims: (0, 0),
         });
         Some((GfxDvcBridge::new(handle.clone()), handle))
     }

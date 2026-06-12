@@ -5,7 +5,7 @@
 //! exercised on Linux CI.
 
 use std::num::{NonZeroU16, NonZeroUsize};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -94,6 +94,41 @@ impl Default for ClickSignal {
     }
 }
 
+/// Live session desktop size, shared by every component that must agree on
+/// it: `CaptureDisplay` (SCK capture size + `RdpServerDisplay::size`),
+/// `MacInputHandler` (mouse-coordinate scaling), and the H.264 `Gfx`
+/// pipeline (EGFX surface + encoder dimensions). Starts at the size resolved
+/// in `main.rs`; mutated only by `request_initial_size` when the
+/// client-resolution auto-adopt is active. Packed into one `AtomicU32`
+/// (width << 16 | height) so readers on the per-event input path get a
+/// coherent pair without a lock.
+#[derive(Clone)]
+pub struct SharedDesktopSize {
+    packed: Arc<AtomicU32>,
+}
+
+impl SharedDesktopSize {
+    pub fn new(width: u16, height: u16) -> Self {
+        Self {
+            packed: Arc::new(AtomicU32::new(Self::pack(width, height))),
+        }
+    }
+
+    fn pack(width: u16, height: u16) -> u32 {
+        (u32::from(width) << 16) | u32::from(height)
+    }
+
+    pub fn get(&self) -> (u16, u16) {
+        let v = self.packed.load(Ordering::Relaxed);
+        ((v >> 16) as u16, (v & 0xFFFF) as u16)
+    }
+
+    pub fn set(&self, width: u16, height: u16) {
+        self.packed
+            .store(Self::pack(width, height), Ordering::Relaxed);
+    }
+}
+
 /// Live RDP-session counter. ironrdp_server calls `RdpServerDisplay::updates()`
 /// once per accepted client connection and drops the returned stream when the
 /// connection ends, so wrapping that stream is the natural place to count
@@ -157,8 +192,29 @@ impl RdpServerDisplayUpdates for CountedUpdates {
 }
 
 pub struct CaptureDisplay {
-    pub width: u16,
-    pub height: u16,
+    /// Session desktop size — shared with the input handler and the H.264
+    /// pipeline so all three stay in sync when `auto_size` adopts the
+    /// client's requested resolution.
+    pub desktop_size: SharedDesktopSize,
+    /// Adopt the resolution the client asks for (its Confirm Active bitmap
+    /// capset, e.g. mstsc full-screen at 1920×1080) instead of always
+    /// serving the size resolved at startup. Serving the client's exact
+    /// resolution means the client never rescales the decoded video —
+    /// client-side rescaling on mstsc costs typing latency and, with
+    /// `--enable-h264`, audio desync. Enabled by default on the
+    /// mirror-primary path when no explicit `--width`/`--height`/`--hidpi`
+    /// was given; `--no-client-resolution` opts out.
+    ///
+    /// The actual size negotiation happens in the vendored
+    /// `ironrdp-acceptor` (`honor_client_desktop_size`, wired via
+    /// `RdpServer::set_honor_client_desktop_size`): the client's true
+    /// request is only visible in its GCC Client Core Data, and the
+    /// acceptor commits a size in Demand Active before any server code
+    /// runs. This flag's job is the receiving end — adopt the negotiated
+    /// size (echoed back through `request_initial_size`) into
+    /// `desktop_size` so capture, input scaling, and the H.264 pipeline
+    /// all serve it.
+    pub auto_size: bool,
     pub fps: u32,
     /// `Some(CGDirectDisplayID)` captures that specific display (e.g. a
     /// `VirtualDisplay`); `None` captures the first SCK display, which
@@ -243,18 +299,45 @@ pub async fn primary_display_size() -> Result<Option<(u16, u16)>> {
 #[async_trait::async_trait]
 impl RdpServerDisplay for CaptureDisplay {
     async fn size(&mut self) -> DesktopSize {
-        DesktopSize {
-            width: self.width,
-            height: self.height,
+        let (width, height) = self.desktop_size.get();
+        DesktopSize { width, height }
+    }
+
+    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+        let (width, height) = self.desktop_size.get();
+        // With auto_size on, the vendored acceptor has already negotiated
+        // the client's requested size (from its Client Core Data) in Demand
+        // Active, and `client_size` here is the client's Confirm Active echo
+        // of that. Adopt it into the shared size so capture, input scaling,
+        // and the H.264 pipeline all serve the negotiated resolution. The
+        // 200..=8192 band is the protocol-legal desktop range (MS-RDPBCGR);
+        // an echo outside it is garbage we refuse to adopt.
+        if self.auto_size
+            && (client_size.width, client_size.height) != (width, height)
+            && (200..=8192).contains(&client_size.width)
+            && (200..=8192).contains(&client_size.height)
+        {
+            tracing::info!(
+                client_w = client_size.width,
+                client_h = client_size.height,
+                prev_w = width,
+                prev_h = height,
+                "serving client-requested desktop resolution \
+                 (--no-client-resolution disables)"
+            );
+            self.desktop_size.set(client_size.width, client_size.height);
+            return client_size;
         }
+        DesktopSize { width, height }
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+        let (width, height) = self.desktop_size.get();
         #[cfg(target_os = "macos")]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> = Box::new(
             macos::ScreenCaptureUpdates::start(
-                self.width,
-                self.height,
+                width,
+                height,
                 self.fps,
                 self.display_id,
                 self.screen_size_pts,
@@ -270,7 +353,7 @@ impl RdpServerDisplay for CaptureDisplay {
         );
         #[cfg(not(target_os = "macos"))]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> =
-            Box::new(stub::StubUpdates::new(self.width, self.height)?);
+            Box::new(stub::StubUpdates::new(width, height)?);
         Ok(match self.session_tracker.clone() {
             Some(tracker) => Box::new(CountedUpdates::new(inner, tracker)),
             None => inner,
@@ -994,5 +1077,22 @@ mod stub {
             std::future::pending::<()>().await;
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_desktop_size_roundtrips() {
+        let size = SharedDesktopSize::new(1512, 982);
+        assert_eq!(size.get(), (1512, 982));
+        size.set(1920, 1080);
+        assert_eq!(size.get(), (1920, 1080));
+        // Clones observe the same cell — that's the whole point.
+        let clone = size.clone();
+        clone.set(u16::MAX, 1);
+        assert_eq!(size.get(), (u16::MAX, 1));
     }
 }

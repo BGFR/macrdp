@@ -1,0 +1,32 @@
+[package]
+name = "ironrdp-acceptor"
+version = "0.8.0"
+readme = "README.md"
+description = "State machines to drive an RDP connection acceptance sequence"
+# Vendored copy of upstream master ironrdp-acceptor (copied 2026-06-12 from
+# Devolutions/IronRDP@879ffed). Workspace-inherited fields are inlined below
+# because we're not inside the IronRDP cargo workspace. See CLAUDE.md in this
+# directory for the divergence log.
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/Devolutions/IronRDP"
+repository = "https://github.com/Devolutions/IronRDP"
+authors = ["Devolutions Inc. <infos@devolutions.net>"]
+keywords = ["rdp", "remote-desktop", "network", "client", "protocol"]
+categories = ["network-programming"]
+
+[lib]
+doctest = false
+test = false
+
+[dependencies]
+# path = "../ironrdp-*" entries dropped — we live outside the upstream
+# workspace, so cargo resolves these via the root macrdp Cargo.toml's
+# [patch.crates-io] redirects (git pin to upstream master).
+ironrdp-core = { version = "0.1", features = ["alloc"] } # public
+ironrdp-pdu = "0.7" # public
+ironrdp-svc = "0.6" # public
+ironrdp-connector = "0.8" # public
+ironrdp-async = "0.8" # public
+tracing = { version = "0.1", features = ["log"] }

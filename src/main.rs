@@ -407,6 +407,18 @@ struct Args {
     #[arg(long, default_value_t = 128_000)]
     aac_bitrate: u32,
 
+    /// Don't adopt the client's requested desktop resolution. By default —
+    /// when mirroring the primary display without --width/--height/--hidpi —
+    /// macrdp reads the resolution the client asked for while connecting
+    /// (e.g. mstsc full-screen on a 1920×1080 monitor) and serves the session
+    /// at exactly that size, so the client presents the video 1:1 instead of
+    /// rescaling it (client-side rescaling on mstsc costs typing latency and,
+    /// with --enable-h264, contributes to audio drift). Pass this to always
+    /// serve the size resolved at startup (the Mac display's native size)
+    /// and let the client scale.
+    #[arg(long = "no-client-resolution", action = clap::ArgAction::SetTrue)]
+    no_client_resolution: bool,
+
     /// Force QOI BitmapUpdates to be encoded with `Channels::Rgb` instead of
     /// `Channels::Rgba`. The default (off) emits RGBA per the underlying
     /// PixelFormat, matching upstream `ironrdp-server`. Upstream
@@ -1071,6 +1083,28 @@ async fn async_main() -> Result<()> {
     // the legacy bitmap path (which has no such buffer and is bandwidth-heavier).
     let fps = args.fps.unwrap_or(if args.enable_h264 { 60 } else { 15 });
 
+    // Live session desktop size, shared by capture, input scaling, and the
+    // H.264 pipeline. Starts at the size resolved above; when `auto_size`
+    // is on, `CaptureDisplay::request_initial_size` overwrites it with the
+    // client's requested resolution at connect time.
+    let desktop_size = capture::SharedDesktopSize::new(width, height);
+
+    // Adopt the client's requested resolution only on the mirror-primary
+    // path with no explicit size choice: --width/--height pin a size,
+    // --hidpi pins backing pixels, and --virtual-display owns its own
+    // fixed-size display.
+    let auto_size = !args.no_client_resolution
+        && !args.virtual_display
+        && !args.hidpi
+        && args.width.is_none()
+        && args.height.is_none();
+    if auto_size {
+        info!(
+            "client-resolution auto-adopt enabled — the session will be served at \
+             the resolution the client requests (--no-client-resolution disables)"
+        );
+    }
+
     ironrdp_server::set_qoi_force_rgb(args.qoi_force_rgb);
 
     // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
@@ -1079,8 +1113,7 @@ async fn async_main() -> Result<()> {
     #[cfg(target_os = "macos")]
     let gfx = args.enable_h264.then(|| {
         h264::Gfx::new(
-            width,
-            height,
+            desktop_size.clone(),
             fps,
             args.bitrate.max(1).saturating_mul(1_000_000),
             args.keyframe_interval,
@@ -1110,8 +1143,8 @@ async fn async_main() -> Result<()> {
     let display_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let display = CaptureDisplay {
-        width,
-        height,
+        desktop_size: desktop_size.clone(),
+        auto_size,
         fps,
         display_id: capture_display_id,
         screen_size_pts,
@@ -1132,7 +1165,8 @@ async fn async_main() -> Result<()> {
         display_suppressed: Some(display_suppressed.clone()),
     };
 
-    let input_handler = MacInputHandler::new(width, height, capture_display_id, click_signal)?;
+    let input_handler =
+        MacInputHandler::new(desktop_size.clone(), capture_display_id, click_signal)?;
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> = {
         #[cfg(target_os = "macos")]
         {
@@ -1175,6 +1209,14 @@ async fn async_main() -> Result<()> {
     // reads from. Without this, the server uses an internally-created
     // flag the display never sees.
     server.set_display_suppressed_handle(display_suppressed);
+
+    // Client-resolution auto-adopt: the vendored acceptor reads the desktop
+    // size the client requests in its GCC Client Core Data and negotiates
+    // the session at that size from the start (Demand Active); the
+    // CaptureDisplay's `request_initial_size` then adopts it into the
+    // shared `desktop_size` that capture, input scaling, and the H.264
+    // pipeline all read.
+    server.set_honor_client_desktop_size(auto_size);
 
     // ironrdp_server::Credentials holds a plain String, so this copy is
     // outside our control and won't be zeroed when the server shuts down.

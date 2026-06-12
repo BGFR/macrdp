@@ -320,6 +320,11 @@ pub struct RdpServer {
     /// frames during a long minimize and the refocus chew-through locks
     /// up its input dispatch for several seconds.
     display_suppressed: Arc<AtomicBool>,
+    /// (vendored) Forwarded to each connection's `Acceptor` so it adopts
+    /// the desktop size the client requests in its Client Core Data
+    /// before Demand Active is sent. See
+    /// [`Self::set_honor_client_desktop_size`].
+    honor_client_desktop_size: bool,
 }
 
 #[derive(Debug)]
@@ -408,6 +413,7 @@ impl RdpServer {
             autodetect: None,
             connection_handler,
             display_suppressed: Arc::new(AtomicBool::new(false)),
+            honor_client_desktop_size: false,
         }
     }
 
@@ -440,6 +446,19 @@ impl RdpServer {
     /// Must be called before any client connects.
     pub fn set_display_suppressed_handle(&mut self, handle: Arc<AtomicBool>) {
         self.display_suppressed = handle;
+    }
+
+    /// (vendored) Serve each session at the desktop size the client
+    /// requests in its Client Core Data (e.g. an mstsc full-screen
+    /// monitor size), instead of the size the display handler reports
+    /// at connect time. The acceptor adopts the client's size before
+    /// Demand Active, so no deactivation-reactivation resize is needed;
+    /// the display handler observes the adopted size through its normal
+    /// `request_initial_size` call (the client's Confirm Active bitmap
+    /// capset echoes the Demand Active size). Must be called before any
+    /// client connects.
+    pub fn set_honor_client_desktop_size(&mut self, honor: bool) {
+        self.honor_client_desktop_size = honor;
     }
 
     /// Returns the shared ECHO server handle for runtime probe requests and RTT measurements.
@@ -538,6 +557,9 @@ impl RdpServer {
         let size = self.display.lock().await.size().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
         let mut acceptor = Acceptor::new(self.opts.security.flag(), size, capabilities, self.creds.clone());
+        // (vendored) Let the acceptor adopt the client's requested desktop
+        // size from Client Core Data before Demand Active goes out.
+        acceptor.set_honor_client_desktop_size(self.honor_client_desktop_size);
 
         self.attach_channels(&mut acceptor);
 

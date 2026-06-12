@@ -76,8 +76,11 @@ screencapturekit = { version = "2.1", features = ["async"] }
 # git pin list below.
 [patch.crates-io]
 ironrdp-server = { path = "vendor/ironrdp-server" }
+# ironrdp-acceptor is vendored (same upstream rev as the git pins below) for
+# the honor-client-desktop-size divergence — serve the resolution the client
+# requests. See vendor/ironrdp-acceptor/CLAUDE.md.
+ironrdp-acceptor = { path = "vendor/ironrdp-acceptor" }
 ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-acceptor         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }

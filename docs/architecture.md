@@ -75,11 +75,23 @@ vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in via
                           divergences (audio-lag tracker, resize-stall
                           resync, per-batch dispatch priority, SuppressOutput
                           handling, NSCodec encoder, opt-in QOI Rgb
-                          workaround) are documented in
+                          workaround, honor-client-desktop-size plumbing)
+                          are documented in
                           vendor/ironrdp-server/CLAUDE.md — that nested
                           memory loads when you work in the fork. Keep the
                           vendor dir until all of those are upstreamed AND
                           released.
+
+vendor/ironrdp-acceptor/  Local fork of ironrdp-acceptor 0.8.0 (added
+                          2026-06-12, same upstream rev as the git pins).
+                          Single divergence: honor_client_desktop_size —
+                          adopt the client's requested desktop size from its
+                          GCC Client Core Data BEFORE Demand Active, which
+                          is what powers the default client-resolution
+                          auto-adopt (--no-client-resolution opts out). See
+                          vendor/ironrdp-acceptor/CLAUDE.md and the
+                          client-resolution quirk note for why this cannot
+                          be done from server-side code.
 
 (vendor/ironrdp-egfx/     DELETED 2026-05-25. The CapabilitySet::decode
                           tolerance fix was merged upstream as PR #1298

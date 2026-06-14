@@ -281,7 +281,10 @@ This was done to scratch an itch.  There are practically no active open source R
 
 ## License
 
-MIT OR Apache-2.0.
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at
+your option. Being permissively licensed, a productized/notarized build may be
+sold commercially with support — that's selling the product, not a license
+exemption.
 
 [IronRDP]: https://github.com/Devolutions/IronRDP
 [Thincast client]: https://thincast.com/en/products/client

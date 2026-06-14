@@ -401,14 +401,22 @@ async fn capture_loop(
     // Each slot is ~20 ms of audio, so 2 caps capture-side staleness at ~40 ms
     // while leaving one slot of headroom against scheduler jitter. Lower would
     // trade dropouts for marginal latency; the real backlog is downstream.
-    let stream = AsyncSCStream::new(&filter, &config, 2, SCStreamOutputType::Audio);
-    stream
-        .start_capture()
-        .map_err(|e| anyhow!("audio start_capture: {e:?}"))?;
-    debug!("audio capture started");
+    // Restart bookkeeping. Over a long session ScreenCaptureKit can stop
+    // delivering audio samples (the async stream yields `None`) or transiently
+    // fail to (re)start; without recovery that left the connection permanently
+    // silent while video — a separate SCStream — kept running. We rebuild the
+    // stream with capped exponential backoff instead of exiting. `my_gen` is
+    // unchanged across restarts, so the generation guard still retires this
+    // loop on reconnect and there is no double-capture risk.
+    const RESTART_BACKOFF_BASE_MS: u64 = 250;
+    const RESTART_BACKOFF_MAX_MS: u64 = 5000;
+    let mut consecutive_failures: u32 = 0;
 
     let start_instant = std::time::Instant::now();
-    let mut format_logged = false;
+    // Set false at the top of every (re)connect so SCK's delivered format is
+    // re-logged after a restart; the first read is always dominated by that
+    // assignment.
+    let mut format_logged: bool;
 
     // Per-reader debounce for the mute-on-minimize gate (mirrors
     // `capture.rs`'s `suppressed_since`). `None` while the shared
@@ -444,226 +452,274 @@ async fn capture_loop(
     // is doing what it claims.
     let mut bytes_emitted: u64 = 0;
 
-    loop {
+    'reconnect: loop {
         if generation.load(Ordering::SeqCst) != my_gen {
             debug!(my_gen, "audio capture loop superseded; exiting");
-            break;
-        }
-        let Some(sample) = stream.next().await else {
-            break;
-        };
-
-        // Log the format SCK actually delivers, once per session. SCK does not
-        // always honor the requested rate/channels; a mismatch against the
-        // advertised RDPSND format makes the client play at the wrong frame
-        // rate — audible as drift and lowered pitch.
-        if !format_logged {
-            format_logged = true;
-            if let Some(fd) = sample.format_description() {
-                let rate = fd.audio_sample_rate().unwrap_or(0.0);
-                let channels = fd.audio_channel_count().unwrap_or(0);
-                info!(rate, channels, "SCK audio format");
-                if rate != 0.0 && (rate - f64::from(SCK_SAMPLE_RATE)).abs() > 1.0 {
-                    warn!(
-                        delivered = rate,
-                        requested = SCK_SAMPLE_RATE,
-                        "SCK audio rate differs from what we requested; \
-                         the 48->44.1 resampler assumes 48 kHz input"
-                    );
-                }
-            }
+            break 'reconnect;
         }
 
-        let Some(list) = sample.audio_buffer_list() else {
-            continue;
-        };
-
-        // SCK delivers float32 PCM as planar (one buffer per channel) or a
-        // single interleaved buffer. Normalize to planar stereo f32 at the
-        // SCK rate, accumulate into the resampler input buffer, then emit
-        // resampled chunks as interleaved 16-bit stereo at SAMPLE_RATE.
-        let (in_left, in_right) = float_list_to_planar_f32_stereo(&list);
-        if in_left.is_empty() {
-            continue;
-        }
-        input_buf[0].extend_from_slice(&in_left);
-        input_buf[1].extend_from_slice(&in_right);
-
-        // Track actual delivery rate. One sample = one frame (per channel),
-        // so left-channel count is what we compare against SCK_SAMPLE_RATE.
-        samples_received += in_left.len() as u64;
-        if last_rate_log.elapsed() >= std::time::Duration::from_secs(5) {
-            let elapsed = last_rate_log.elapsed().as_secs_f64();
-            let measured_in = samples_received as f64 / elapsed;
-            let measured_out = output_samples as f64 / elapsed;
-            let measured_waves = waves_emitted as f64 / elapsed;
-            let expected_in = f64::from(SCK_SAMPLE_RATE);
-            let expected_out = f64::from(SAMPLE_RATE);
-            // PCM emits one wave per resampled chunk (RESAMPLE_CHUNK input
-            // samples at the SCK rate → ~46.875/s). AAC emits one wave per
-            // 1024-frame access unit at the *output* rate → ~43.07/s. Pick the
-            // right baseline so `waves_per_sec` vs `waves_expected` is a real
-            // health check for the active codec, not always the PCM number.
-            let expected_waves = if use_aac {
-                expected_out / crate::aac::FRAMES_PER_PACKET as f64
-            } else {
-                expected_in / RESAMPLE_CHUNK as f64
-            };
-            let avg_wave_samples = if waves_emitted > 0 {
-                output_samples as f64 / waves_emitted as f64
-            } else {
-                0.0
-            };
-            // Server's vendored audio-lag model assumes each wave is exactly
-            // 1024/48 = 21.33 ms. If avg_wave_samples / SAMPLE_RATE * 1000
-            // differs from that, the model drifts.
-            let avg_wave_ms = if waves_emitted > 0 {
-                avg_wave_samples / f64::from(SAMPLE_RATE) * 1000.0
-            } else {
-                0.0
-            };
-            let wire_kbps = bytes_emitted as f64 * 8.0 / elapsed / 1000.0;
-            debug!(
-                in_rate = measured_in,
-                in_expected = expected_in,
-                out_rate = measured_out,
-                out_expected = expected_out,
-                waves_per_sec = measured_waves,
-                waves_expected = expected_waves,
-                avg_wave_samples,
-                avg_wave_ms,
-                wire_kbps,
-                codec = if use_aac { "aac" } else { "pcm" },
-                model_wave_ms = 1024.0 / 48.0,
-                "audio capture rates"
+        // (Re)build the audio SCStream. On a start_capture error, back off and
+        // retry rather than ending the loop — a transient failure mid-session
+        // must not silence the rest of the connection.
+        let stream = AsyncSCStream::new(&filter, &config, 2, SCStreamOutputType::Audio);
+        if let Err(e) = stream.start_capture() {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            let backoff = RESTART_BACKOFF_MAX_MS
+                .min(RESTART_BACKOFF_BASE_MS << consecutive_failures.saturating_sub(1).min(5));
+            warn!(
+                attempt = consecutive_failures,
+                backoff_ms = backoff,
+                "audio start_capture failed; retrying: {e:?}"
             );
-            samples_received = 0;
-            output_samples = 0;
-            waves_emitted = 0;
-            bytes_emitted = 0;
-            last_rate_log = std::time::Instant::now();
+            tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+            continue 'reconnect;
         }
+        debug!(my_gen, "audio capture started");
+        // A fresh format line per (re)start doubles as a "stream healthy again"
+        // marker in the log.
+        format_logged = false;
+        // Drop any partial pre-gap chunk so we don't stitch samples across the
+        // restart discontinuity.
+        input_buf[0].clear();
+        input_buf[1].clear();
 
-        while input_buf[0].len() >= RESAMPLE_CHUNK && input_buf[1].len() >= RESAMPLE_CHUNK {
-            // Mute-on-minimize gate (default-on; opt out with
-            // `--no-mute-on-minimize`). When the client has sent
-            // `SuppressOutput { None }` (mstsc is minimized), drop incoming
-            // audio at the source — mstsc's audio renderer drains naturally,
-            // and on refocus fresh waves resume in sync with the freshly
-            // IDR'd video. Without this, audio kept flowing during minimize
-            // accumulates in audiodg.exe's buffer (invisible to the server)
-            // and plays out late on refocus, leaving audio drifted by however
-            // long was spent minimized. We drain the input buffer here so it
-            // doesn't grow unbounded across a long minimize; the cheap drain
-            // also avoids the rubato resample + channel send below.
-            //
-            // **Debounced** (see `SUPPRESS_DEBOUNCE` and the matching gate
-            // in `capture.rs`): mstsc emits transient
-            // `SuppressOutput`→`RefreshRectangle` pairs under wire pressure
-            // (tens of ms each), and reacting to them thrashes the mute and
-            // causes audible stutter. Only honor the flag after it's been
-            // steady-`true` for >= 1 s.
-            if mute_on_minimize {
-                if let Some(flag) = display_suppressed.as_ref() {
-                    if flag.load(Ordering::Relaxed) {
-                        let started = *suppressed_since.get_or_insert_with(std::time::Instant::now);
-                        if started.elapsed() >= SUPPRESS_DEBOUNCE {
-                            input_buf[0].drain(..RESAMPLE_CHUNK);
-                            input_buf[1].drain(..RESAMPLE_CHUNK);
-                            continue;
-                        }
-                    } else {
-                        suppressed_since = None;
+        loop {
+            if generation.load(Ordering::SeqCst) != my_gen {
+                debug!(my_gen, "audio capture loop superseded; exiting");
+                let _ = stream.stop_capture();
+                break 'reconnect;
+            }
+            let Some(sample) = stream.next().await else {
+                // SCK stopped delivering. Stop, back off, and rebuild rather
+                // than ending the loop (which would silence audio for the rest
+                // of the session).
+                let _ = stream.stop_capture();
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let backoff = RESTART_BACKOFF_MAX_MS
+                    .min(RESTART_BACKOFF_BASE_MS << consecutive_failures.saturating_sub(1).min(5));
+                warn!(
+                    attempt = consecutive_failures,
+                    backoff_ms = backoff,
+                    "audio SCK stream ended; restarting capture"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                continue 'reconnect;
+            };
+            // Delivered a sample → the stream is healthy; reset the backoff.
+            consecutive_failures = 0;
+
+            // Log the format SCK actually delivers, once per session. SCK does not
+            // always honor the requested rate/channels; a mismatch against the
+            // advertised RDPSND format makes the client play at the wrong frame
+            // rate — audible as drift and lowered pitch.
+            if !format_logged {
+                format_logged = true;
+                if let Some(fd) = sample.format_description() {
+                    let rate = fd.audio_sample_rate().unwrap_or(0.0);
+                    let channels = fd.audio_channel_count().unwrap_or(0);
+                    info!(rate, channels, "SCK audio format");
+                    if rate != 0.0 && (rate - f64::from(SCK_SAMPLE_RATE)).abs() > 1.0 {
+                        warn!(
+                            delivered = rate,
+                            requested = SCK_SAMPLE_RATE,
+                            "SCK audio rate differs from what we requested; \
+                         the 48->44.1 resampler assumes 48 kHz input"
+                        );
                     }
                 }
             }
 
-            chunk[0].copy_from_slice(&input_buf[0][..RESAMPLE_CHUNK]);
-            chunk[1].copy_from_slice(&input_buf[1][..RESAMPLE_CHUNK]);
-            let resampled = resampler
-                .process(&chunk, None)
-                .map_err(|e| anyhow!("rubato resample: {e}"))?;
-            input_buf[0].drain(..RESAMPLE_CHUNK);
-            input_buf[1].drain(..RESAMPLE_CHUNK);
-            // Per-call output sample count (one channel; planar so all
-            // channels have the same len). Counted before pcm.is_empty so
-            // we capture empties too.
-            output_samples += resampled[0].len() as u64;
-            let pcm = planar_f32_to_interleaved_i16(&resampled);
-            if pcm.is_empty() {
+            let Some(list) = sample.audio_buffer_list() else {
+                continue;
+            };
+
+            // SCK delivers float32 PCM as planar (one buffer per channel) or a
+            // single interleaved buffer. Normalize to planar stereo f32 at the
+            // SCK rate, accumulate into the resampler input buffer, then emit
+            // resampled chunks as interleaved 16-bit stereo at SAMPLE_RATE.
+            let (in_left, in_right) = float_list_to_planar_f32_stereo(&list);
+            if in_left.is_empty() {
                 continue;
             }
+            input_buf[0].extend_from_slice(&in_left);
+            input_buf[1].extend_from_slice(&in_right);
 
-            // The wave(s) to ship for this resampled chunk. PCM emits exactly
-            // one wave with the bytes as-is (`None` duration → the dispatcher
-            // derives playback time from byte length). AAC feeds the chunk to
-            // the encoder, which returns zero or more raw access units (it
-            // buffers internally to 1024-frame packets, with a one-time
-            // priming delay at stream start); each AU carries an explicit
-            // duration so the vendored audio-lag model gets a real playback
-            // time instead of dividing the compressed byte count by 176.4.
-            let waves: Vec<(Vec<u8>, Option<f64>)> = if let Some(enc) = aac_encoder.as_mut() {
-                let dur = crate::aac::packet_duration_ms(enc.sample_rate());
-                match enc.encode(&pcm) {
-                    Ok(aus) => aus.into_iter().map(|au| (au, Some(dur))).collect(),
-                    Err(e) => {
-                        warn!("AAC encode failed: {e}");
-                        Vec::new()
+            // Track actual delivery rate. One sample = one frame (per channel),
+            // so left-channel count is what we compare against SCK_SAMPLE_RATE.
+            samples_received += in_left.len() as u64;
+            if last_rate_log.elapsed() >= std::time::Duration::from_secs(5) {
+                let elapsed = last_rate_log.elapsed().as_secs_f64();
+                let measured_in = samples_received as f64 / elapsed;
+                let measured_out = output_samples as f64 / elapsed;
+                let measured_waves = waves_emitted as f64 / elapsed;
+                let expected_in = f64::from(SCK_SAMPLE_RATE);
+                let expected_out = f64::from(SAMPLE_RATE);
+                // PCM emits one wave per resampled chunk (RESAMPLE_CHUNK input
+                // samples at the SCK rate → ~46.875/s). AAC emits one wave per
+                // 1024-frame access unit at the *output* rate → ~43.07/s. Pick the
+                // right baseline so `waves_per_sec` vs `waves_expected` is a real
+                // health check for the active codec, not always the PCM number.
+                let expected_waves = if use_aac {
+                    expected_out / crate::aac::FRAMES_PER_PACKET as f64
+                } else {
+                    expected_in / RESAMPLE_CHUNK as f64
+                };
+                let avg_wave_samples = if waves_emitted > 0 {
+                    output_samples as f64 / waves_emitted as f64
+                } else {
+                    0.0
+                };
+                // Server's vendored audio-lag model assumes each wave is exactly
+                // 1024/48 = 21.33 ms. If avg_wave_samples / SAMPLE_RATE * 1000
+                // differs from that, the model drifts.
+                let avg_wave_ms = if waves_emitted > 0 {
+                    avg_wave_samples / f64::from(SAMPLE_RATE) * 1000.0
+                } else {
+                    0.0
+                };
+                let wire_kbps = bytes_emitted as f64 * 8.0 / elapsed / 1000.0;
+                debug!(
+                    in_rate = measured_in,
+                    in_expected = expected_in,
+                    out_rate = measured_out,
+                    out_expected = expected_out,
+                    waves_per_sec = measured_waves,
+                    waves_expected = expected_waves,
+                    avg_wave_samples,
+                    avg_wave_ms,
+                    wire_kbps,
+                    codec = if use_aac { "aac" } else { "pcm" },
+                    model_wave_ms = 1024.0 / 48.0,
+                    "audio capture rates"
+                );
+                samples_received = 0;
+                output_samples = 0;
+                waves_emitted = 0;
+                bytes_emitted = 0;
+                last_rate_log = std::time::Instant::now();
+            }
+
+            while input_buf[0].len() >= RESAMPLE_CHUNK && input_buf[1].len() >= RESAMPLE_CHUNK {
+                // Mute-on-minimize gate (default-on; opt out with
+                // `--no-mute-on-minimize`). When the client has sent
+                // `SuppressOutput { None }` (mstsc is minimized), drop incoming
+                // audio at the source — mstsc's audio renderer drains naturally,
+                // and on refocus fresh waves resume in sync with the freshly
+                // IDR'd video. Without this, audio kept flowing during minimize
+                // accumulates in audiodg.exe's buffer (invisible to the server)
+                // and plays out late on refocus, leaving audio drifted by however
+                // long was spent minimized. We drain the input buffer here so it
+                // doesn't grow unbounded across a long minimize; the cheap drain
+                // also avoids the rubato resample + channel send below.
+                //
+                // **Debounced** (see `SUPPRESS_DEBOUNCE` and the matching gate
+                // in `capture.rs`): mstsc emits transient
+                // `SuppressOutput`→`RefreshRectangle` pairs under wire pressure
+                // (tens of ms each), and reacting to them thrashes the mute and
+                // causes audible stutter. Only honor the flag after it's been
+                // steady-`true` for >= 1 s.
+                if mute_on_minimize {
+                    if let Some(flag) = display_suppressed.as_ref() {
+                        if flag.load(Ordering::Relaxed) {
+                            let started =
+                                *suppressed_since.get_or_insert_with(std::time::Instant::now);
+                            if started.elapsed() >= SUPPRESS_DEBOUNCE {
+                                input_buf[0].drain(..RESAMPLE_CHUNK);
+                                input_buf[1].drain(..RESAMPLE_CHUNK);
+                                continue;
+                            }
+                        } else {
+                            suppressed_since = None;
+                        }
                     }
                 }
-            } else {
-                vec![(pcm, None)]
-            };
 
-            for (data, duration_ms) in waves {
-                waves_emitted += 1;
-                bytes_emitted += data.len() as u64;
-                let ts_ms = start_instant.elapsed().as_millis() as u32;
-
-                // Lazy resolve both senders on first need. If set_sender /
-                // set_audio_sender haven't populated their Mutexes yet, retry
-                // next iteration — at 48 kHz / 1024 samples this is ~21 ms
-                // later.
-                if audio_s.is_none() {
-                    audio_s = audio_sender.lock().unwrap().clone();
+                chunk[0].copy_from_slice(&input_buf[0][..RESAMPLE_CHUNK]);
+                chunk[1].copy_from_slice(&input_buf[1][..RESAMPLE_CHUNK]);
+                let resampled = resampler
+                    .process(&chunk, None)
+                    .map_err(|e| anyhow!("rubato resample: {e}"))?;
+                input_buf[0].drain(..RESAMPLE_CHUNK);
+                input_buf[1].drain(..RESAMPLE_CHUNK);
+                // Per-call output sample count (one channel; planar so all
+                // channels have the same len). Counted before pcm.is_empty so
+                // we capture empties too.
+                output_samples += resampled[0].len() as u64;
+                let pcm = planar_f32_to_interleaved_i16(&resampled);
+                if pcm.is_empty() {
+                    continue;
                 }
-                if let Some(audio_ref) = audio_s.as_ref() {
-                    // Bounded channel: send().await applies backpressure if
-                    // the dispatch_audio task is behind, but if we're at
-                    // capacity we'd rather drop this wave at the SCK level
-                    // than block the capture loop (which would back up the
-                    // SCK ring buffer and lose newer audio anyway). Use
-                    // try_send: on Full, log+drop; on Closed, exit.
-                    match audio_ref.try_send((data, ts_ms, duration_ms)) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            debug!("audio channel full; dropping wave (dispatch_audio behind)");
+
+                // The wave(s) to ship for this resampled chunk. PCM emits exactly
+                // one wave with the bytes as-is (`None` duration → the dispatcher
+                // derives playback time from byte length). AAC feeds the chunk to
+                // the encoder, which returns zero or more raw access units (it
+                // buffers internally to 1024-frame packets, with a one-time
+                // priming delay at stream start); each AU carries an explicit
+                // duration so the vendored audio-lag model gets a real playback
+                // time instead of dividing the compressed byte count by 176.4.
+                let waves: Vec<(Vec<u8>, Option<f64>)> = if let Some(enc) = aac_encoder.as_mut() {
+                    let dur = crate::aac::packet_duration_ms(enc.sample_rate());
+                    match enc.encode(&pcm) {
+                        Ok(aus) => aus.into_iter().map(|au| (au, Some(dur))).collect(),
+                        Err(e) => {
+                            warn!("AAC encode failed: {e}");
+                            Vec::new()
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                     }
                 } else {
-                    // Audio sender not wired (older server build / non-macrdp
-                    // host). Fall back to the unified ServerEvent channel.
-                    // Note: this path can't carry an explicit duration, so AAC
-                    // over it would mistime — but our vendored server always
-                    // wires the audio sender, so AAC never takes this branch.
-                    if s.is_none() {
-                        s = sender.lock().unwrap().clone();
+                    vec![(pcm, None)]
+                };
+
+                for (data, duration_ms) in waves {
+                    waves_emitted += 1;
+                    bytes_emitted += data.len() as u64;
+                    let ts_ms = start_instant.elapsed().as_millis() as u32;
+
+                    // Lazy resolve both senders on first need. If set_sender /
+                    // set_audio_sender haven't populated their Mutexes yet, retry
+                    // next iteration — at 48 kHz / 1024 samples this is ~21 ms
+                    // later.
+                    if audio_s.is_none() {
+                        audio_s = audio_sender.lock().unwrap().clone();
                     }
-                    let Some(s_ref) = s.as_ref() else { continue };
-                    if s_ref
-                        .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, ts_ms)))
-                        .is_err()
-                    {
-                        return Ok(());
+                    if let Some(audio_ref) = audio_s.as_ref() {
+                        // Bounded channel: send().await applies backpressure if
+                        // the dispatch_audio task is behind, but if we're at
+                        // capacity we'd rather drop this wave at the SCK level
+                        // than block the capture loop (which would back up the
+                        // SCK ring buffer and lose newer audio anyway). Use
+                        // try_send: on Full, log+drop; on Closed, exit.
+                        match audio_ref.try_send((data, ts_ms, duration_ms)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                debug!("audio channel full; dropping wave (dispatch_audio behind)");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                        }
+                    } else {
+                        // Audio sender not wired (older server build / non-macrdp
+                        // host). Fall back to the unified ServerEvent channel.
+                        // Note: this path can't carry an explicit duration, so AAC
+                        // over it would mistime — but our vendored server always
+                        // wires the audio sender, so AAC never takes this branch.
+                        if s.is_none() {
+                            s = sender.lock().unwrap().clone();
+                        }
+                        let Some(s_ref) = s.as_ref() else { continue };
+                        if s_ref
+                            .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, ts_ms)))
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
                     }
                 }
             }
         }
     }
 
-    let _ = stream.stop_capture();
-    debug!("audio capture stopped");
+    debug!(my_gen, "audio capture loop exiting");
     Ok(())
 }
 

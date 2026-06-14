@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macrdp.app Info.plist (template).
+
+  __VERSION__ is substituted by make-app.sh from Cargo.toml.
+
+  Notes on permissions:
+    * Screen Recording and Accessibility are NOT requested via Info.plist
+      purpose strings — they are system-level TCC grants prompted at runtime
+      and toggled in System Settings -> Privacy & Security. The value of the
+      bundle is a *stable signed identity* so those grants survive rebuilds.
+    * NSAppleEventsUsageDescription IS a real purpose string and is included
+      because macrdp drives AppleScript / System Events (Spotlight, paste).
+
+  LSUIElement=true makes this a background agent: no Dock icon, no menu bar.
+  The LaunchAgent (see com.clintcan.macrdp.plist) is what actually runs it.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>macrdp</string>
+    <key>CFBundleDisplayName</key>
+    <string>macrdp</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.clintcan.macrdp</string>
+    <key>CFBundleExecutable</key>
+    <string>macrdp</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>macrdp uses AppleScript to forward macOS hotkeys (Spotlight, clipboard paste) on behalf of connected RDP clients.</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>macrdp — native RDP server for macOS.</string>
+</dict>
+</plist>

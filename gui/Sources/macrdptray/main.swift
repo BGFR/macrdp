@@ -9,7 +9,18 @@ import AppKit
 
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    let label = "com.clintcan.macrdp"
+
+    /// The server's LaunchAgent label, derived from this controller's own bundle
+    /// id by stripping the ".controller" suffix — so whatever BUNDLE_PREFIX the
+    /// app was built with, the controller drives the matching agent. Falls back
+    /// to the default prefix for unbundled `swift run` during development.
+    let label: String = {
+        if let bid = Bundle.main.bundleIdentifier, bid.hasSuffix(".controller") {
+            return String(bid.dropLast(".controller".count))
+        }
+        return "com.clintcan.macrdp"
+    }()
+
     var uid: String { String(getuid()) }
     var domain: String { "gui/\(uid)" }
     var service: String { "gui/\(uid)/\(label)" }

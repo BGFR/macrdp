@@ -14,7 +14,9 @@
       because macrdp drives AppleScript / System Events (Spotlight, paste).
 
   LSUIElement=true makes this a background agent: no Dock icon, no menu bar.
-  The LaunchAgent (see com.clintcan.macrdp.plist) is what actually runs it.
+  The LaunchAgent (see launchagent.plist.template) is what actually runs it.
+  CFBundleIdentifier (__BUNDLE_ID__ = $BUNDLE_PREFIX.macrdp) is substituted by
+  make-app.sh.
 -->
 <plist version="1.0">
 <dict>
@@ -23,7 +25,7 @@
     <key>CFBundleDisplayName</key>
     <string>macrdp</string>
     <key>CFBundleIdentifier</key>
-    <string>com.clintcan.macrdp</string>
+    <string>__BUNDLE_ID__</string>
     <key>CFBundleExecutable</key>
     <string>macrdp</string>
     <key>CFBundlePackageType</key>

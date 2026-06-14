@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  LaunchAgent template. __APP_DIR__ and __HOME__ are substituted by
+  LaunchAgent template. __LABEL__, __APP_DIR__ and __HOME__ are substituted by
   install-launchagent.sh and the result is written to
-  ~/Library/LaunchAgents/com.clintcan.macrdp.plist.
+  ~/Library/LaunchAgents/<label>.plist (label = $BUNDLE_PREFIX.macrdp).
 
   This runs the wrapper (which reads config.env and execs the signed binary),
   keeps it alive, and logs to ~/Library/Logs/macrdp.log.
@@ -11,7 +11,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.clintcan.macrdp</string>
+    <string>__LABEL__</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -22,7 +22,7 @@
     <true/>
 
     <!-- Always-on personal server: restart if it dies. To stop it entirely,
-         `launchctl bootout gui/$(id -u)/com.clintcan.macrdp`. -->
+         `launchctl bootout gui/$(id -u)/<label>`. -->
     <key>KeepAlive</key>
     <true/>
 

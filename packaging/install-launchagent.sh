@@ -11,7 +11,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PKG_DIR="$REPO_ROOT/packaging"
 APP_DIR="${APP_DIR:-/Applications}"
-LABEL="com.clintcan.macrdp"
+# MUST match the BUNDLE_PREFIX used by make-app.sh (and gui/make-tray-app.sh),
+# or the controller targets a different label than the agent installed here.
+BUNDLE_PREFIX="${BUNDLE_PREFIX:-com.clintcan}"
+LABEL="$BUNDLE_PREFIX.macrdp"
 UID_NUM="$(id -u)"
 
 APP="$APP_DIR/macrdp.app"
@@ -30,8 +33,8 @@ fi
 
 # 2. Render the LaunchAgent plist from the template.
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-sed -e "s#__APP_DIR__#$APP_DIR#g" -e "s#__HOME__#$HOME#g" \
-    "$PKG_DIR/$LABEL.plist" > "$PLIST"
+sed -e "s#__LABEL__#$LABEL#g" -e "s#__APP_DIR__#$APP_DIR#g" -e "s#__HOME__#$HOME#g" \
+    "$PKG_DIR/launchagent.plist.template" > "$PLIST"
 echo "==> wrote $PLIST"
 
 # 3. (Re)bootstrap the agent.

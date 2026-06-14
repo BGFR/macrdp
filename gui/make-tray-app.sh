@@ -12,11 +12,16 @@ GUI_DIR="$REPO_ROOT/gui"
 APP_DIR="${APP_DIR:-/Applications}"
 IDENTITY="${CODESIGN_IDENTITY:--}"
 APP_NAME="macrdpController.app"
+# MUST match the BUNDLE_PREFIX used by packaging/{make-app,install-launchagent}.sh.
+# The controller derives the server's LaunchAgent label by stripping ".controller"
+# from its own bundle id at runtime, so this prefix decides which agent it drives.
+BUNDLE_PREFIX="${BUNDLE_PREFIX:-com.clintcan}"
+CONTROLLER_ID="$BUNDLE_PREFIX.macrdp.controller"
 
 VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
 [ -n "$VERSION" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
 
-echo "==> macrdpController v$VERSION  (identity: $IDENTITY, install: $APP_DIR)"
+echo "==> macrdpController v$VERSION  (id: $CONTROLLER_ID, identity: $IDENTITY, install: $APP_DIR)"
 
 echo "==> swift build -c release"
 ( cd "$GUI_DIR" && swift build -c release )
@@ -35,7 +40,7 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
 <dict>
     <key>CFBundleName</key><string>macrdp Controller</string>
     <key>CFBundleDisplayName</key><string>macrdp Controller</string>
-    <key>CFBundleIdentifier</key><string>com.clintcan.macrdp.controller</string>
+    <key>CFBundleIdentifier</key><string>$CONTROLLER_ID</string>
     <key>CFBundleExecutable</key><string>macrdptray</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleVersion</key><string>$VERSION</string>

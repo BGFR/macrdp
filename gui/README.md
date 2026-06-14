@@ -35,6 +35,12 @@ Built with plain SwiftPM (no `.xcodeproj`): `swift build -c release` produces
 the executable, `make-tray-app.sh` wraps it into a signed `LSUIElement` bundle
 in `target/` and installs it.
 
+The bundle-ID prefix is configurable with `BUNDLE_PREFIX` (default `com.clintcan`)
+— the controller becomes `$BUNDLE_PREFIX.macrdp.controller` and derives the
+server's LaunchAgent label by stripping `.controller` at runtime. **Use the same
+`BUNDLE_PREFIX` here as in `../packaging/`**, or the controller drives the wrong
+agent.
+
 ## Menu
 
 - **Status header** — running (with pid) / stopped / not installed.

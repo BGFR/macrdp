@@ -25,7 +25,7 @@ same co-signed helper and edits the same `config.env` — no re-permissioning.
 | `Info.plist` | Bundle metadata template (`__VERSION__` filled from `Cargo.toml`); `LSUIElement` agent, `NSAppleEventsUsageDescription`. |
 | `macrdp-launch` | Wrapper run by launchd: reads `config.env`, translates to flags, `exec`s the signed binary. |
 | `config.env.example` | Seed for `~/Library/Application Support/macrdp/config.env`. |
-| `com.clintcan.macrdp.plist` | LaunchAgent template (`__APP_DIR__`/`__HOME__` filled at install). |
+| `launchagent.plist.template` | LaunchAgent template (`__LABEL__`/`__APP_DIR__`/`__HOME__` filled at install). |
 | `make-app.sh` | Build → assemble bundle → co-sign helper + bundle → install. |
 | `install-launchagent.sh` | Seed config, render plist, bootstrap the agent. |
 
@@ -63,6 +63,20 @@ the code signature or the TCC grants.
 
 ## Notes & limits
 
+- **Bundle-ID prefix is configurable** via `BUNDLE_PREFIX` (default `com.clintcan`):
+  the app becomes `$BUNDLE_PREFIX.macrdp`, the LaunchAgent label the same, and the
+  controller `$BUNDLE_PREFIX.macrdp.controller`. **Set the *same* `BUNDLE_PREFIX`
+  for `make-app.sh`, `install-launchagent.sh`, and `gui/make-tray-app.sh`** — the
+  controller derives the agent label from its own bundle id, so a mismatch makes
+  it drive the wrong (or no) agent. Pick this before your first public build (it's
+  what publishes under your company's reverse-DNS). The launchctl examples below
+  use the default label; substitute yours if you changed the prefix.
+
+  ```bash
+  BUNDLE_PREFIX="com.acme" packaging/make-app.sh
+  BUNDLE_PREFIX="com.acme" packaging/install-launchagent.sh
+  BUNDLE_PREFIX="com.acme" gui/make-tray-app.sh
+  ```
 - **Ad-hoc signing is local-only.** `make-app.sh` ad-hoc signs by default
   (`CODESIGN_IDENTITY=-`), which is fine for your own machine but Gatekeeper
   quarantines it on anyone else's. For distribution, sign with a Developer ID

@@ -17,11 +17,16 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PKG_DIR="$REPO_ROOT/packaging"
 APP_DIR="${APP_DIR:-/Applications}"
 IDENTITY="${CODESIGN_IDENTITY:--}"
+# Bundle-ID prefix (reverse-DNS of the publishing entity). MUST match what
+# install-launchagent.sh and gui/make-tray-app.sh use, or the controller will
+# target the wrong LaunchAgent label.
+BUNDLE_PREFIX="${BUNDLE_PREFIX:-com.clintcan}"
+BUNDLE_ID="$BUNDLE_PREFIX.macrdp"
 
 VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
 [ -n "$VERSION" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
 
-echo "==> macrdp.app v$VERSION  (identity: $IDENTITY, install: $APP_DIR)"
+echo "==> macrdp.app v$VERSION  (id: $BUNDLE_ID, identity: $IDENTITY, install: $APP_DIR)"
 
 # 1. Build the release binary (native target).
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
@@ -38,7 +43,8 @@ echo "==> staging bundle at $STAGE"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 
-sed "s/__VERSION__/$VERSION/g" "$PKG_DIR/Info.plist" > "$STAGE/Contents/Info.plist"
+sed -e "s/__VERSION__/$VERSION/g" -e "s#__BUNDLE_ID__#$BUNDLE_ID#g" \
+    "$PKG_DIR/Info.plist" > "$STAGE/Contents/Info.plist"
 cp "$BIN" "$STAGE/Contents/MacOS/macrdp"
 # The wrapper goes in Resources/ (sealed as a resource by the bundle signature),
 # NOT MacOS/ — a script in MacOS/ is treated as nested code that needs its own

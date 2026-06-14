@@ -37,6 +37,26 @@ launchctl kickstart -k gui/$UID/com.user.macrdp    # restart
 launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
 ```
 
+## App bundle (`.app`)
+
+`dist/install.sh` above installs a **bare binary**. If you'd rather have a
+proper **signed `macrdp.app`** — a stable bundle identity at a fixed path (so
+TCC grants survive rebuilds), an `LSUIElement` background agent, and a layout a
+future menu-bar GUI could drive — use `packaging/` instead:
+
+```bash
+packaging/make-app.sh                                 # build + sign + install to /Applications
+security add-generic-password -s macrdp -a "$(id -un)" -w 'YOUR_PASSWORD'
+packaging/install-launchagent.sh                      # load LaunchAgent (label com.clintcan.macrdp)
+```
+
+Toggle features (H.264/AAC/HiDPI), bind address, and an `EXTRA_FLAGS` escape
+hatch live in `~/Library/Application Support/macrdp/config.env` — outside the
+bundle, so edits never disturb the signature or the TCC grants. See
+[packaging/README.md](packaging/README.md) for the full guide. The two
+auto-start paths are **mutually exclusive** (both bind `:3390` and share the
+`macrdp` Keychain entry) — pick one.
+
 ## CLI
 
 ```
@@ -235,6 +255,8 @@ At 60fps the frame budget is 16.67 ms. The scalar path is fine at 1080p (~30% of
 ## Audio
 
 System audio rides over the RDPSND virtual channel as 16-bit stereo PCM at **44.1 kHz**. ScreenCaptureKit only supports 8 / 16 / 24 / 48 kHz, so the capture loop captures at 48 kHz and resamples to 44.1 with [`rubato`](https://github.com/HEnquist/rubato) before sending. 44.1 matches the native rate of most Windows audio endpoints, which avoids the client-side resampling drift that otherwise accumulates into multi-second audio backlogs. A generation counter on the audio factory keeps a client reconnect from leaving a second capture loop feeding the channel. The vendored `ironrdp-server` carries a single patch that makes `dispatch_server_events` keep the *newest* queued waves on per-batch overflow instead of the oldest — without it, a one-off video-encode stall would bake a permanent audio-latency offset into the session.
+
+The capture loop also **self-heals a dead SCK audio stream**: over a long session ScreenCaptureKit can stop delivering samples or transiently fail to start, which previously left the connection silent for the rest of the session (video is a separate stream and kept running). The loop now rebuilds the audio `SCStream` with capped exponential backoff (250 ms → 5 s) on both start failures and mid-stream end, resetting the backoff once a sample arrives; the generation guard still retires it on reconnect, so there's no double-capture.
 
 **AAC compression** (opt-in, `--enable-aac`). By default audio is uncompressed PCM (~1.4 Mbit/s). Pass `--enable-aac` to encode it as **AAC-LC** over RDPSND (`WAVE_FORMAT_AAC_MS`, ~128 kbps by default — about 11x smaller), which matters over WAN or constrained links. The encoder is AudioToolbox (software AAC-LC); the wire payload is raw AAC access units. The server advertises AAC ahead of PCM, so clients that decode it (mstsc, Microsoft Remote Desktop / Windows App, FreeRDP built with AAC support) negotiate AAC automatically while clients without it fall back to PCM transparently. It's off by default because AAC adds ~40–50 ms of encoder priming latency — on a LAN, PCM's zero added latency is the better default. Tune the bitrate with `--aac-bitrate` (default `128000`; `96000` saves the most bandwidth, `192000` is near-transparent for music).
 

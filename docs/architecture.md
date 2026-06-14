@@ -43,6 +43,13 @@ src/runloop_thread.rs  Dedicated CFRunLoop-hosting std::thread with a
 src/audio.rs      RDPSND ← second SCK stream with system-audio capture,
                   rubato 48→44.1 kHz resample, latency-bounded. Ships raw
                   PCM by default, or AAC-LC via src/aac.rs (--enable-aac).
+                  Capture loop self-heals a dead SCK stream: rebuilds the
+                  SCStream with capped exponential backoff (250 ms→5 s) on
+                  start failure OR mid-stream end (the async stream yielding
+                  None), instead of going silent for the rest of the session;
+                  backoff resets on the first delivered sample. The 'reconnect
+                  outer loop preserves my_gen, so the generation guard still
+                  retires it on client reconnect (no double-capture).
 src/aac.rs        AudioToolbox AAC-LC encoder (--enable-aac). AudioConverter
                   FFI: interleaved i16 PCM → raw AAC access units for the
                   WAVE_FORMAT_AAC_MS RDPSND path. macOS-only.

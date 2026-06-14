@@ -16,14 +16,9 @@ API caller), and this controller needs none of them.
 
 ## Build & install
 
-Prereq: set up the server bundle + LaunchAgent first (see `../packaging/`):
-
-```bash
-../packaging/make-app.sh
-../packaging/install-launchagent.sh
-```
-
-Then build the controller:
+Prereq: build the server bundle (`../packaging/make-app.sh`). You do **not**
+need to run `install-launchagent.sh` — the controller **self-installs** the
+LaunchAgent and onboards the Keychain password on first **Start** (see below).
 
 ```bash
 ./make-tray-app.sh                                  # -> /Applications/macrdpController.app
@@ -41,13 +36,39 @@ server's LaunchAgent label by stripping `.controller` at runtime. **Use the same
 `BUNDLE_PREFIX` here as in `../packaging/`**, or the controller drives the wrong
 agent.
 
+## First-run self-install
+
+The intended end-user flow is just: drag both apps from the DMG into
+`/Applications`, open the controller, click **Start**. On first Start the
+controller:
+
+1. **Locates `macrdp.app`** (sibling in the same folder, else `/Applications`,
+   else `~/Applications`).
+2. **Prompts for your macOS account password** and stores it in the Keychain
+   (the headless server reads it from there; written via `security` so there's
+   no read-time Keychain prompt).
+3. **Writes + loads the LaunchAgent** pointing at that server bundle.
+4. **Reminds you to grant** Screen Recording + Accessibility, with a button to
+   open the pane.
+
+No Terminal, no `install-launchagent.sh`. For unattended/MDM deploys there's a
+headless equivalent:
+
+```bash
+macrdpController.app/Contents/MacOS/macrdptray --install-agent   # locate + write + load agent
+macrdpController.app/Contents/MacOS/macrdptray --print-paths      # diagnose resolved paths (no side effects)
+```
+(`--install-agent` assumes the Keychain password is set separately.)
+
 ## Menu
 
 - **Status header** — running (with pid) / stopped / not installed.
-- **Start · Stop · Restart** — bootstrap + `kickstart -k` / `bootout` the agent.
+- **Start · Stop · Restart** — self-installs on first run, then `kickstart -k` /
+  `bootout` the agent.
 - **Options** — H.264 / AAC / HiDPI checkmarks (write `config.env` and live
   `kickstart` if running); shows the current bind address.
-- **Edit config…** — opens `~/Library/Application Support/macrdp/config.env`.
+- **Edit config… · Set/Change Account Password…** — edit flags; (re)store the
+  Keychain password.
 - **Open Logs** — opens `~/Library/Logs/macrdp.log`.
 - **Permissions** — deep-links to the Screen Recording / Accessibility panes.
 - **Quit Controller** — quits the menu-bar app only; the server keeps running.

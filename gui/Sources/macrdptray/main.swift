@@ -8,7 +8,9 @@ import AppKit
 // the Screen Recording / Accessibility grants belong to the macrdp binary.
 
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    // Lazy so the controller can be instantiated for the headless --install-agent
+    // path without touching the status bar (which needs a GUI app context).
+    lazy var statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
     /// The server's LaunchAgent label, derived from this controller's own bundle
     /// id by stripping the ".controller" suffix — so whatever BUNDLE_PREFIX the
@@ -93,15 +95,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item("Stop", #selector(stop)))
             menu.addItem(item("Restart", #selector(restart)))
         } else {
-            let start = item("Start", #selector(start))
-            start.isEnabled = st.loaded || FileManager.default.fileExists(atPath: plistURL.path)
-            menu.addItem(start)
-        }
-        if !st.loaded && !FileManager.default.fileExists(atPath: plistURL.path) {
-            let hint = NSMenuItem(title: "Run packaging/install-launchagent.sh first",
-                                  action: nil, keyEquivalent: "")
-            hint.isEnabled = false
-            menu.addItem(hint)
+            // Start self-installs the LaunchAgent + onboards the password on
+            // first run, so it's always actionable (no Terminal step needed).
+            menu.addItem(item(st.loaded ? "Start" : "Start (first run sets up)", #selector(start)))
         }
         menu.addItem(.separator())
 
@@ -119,6 +115,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         optsItem.submenu = opts
         menu.addItem(optsItem)
         menu.addItem(item("Edit config…", #selector(editConfig)))
+        let pwTitle = hasKeychainPassword() ? "Change Account Password…" : "Set Account Password…"
+        menu.addItem(item(pwTitle, #selector(setPassword)))
         menu.addItem(.separator())
 
         menu.addItem(item("Open Logs", #selector(openLogs)))
@@ -148,9 +146,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Actions
 
     @objc func start() {
+        // Self-install on first run: locate the server app, onboard the Keychain
+        // password, write + register the LaunchAgent — no Terminal step needed.
+        guard let serverApp = locateServerApp() else {
+            alert(style: .warning, "Can't find macrdp.app",
+                  "Move both macrdp.app and macrdp Controller into /Applications "
+                  + "(or ~/Applications), then click Start again.")
+            return
+        }
+        if !hasKeychainPassword() {
+            guard promptAndStorePassword() else { return } // user cancelled
+        }
+        ensureConfigExists()
+        let firstInstall = !FileManager.default.fileExists(atPath: plistURL.path)
+        if firstInstall { installLaunchAgent(serverApp: serverApp) }
         ensureLoaded()
         _ = run("/bin/launchctl", ["kickstart", "-k", service])
         refreshGlyph()
+        if firstInstall { remindPermissions() }
     }
 
     @objc func stop() {
@@ -165,6 +178,137 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             _ = run("/bin/launchctl", ["bootstrap", domain, plistURL.path])
             _ = run("/bin/launchctl", ["enable", service])
         }
+    }
+
+    // MARK: - Headless entry (scripted/MDM deploy + testing)
+
+    /// Runs the install logic without the GUI. `--print-paths` is side-effect
+    /// free; `--install-agent` locates the server, writes + loads the agent
+    /// (assumes the Keychain password is set separately for unattended deploys).
+    func runHeadless(_ args: [String]) -> Int32 {
+        if args.contains("--print-paths") {
+            print("label:      \(label)")
+            print("server app: \(locateServerApp()?.path ?? "NOT FOUND")")
+            print("plist:      \(plistURL.path)")
+            print("config:     \(configURL.path)")
+            print("log:        \(logURL.path)")
+            print("password:   \(hasKeychainPassword() ? "set" : "MISSING")")
+            return 0
+        }
+        guard let serverApp = locateServerApp() else {
+            FileHandle.standardError.write(Data(
+                "error: macrdp.app not found next to the controller or in /Applications\n".utf8))
+            return 1
+        }
+        ensureConfigExists()
+        installLaunchAgent(serverApp: serverApp)
+        ensureLoaded()
+        _ = run("/bin/launchctl", ["kickstart", "-k", service])
+        print("installed: \(plistURL.path) -> \(serverApp.path)")
+        if !hasKeychainPassword() {
+            print("note: Keychain password not set — store it with:")
+            print("  security add-generic-password -U -s macrdp -a \(NSUserName()) -w '<password>'")
+        }
+        return 0
+    }
+
+    // MARK: - Self-install
+
+    /// Locate the server bundle (`macrdp.app`): next to this controller first
+    /// (the usual case — both dragged into the same folder), then the standard
+    /// install locations.
+    func locateServerApp() -> URL? {
+        let candidates = [
+            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("macrdp.app"),
+            URL(fileURLWithPath: "/Applications/macrdp.app"),
+            home.appendingPathComponent("Applications/macrdp.app"),
+        ]
+        let fm = FileManager.default
+        return candidates.first {
+            fm.fileExists(atPath: $0.appendingPathComponent("Contents/Resources/macrdp-launch").path)
+        }
+    }
+
+    /// Write + register the LaunchAgent plist pointing at the located server's
+    /// launch wrapper. Mirrors packaging/install-launchagent.sh, in-process.
+    func installLaunchAgent(serverApp: URL) {
+        let launch = serverApp.appendingPathComponent("Contents/Resources/macrdp-launch").path
+        let dict: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": [launch],
+            "RunAtLoad": true,
+            "KeepAlive": true,
+            "StandardOutPath": logURL.path,
+            "StandardErrorPath": logURL.path,
+            "EnvironmentVariables": ["RUST_LOG": "info"],
+        ]
+        let fm = FileManager.default
+        try? fm.createDirectory(at: plistURL.deletingLastPathComponent(),
+                                withIntermediateDirectories: true)
+        try? fm.createDirectory(at: logURL.deletingLastPathComponent(),
+                                withIntermediateDirectories: true)
+        if let data = try? PropertyListSerialization.data(fromPropertyList: dict,
+                                                          format: .xml, options: 0) {
+            try? data.write(to: plistURL)
+        }
+    }
+
+    // MARK: - Keychain password onboarding
+
+    /// The server (run headless by launchd) reads its account password from the
+    /// Keychain via the `security` CLI, so we write it the same way — keeping the
+    /// item's access context as /usr/bin/security so no read-time prompt appears.
+    func hasKeychainPassword() -> Bool {
+        run("/usr/bin/security", ["find-generic-password", "-s", "macrdp", "-a", NSUserName()]).code == 0
+    }
+
+    @discardableResult
+    func promptAndStorePassword() -> Bool {
+        let a = NSAlert()
+        a.messageText = "Enter your macOS account password"
+        a.informativeText = "macrdp authenticates RDP clients against your Mac account and "
+            + "starts headless via launchd, so the password is stored in your login Keychain. "
+            + "It never leaves this Mac."
+        a.addButton(withTitle: "Save")
+        a.addButton(withTitle: "Cancel")
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.placeholderString = "Account password for \(NSUserName())"
+        a.accessoryView = field
+        a.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty else { return false }
+        let r = run("/usr/bin/security",
+                    ["add-generic-password", "-U", "-s", "macrdp", "-a", NSUserName(),
+                     "-w", field.stringValue])
+        if r.code != 0 {
+            alert(style: .critical, "Couldn't save password", "Keychain returned an error.")
+            return false
+        }
+        return true
+    }
+
+    @objc func setPassword() { promptAndStorePassword() }
+
+    func remindPermissions() {
+        let a = NSAlert()
+        a.messageText = "Grant macrdp two permissions"
+        a.informativeText = "macrdp needs Screen Recording (to share the display) and "
+            + "Accessibility (to forward keyboard/mouse). Enable macrdp.app in System "
+            + "Settings → Privacy & Security, then it'll work."
+        a.addButton(withTitle: "Open Privacy Settings")
+        a.addButton(withTitle: "Later")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertFirstButtonReturn { openScreenRecording() }
+    }
+
+    func alert(style: NSAlert.Style, _ message: String, _ info: String) {
+        let a = NSAlert()
+        a.alertStyle = style
+        a.messageText = message
+        a.informativeText = info
+        a.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        _ = a.runModal()
     }
 
     @objc func toggleH264() { flip("ENABLE_H264") }
@@ -262,6 +406,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         p.waitUntilExit()
         return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
     }
+}
+
+// Headless entry for scripted/MDM deploy + testing (no GUI, no status bar).
+let cliArgs = CommandLine.arguments
+if cliArgs.contains("--install-agent") || cliArgs.contains("--print-paths") {
+    exit(AppController().runHeadless(cliArgs))
 }
 
 let app = NSApplication.shared

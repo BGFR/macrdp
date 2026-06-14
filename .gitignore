@@ -9,3 +9,6 @@ Cargo.lock.bak
 
 # macOS
 .DS_Store
+
+# SwiftPM build output for the menu-bar controller (gui/)
+/gui/.build/

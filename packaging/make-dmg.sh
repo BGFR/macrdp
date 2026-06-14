@@ -1,0 +1,72 @@
+#!/bin/bash
+# Build a signed (+ optionally notarized) distribution DMG containing the given
+# .app bundle(s) plus an /Applications drop-link for drag-to-install.
+#
+# The apps SHOULD already be signed + notarized + stapled (run make-app.sh /
+# make-tray-app.sh with NOTARIZE=1 first). This wraps them, signs the DMG, and
+# notarizes + staples the DMG itself so the download passes Gatekeeper offline.
+#
+# Usage:
+#   packaging/make-dmg.sh [App.app ...]
+#     With no args, includes target/macrdp.app and target/macrdpController.app
+#     if present.
+#
+# Env:
+#   CODESIGN_IDENTITY="-"            "-" = ad-hoc (won't pass Gatekeeper); or a
+#                                    "Developer ID Application: …" identity.
+#   NOTARIZE=1 + NOTARY_PROFILE=<p>  notarize + staple the DMG.
+#   OUT_DIR=<dir>                    output dir (default: target/, gitignored).
+#   DMG_NAME=<name.dmg>              output filename (default: macrdp-<version>.dmg).
+#   VOL_NAME=<name>                  mounted volume name (default: "macrdp <version>").
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PKG_DIR="$REPO_ROOT/packaging"
+IDENTITY="${CODESIGN_IDENTITY:--}"
+OUT_DIR="${OUT_DIR:-$REPO_ROOT/target}"
+VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
+[ -n "$VERSION" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
+
+# Collect app bundles: explicit args, else the staged builds under target/.
+apps=("$@")
+if [ ${#apps[@]} -eq 0 ]; then
+    for a in "$REPO_ROOT/target/macrdp.app" "$REPO_ROOT/target/macrdpController.app"; do
+        [ -d "$a" ] && apps+=("$a")
+    done
+fi
+[ ${#apps[@]} -gt 0 ] || { echo "no .app bundles given or found in target/ — build them first" >&2; exit 1; }
+for a in "${apps[@]}"; do [ -d "$a" ] || { echo "not a bundle: $a" >&2; exit 1; }; done
+
+DMG_NAME="${DMG_NAME:-macrdp-$VERSION.dmg}"
+VOL_NAME="${VOL_NAME:-macrdp $VERSION}"
+DMG="$OUT_DIR/$DMG_NAME"
+mkdir -p "$OUT_DIR"
+
+echo "==> DMG v$VERSION (identity: $IDENTITY) including:"
+for a in "${apps[@]}"; do echo "      - $(basename "$a")"; done
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+STAGE="$WORK/dmg"
+mkdir -p "$STAGE"
+for a in "${apps[@]}"; do cp -R "$a" "$STAGE/"; done
+ln -s /Applications "$STAGE/Applications"   # drag-to-install target
+
+echo "==> hdiutil create"
+rm -f "$DMG"
+hdiutil create -volname "$VOL_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+
+if [ "$IDENTITY" != "-" ]; then
+    echo "==> codesign DMG (secure timestamp)"
+    codesign --force --timestamp -s "$IDENTITY" "$DMG"
+    codesign --verify --strict "$DMG"
+fi
+
+if [ "${NOTARIZE:-0}" = "1" ]; then
+    [ "$IDENTITY" != "-" ] || { echo "NOTARIZE=1 needs a real CODESIGN_IDENTITY (not ad-hoc)" >&2; exit 1; }
+    "$PKG_DIR/notarize.sh" "$DMG"
+fi
+
+echo
+echo "DMG ready: $DMG"
+ls -lh "$DMG" | awk '{print "    size: "$5}'

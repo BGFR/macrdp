@@ -28,6 +28,8 @@ same co-signed helper and edits the same `config.env` — no re-permissioning.
 | `launchagent.plist.template` | LaunchAgent template (`__LABEL__`/`__APP_DIR__`/`__HOME__` filled at install). |
 | `make-app.sh` | Build → assemble bundle → co-sign helper + bundle → install. |
 | `install-launchagent.sh` | Seed config, render plist, bootstrap the agent. |
+| `notarize.sh` | Notarize + staple a `.app`/`.dmg`/`.pkg` (used by the build scripts). |
+| `make-dmg.sh` | Wrap signed apps into a signed + notarized distribution DMG. |
 
 ## One-time setup
 
@@ -97,6 +99,21 @@ the code signature or the TCC grants.
   **Note:** the Mac App Store is not a viable channel — macrdp uses the private
   `CGVirtualDisplay` API and system-wide `CGEventPost`/ScreenCaptureKit, which
   the MAS sandbox forbids. Ship a notarized direct download (DMG/zip).
+
+- **Distribution DMG.** Once the app(s) are signed + notarized, wrap them into a
+  download-ready DMG (with an `/Applications` drop-link), then sign + notarize
+  the DMG itself so it passes Gatekeeper offline:
+
+  ```bash
+  # build + notarize both apps first (NOTARIZE=1 as above), then:
+  CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+    NOTARIZE=1 NOTARY_PROFILE=macrdp-notary packaging/make-dmg.sh
+  # -> target/macrdp-<version>.dmg  (pass explicit App.app paths to override)
+  ```
+
+  Verifying a notarized DMG: `xcrun stapler validate <dmg>` is definitive;
+  `spctl` needs `--type open --context context:primary-signature` or it reports
+  a misleading "Insufficient Context".
 - **TCC is keyed to the binary, not the wrapper.** The grants attach to
   `Contents/MacOS/macrdp` (the process that calls ScreenCaptureKit / CGEventPost
   after `exec`). Keep the install path stable and the grants persist.

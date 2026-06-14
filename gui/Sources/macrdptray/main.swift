@@ -106,10 +106,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         opts.addItem(toggle("H.264 video", key: "ENABLE_H264", cfg: cfg, sel: #selector(toggleH264)))
         opts.addItem(toggle("AAC audio", key: "ENABLE_AAC", cfg: cfg, sel: #selector(toggleAAC)))
         opts.addItem(toggle("HiDPI capture", key: "HIDPI", cfg: cfg, sel: #selector(toggleHiDPI)))
-        let bind = cfg["BIND"] ?? "127.0.0.1:3390"
-        let bindItem = NSMenuItem(title: "Bind: \(bind)", action: nil, keyEquivalent: "")
-        bindItem.isEnabled = false
         opts.addItem(.separator())
+        let bind = cfg["BIND"] ?? "127.0.0.1:3390"
+        let net = item("Allow network connections", #selector(toggleNetwork))
+        net.state = bind.hasPrefix("0.0.0.0") ? .on : .off
+        opts.addItem(net)
+        let bindItem = NSMenuItem(title: "Listening on: \(bind)", action: nil, keyEquivalent: "")
+        bindItem.isEnabled = false
         opts.addItem(bindItem)
         let optsItem = NSMenuItem(title: "Options", action: nil, keyEquivalent: "")
         optsItem.submenu = opts
@@ -188,6 +191,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func runHeadless(_ args: [String]) -> Int32 {
         if args.contains("--print-paths") {
             print("label:      \(label)")
+            print("bind:       \(readConfig()["BIND"] ?? "127.0.0.1:3390")")
             print("server app: \(locateServerApp()?.path ?? "NOT FOUND")")
             print("plist:      \(plistURL.path)")
             print("config:     \(configURL.path)")
@@ -320,6 +324,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let next = (cfg[key] == "1") ? "0" : "1"
         writeConfig(key: key, value: next)
         // Apply live if the server is running.
+        if agentState().pid != nil {
+            _ = run("/bin/launchctl", ["kickstart", "-k", service])
+        }
+    }
+
+    /// Flip BIND between loopback-only (127.0.0.1) and all-interfaces (0.0.0.0),
+    /// preserving the port. Confirms before exposing to the network.
+    @objc func toggleNetwork() {
+        let bind = readConfig()["BIND"] ?? "127.0.0.1:3390"
+        let port = bind.split(separator: ":").last.map(String.init) ?? "3390"
+        let enabling = !bind.hasPrefix("0.0.0.0")
+        if enabling {
+            let a = NSAlert()
+            a.messageText = "Allow connections from the network?"
+            a.informativeText = "macrdp will listen on all interfaces (0.0.0.0:\(port)), so "
+                + "other devices on your network can connect. Access still requires TLS and your "
+                + "macOS account password — but only enable this on a network you trust."
+            a.addButton(withTitle: "Allow")
+            a.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            guard a.runModal() == .alertFirstButtonReturn else { return }
+        }
+        writeConfig(key: "BIND", value: "\(enabling ? "0.0.0.0" : "127.0.0.1"):\(port)")
         if agentState().pid != nil {
             _ = run("/bin/launchctl", ["kickstart", "-k", service])
         }

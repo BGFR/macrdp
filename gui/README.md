@@ -65,8 +65,10 @@ macrdpController.app/Contents/MacOS/macrdptray --print-paths      # diagnose res
 - **Status header** — running (with pid) / stopped / not installed.
 - **Start · Stop · Restart** — self-installs on first run, then `kickstart -k` /
   `bootout` the agent.
-- **Options** — H.264 / AAC / HiDPI checkmarks (write `config.env` and live
-  `kickstart` if running); shows the current bind address.
+- **Options** — H.264 / AAC / HiDPI checkmarks, plus **Allow network
+  connections** (flips `BIND` between `127.0.0.1` and `0.0.0.0`, preserving the
+  port, with a confirmation before exposing to the LAN); shows the current
+  listening address. All write `config.env` and live-`kickstart` if running.
 - **Edit config… · Set/Change Account Password…** — edit flags; (re)store the
   Keychain password.
 - **Open Logs** — opens `~/Library/Logs/macrdp.log`.

@@ -47,11 +47,20 @@ cp "$PKG_DIR/macrdp-launch" "$STAGE/Contents/Resources/macrdp-launch"
 chmod +x "$STAGE/Contents/MacOS/macrdp" "$STAGE/Contents/Resources/macrdp-launch"
 
 # 3. Sign the Mach-O executable, then the bundle (which seals Info.plist + the
-#    Resources, including the wrapper script).
-echo "==> codesign (hardened runtime)"
-codesign --force --options runtime --timestamp=none -s "$IDENTITY" "$STAGE/Contents/MacOS/macrdp"
-codesign --force --options runtime --timestamp=none -s "$IDENTITY" "$STAGE"
+#    Resources, including the wrapper script). Ad-hoc ("-") can't use a secure
+#    timestamp; a real Developer ID must (notarization requires it).
+if [ "$IDENTITY" = "-" ]; then TS="--timestamp=none"; else TS="--timestamp"; fi
+echo "==> codesign (hardened runtime, ts: $TS)"
+codesign --force --options runtime $TS -s "$IDENTITY" "$STAGE/Contents/MacOS/macrdp"
+codesign --force --options runtime $TS -s "$IDENTITY" "$STAGE"
 codesign --verify --deep --strict "$STAGE"
+
+# 3b. Optional notarization (NOTARIZE=1, real Developer ID + NOTARY_PROFILE).
+#     Done on the staged app so the stapled ticket travels with the install copy.
+if [ "${NOTARIZE:-0}" = "1" ]; then
+    [ "$IDENTITY" != "-" ] || { echo "NOTARIZE=1 needs a real CODESIGN_IDENTITY (not ad-hoc)" >&2; exit 1; }
+    "$PKG_DIR/notarize.sh" "$STAGE"
+fi
 
 # 4. Install to the stable path. cp -R preserves the signature.
 echo "==> installing to $APP_DIR/macrdp.app"

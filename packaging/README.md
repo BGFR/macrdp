@@ -64,10 +64,25 @@ the code signature or the TCC grants.
 ## Notes & limits
 
 - **Ad-hoc signing is local-only.** `make-app.sh` ad-hoc signs by default
-  (`CODESIGN_IDENTITY=-`), which is fine for your own machine. To hand the app
-  to anyone else you need a Developer ID Application cert + notarization
-  (`CODESIGN_IDENTITY="Developer ID Application: …"`, then `notarytool` +
-  `stapler`) — otherwise Gatekeeper quarantines the download.
+  (`CODESIGN_IDENTITY=-`), which is fine for your own machine but Gatekeeper
+  quarantines it on anyone else's. For distribution, sign with a Developer ID
+  and notarize:
+
+  ```bash
+  # one-time: store notary credentials in the keychain
+  xcrun notarytool store-credentials macrdp-notary \
+    --apple-id you@example.com --team-id TEAMID --password <app-specific-pw>
+
+  # build signed + notarized + stapled (secure timestamp is automatic for a real ID)
+  CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+    NOTARIZE=1 NOTARY_PROFILE=macrdp-notary packaging/make-app.sh
+  ```
+
+  `packaging/notarize.sh` (zip → `notarytool submit --wait` → `stapler staple`)
+  runs on the staged app so the ticket travels with the install copy.
+  **Note:** the Mac App Store is not a viable channel — macrdp uses the private
+  `CGVirtualDisplay` API and system-wide `CGEventPost`/ScreenCaptureKit, which
+  the MAS sandbox forbids. Ship a notarized direct download (DMG/zip).
 - **TCC is keyed to the binary, not the wrapper.** The grants attach to
   `Contents/MacOS/macrdp` (the process that calls ScreenCaptureKit / CGEventPost
   after `exec`). Keep the install path stable and the grants persist.

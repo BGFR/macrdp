@@ -12,7 +12,11 @@ use std::sync::{
 };
 
 use ironrdp_rdpsnd::pdu::{AudioFormat, ClientAudioFormatPdu, WaveFormat};
-use ironrdp_rdpsnd::server::{RdpsndServerHandler, RdpsndServerMessage};
+use ironrdp_rdpsnd::server::RdpsndServerHandler;
+// Only the macOS capture path ships waves via the unified ServerEvent fallback;
+// on the Linux cross-compile stub this name is unused.
+#[cfg(target_os = "macos")]
+use ironrdp_rdpsnd::server::RdpsndServerMessage;
 use ironrdp_server::{AudioWave, ServerEvent, ServerEventSender, SoundServerFactory};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};

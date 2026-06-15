@@ -419,6 +419,16 @@ struct Args {
     #[arg(long = "no-client-resolution", action = clap::ArgAction::SetTrue)]
     no_client_resolution: bool,
 
+    /// On the auto-size path, stretch the Mac screen to fill the client frame
+    /// instead of preserving the Mac's aspect ratio. By default, when the client
+    /// requests a resolution with a different aspect ratio than the Mac display,
+    /// macrdp letterboxes/pillarboxes (keeps the picture undistorted, adds black
+    /// bars) and maps mouse input into the centered content area. Pass this to
+    /// get the old fill-and-distort behavior (no bars). No effect with
+    /// --width/--height (those already stretch) or at a matching aspect ratio.
+    #[arg(long)]
+    stretch: bool,
+
     /// Force QOI BitmapUpdates to be encoded with `Channels::Rgb` instead of
     /// `Channels::Rgba`. The default (off) emits RGBA per the underlying
     /// PixelFormat, matching upstream `ironrdp-server`. Upstream
@@ -1145,6 +1155,7 @@ async fn async_main() -> Result<()> {
     let display = CaptureDisplay {
         desktop_size: desktop_size.clone(),
         auto_size,
+        stretch: args.stretch,
         fps,
         display_id: capture_display_id,
         screen_size_pts,

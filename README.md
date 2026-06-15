@@ -75,6 +75,20 @@ auto-start paths are **mutually exclusive** (both bind `:3390` and share the
                           vs 1512×982) for crisp native pixels. ~4× the pixels;
                           best with --enable-h264. Ignored with --width/--height
                           or --virtual-display. See "Display". macOS-only.
+--no-client-resolution    Serve the Mac's native size instead of adopting the
+                          resolution the client requests at connect. By default,
+                          when mirroring without --width/--height/--hidpi/
+                          --virtual-display, macrdp serves exactly what the client
+                          asks for (so mstsc presents 1:1, no client-side rescale).
+                          Pass this to serve native and let the client scale.
+--stretch                 On the auto-size path, stretch the Mac screen to fill
+                          the client frame. By default, when the client's
+                          resolution has a different aspect ratio than the Mac,
+                          macrdp preserves the Mac's aspect ratio with black bars
+                          (letterbox/pillarbox) and maps mouse input into the
+                          centered picture. Pass this for the old fill-and-distort
+                          behavior. No effect with --width/--height or at a
+                          matching aspect ratio. See "Display".
 --fps N                   Frame rate cap (default 15, or 60 with --enable-h264
                           — see "Video" for why H.264 wants the higher rate)
 --enable-h264             Stream the display as H.264 over EGFX (AVC420),
@@ -213,6 +227,12 @@ Pass **`--hidpi`** to capture at the display's **backing (Retina) pixel resoluti
 - Ignored when you pass explicit `--width`/`--height` (you've chosen the size) or with `--virtual-display` (already an explicit resolution).
 
 Input and cursor are resolution-correct at any setting — clicks land precisely and the pointer stays normal-sized.
+
+### Aspect ratio (auto-size path)
+
+By default macrdp serves exactly the resolution the connecting client requests (e.g. mstsc full-screen on a 1920×1080 monitor gets a 1920×1080 session). When that resolution's aspect ratio differs from the Mac's panel (e.g. a 16:9 client against a 16:10 MacBook), macrdp **preserves the Mac's aspect ratio and adds black bars** (letterbox top/bottom or pillarbox left/right) so the picture isn't distorted, and maps mouse input into the centered picture so clicks stay accurate. Verified: a 1512×982 Mac served to a 1920×1080 client produces a centered 1663×1080 image with 128 px bars each side.
+
+Pass **`--stretch`** to instead fill the whole frame (the old behavior) — no bars, but the image is non-uniformly scaled on an aspect mismatch (e.g. ~13.5% vertical compression for 16:10→16:9). `--stretch` has no effect when the aspect already matches, or with explicit `--width`/`--height` (those always stretch). Either way, serving a non-native resolution forces full-frame updates (higher bandwidth) and, on **mstsc with `--enable-h264`**, the scaling amplifies its trailing-frame presentation lag — a Mac whose native resolution already matches the client (no scaling) is snappier. See "Video".
 
 ## Video (H.264)
 

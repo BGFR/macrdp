@@ -105,12 +105,18 @@ impl Default for ClickSignal {
 #[derive(Clone)]
 pub struct SharedDesktopSize {
     packed: Arc<AtomicU32>,
+    /// True when capture is letterboxing/pillarboxing (preserving the Mac's
+    /// aspect ratio inside a differently-shaped client frame) rather than
+    /// stretching to fill. `input.rs` reads this so mouse coords map into the
+    /// centered content sub-rect instead of the whole frame.
+    letterbox: Arc<AtomicBool>,
 }
 
 impl SharedDesktopSize {
     pub fn new(width: u16, height: u16) -> Self {
         Self {
             packed: Arc::new(AtomicU32::new(Self::pack(width, height))),
+            letterbox: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -126,6 +132,14 @@ impl SharedDesktopSize {
     pub fn set(&self, width: u16, height: u16) {
         self.packed
             .store(Self::pack(width, height), Ordering::Relaxed);
+    }
+
+    pub fn set_letterbox(&self, on: bool) {
+        self.letterbox.store(on, Ordering::Relaxed);
+    }
+
+    pub fn letterbox(&self) -> bool {
+        self.letterbox.load(Ordering::Relaxed)
     }
 }
 
@@ -215,6 +229,11 @@ pub struct CaptureDisplay {
     /// `desktop_size` so capture, input scaling, and the H.264 pipeline
     /// all serve it.
     pub auto_size: bool,
+    /// Opt out of aspect-preserving letterbox on the auto-size path: stretch the
+    /// Mac screen to fill the client frame (the old default) instead of adding
+    /// black bars. Only relevant when `auto_size` is scaling to a non-native
+    /// aspect; ignored otherwise.
+    pub stretch: bool,
     pub fps: u32,
     /// `Some(CGDirectDisplayID)` captures that specific display (e.g. a
     /// `VirtualDisplay`); `None` captures the first SCK display, which
@@ -348,6 +367,9 @@ impl RdpServerDisplay for CaptureDisplay {
                 self.click_signal.clone(),
                 self.flush_frames,
                 self.display_suppressed.clone(),
+                self.auto_size,
+                self.stretch,
+                self.desktop_size.clone(),
             )
             .await?,
         );
@@ -486,6 +508,9 @@ mod macos {
             click_signal: Option<ClickSignal>,
             flush_frames: u32,
             display_suppressed: Option<Arc<AtomicBool>>,
+            auto_size: bool,
+            stretch: bool,
+            desktop_size: SharedDesktopSize,
         ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
                 .await
@@ -539,6 +564,12 @@ mod macos {
             };
             let force_full_frame = !((native_w == width && native_h == height)
                 || (backing_w == width && backing_h == height));
+            // Letterbox (preserve the Mac's aspect ratio with black bars) instead
+            // of stretching to fill — only on the auto-size path, unless --stretch
+            // opts back into fill. When the configured size already matches native
+            // (no scaling), there's nothing to letterbox.
+            let letterbox = force_full_frame && auto_size && !stretch;
+            desktop_size.set_letterbox(letterbox);
             if force_full_frame {
                 tracing::warn!(
                     requested_w = width,
@@ -547,6 +578,7 @@ mod macos {
                     native_h,
                     backing_w,
                     backing_h,
+                    aspect_mode = if letterbox { "letterbox" } else { "stretch" },
                     "configured size != native points or backing; SCK dirty rects are in \
                      source coords and would misalign — sending full frames every tick \
                      (higher bandwidth)"
@@ -567,21 +599,24 @@ mod macos {
                 // it separately as RGBAPointer so the client renders its own
                 // (real-shape) cursor without doubling up.
                 .with_shows_cursor(false)
-                // Stretch the source to fill the output exactly instead of
-                // pillarboxing/letterboxing on aspect mismatch. Without this,
-                // asking for 1920x1080 on a 16:10 MacBook leaves black bars
-                // on the sides; the captured Mac content then sits in a
-                // shifted sub-rectangle, so client-predicted cursor sprites
-                // drift away from the actual click coord (offset grows
-                // proportionally to distance from screen center).
+                // Aspect handling on a scaling (non-native) capture:
+                //   * letterbox=false (default for explicit --width/--height, or
+                //     auto-size + --stretch): stretch the source to fill the
+                //     output exactly — no black bars, but distorts on aspect
+                //     mismatch.
+                //   * letterbox=true (auto-size default): preserve the Mac's
+                //     aspect ratio, padding with black bars. input.rs maps mouse
+                //     coords into the centered content sub-rect to keep clicks
+                //     aligned (the stretch path needs no such correction, which
+                //     is why fill used to be the only mode).
                 //
                 // Apple replaced `scalesToFit` with `preservesAspectRatio`
-                // (inverse semantics) in macOS 14; on macOS 14+ the newer
-                // property is what actually takes effect. Set both so a single
-                // build works across versions — the no-longer-load-bearing one
-                // is a no-op on the version where it doesn't apply.
+                // (inverse semantics) in macOS 14; on 14+ the newer property is
+                // what takes effect. `scales_to_fit(true)` stays set so the
+                // source scales to the output either way; `preserves_aspect_ratio`
+                // is the knob that picks letterbox vs stretch.
                 .with_scales_to_fit(true)
-                .with_preserves_aspect_ratio(false);
+                .with_preserves_aspect_ratio(letterbox);
 
             let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
             stream

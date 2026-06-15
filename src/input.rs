@@ -70,10 +70,105 @@ impl RdpServerInputHandler for MacInputHandler {
         #[cfg(target_os = "macos")]
         {
             let (width, height) = self.desktop_size.get();
-            self.inner.mouse(event, width, height);
+            let letterbox = self.desktop_size.letterbox();
+            self.inner.mouse(event, width, height, letterbox);
         }
         #[cfg(not(target_os = "macos"))]
         trace!(?event, "mouse event (stub)");
+    }
+}
+
+/// Map an RDP client coordinate (`x`,`y` in a `dw`×`dh` client frame) to a point
+/// *offset* within the target Mac display (`sw`×`sh` points; caller adds the
+/// display origin).
+///
+/// - `letterbox = false` (stretch/fill): the whole client frame maps linearly
+///   onto the whole Mac screen.
+/// - `letterbox = true`: the Mac occupies a centered, aspect-preserved sub-rect
+///   of the client frame (matching capture's `preserves_aspect_ratio`), so we map
+///   into that sub-rect; coords landing in the black bars clamp to the nearest
+///   screen edge rather than off-screen.
+///
+/// Pure (no platform deps) so it's unit-tested on every target.
+fn map_client_to_display(
+    x: u16,
+    y: u16,
+    dw: u16,
+    dh: u16,
+    sw: f64,
+    sh: f64,
+    letterbox: bool,
+) -> (f64, f64) {
+    let dwf = f64::from(dw.max(1));
+    let dhf = f64::from(dh.max(1));
+    if letterbox {
+        let mac_aspect = sw / sh.max(1.0);
+        let out_aspect = dwf / dhf;
+        let (cw, ch) = if out_aspect > mac_aspect {
+            (dhf * mac_aspect, dhf) // pillarbox: bars left/right
+        } else {
+            (dwf, dwf / mac_aspect) // letterbox: bars top/bottom
+        };
+        let off_x = (dwf - cw) / 2.0;
+        let off_y = (dhf - ch) / 2.0;
+        let fx = ((f64::from(x) - off_x) / cw).clamp(0.0, 1.0);
+        let fy = ((f64::from(y) - off_y) / ch).clamp(0.0, 1.0);
+        (fx * sw, fy * sh)
+    } else {
+        (f64::from(x) * sw / dwf, f64::from(y) * sh / dhf)
+    }
+}
+
+#[cfg(test)]
+mod coord_tests {
+    use super::map_client_to_display;
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 0.5
+    }
+
+    #[test]
+    fn stretch_maps_full_frame() {
+        // 16:9 client onto a 16:10 Mac, fill mode: corners map to corners.
+        let (mx, my) = map_client_to_display(1920, 1080, 1920, 1080, 1512.0, 982.0, false);
+        assert!(approx(mx, 1512.0) && approx(my, 982.0));
+        let (mx, my) = map_client_to_display(960, 540, 1920, 1080, 1512.0, 982.0, false);
+        assert!(approx(mx, 756.0) && approx(my, 491.0)); // center
+    }
+
+    #[test]
+    fn pillarbox_when_client_wider_than_mac() {
+        // Mac 1512x982 (~1.54) into 1920x1080 (~1.78, wider) → bars left/right.
+        // content_w = 1080 * 1.54 = 1663.7, off_x = (1920-1663.7)/2 = 128.1.
+        let sw = 1512.0;
+        let sh = 982.0;
+        // center stays center
+        let (mx, my) = map_client_to_display(960, 540, 1920, 1080, sw, sh, true);
+        assert!(approx(mx, sw / 2.0) && approx(my, sh / 2.0));
+        // left bar (x=50 < off_x) clamps to the left edge
+        let (mx, _) = map_client_to_display(50, 540, 1920, 1080, sw, sh, true);
+        assert!(approx(mx, 0.0));
+        // right bar clamps to the right edge
+        let (mx, _) = map_client_to_display(1900, 540, 1920, 1080, sw, sh, true);
+        assert!(approx(mx, sw));
+        // top/bottom fill the height → no vertical clamp at extremes
+        let (_, my) = map_client_to_display(960, 0, 1920, 1080, sw, sh, true);
+        assert!(approx(my, 0.0));
+        let (_, my) = map_client_to_display(960, 1080, 1920, 1080, sw, sh, true);
+        assert!(approx(my, sh));
+    }
+
+    #[test]
+    fn letterbox_when_client_taller_than_mac() {
+        // Mac 1512x982 (~1.54) into 1280x1024 (1.25, taller) → bars top/bottom.
+        let sw = 1512.0;
+        let sh = 982.0;
+        let (mx, my) = map_client_to_display(640, 512, 1280, 1024, sw, sh, true);
+        assert!(approx(mx, sw / 2.0) && approx(my, sh / 2.0)); // center
+        let (_, my) = map_client_to_display(640, 5, 1280, 1024, sw, sh, true);
+        assert!(approx(my, 0.0)); // top bar clamps up
+        let (mx, _) = map_client_to_display(0, 512, 1280, 1024, sw, sh, true);
+        assert!(approx(mx, 0.0)); // full width → left edge maps to 0
     }
 }
 
@@ -605,9 +700,15 @@ mod macos {
             ev.post(CGEventTapLocation::HID);
         }
 
-        pub fn mouse(&mut self, event: MouseEvent, desktop_w: u16, desktop_h: u16) {
+        pub fn mouse(
+            &mut self,
+            event: MouseEvent,
+            desktop_w: u16,
+            desktop_h: u16,
+            letterbox: bool,
+        ) {
             match event {
-                MouseEvent::Move { x, y } => self.move_to(x, y, desktop_w, desktop_h),
+                MouseEvent::Move { x, y } => self.move_to(x, y, desktop_w, desktop_h, letterbox),
                 MouseEvent::LeftPressed => self.button(CGMouseButton::Left, true),
                 MouseEvent::LeftReleased => self.button(CGMouseButton::Left, false),
                 MouseEvent::RightPressed => self.button(CGMouseButton::Right, true),
@@ -628,15 +729,17 @@ mod macos {
             }
         }
 
-        fn move_to(&mut self, x: u16, y: u16, desktop_w: u16, desktop_h: u16) {
+        fn move_to(&mut self, x: u16, y: u16, desktop_w: u16, desktop_h: u16, letterbox: bool) {
             // Scale desktop coords → screen points, then translate into the
             // target display's slot in the global coord space. The origin
             // offset is what makes CGEventPost route events to a non-primary
             // display (virtual or external) — the WindowServer dispatches by
             // which display contains the global coord.
             let (ox, oy, sw, sh) = self.target_bounds();
-            let sx = ox + f64::from(x) * sw / f64::from(desktop_w.max(1));
-            let sy = oy + f64::from(y) * sh / f64::from(desktop_h.max(1));
+            let (mx, my) =
+                super::map_client_to_display(x, y, desktop_w, desktop_h, sw, sh, letterbox);
+            let sx = ox + mx;
+            let sy = oy + my;
             self.last_x = sx;
             self.last_y = sy;
 

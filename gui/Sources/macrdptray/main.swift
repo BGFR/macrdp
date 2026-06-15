@@ -126,10 +126,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let vd = item("Virtual display (headless)", #selector(toggleVirtualDisplay))
         vd.state = vdOn ? .on : .off
         disp.addItem(vd)
-        let cap = item("Blank local screen", #selector(toggleCapturePrimary))
-        cap.state = (cfg["CAPTURE_PRIMARY"] == "1") ? .on : .off
-        cap.isEnabled = vdOn // --capture-primary requires --virtual-display
-        disp.addItem(cap)
+        // Primary-screen handling (radio). "detach" moves your apps onto the
+        // virtual display so you can see/use them remotely; "capture" just
+        // blanks the panel (apps stay on it). Both need the virtual display, so
+        // picking one auto-enables it.
+        let curMode: String = {
+            if let m = cfg["PRIMARY_MODE"], !m.isEmpty { return m }
+            return cfg["CAPTURE_PRIMARY"] == "1" ? "capture" : "none" // back-compat
+        }()
+        let primary = NSMenu()
+        for (mode, label) in [
+            ("none", "Keep local screen on"),
+            ("detach", "Detach — move apps to remote"),
+            ("capture", "Blank — keep apps on Mac"),
+        ] {
+            let mi = NSMenuItem(title: label, action: #selector(setPrimaryMode(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = mode
+            mi.state = (curMode == mode) ? .on : .off
+            primary.addItem(mi)
+        }
+        let primaryItem = NSMenuItem(title: "Primary screen", action: nil, keyEquivalent: "")
+        primaryItem.submenu = primary
+        disp.addItem(primaryItem)
         disp.addItem(.separator())
         let curW = cfg["VD_WIDTH"] ?? "1920"
         let curH = cfg["VD_HEIGHT"] ?? "1080"
@@ -392,17 +411,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleVirtualDisplay() {
         let on = readConfig()["VIRTUAL_DISPLAY"] == "1"
         writeConfig(key: "VIRTUAL_DISPLAY", value: on ? "0" : "1")
-        // Turning the virtual display OFF also disables capture-primary, which
-        // the server rejects without --virtual-display.
-        if on { writeConfig(key: "CAPTURE_PRIMARY", value: "0") }
+        // Turning the virtual display OFF resets the primary-screen mode to
+        // none — detach/capture both require --virtual-display.
+        if on {
+            writeConfig(key: "PRIMARY_MODE", value: "none")
+            writeConfig(key: "CAPTURE_PRIMARY", value: "0")
+        }
         applyIfRunning()
     }
 
-    @objc func toggleCapturePrimary() {
-        let on = readConfig()["CAPTURE_PRIMARY"] == "1"
-        // Enabling capture-primary requires the virtual display.
-        if !on { writeConfig(key: "VIRTUAL_DISPLAY", value: "1") }
-        writeConfig(key: "CAPTURE_PRIMARY", value: on ? "0" : "1")
+    /// Set how the physical screen is handled while connected:
+    /// none / detach (move apps to the virtual display) / capture (blank it).
+    @objc func setPrimaryMode(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? String else { return }
+        // detach/capture require the virtual display, so enable it.
+        if mode != "none" { writeConfig(key: "VIRTUAL_DISPLAY", value: "1") }
+        writeConfig(key: "PRIMARY_MODE", value: mode)
+        // Clear the legacy boolean so it can't conflict with PRIMARY_MODE.
+        writeConfig(key: "CAPTURE_PRIMARY", value: "0")
         applyIfRunning()
     }
 
@@ -469,7 +495,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if k == key { lines[i] = "\(key)=\(value)"; found = true; break }
         }
         if !found { lines.append("\(key)=\(value)") }
-        try? lines.joined(separator: "\n").write(to: configURL, atomically: true, encoding: .utf8)
+        // Always end with exactly one trailing newline — a config file with no
+        // final newline makes a downstream append concatenate onto the last
+        // key (which silently corrupted VD_HEIGHT + a new key once).
+        let body = lines.joined(separator: "\n")
+        let out = body.hasSuffix("\n") ? body : body + "\n"
+        try? out.write(to: configURL, atomically: true, encoding: .utf8)
     }
 
     func ensureConfigExists() {
@@ -484,10 +515,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ENABLE_AAC=0
             HIDPI=0
             VIRTUAL_DISPLAY=0
-            CAPTURE_PRIMARY=0
+            PRIMARY_MODE=none
             VD_WIDTH=1920
             VD_HEIGHT=1080
             EXTRA_FLAGS=""
+
             """
             try? defaults.write(to: configURL, atomically: true, encoding: .utf8)
         }

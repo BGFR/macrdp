@@ -32,7 +32,13 @@ ENABLE_H264=0
 ENABLE_AAC=0
 HIDPI=0
 VIRTUAL_DISPLAY=0     # serve a headless virtual display instead of mirroring
-CAPTURE_PRIMARY=0     # (only with VIRTUAL_DISPLAY) blank the physical panel
+# Physical screen handling while a client is connected (only with VIRTUAL_DISPLAY=1):
+#   none    - leave it on; your apps stay on it and the virtual desktop is empty
+#   detach  - disable it; macOS moves your apps onto the virtual display (recommended)
+#   capture - keep it active but gamma-black it; apps stay on it (for hardware
+#             where 'detach' doesn't visibly blank the panel)
+PRIMARY_MODE=none
+CAPTURE_PRIMARY=0     # deprecated: PRIMARY_MODE wins; kept so old configs still work
 VD_WIDTH=1920         # virtual-display resolution (only used when VIRTUAL_DISPLAY=1)
 VD_HEIGHT=1080
 EXTRA_FLAGS=""        # space-separated escape hatch for any flag not modeled above
@@ -49,10 +55,17 @@ args=( --bind "$BIND" --username "$USERNAME" )
 [ "${ENABLE_AAC}" = "1" ]  && args+=( --enable-aac )
 [ "${HIDPI}" = "1" ]       && args+=( --hidpi )
 if [ "${VIRTUAL_DISPLAY}" = "1" ]; then
-    # --virtual-display requires --width/--height; --capture-primary requires
-    # --virtual-display. HIDPI is incompatible with an explicit vdisplay size.
+    # --virtual-display requires --width/--height; --detach-primary /
+    # --capture-primary require --virtual-display and are mutually exclusive.
     args+=( --virtual-display --width "${VD_WIDTH}" --height "${VD_HEIGHT}" )
-    [ "${CAPTURE_PRIMARY}" = "1" ] && args+=( --capture-primary )
+    # Back-compat: an old config with CAPTURE_PRIMARY=1 and no PRIMARY_MODE.
+    if [ "${PRIMARY_MODE}" = "none" ] && [ "${CAPTURE_PRIMARY}" = "1" ]; then
+        PRIMARY_MODE=capture
+    fi
+    case "${PRIMARY_MODE}" in
+        detach)  args+=( --detach-primary ) ;;
+        capture) args+=( --capture-primary ) ;;
+    esac
 fi
 # shellcheck disable=SC2206
 [ -n "${EXTRA_FLAGS}" ] && args+=( ${EXTRA_FLAGS} )

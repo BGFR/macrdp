@@ -60,7 +60,7 @@ launchctl bootout    gui/$(id -u)/com.clintcan.macrdp   # stop entirely
 ```
 
 Edit feature toggles (H.264, AAC, HiDPI), the headless virtual display
-(`VIRTUAL_DISPLAY`/`CAPTURE_PRIMARY`/`VD_WIDTH`/`VD_HEIGHT`), bind address, and
+(`VIRTUAL_DISPLAY`/`PRIMARY_MODE`/`VD_WIDTH`/`VD_HEIGHT`), bind address, and
 an `EXTRA_FLAGS` escape hatch in `config.env`. It's outside the bundle, so edits
 never disturb the code signature or the TCC grants.
 

@@ -69,12 +69,16 @@ macrdpController.app/Contents/MacOS/macrdptray --print-paths      # diagnose res
   connections** (flips `BIND` between `127.0.0.1` and `0.0.0.0`, preserving the
   port, with a confirmation before exposing to the LAN); shows the current
   listening address. All write `config.env` and live-`kickstart` if running.
-- **Display** — **Virtual display (headless)** toggle, **Blank local screen**
-  toggle (`--capture-primary`; only enabled when the virtual display is on, since
-  it requires it — and turning it on auto-enables the virtual display), and a
-  **Virtual display resolution** picker (1280×720 / 1600×900 / 1920×1080 default
-  / 2560×1440). A virtual display at the client's resolution is captured 1:1 (no
-  scaling), so it's snappier than mirroring a non-matching panel.
+- **Display** — **Virtual display (headless)** toggle, a **Primary screen** radio
+  (`PRIMARY_MODE`: *Keep local screen on* / *Detach — move apps to remote* /
+  *Blank — keep apps on Mac*), and a **Virtual display resolution** picker
+  (1280×720 / 1600×900 / 1920×1080 default / 2560×1440). **Detach** disables the
+  physical panel so macOS moves your real apps onto the virtual display (the
+  responsive "remote into my desktop" setup); **Blank** (capture) just blacks the
+  panel and leaves apps on it. Both need the virtual display, so picking either
+  auto-enables it; turning the virtual display off resets the mode to *Keep on*.
+  A virtual display at the client's resolution is captured 1:1 (no scaling), so
+  it's snappier than mirroring a non-matching panel.
 - **Edit config… · Set/Change Account Password…** — edit flags; (re)store the
   Keychain password.
 - **Open Logs** — opens `~/Library/Logs/macrdp.log`.

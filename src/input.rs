@@ -1840,29 +1840,66 @@ mod macos {
             )
         };
 
-        // Best-effort: raise the focused window. AX returns a +1 retain
-        // on Copy* calls, so we must release the result. Failure here
-        // shouldn't fail the overall activation — the caller cares
-        // about whether the app got activated, not which window came up.
-        let focused_attr = CFString::from_static_string("AXFocusedWindow");
-        let mut focused: CFTypeRef = ptr::null();
-        let copy_err = unsafe {
-            AXUIElementCopyAttributeValue(
-                app_ref,
-                focused_attr.as_concrete_TypeRef().cast(),
-                &mut focused,
-            )
+        // Raise + main a window of the app. `kAXFrontmost` activates the
+        // *process* (menu bar), but a window only surfaces if we raise one —
+        // and `AXFocusedWindow` is **null for an app the user hasn't interacted
+        // with on this Space** (the common case right after `--detach-primary`
+        // evacuates everyone onto the virtual display). When that happens,
+        // `kAXFrontmost` succeeds but nothing visibly comes forward, so the
+        // cycle appears to "only switch between the 2 recently-touched apps"
+        // until a real mouse click populates each app's focused window.
+        //
+        // Fix: fall back AXFocusedWindow -> AXMainWindow -> AXWindows[0], then
+        // both AXRaise it AND set AXMain=true. AXMain is what actually moves
+        // window stacking for apps where AXRaise alone is a no-op (Electron —
+        // VSCode/Slack/etc.). All best-effort: the caller only cares that the
+        // process was activated.
+        let raise_and_main = |win: *mut c_void| unsafe {
+            let raise = CFString::from_static_string("AXRaise");
+            AXUIElementPerformAction(win, raise.as_concrete_TypeRef().cast());
+            let main_attr = CFString::from_static_string("AXMain");
+            AXUIElementSetAttributeValue(
+                win,
+                main_attr.as_concrete_TypeRef().cast(),
+                true_val.as_CFTypeRef() as CFTypeRef,
+            );
         };
-        if copy_err == AX_ERROR_SUCCESS && !focused.is_null() {
-            let raise_action = CFString::from_static_string("AXRaise");
-            unsafe {
-                AXUIElementPerformAction(
-                    focused as *mut c_void,
-                    raise_action.as_concrete_TypeRef().cast(),
-                );
-                CFRelease(focused.cast());
+
+        let mut raised_via: &str = "none";
+        // Single-window attributes first (own a +1 retain → release after use).
+        for attr in ["AXFocusedWindow", "AXMainWindow"] {
+            let a = CFString::new(attr);
+            let mut win: CFTypeRef = ptr::null();
+            let err = unsafe {
+                AXUIElementCopyAttributeValue(app_ref, a.as_concrete_TypeRef().cast(), &mut win)
+            };
+            if err == AX_ERROR_SUCCESS && !win.is_null() {
+                raise_and_main(win as *mut c_void);
+                unsafe { CFRelease(win.cast()) };
+                raised_via = attr;
+                break;
             }
         }
+        // Fall back to the first window in AXWindows. Array elements are
+        // borrowed (not retained), so raise while the array is still alive.
+        if raised_via == "none" {
+            let a = CFString::new("AXWindows");
+            let mut arr: CFTypeRef = ptr::null();
+            let err = unsafe {
+                AXUIElementCopyAttributeValue(app_ref, a.as_concrete_TypeRef().cast(), &mut arr)
+            };
+            if err == AX_ERROR_SUCCESS && !arr.is_null() {
+                if unsafe { CFArrayGetCount(arr.cast()) } > 0 {
+                    let w = unsafe { CFArrayGetValueAtIndex(arr.cast(), 0) };
+                    if !w.is_null() {
+                        raise_and_main(w as *mut c_void);
+                        raised_via = "AXWindows[0]";
+                    }
+                }
+                unsafe { CFRelease(arr.cast()) };
+            }
+        }
+        debug!(pid, raised_via, "ax_make_frontmost: window raise");
 
         unsafe { CFRelease(app_ref as *const c_void) };
         frontmost_err

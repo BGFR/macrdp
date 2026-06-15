@@ -31,6 +31,10 @@ USE_KEYCHAIN=1        # read the password from the login Keychain (non-interacti
 ENABLE_H264=0
 ENABLE_AAC=0
 HIDPI=0
+VIRTUAL_DISPLAY=0     # serve a headless virtual display instead of mirroring
+CAPTURE_PRIMARY=0     # (only with VIRTUAL_DISPLAY) blank the physical panel
+VD_WIDTH=1920         # virtual-display resolution (only used when VIRTUAL_DISPLAY=1)
+VD_HEIGHT=1080
 EXTRA_FLAGS=""        # space-separated escape hatch for any flag not modeled above
 # --------------------------------------------------------------------------
 
@@ -44,6 +48,12 @@ args=( --bind "$BIND" --username "$USERNAME" )
 [ "${ENABLE_H264}" = "1" ] && args+=( --enable-h264 )
 [ "${ENABLE_AAC}" = "1" ]  && args+=( --enable-aac )
 [ "${HIDPI}" = "1" ]       && args+=( --hidpi )
+if [ "${VIRTUAL_DISPLAY}" = "1" ]; then
+    # --virtual-display requires --width/--height; --capture-primary requires
+    # --virtual-display. HIDPI is incompatible with an explicit vdisplay size.
+    args+=( --virtual-display --width "${VD_WIDTH}" --height "${VD_HEIGHT}" )
+    [ "${CAPTURE_PRIMARY}" = "1" ] && args+=( --capture-primary )
+fi
 # shellcheck disable=SC2206
 [ -n "${EXTRA_FLAGS}" ] && args+=( ${EXTRA_FLAGS} )
 

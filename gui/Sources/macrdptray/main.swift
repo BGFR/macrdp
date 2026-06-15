@@ -117,6 +117,37 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let optsItem = NSMenuItem(title: "Options", action: nil, keyEquivalent: "")
         optsItem.submenu = opts
         menu.addItem(optsItem)
+
+        // Display: headless virtual display + blank-screen + resolution. A
+        // virtual display at the client's resolution is captured 1:1 (no
+        // scaling) and is snappier than mirroring a non-matching panel.
+        let disp = NSMenu()
+        let vdOn = cfg["VIRTUAL_DISPLAY"] == "1"
+        let vd = item("Virtual display (headless)", #selector(toggleVirtualDisplay))
+        vd.state = vdOn ? .on : .off
+        disp.addItem(vd)
+        let cap = item("Blank local screen", #selector(toggleCapturePrimary))
+        cap.state = (cfg["CAPTURE_PRIMARY"] == "1") ? .on : .off
+        cap.isEnabled = vdOn // --capture-primary requires --virtual-display
+        disp.addItem(cap)
+        disp.addItem(.separator())
+        let curW = cfg["VD_WIDTH"] ?? "1920"
+        let curH = cfg["VD_HEIGHT"] ?? "1080"
+        let resMenu = NSMenu()
+        for (w, h, label) in Self.resolutions {
+            let mi = NSMenuItem(title: label, action: #selector(setResolution(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = "\(w)x\(h)"
+            mi.state = (curW == "\(w)" && curH == "\(h)") ? .on : .off
+            resMenu.addItem(mi)
+        }
+        let resItem = NSMenuItem(title: "Virtual display resolution", action: nil, keyEquivalent: "")
+        resItem.submenu = resMenu
+        disp.addItem(resItem)
+        let dispItem = NSMenuItem(title: "Display", action: nil, keyEquivalent: "")
+        dispItem.submenu = disp
+        menu.addItem(dispItem)
+
         menu.addItem(item("Edit config…", #selector(editConfig)))
         let pwTitle = hasKeychainPassword() ? "Change Account Password…" : "Set Account Password…"
         menu.addItem(item(pwTitle, #selector(setPassword)))
@@ -347,6 +378,45 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard a.runModal() == .alertFirstButtonReturn else { return }
         }
         writeConfig(key: "BIND", value: "\(enabling ? "0.0.0.0" : "127.0.0.1"):\(port)")
+        applyIfRunning()
+    }
+
+    // Standard 16:9 virtual-display resolutions, highest 1440p; default 1920×1080.
+    static let resolutions: [(Int, Int, String)] = [
+        (1280, 720, "1280 × 720"),
+        (1600, 900, "1600 × 900"),
+        (1920, 1080, "1920 × 1080 (1080p)"),
+        (2560, 1440, "2560 × 1440 (1440p)"),
+    ]
+
+    @objc func toggleVirtualDisplay() {
+        let on = readConfig()["VIRTUAL_DISPLAY"] == "1"
+        writeConfig(key: "VIRTUAL_DISPLAY", value: on ? "0" : "1")
+        // Turning the virtual display OFF also disables capture-primary, which
+        // the server rejects without --virtual-display.
+        if on { writeConfig(key: "CAPTURE_PRIMARY", value: "0") }
+        applyIfRunning()
+    }
+
+    @objc func toggleCapturePrimary() {
+        let on = readConfig()["CAPTURE_PRIMARY"] == "1"
+        // Enabling capture-primary requires the virtual display.
+        if !on { writeConfig(key: "VIRTUAL_DISPLAY", value: "1") }
+        writeConfig(key: "CAPTURE_PRIMARY", value: on ? "0" : "1")
+        applyIfRunning()
+    }
+
+    @objc func setResolution(_ sender: NSMenuItem) {
+        guard let s = sender.representedObject as? String else { return }
+        let parts = s.split(separator: "x")
+        guard parts.count == 2 else { return }
+        writeConfig(key: "VD_WIDTH", value: String(parts[0]))
+        writeConfig(key: "VD_HEIGHT", value: String(parts[1]))
+        applyIfRunning()
+    }
+
+    /// Re-exec the agent so config.env changes take effect, if it's running.
+    func applyIfRunning() {
         if agentState().pid != nil {
             _ = run("/bin/launchctl", ["kickstart", "-k", service])
         }
@@ -413,6 +483,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ENABLE_H264=0
             ENABLE_AAC=0
             HIDPI=0
+            VIRTUAL_DISPLAY=0
+            CAPTURE_PRIMARY=0
+            VD_WIDTH=1920
+            VD_HEIGHT=1080
             EXTRA_FLAGS=""
             """
             try? defaults.write(to: configURL, atomically: true, encoding: .utf8)

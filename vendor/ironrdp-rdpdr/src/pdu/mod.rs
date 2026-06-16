@@ -11,7 +11,7 @@ use self::efs::{
     ClientDriveQueryInformationResponse, ClientDriveQueryVolumeInformationResponse, ClientDriveSetInformationResponse,
     ClientNameRequest, CoreCapability, CoreCapabilityKind, DeviceCloseResponse, DeviceControlResponse,
     DeviceCreateResponse, DeviceIoRequest, DeviceReadResponse, DeviceWriteResponse, ServerDeviceAnnounceResponse,
-    VersionAndIdPdu, VersionAndIdPduKind,
+    ServerDriveIoRequest, VersionAndIdPdu, VersionAndIdPduKind,
 };
 
 pub mod efs;
@@ -212,6 +212,46 @@ impl Encode for RdpdrPdu {
 }
 
 impl SvcEncode for RdpdrPdu {}
+
+/// (vendored) Server-direction encoding for drive I/O requests
+/// (PAKID_CORE_DEVICE_IOREQUEST). Upstream `ServerDriveIoRequest` is decode-only
+/// (the client parses these); this lets the *server* emit them. Only the
+/// request kinds the macrdp server issues are encodable; the rest error.
+impl Encode for ServerDriveIoRequest {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        SharedHeader {
+            component: Component::RdpdrCtypCore,
+            packet_id: PacketId::CoreDeviceIoRequest,
+        }
+        .encode(dst)?;
+        match self {
+            ServerDriveIoRequest::ServerCreateDriveRequest(req) => req.encode(dst),
+            ServerDriveIoRequest::DeviceReadRequest(req) => req.encode(dst),
+            ServerDriveIoRequest::DeviceCloseRequest(req) => req.encode(dst),
+            other => Err(unsupported_value_err!(
+                "ServerDriveIoRequest::encode",
+                "ServerDriveIoRequest",
+                format!("{other:?}")
+            )),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "DR_DRIVE_CORE_DEVICE_IOREQUEST"
+    }
+
+    fn size(&self) -> usize {
+        SharedHeader::SIZE
+            + match self {
+                ServerDriveIoRequest::ServerCreateDriveRequest(req) => req.size(),
+                ServerDriveIoRequest::DeviceReadRequest(req) => req.size(),
+                ServerDriveIoRequest::DeviceCloseRequest(req) => req.size(),
+                _ => 0,
+            }
+    }
+}
+
+impl SvcEncode for ServerDriveIoRequest {}
 
 impl fmt::Debug for RdpdrPdu {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

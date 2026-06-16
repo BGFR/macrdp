@@ -26,8 +26,11 @@ src/rdpdr/        RDPDR drive redirection — the macrdp side of the server-side
                   read-only). The protocol state machine (handshake + device
                   discovery) lives in the vendored ironrdp-server::rdpdr; this
                   module is the MacRdpdr factory + RdpdrServerHandler backend.
-                  Phase 1a: handshake + log the client's announced drives.
-                  Device I/O (file read) + a temp-folder Finder surface follow.
+                  1a: handshake + drive discovery. 1b: device I/O — the backend
+                  reads files off the client drive via RdpdrHandle::read_file
+                  (create/read/close, matched by a completion-id router in the
+                  vendored server). Directory listing + a temp-folder Finder
+                  surface are the remaining pieces.
 src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB
                   + Mac↔Windows file copy via FileGroupDescriptorW
                   and FileContentsRequest streaming)

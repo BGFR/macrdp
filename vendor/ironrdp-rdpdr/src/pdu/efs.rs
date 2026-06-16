@@ -1967,6 +1967,32 @@ impl DeviceCreateRequest {
             path,
         })
     }
+
+    /// (vendored) Server-direction encode — the inverse of [`Self::decode`], for a
+    /// server issuing IRP_MJ_CREATE (open a file/directory) to the client.
+    pub fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(ctx: "DeviceCreateRequest", in: dst, size: self.size());
+        self.device_io_request.encode(dst)?;
+        dst.write_u32(self.desired_access.bits());
+        dst.write_u64(self.allocation_size);
+        dst.write_u32(self.file_attributes.bits());
+        dst.write_u32(self.shared_access.bits());
+        dst.write_u32(u32::from(self.create_disposition));
+        dst.write_u32(self.create_options.bits());
+        let path_length = cast_length!(
+            "DeviceCreateRequest",
+            "PathLength",
+            encoded_str_len(&self.path, CharacterSet::Unicode, true)
+        )?;
+        dst.write_u32(path_length);
+        write_string_to_cursor(dst, &self.path, CharacterSet::Unicode, true)
+    }
+
+    pub fn size(&self) -> usize {
+        self.device_io_request.size()
+            + Self::FIXED_PART_SIZE
+            + encoded_str_len(&self.path, CharacterSet::Unicode, true)
+    }
 }
 
 bitflags! {
@@ -2166,6 +2192,20 @@ impl DeviceCreateResponse {
         dst.write_u32(self.file_id);
         dst.write_u8(self.information.bits());
         Ok(())
+    }
+
+    /// (vendored) Server-direction decode — the inverse of [`Self::encode`], for a
+    /// server reading the client's create response.
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        let device_io_reply = DeviceIoResponse::decode(src)?;
+        ensure_size!(ctx: Self::NAME, in: src, size: 4 + 1);
+        let file_id = src.read_u32();
+        let information = Information::from_bits_retain(src.read_u8());
+        Ok(Self {
+            device_io_reply,
+            file_id,
+            information,
+        })
     }
 
     pub fn size(&self) -> usize {
@@ -2950,6 +2990,19 @@ impl DeviceCloseRequest {
             device_io_request: dev_io_req,
         }
     }
+
+    /// (vendored) Server-direction encode — IRP_MJ_CLOSE: the DeviceIoRequest
+    /// header followed by 32 bytes of (ignored) padding.
+    pub fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(ctx: "DR_CLOSE_REQ", in: dst, size: self.size());
+        self.device_io_request.encode(dst)?;
+        write_padding!(dst, 32);
+        Ok(())
+    }
+
+    pub fn size(&self) -> usize {
+        self.device_io_request.size() + 32
+    }
 }
 
 /// [2.2.1.5.2] Device Close Response (DR_CLOSE_RSP)
@@ -2973,6 +3026,13 @@ impl DeviceCloseResponse {
         self.device_io_response.encode(dst)?;
         dst.write_u32(0); // Padding
         Ok(())
+    }
+
+    /// (vendored) Server-direction decode — the 4-byte trailing padding is
+    /// ignored, so only the DeviceIoResponse is read.
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        let device_io_response = DeviceIoResponse::decode(src)?;
+        Ok(Self { device_io_response })
     }
 
     pub fn size(&self) -> usize {
@@ -3544,6 +3604,21 @@ impl DeviceReadRequest {
             offset,
         })
     }
+
+    /// (vendored) Server-direction encode — IRP_MJ_READ: header + Length +
+    /// Offset + 20 bytes of (ignored) padding.
+    pub fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(ctx: "DR_READ_REQ", in: dst, size: self.size());
+        self.device_io_request.encode(dst)?;
+        dst.write_u32(self.length);
+        dst.write_u64(self.offset);
+        write_padding!(dst, 20);
+        Ok(())
+    }
+
+    pub fn size(&self) -> usize {
+        self.device_io_request.size() + Self::FIXED_PART_SIZE
+    }
 }
 
 /// [2.2.1.5.3] Device Read Response (DR_READ_RSP)
@@ -3563,6 +3638,20 @@ impl DeviceReadResponse {
         dst.write_u32(cast_length!("DeviceReadResponse", "length", self.read_data.len())?);
         dst.write_slice(&self.read_data);
         Ok(())
+    }
+
+    /// (vendored) Server-direction decode — the inverse of [`Self::encode`], for a
+    /// server reading the client's read response (Length + ReadData).
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        let device_io_reply = DeviceIoResponse::decode(src)?;
+        ensure_size!(ctx: Self::NAME, in: src, size: 4);
+        let length: usize = cast_length!("DeviceReadResponse", "Length", src.read_u32())?;
+        ensure_size!(ctx: Self::NAME, in: src, size: length);
+        let read_data = src.read_slice(length).to_vec();
+        Ok(Self {
+            device_io_reply,
+            read_data,
+        })
     }
 
     pub fn name(&self) -> &'static str {

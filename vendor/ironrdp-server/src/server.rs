@@ -346,6 +346,9 @@ pub enum ServerEvent {
     /// `ClipboardMessage` enum.
     ClipboardFileCopy(Vec<ironrdp_cliprdr::pdu::FileDescriptor>),
     Rdpsnd(RdpsndServerMessage),
+    /// Server-initiated RDPDR device-I/O requests, framed by [`RdpdrHandle`]
+    /// (drive redirection). Written on the rdpdr static channel.
+    Rdpdr(crate::RdpdrServerMessage),
     Echo(EchoServerMessage),
     SetCredentials(Credentials),
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
@@ -535,11 +538,12 @@ impl RdpServer {
         }
 
         // RDPDR (drive redirection). MS-RDPEFS requires it be co-advertised with
-        // rdpsnd, so it's attached right after the sound channel.
+        // rdpsnd, so it's attached right after the sound channel. build_rdpdr
+        // wires the backend's RdpdrHandle to this connection's event sender so it
+        // can issue device-I/O requests.
         if let Some(factory) = self.rdpdr_factory.as_deref() {
-            let backend = factory.build_backend();
-            let computer_name = factory.computer_name();
-            acceptor.attach_static_channel(crate::RdpdrServer::new(backend, computer_name));
+            let rdpdr = crate::rdpdr::build_rdpdr(factory, self.ev_sender.clone());
+            acceptor.attach_static_channel(rdpdr);
         }
 
         let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
@@ -1006,6 +1010,16 @@ impl RdpServer {
                             .context("DRDYNVC channel not found")?;
 
                         let data = server_encode_svc_messages(messages, drdynvc_channel_id, user_channel_id)?;
+                        writer.write_all(&data).await?;
+                    }
+                },
+                ServerEvent::Rdpdr(msg) => match msg {
+                    crate::RdpdrServerMessage::SendMessages(messages) => {
+                        let Some(channel_id) = self.get_channel_id_by_type::<crate::RdpdrServer>() else {
+                            warn!("No RDPDR channel, dropping device-I/O request");
+                            continue;
+                        };
+                        let data = server_encode_svc_messages(messages, channel_id, user_channel_id)?;
                         writer.write_all(&data).await?;
                     }
                 },

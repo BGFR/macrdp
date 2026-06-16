@@ -33,7 +33,10 @@ pub use echo::{EchoDvcBridge, EchoRoundTripMeasurement, EchoServerHandle, EchoSe
 #[cfg(feature = "egfx")]
 pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
 pub use handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
-pub use rdpdr::{AnnouncedDevice, RdpdrBackendFactory, RdpdrServer, RdpdrServerFactory, RdpdrServerHandler};
+pub use rdpdr::{
+    AnnouncedDevice, RdpdrBackendFactory, RdpdrHandle, RdpdrServer, RdpdrServerFactory, RdpdrServerHandler,
+    RdpdrServerMessage,
+};
 #[cfg(feature = "helper")]
 pub use helper::TlsIdentityCtx;
 pub use server::{

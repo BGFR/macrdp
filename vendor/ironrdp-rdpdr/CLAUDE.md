@@ -28,10 +28,15 @@ reused as-is; we only add the missing server-direction halves.
     `ServerDeviceAnnounceResponse` all have public fields and working `encode`,
     so the server constructs them directly.
 
-    Phase 1b will add the remaining halves here: encode for
-    `DeviceCreateRequest` / `ServerDriveQueryDirectoryRequest` /
-    `DeviceReadRequest` / `DeviceCloseRequest`, and decode for the matching
-    `*Response` types (all decode-only or encode-only upstream today).
+    Phase 1b added the device-I/O halves: `encode` for `DeviceCreateRequest` /
+    `DeviceReadRequest` / `DeviceCloseRequest` (write the `DeviceIoRequest`
+    header + body), `decode` for `DeviceCreateResponse` / `DeviceReadResponse` /
+    `DeviceCloseResponse`, and an `impl Encode + SvcEncode for
+    ServerDriveIoRequest` (in `pdu/mod.rs`) that prepends the
+    `PAKID_CORE_DEVICE_IOREQUEST` SharedHeader so the server can emit a request
+    as an `SvcMessage`. Still pending (list_dir / Phase 1b-ii): encode for
+    `ServerDriveQueryDirectoryRequest` + decode of the directory-info classes in
+    `ClientDriveQueryDirectoryResponse`.
 
     Upstreamable as a `SvcServerProcessor` peer to the client `Rdpdr` (offer the
     decode halves + the server processor together). De-vendor once a published

@@ -151,9 +151,15 @@ AND released — #1276 landing is NOT sufficient.
     `attach_channels` **right after rdpsnd** (MS-RDPEFS requires rdpdr be
     co-advertised with rdpsnd), and `RdpServerBuilder::with_rdpdr_factory`.
     `ironrdp-rdpdr` added to Cargo.toml deps for the wire types. The server's
-    static-channel `start()` dispatch (`client_accepted`) already ships the
-    Server Announce — no extra send path needed for the handshake; Phase 1b
-    adds a `ServerEvent::Rdpdr` arm for server-initiated device-I/O requests.
+    static-channel `start()` dispatch (`client_accepted`) ships the Server
+    Announce — no extra send path needed for the handshake. Phase 1b added
+    device I/O: an `IoRouter` (completion-id → oneshot, like clipboard's
+    `DownloadRouter`), an async `RdpdrHandle` (`read_file` = create→read→close,
+    wired with the connection's event sender by `build_rdpdr` and handed to the
+    backend via `RdpdrServerHandler::set_handle`), a `ServerEvent::Rdpdr`
+    variant + dispatch arm (encodes the handle's `SvcMessage`s on the rdpdr
+    channel), and `RdpdrServer::process` routing `CoreDeviceIoCompletion`
+    responses back to the waiting caller by completion id.
     Read-only; macrdp gates it behind `--enable-drive-redirection`.
     Upstreamable as the server counterpart to the client `Rdpdr`.
 

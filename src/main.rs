@@ -12,6 +12,7 @@ mod file_promise_lazy;
 #[cfg(target_os = "macos")]
 mod h264;
 mod input;
+mod keyboard_layout;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
 mod videotoolbox;
@@ -448,6 +449,19 @@ struct Args {
     #[arg(long)]
     qoi_force_rgb: bool,
 
+    /// Keyboard layout to interpret the client's keystrokes as, for non-US
+    /// clients. Without this, keys are posted as positional keycodes that
+    /// macOS turns into characters using the Mac's *active* input source, so a
+    /// French/German/etc. client on a US-configured Mac gets the wrong letters.
+    /// With it, macrdp translates each key against the named layout via
+    /// `UCKeyTranslate` and posts the correct character — without changing the
+    /// Mac's own input source. Cmd/Ctrl shortcuts stay on the keycode path.
+    /// Accepts a macOS input-source id (`com.apple.keylayout.French`), a short
+    /// name (`french`, `de`, `azerty`, `swissgerman`), or a Windows KLID
+    /// (`0x040C`). The layout must be installed on the Mac. macOS-only.
+    #[arg(long)]
+    keyboard_layout: Option<String>,
+
     /// Read all settings from a `key=value` config file (the same `config.env`
     /// the menu-bar controller writes) instead of from individual flags. When
     /// present, every other flag is ignored and the effective settings come
@@ -864,6 +878,12 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "detach" => argv.push("--detach-primary".into()),
             "capture" => argv.push("--capture-primary".into()),
             _ => {}
+        }
+    }
+    if let Some(layout) = cfg.get("KEYBOARD_LAYOUT") {
+        if !layout.is_empty() {
+            argv.push("--keyboard-layout".into());
+            argv.push(layout.clone());
         }
     }
     // EXTRA_FLAGS: space-separated escape hatch, appended verbatim.
@@ -1297,8 +1317,12 @@ async fn async_main() -> Result<()> {
         display_suppressed: Some(display_suppressed.clone()),
     };
 
-    let input_handler =
-        MacInputHandler::new(desktop_size.clone(), capture_display_id, click_signal)?;
+    let input_handler = MacInputHandler::new(
+        desktop_size.clone(),
+        capture_display_id,
+        click_signal,
+        args.keyboard_layout.clone(),
+    )?;
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> = {
         #[cfg(target_os = "macos")]
         {

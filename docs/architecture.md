@@ -5,12 +5,22 @@ src/main.rs       CLI, TCC preflight, TLS cert mgmt, RdpServer assembly
 src/auth.rs       Startup PAM auth against the macOS account (libpam FFI)
 src/capture.rs    ScreenCaptureKit → BgrA32 BitmapUpdate, dirty-rect driven
 src/cursor.rs     NSCursor → RGBAPointer, hashed for change detection
-src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI),
+src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI by
+                  default; non-US via src/keyboard_layout.rs),
                   per-side modifier state with NX_DEVICE bits, Caps Lock
                   toggle, AX-driven symbolic-hotkey workarounds
                   (Cmd+Tab app cycle, Cmd+` window cycle, Spotlight,
                   screencapture) since WindowServer's symbolic-hotkey
                   dispatcher won't fire for CGEventPost
+src/keyboard_layout.rs  Optional non-US layout translation
+                  (--keyboard-layout). Resolves a name/KLID/input-source-id
+                  to a macOS UCKeyboardLayout via TIS and translates
+                  (keycode + mods) → Unicode with UCKeyTranslate, so input.rs
+                  posts the right character for non-US clients WITHOUT changing
+                  the Mac's active input source. Cmd/Ctrl combos stay on the
+                  keycode path; dead keys compose via UCKeyTranslate state.
+                  macOS-only (Carbon); the translatable-key set + spec parsing
+                  are platform-independent and unit-tested.
 src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB
                   + Mac↔Windows file copy via FileGroupDescriptorW
                   and FileContentsRequest streaming)

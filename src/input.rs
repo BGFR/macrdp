@@ -33,11 +33,15 @@ impl MacInputHandler {
         desktop_size: crate::capture::SharedDesktopSize,
         target_display_id: Option<u32>,
         click_signal: Option<crate::capture::ClickSignal>,
+        keyboard_layout: Option<String>,
     ) -> anyhow::Result<Self> {
         #[cfg(target_os = "macos")]
-        let inner = macos::Inner::new(target_display_id)?;
+        let inner = macos::Inner::new(target_display_id, keyboard_layout.as_deref())?;
         #[cfg(not(target_os = "macos"))]
-        let _ = target_display_id;
+        {
+            let _ = target_display_id;
+            let _ = keyboard_layout;
+        }
         Ok(Self {
             desktop_size,
             click_signal,
@@ -343,6 +347,19 @@ mod macos {
             CGEventFlags::from_bits_retain(bits)
         }
 
+        fn has_shift(&self) -> bool {
+            self.l_shift || self.r_shift
+        }
+        fn has_ctrl(&self) -> bool {
+            self.l_ctrl || self.r_ctrl
+        }
+        fn has_alt(&self) -> bool {
+            self.l_alt || self.r_alt
+        }
+        fn has_cmd(&self) -> bool {
+            self.l_cmd || self.r_cmd
+        }
+
         /// True if `vk` is a known modifier (incl. Caps Lock). The caller
         /// uses this to branch into the FlagsChanged path.
         fn is_modifier_vk(vk: u16) -> bool {
@@ -422,10 +439,14 @@ mod macos {
         // key-up gets swallowed too so the focused app doesn't see a bare
         // release with no preceding press.
         consumed_keys: HashSet<u16>,
+        // Optional non-US keyboard layout. When set, ordinary typing keys are
+        // translated to characters against this layout and posted as Unicode
+        // strings instead of positional keycodes. `None` → keycode path only.
+        layout: Option<crate::keyboard_layout::KeyboardLayout>,
     }
 
     impl Inner {
-        pub fn new(target_display_id: Option<u32>) -> Result<Self> {
+        pub fn new(target_display_id: Option<u32>, keyboard_layout: Option<&str>) -> Result<Self> {
             // Two sources because macOS has two independent modifier-state
             // machines and different consumers read from different ones:
             //
@@ -453,6 +474,10 @@ mod macos {
             // not just our Cmd+Tab commits. Idempotent — only one thread
             // is ever spawned across handler reconstructions.
             start_workspace_mru_poller();
+            let layout = keyboard_layout.and_then(crate::keyboard_layout::KeyboardLayout::resolve);
+            if let Some(l) = &layout {
+                tracing::info!(layout = %l.label(), "non-US keyboard layout translation active");
+            }
             Ok(Self {
                 source,
                 source_hid,
@@ -467,6 +492,7 @@ mod macos {
                 click_right: None,
                 click_middle: None,
                 consumed_keys: HashSet::new(),
+                layout,
             })
         }
 
@@ -582,6 +608,44 @@ mod macos {
                 return;
             }
             if !down && self.consumed_keys.remove(&vk) {
+                return;
+            }
+
+            // Non-US layout translation: for ordinary typing keys with no
+            // Cmd/Ctrl held, produce the character this key yields in the
+            // configured layout and post it as a Unicode string, leaving the
+            // Mac's own input source untouched. Cmd/Ctrl combos fall through to
+            // the keycode path below so shortcuts still work. Once a layout is
+            // active these keys are fully owned here — the matching key-up is
+            // swallowed too (Unicode string events have no release side, like
+            // the RDP Unicode-keyboard path).
+            if self.layout.is_some()
+                && !self.mods.has_cmd()
+                && !self.mods.has_ctrl()
+                && crate::keyboard_layout::is_translatable_keycode(vk)
+            {
+                if down {
+                    let shift = self.mods.has_shift();
+                    let option = self.mods.has_alt();
+                    let caps = self.mods.caps_lock;
+                    if let Some(text) = self
+                        .layout
+                        .as_mut()
+                        .and_then(|l| l.translate(vk, shift, option, caps))
+                    {
+                        // Empty string = a pending dead key; swallow it and let
+                        // the composed character arrive on the next keystroke.
+                        if !text.is_empty() {
+                            let utf16: Vec<u16> = text.encode_utf16().collect();
+                            if let Ok(ev) =
+                                CGEvent::new_keyboard_event(self.source.clone(), 0, true)
+                            {
+                                ev.set_string_from_utf16_unchecked(&utf16);
+                                ev.post(CGEventTapLocation::HID);
+                            }
+                        }
+                    }
+                }
                 return;
             }
 

@@ -34,7 +34,7 @@ pub use echo::{EchoDvcBridge, EchoRoundTripMeasurement, EchoServerHandle, EchoSe
 pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
 pub use handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 pub use rdpdr::{
-    AnnouncedDevice, RdpdrBackendFactory, RdpdrHandle, RdpdrServer, RdpdrServerFactory, RdpdrServerHandler,
+    AnnouncedDevice, DirEntry, RdpdrBackendFactory, RdpdrHandle, RdpdrServer, RdpdrServerFactory, RdpdrServerHandler,
     RdpdrServerMessage,
 };
 #[cfg(feature = "helper")]

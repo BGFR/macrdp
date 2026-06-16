@@ -4,8 +4,8 @@
 //! Mac (server) browses/reads the client's files.
 //!
 //! Done: the MS-RDPEFS init handshake (1a) and device I/O — the backend can
-//! `read_file` off the client's drive via the [`RdpdrHandle`] (1b). The Finder
-//! temp-folder surface and directory listing are the remaining pieces.
+//! `list_dir` and `read_file` the client's drive via the [`RdpdrHandle`] (1b).
+//! The macOS Finder temp-folder surface (1c) is the remaining piece.
 //! Opt-in via `--enable-drive-redirection`.
 
 use ironrdp_rdpdr::pdu::efs::DeviceType;
@@ -68,13 +68,10 @@ impl RdpdrServerHandler for MacRdpdrHandler {
             );
         }
 
-        // Phase 1b verification hook (read-only, no Finder surface yet): when
-        // MACRDP_RDPDR_TEST_READ=<path> is set, read that path from the first
-        // redirected filesystem and log the bytes. The Finder surface (Phase 1c)
-        // is what drives reads in normal use.
-        let Ok(path) = std::env::var("MACRDP_RDPDR_TEST_READ") else {
-            return;
-        };
+        // Phase 1b verification hooks (read-only, no Finder surface yet): on the
+        // first redirected filesystem, MACRDP_RDPDR_TEST_LIST=1 lists the root and
+        // MACRDP_RDPDR_TEST_READ=<path> reads that path, logging the result. The
+        // Finder surface (Phase 1c) is what drives these in normal use.
         let (Some(handle), Some(dev)) = (
             self.handle.clone(),
             devices
@@ -84,23 +81,45 @@ impl RdpdrServerHandler for MacRdpdrHandler {
             return;
         };
         let device_id = dev.device_id;
-        tokio::spawn(async move {
-            match handle.read_file(device_id, &path, 0, 4096).await {
-                Ok(bytes) => {
-                    let n = bytes.len().min(160);
-                    info!(
-                        device_id,
-                        path = %path,
-                        bytes = bytes.len(),
-                        preview = %String::from_utf8_lossy(&bytes[..n]),
-                        "drive redirection: read_file OK"
-                    );
+
+        if std::env::var("MACRDP_RDPDR_TEST_LIST").is_ok() {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                match handle.list_dir(device_id, "\\").await {
+                    Ok(entries) => {
+                        info!(
+                            device_id,
+                            count = entries.len(),
+                            "drive redirection: list_dir(\\) OK"
+                        );
+                        for e in &entries {
+                            info!(name = %e.name, size = e.size, is_dir = e.is_dir, "drive redirection:   entry");
+                        }
+                    }
+                    Err(e) => warn!(device_id, error = %e, "drive redirection: list_dir failed"),
                 }
-                Err(e) => {
-                    warn!(device_id, path = %path, error = %e, "drive redirection: read_file failed")
+            });
+        }
+
+        if let Ok(path) = std::env::var("MACRDP_RDPDR_TEST_READ") {
+            tokio::spawn(async move {
+                match handle.read_file(device_id, &path, 0, 4096).await {
+                    Ok(bytes) => {
+                        let n = bytes.len().min(160);
+                        info!(
+                            device_id,
+                            path = %path,
+                            bytes = bytes.len(),
+                            preview = %String::from_utf8_lossy(&bytes[..n]),
+                            "drive redirection: read_file OK"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(device_id, path = %path, error = %e, "drive redirection: read_file failed")
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 }
 

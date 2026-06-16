@@ -228,6 +228,7 @@ impl Encode for ServerDriveIoRequest {
             ServerDriveIoRequest::ServerCreateDriveRequest(req) => req.encode(dst),
             ServerDriveIoRequest::DeviceReadRequest(req) => req.encode(dst),
             ServerDriveIoRequest::DeviceCloseRequest(req) => req.encode(dst),
+            ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(req) => req.encode(dst),
             other => Err(unsupported_value_err!(
                 "ServerDriveIoRequest::encode",
                 "ServerDriveIoRequest",
@@ -246,6 +247,7 @@ impl Encode for ServerDriveIoRequest {
                 ServerDriveIoRequest::ServerCreateDriveRequest(req) => req.size(),
                 ServerDriveIoRequest::DeviceReadRequest(req) => req.size(),
                 ServerDriveIoRequest::DeviceCloseRequest(req) => req.size(),
+                ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(req) => req.size(),
                 _ => 0,
             }
     }

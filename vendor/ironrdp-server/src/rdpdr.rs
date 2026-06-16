@@ -26,8 +26,9 @@ use ironrdp_pdu::{decode_err, PduResult};
 use ironrdp_rdpdr::pdu::efs::{
     Capabilities, ClientDeviceListAnnounce, ClientNameRequest, CoreCapability, CoreCapabilityKind, CreateDisposition,
     CreateOptions, DeviceCloseRequest, DeviceCreateRequest, DeviceCreateResponse, DeviceIoRequest, DeviceIoResponse,
-    DeviceReadRequest, DeviceReadResponse, DeviceType, DesiredAccess, FileAttributes, MajorFunction, MinorFunction,
-    NtStatus, ServerDeviceAnnounceResponse, ServerDriveIoRequest, SharedAccess, VersionAndIdPdu, VersionAndIdPduKind,
+    DeviceReadRequest, DeviceReadResponse, DeviceType, DesiredAccess, FileAttributes, FileDirectoryInformation,
+    FileInformationClassLevel, MajorFunction, MinorFunction, NtStatus, ServerDeviceAnnounceResponse,
+    ServerDriveIoRequest, ServerDriveQueryDirectoryRequest, SharedAccess, VersionAndIdPdu, VersionAndIdPduKind,
     VERSION_MAJOR, VERSION_MINOR_RDP51,
 };
 use ironrdp_rdpdr::pdu::{PacketId, RdpdrPdu, SharedHeader};
@@ -75,6 +76,16 @@ pub trait RdpdrServerFactory: RdpdrBackendFactory + ServerEventSender {}
 pub enum RdpdrServerMessage {
     /// Pre-framed SVC messages to write on the rdpdr static channel.
     SendMessages(Vec<SvcMessage>),
+}
+
+/// One entry from a directory listing.
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    /// File/directory name (no path).
+    pub name: String,
+    /// Size in bytes (0 for directories).
+    pub size: u64,
+    pub is_dir: bool,
 }
 
 /// Matches `DeviceIoCompletion` responses to the request awaiting them, keyed by
@@ -138,11 +149,81 @@ impl RdpdrHandle {
     /// close — returning the bytes read. Path uses Windows backslash separators
     /// relative to the redirected drive root (e.g. `\\readme.txt`).
     pub async fn read_file(&self, device_id: u32, path: &str, offset: u64, length: u32) -> Result<Vec<u8>> {
-        let file_id = self.create(device_id, path).await?;
+        let file_id = self
+            .create_with(
+                device_id,
+                path,
+                DesiredAccess::GENERIC_READ,
+                CreateOptions::FILE_NON_DIRECTORY_FILE,
+            )
+            .await?;
         let data = self.read(device_id, file_id, offset, length).await;
         // Best-effort close even if the read failed, so the client releases the handle.
         let _ = self.close(device_id, file_id).await;
         data
+    }
+
+    /// List the entries of directory `dir_path` (Windows backslash path relative
+    /// to the drive root; `\\` is the root). Returns the entries excluding the
+    /// `.`/`..` pseudo-entries.
+    pub async fn list_dir(&self, device_id: u32, dir_path: &str) -> Result<Vec<DirEntry>> {
+        let file_id = self
+            .create_with(
+                device_id,
+                dir_path,
+                DesiredAccess::FILE_READ_DATA_OR_FILE_LIST_DIRECTORY | DesiredAccess::FILE_READ_ATTRIBUTES,
+                CreateOptions::FILE_DIRECTORY_FILE,
+            )
+            .await?;
+        let pattern = query_pattern(dir_path);
+        let mut entries = Vec::new();
+        let mut initial = true;
+        loop {
+            let (completion_id, rx) = self.router.register();
+            let mut header = self.io_header(device_id, completion_id, MajorFunction::DirectoryControl);
+            header.file_id = file_id;
+            header.minor_function = MinorFunction::IRP_MN_QUERY_DIRECTORY;
+            self.send(ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(
+                ServerDriveQueryDirectoryRequest {
+                    device_io_request: header,
+                    file_info_class_lvl: FileInformationClassLevel::FILE_DIRECTORY_INFORMATION,
+                    initial_query: u8::from(initial),
+                    path: if initial { pattern.clone() } else { String::new() },
+                },
+            ))?;
+            initial = false;
+
+            let body = rx.await.context("RDPDR query-dir: connection closed")?;
+            let mut src = ReadCursor::new(&body);
+            let io = DeviceIoResponse::decode(&mut src).map_err(|e| anyhow!("{e}"))?;
+            // The client signals end-of-enumeration with NO_MORE_FILES; some
+            // return another error code there instead — either way we're done.
+            if io.io_status != NtStatus::SUCCESS {
+                break;
+            }
+            if src.len() < 4 {
+                break;
+            }
+            let _length = src.read_u32();
+            let entry = match FileDirectoryInformation::decode(&mut src) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(error = ?e, "RDPDR: undecodable directory entry");
+                    break;
+                }
+            };
+            if entry.file_name == "." || entry.file_name == ".." {
+                continue;
+            }
+            let is_dir = entry.file_attributes.contains(FileAttributes::FILE_ATTRIBUTE_DIRECTORY);
+            entries.push(DirEntry {
+                name: entry.file_name,
+                size: u64::try_from(entry.end_of_file).unwrap_or(0),
+                is_dir,
+            });
+        }
+        let _ = self.close(device_id, file_id).await;
+        Ok(entries)
     }
 
     fn send(&self, req: ServerDriveIoRequest) -> Result<()> {
@@ -162,16 +243,22 @@ impl RdpdrHandle {
         }
     }
 
-    async fn create(&self, device_id: u32, path: &str) -> Result<u32> {
+    async fn create_with(
+        &self,
+        device_id: u32,
+        path: &str,
+        desired_access: DesiredAccess,
+        create_options: CreateOptions,
+    ) -> Result<u32> {
         let (completion_id, rx) = self.router.register();
         self.send(ServerDriveIoRequest::ServerCreateDriveRequest(DeviceCreateRequest {
             device_io_request: self.io_header(device_id, completion_id, MajorFunction::Create),
-            desired_access: DesiredAccess::GENERIC_READ,
+            desired_access,
             allocation_size: 0,
             file_attributes: FileAttributes::empty(),
             shared_access: SharedAccess::FILE_SHARE_READ,
             create_disposition: CreateDisposition::FILE_OPEN,
-            create_options: CreateOptions::FILE_NON_DIRECTORY_FILE,
+            create_options,
             path: path.to_owned(),
         }))?;
         let body = rx.await.context("RDPDR create: connection closed")?;
@@ -361,6 +448,18 @@ impl SvcProcessor for RdpdrServer {
 }
 
 impl SvcServerProcessor for RdpdrServer {}
+
+/// The search pattern for an initial query-directory request: the directory
+/// path with a trailing `\*` wildcard (relative to the drive root).
+fn query_pattern(dir: &str) -> String {
+    if dir.is_empty() || dir == "\\" {
+        "\\*".to_owned()
+    } else if dir.ends_with('\\') {
+        format!("{dir}*")
+    } else {
+        format!("{dir}\\*")
+    }
+}
 
 /// Build the channel processor + wire the backend's [`RdpdrHandle`]. Called from
 /// `RdpServer::attach_channels` with the connection's `ServerEvent` sender.

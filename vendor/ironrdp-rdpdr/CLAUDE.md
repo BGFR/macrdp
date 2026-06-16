@@ -34,9 +34,12 @@ reused as-is; we only add the missing server-direction halves.
     `DeviceCloseResponse`, and an `impl Encode + SvcEncode for
     ServerDriveIoRequest` (in `pdu/mod.rs`) that prepends the
     `PAKID_CORE_DEVICE_IOREQUEST` SharedHeader so the server can emit a request
-    as an `SvcMessage`. Still pending (list_dir / Phase 1b-ii): encode for
-    `ServerDriveQueryDirectoryRequest` + decode of the directory-info classes in
-    `ClientDriveQueryDirectoryResponse`.
+    as an `SvcMessage`. Phase 1b-ii (list_dir) added `encode` for
+    `ServerDriveQueryDirectoryRequest` and `decode` for `FileDirectoryInformation`
+    (the directory-entry class the server requests); the query-directory response
+    is decoded inline in the server's `RdpdrHandle::list_dir` (DeviceIoResponse +
+    Length + one entry per response, looped until NO_MORE_FILES). Still pending:
+    write support (`DeviceWriteRequest`/`Response`) for Phase 2.
 
     Upstreamable as a `SvcServerProcessor` peer to the client `Rdpdr` (offer the
     decode halves + the server processor together). De-vendor once a published

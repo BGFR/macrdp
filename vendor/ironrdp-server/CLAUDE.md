@@ -159,7 +159,9 @@ AND released — #1276 landing is NOT sufficient.
     backend via `RdpdrServerHandler::set_handle`), a `ServerEvent::Rdpdr`
     variant + dispatch arm (encodes the handle's `SvcMessage`s on the rdpdr
     channel), and `RdpdrServer::process` routing `CoreDeviceIoCompletion`
-    responses back to the waiting caller by completion id.
+    responses back to the waiting caller by completion id. `RdpdrHandle` exposes
+    `read_file` (create→read→close) and `list_dir` (create→query-directory loop
+    until NO_MORE_FILES→close, returning `DirEntry`s).
     Read-only; macrdp gates it behind `--enable-drive-redirection`.
     Upstreamable as the server counterpart to the client `Rdpdr`.
 

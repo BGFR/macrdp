@@ -2972,6 +2972,39 @@ impl FileDirectoryInformation {
         + 4 // FileNameLength
         + encoded_str_len(&self.file_name, CharacterSet::Unicode, false)
     }
+
+    /// (vendored) Server-direction decode — the inverse of [`Self::encode`], for a
+    /// server reading a FileDirectoryInformation entry out of a query-directory
+    /// response.
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        const FIXED: usize = 4 + 4 + 8 * 6 + 4 + 4; // up to (and incl.) FileNameLength
+        ensure_size!(ctx: "FileDirectoryInformation", in: src, size: FIXED);
+        let next_entry_offset = src.read_u32();
+        let file_index = src.read_u32();
+        let creation_time = src.read_i64();
+        let last_access_time = src.read_i64();
+        let last_write_time = src.read_i64();
+        let change_time = src.read_i64();
+        let end_of_file = src.read_i64();
+        let allocation_size = src.read_i64();
+        let file_attributes = FileAttributes::from_bits_retain(src.read_u32());
+        let file_name_length: usize =
+            cast_length!("FileDirectoryInformation", "FileNameLength", src.read_u32())?;
+        ensure_size!(ctx: "FileDirectoryInformation", in: src, size: file_name_length);
+        let file_name = decode_string(src.read_slice(file_name_length), CharacterSet::Unicode, false)?;
+        Ok(Self {
+            next_entry_offset,
+            file_index,
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time,
+            end_of_file,
+            allocation_size,
+            file_attributes,
+            file_name,
+        })
+    }
 }
 
 /// [2.2.1.4.2] Device Close Request (DR_CLOSE_REQ)
@@ -3088,6 +3121,36 @@ impl ServerDriveQueryDirectoryRequest {
             initial_query,
             path,
         })
+    }
+
+    /// (vendored) Server-direction encode — IRP_MJ_DIRECTORY_CONTROL /
+    /// IRP_MN_QUERY_DIRECTORY. A continuation query (`initial_query == 0`) sends
+    /// an empty path (PathLength 0); the initial query sends a null-terminated
+    /// UTF-16 search pattern.
+    pub fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(ctx: "ServerDriveQueryDirectoryRequest", in: dst, size: self.size());
+        self.device_io_request.encode(dst)?;
+        dst.write_u32(self.file_info_class_lvl.clone().into());
+        dst.write_u8(self.initial_query);
+        let path_length = self.encoded_path_len();
+        dst.write_u32(cast_length!("ServerDriveQueryDirectoryRequest", "PathLength", path_length)?);
+        write_padding!(dst, 23);
+        if !self.path.is_empty() {
+            write_string_to_cursor(dst, &self.path, CharacterSet::Unicode, true)?;
+        }
+        Ok(())
+    }
+
+    fn encoded_path_len(&self) -> usize {
+        if self.path.is_empty() {
+            0
+        } else {
+            encoded_str_len(&self.path, CharacterSet::Unicode, true)
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.device_io_request.size() + Self::FIXED_PART_SIZE + self.encoded_path_len()
     }
 }
 

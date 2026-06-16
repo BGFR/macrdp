@@ -1,308 +1,540 @@
-//! macOS Finder surface for RDPDR drive redirection (Phase 1c).
+//! macOS NFS-mount surface for RDPDR drive redirection (Phase 2).
 //!
-//! On connect, the client's redirected drive root is enumerated via
-//! [`RdpdrHandle::list_dir`] and mirrored into a temp folder
-//! `/tmp/macrdp-rdpdr-<pid>/<drive>/`: subdirectories become empty folders and
-//! files become **pre-sized placeholders**, each backed by an `NSFilePresenter`.
-//! The folder is opened in Finder. When the user opens a file, Finder's
-//! coordinated read fires `relinquishPresentedItemToReader:`, where we block and
-//! stream the bytes via [`RdpdrHandle::read_to_file`] before letting Finder
-//! proceed — the same on-demand model as the lazy Windows→Mac paste
-//! (`file_promise_lazy`), and it reuses the same dedicated CFRunLoop thread
-//! (`runloop_thread`) for the `NSFileCoordinator` add/remove calls.
+//! Replaces the Phase-1c temp-folder/`NSFilePresenter` mirror with a **real
+//! volume**: an in-process NFSv3 server ([`nfsserve`]) exposes the client's
+//! redirected drive, and macOS's built-in NFS client mounts it at
+//! `/Volumes/<label>`. The OS then routes every `stat`/`readdir`/`read` to our
+//! [`RdpdrFs`], which translates them into RDPDR `list_dir` / `read_file` calls
+//! over the [`RdpdrHandle`]. The win over the temp-folder surface: real
+//! subdirectory navigation (the kernel drives lookups lazily as the user
+//! browses), a proper Finder volume in the sidebar, and no per-file placeholder
+//! bookkeeping — the OS's VFS layer is the cache.
 //!
-//! Read-only, top-level only for now (subdirectory contents are a follow-on —
-//! they show as empty folders). Cleaned up when the connection's backend drops.
+//! No kext / FUSE / app-extension: the mount uses only the built-in `mount_nfs`
+//! against `localhost`, and (verified) needs **no root** for a loopback NFS
+//! mount onto a user-created mountpoint. Read-only for now — every write-side
+//! NFS op returns `NFS3ERR_ROFS`, and the mount itself is `-o rdonly`.
+//!
+//! Cleaned up (unmount + remove mountpoint + stop the server) when the
+//! connection's backend drops.
 
 #![cfg(target_os = "macos")]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use block2::Block;
-use ironrdp_server::RdpdrHandle;
-use objc2::rc::{Allocated, Retained};
-use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
-use objc2_foundation::{NSFileCoordinator, NSFilePresenter, NSOperationQueue, NSString, NSURL};
-use tokio::runtime::Handle;
+use async_trait::async_trait;
+use ironrdp_server::{DirEntry as RdpEntry, RdpdrHandle};
+use nfsserve::nfs::{
+    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3,
+};
+use nfsserve::tcp::{NFSTcp, NFSTcpListener};
+use nfsserve::vfs::{DirEntry as NfsDirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::runloop_thread;
+// ---------------------------------------------------------------------------
+// Path/fileid cache
+// ---------------------------------------------------------------------------
 
-/// Per-presenter fetch state, indexed by the numeric id stored in the
-/// presenter's ivars (Obj-C objects can't carry Rust closures cleanly).
-struct PresenterState {
-    url: Retained<NSURL>,
-    queue: Retained<NSOperationQueue>,
-    dst: PathBuf,
+/// The root directory's NFS fileid (1 by NFS convention).
+const ROOT_ID: fileid3 = 1;
+
+/// One known node in the redirected tree.
+#[derive(Clone)]
+struct Node {
+    /// Windows backslash path relative to the drive root (`\` is the root).
+    remote_path: String,
+    is_dir: bool,
+    size: u64,
+    /// Parent's fileid, for `..` resolution (root is its own parent).
+    parent: fileid3,
+}
+
+/// Bidirectional path↔fileid map. NFS addresses everything by an opaque u64
+/// fileid; RDPDR addresses by path — this interns each path we encounter to a
+/// stable id and remembers its metadata so `getattr` needn't re-stat.
+struct FsCache {
+    next_id: fileid3,
+    id_to_node: HashMap<fileid3, Node>,
+    path_to_id: HashMap<String, fileid3>,
+}
+
+impl FsCache {
+    fn new() -> Self {
+        let mut id_to_node = HashMap::new();
+        let mut path_to_id = HashMap::new();
+        id_to_node.insert(
+            ROOT_ID,
+            Node {
+                remote_path: "\\".to_owned(),
+                is_dir: true,
+                size: 0,
+                parent: ROOT_ID,
+            },
+        );
+        path_to_id.insert("\\".to_owned(), ROOT_ID);
+        Self {
+            next_id: ROOT_ID + 1,
+            id_to_node,
+            path_to_id,
+        }
+    }
+
+    /// Intern `path` (a child of `parent`), returning its stable fileid. Refreshes
+    /// the cached size/kind if the path is already known.
+    fn intern(&mut self, parent: fileid3, path: &str, is_dir: bool, size: u64) -> fileid3 {
+        if let Some(&id) = self.path_to_id.get(path) {
+            if let Some(n) = self.id_to_node.get_mut(&id) {
+                n.is_dir = is_dir;
+                n.size = size;
+            }
+            return id;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.id_to_node.insert(
+            id,
+            Node {
+                remote_path: path.to_owned(),
+                is_dir,
+                size,
+                parent,
+            },
+        );
+        self.path_to_id.insert(path.to_owned(), id);
+        id
+    }
+}
+
+/// Join a child `name` onto a Windows backslash `dir` path.
+fn join_remote(dir: &str, name: &str) -> String {
+    if dir == "\\" {
+        format!("\\{name}")
+    } else {
+        format!("{dir}\\{name}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RdpdrFs — the NFS filesystem backed by the client's redirected drive
+// ---------------------------------------------------------------------------
+
+/// Read-only NFS filesystem over a redirected RDPDR drive. Every NFS op the
+/// kernel issues is satisfied from the cache or via an RDPDR round-trip.
+pub struct RdpdrFs {
     handle: RdpdrHandle,
     device_id: u32,
-    /// Windows-style path on the redirected drive, e.g. `\readme.txt`.
-    remote_path: String,
-    rt: Handle,
-    /// Set after the first successful materialization so a second coordinated
-    /// read doesn't re-fetch.
-    fetched: Mutex<bool>,
+    /// A fixed timestamp (server start) reported for every node — read-only, so
+    /// the value only matters for the client's attribute cache.
+    created_secs: u32,
+    cache: Mutex<FsCache>,
 }
 
-struct SendRetained<T>(Retained<T>);
-// Safe: we only call documented-thread-safe accessors on these immutable
-// Foundation objects, and the presenter add/remove happens on the runloop thread.
-unsafe impl<T> Send for SendRetained<T> {}
-unsafe impl<T> Sync for SendRetained<T> {}
-
-static REGISTRY: OnceLock<Mutex<HashMap<u64, Arc<PresenterState>>>> = OnceLock::new();
-static LIVE_PRESENTERS: OnceLock<Mutex<HashMap<u64, SendRetained<RdpdrPresenter>>>> =
-    OnceLock::new();
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-fn registry() -> &'static Mutex<HashMap<u64, Arc<PresenterState>>> {
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-fn live_presenters() -> &'static Mutex<HashMap<u64, SendRetained<RdpdrPresenter>>> {
-    LIVE_PRESENTERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-declare_class!(
-    /// `NSFilePresenter` subclass, one per redirected file. Holds only a numeric
-    /// id in ivars; real state lives in [`REGISTRY`].
-    struct RdpdrPresenter;
-
-    unsafe impl ClassType for RdpdrPresenter {
-        type Super = NSObject;
-        type Mutability = mutability::InteriorMutable;
-        const NAME: &'static str = "MacrdpRdpdrFilePresenter";
-    }
-
-    impl DeclaredClass for RdpdrPresenter {
-        type Ivars = Ivars;
-    }
-
-    unsafe impl RdpdrPresenter {
-        #[method_id(init)]
-        fn init(this: Allocated<Self>) -> Option<Retained<Self>> {
-            let this = this.set_ivars(Ivars { id: 0 });
-            unsafe { msg_send_id![super(this), init] }
+impl RdpdrFs {
+    fn new(handle: RdpdrHandle, device_id: u32) -> Self {
+        let created_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        Self {
+            handle,
+            device_id,
+            created_secs,
+            cache: Mutex::new(FsCache::new()),
         }
     }
 
-    unsafe impl NSFilePresenter for RdpdrPresenter {
-        #[method_id(presentedItemURL)]
-        #[allow(non_snake_case)]
-        fn presentedItemURL(&self) -> Option<Retained<NSURL>> {
-            let id = self.ivars().id;
-            registry().lock().unwrap().get(&id).map(|s| s.url.clone())
-        }
-
-        #[method_id(presentedItemOperationQueue)]
-        #[allow(non_snake_case)]
-        fn presentedItemOperationQueue(&self) -> Retained<NSOperationQueue> {
-            let id = self.ivars().id;
-            registry()
-                .lock()
-                .unwrap()
-                .get(&id)
-                .map(|s| s.queue.clone())
-                .unwrap_or_else(|| unsafe { NSOperationQueue::mainQueue() })
-        }
-
-        #[method(relinquishPresentedItemToReader:)]
-        unsafe fn relinquish_to_reader(&self, reader: *mut Block<dyn Fn(*mut Block<dyn Fn()>)>) {
-            let id = self.ivars().id;
-            let Some(state) = registry().lock().unwrap().get(&id).cloned() else {
-                if let Some(reader) = reader.as_ref() {
-                    reader.call((std::ptr::null_mut(),));
-                }
-                return;
-            };
-
-            // Block this presenter's operation-queue thread while we stream the
-            // file (Apple's coordination model allows arbitrarily long blocking
-            // here; Finder shows native progress).
-            let mut fetched = state.fetched.lock().unwrap();
-            if !*fetched {
-                debug!(id, path = %state.remote_path, "rdpdr surface: streaming on read");
-                match state.rt.block_on(state.handle.read_to_file(
-                    state.device_id,
-                    &state.remote_path,
-                    &state.dst,
-                )) {
-                    Ok(n) => {
-                        *fetched = true;
-                        info!(id, path = %state.remote_path, bytes = n, "rdpdr surface: file materialized");
-                    }
-                    Err(e) => {
-                        warn!(id, path = %state.remote_path, error = %e, "rdpdr surface: read failed; removing temp file");
-                        let _ = std::fs::remove_file(&state.dst);
-                        registry().lock().unwrap().remove(&id);
-                    }
-                }
+    fn attr(&self, id: fileid3, is_dir: bool, size: u64) -> fattr3 {
+        let t = nfstime3 {
+            seconds: self.created_secs,
+            nseconds: 0,
+        };
+        if is_dir {
+            fattr3 {
+                ftype: ftype3::NF3DIR,
+                mode: 0o555,
+                nlink: 2,
+                size: 4096,
+                used: 4096,
+                fileid: id,
+                atime: t,
+                mtime: t,
+                ctime: t,
+                ..Default::default()
             }
-
-            if let Some(reader) = reader.as_ref() {
-                reader.call((std::ptr::null_mut(),));
+        } else {
+            fattr3 {
+                ftype: ftype3::NF3REG,
+                mode: 0o444,
+                nlink: 1,
+                size,
+                used: size,
+                fileid: id,
+                atime: t,
+                mtime: t,
+                ctime: t,
+                ..Default::default()
             }
         }
     }
-);
 
-unsafe impl NSObjectProtocol for RdpdrPresenter {}
-
-struct Ivars {
-    id: u64,
+    /// List `dirid`'s children via RDPDR and intern each into the cache. Returns
+    /// `(fileid, entry)` pairs. The cache lock is never held across the await.
+    async fn list_and_cache(&self, dirid: fileid3) -> Result<Vec<(fileid3, RdpEntry)>, nfsstat3> {
+        let dir_path = {
+            let c = self.cache.lock().unwrap();
+            let n = c.id_to_node.get(&dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            if !n.is_dir {
+                return Err(nfsstat3::NFS3ERR_NOTDIR);
+            }
+            n.remote_path.clone()
+        };
+        let entries = self
+            .handle
+            .list_dir(self.device_id, &dir_path)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, dir = %dir_path, "rdpdr nfs: list_dir failed");
+                nfsstat3::NFS3ERR_IO
+            })?;
+        let mut out = Vec::with_capacity(entries.len());
+        let mut c = self.cache.lock().unwrap();
+        for e in entries {
+            let child = join_remote(&dir_path, &e.name);
+            let id = c.intern(dirid, &child, e.is_dir, e.size);
+            out.push((id, e));
+        }
+        Ok(out)
+    }
 }
 
-/// A live Finder surface for one redirected drive. Dropping it removes the
-/// presenters and deletes the temp folder.
+#[async_trait]
+impl NFSFileSystem for RdpdrFs {
+    fn capabilities(&self) -> VFSCapabilities {
+        VFSCapabilities::ReadOnly
+    }
+
+    fn root_dir(&self) -> fileid3 {
+        ROOT_ID
+    }
+
+    async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
+        let name = String::from_utf8_lossy(&filename.0).into_owned();
+        if name == "." {
+            return Ok(dirid);
+        }
+        if name == ".." {
+            let c = self.cache.lock().unwrap();
+            return c
+                .id_to_node
+                .get(&dirid)
+                .map(|n| n.parent)
+                .ok_or(nfsstat3::NFS3ERR_NOENT);
+        }
+
+        // Fast path: already interned (e.g. from a prior readdir).
+        let (dir_path, cached) = {
+            let c = self.cache.lock().unwrap();
+            let n = c.id_to_node.get(&dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            if !n.is_dir {
+                return Err(nfsstat3::NFS3ERR_NOTDIR);
+            }
+            let child = join_remote(&n.remote_path, &name);
+            (child.clone(), c.path_to_id.get(&child).copied())
+        };
+        if let Some(id) = cached {
+            return Ok(id);
+        }
+
+        // Slow path: enumerate the parent to discover the child.
+        self.list_and_cache(dirid).await?;
+        self.cache
+            .lock()
+            .unwrap()
+            .path_to_id
+            .get(&dir_path)
+            .copied()
+            .ok_or(nfsstat3::NFS3ERR_NOENT)
+    }
+
+    async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
+        let (is_dir, size) = {
+            let c = self.cache.lock().unwrap();
+            let n = c.id_to_node.get(&id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            (n.is_dir, n.size)
+        };
+        Ok(self.attr(id, is_dir, size))
+    }
+
+    async fn read(
+        &self,
+        id: fileid3,
+        offset: u64,
+        count: u32,
+    ) -> Result<(Vec<u8>, bool), nfsstat3> {
+        let (remote_path, is_dir, size) = {
+            let c = self.cache.lock().unwrap();
+            let n = c.id_to_node.get(&id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            (n.remote_path.clone(), n.is_dir, n.size)
+        };
+        if is_dir {
+            return Err(nfsstat3::NFS3ERR_ISDIR);
+        }
+        if offset >= size {
+            return Ok((Vec::new(), true));
+        }
+        let data = self
+            .handle
+            .read_file(self.device_id, &remote_path, offset, count)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, path = %remote_path, "rdpdr nfs: read_file failed");
+                nfsstat3::NFS3ERR_IO
+            })?;
+        let eof = offset + data.len() as u64 >= size;
+        Ok((data, eof))
+    }
+
+    async fn readdir(
+        &self,
+        dirid: fileid3,
+        start_after: fileid3,
+        max_entries: usize,
+    ) -> Result<ReadDirResult, nfsstat3> {
+        let mut kids = self.list_and_cache(dirid).await?;
+        // Stable canonical order so paginated calls (start_after = last fileid)
+        // stay consistent even if the client re-orders successive listings.
+        kids.sort_by_key(|(id, _)| *id);
+
+        let start_idx = if start_after == 0 {
+            0
+        } else {
+            kids.iter()
+                .position(|(id, _)| *id == start_after)
+                .map(|p| p + 1)
+                .unwrap_or(0)
+        };
+
+        let slice = &kids[start_idx.min(kids.len())..];
+        let mut entries = Vec::new();
+        for (id, e) in slice.iter().take(max_entries) {
+            entries.push(NfsDirEntry {
+                fileid: *id,
+                name: nfsstring(e.name.clone().into_bytes()),
+                attr: self.attr(*id, e.is_dir, e.size),
+            });
+        }
+        let end = start_idx + entries.len() >= kids.len();
+        Ok(ReadDirResult { entries, end })
+    }
+
+    // ---- read-only: every write-side op is rejected ----
+    async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+    async fn write(&self, _id: fileid3, _offset: u64, _data: &[u8]) -> Result<fattr3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+    async fn create(
+        &self,
+        _dirid: fileid3,
+        _filename: &filename3,
+        _attr: sattr3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+    async fn create_exclusive(
+        &self,
+        _dirid: fileid3,
+        _filename: &filename3,
+    ) -> Result<fileid3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+    async fn mkdir(
+        &self,
+        _dirid: fileid3,
+        _dirname: &filename3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+    async fn remove(&self, _dirid: fileid3, _filename: &filename3) -> Result<(), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+    async fn rename(
+        &self,
+        _from_dirid: fileid3,
+        _from_filename: &filename3,
+        _to_dirid: fileid3,
+        _to_filename: &filename3,
+    ) -> Result<(), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+    async fn symlink(
+        &self,
+        _dirid: fileid3,
+        _linkname: &filename3,
+        _symlink: &nfspath3,
+        _attr: &sattr3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+    async fn readlink(&self, _id: fileid3) -> Result<nfspath3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_NOTSUPP)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface — the mount lifecycle
+// ---------------------------------------------------------------------------
+
+/// A live NFS mount of one redirected drive. Dropping it unmounts the volume,
+/// stops the in-process NFS server, and removes the mountpoint.
 #[derive(Debug)]
 pub struct Surface {
-    state: Arc<Mutex<SurfaceState>>,
-}
-
-#[derive(Default, Debug)]
-struct SurfaceState {
-    temp_dir: Option<PathBuf>,
-    presenter_ids: Vec<u64>,
+    mountpoint: Option<PathBuf>,
+    /// The task running the NFS accept loop; aborting it stops the server.
+    serve: Option<JoinHandle<()>>,
 }
 
 impl Surface {
-    /// Build the surface for `device_id` (a redirected filesystem labelled
-    /// `drive_label`): enumerate the root, mirror it into a temp folder, register
-    /// presenters, and open it in Finder. Returns immediately; the build runs on
-    /// the current tokio runtime. Must be called from an async (runtime) context.
+    /// Stand up an NFS server for `device_id` (a redirected filesystem labelled
+    /// `drive_label`) and mount it (see [`prepare_mountpoint`] for where).
+    /// Returns immediately; the bind + mount run on the current tokio runtime.
+    /// Must be called from an async (runtime) context.
     pub fn start(handle: RdpdrHandle, device_id: u32, drive_label: &str) -> Self {
-        let state = Arc::new(Mutex::new(SurfaceState::default()));
-        let rt = Handle::current();
         let label = sanitize_label(drive_label);
-        let build_state = Arc::clone(&state);
-        let build_rt = rt.clone();
-        tokio::spawn(async move {
-            if let Err(e) = build_surface(handle, device_id, &label, build_state, build_rt).await {
-                warn!(device_id, error = %e, "rdpdr surface: build failed");
+        let mountpoint = match prepare_mountpoint(&label) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(label, error = %e, "rdpdr nfs: could not create mountpoint");
+                return Self {
+                    mountpoint: None,
+                    serve: None,
+                };
+            }
+        };
+
+        let mp = mountpoint.clone();
+        let serve = tokio::spawn(async move {
+            let fs = RdpdrFs::new(handle, device_id);
+            let listener = match NFSTcpListener::bind("127.0.0.1:0", fs).await {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!(error = %e, "rdpdr nfs: failed to bind NFS server");
+                    return;
+                }
+            };
+            let port = listener.get_listen_port();
+            info!(port, mountpoint = ?mp, "rdpdr nfs: server listening; mounting");
+
+            // The listener is already accepting (bind queues the SYN in the
+            // backlog), so run the blocking mount concurrently while the accept
+            // loop below picks it up.
+            let mount_mp = mp.clone();
+            tokio::task::spawn_blocking(move || {
+                if run_mount(port, &mount_mp) {
+                    info!(mountpoint = ?mount_mp, "rdpdr nfs: drive mounted — opening in Finder");
+                    let _ = std::process::Command::new("/usr/bin/open")
+                        .arg(&mount_mp)
+                        .spawn();
+                } else {
+                    warn!(mountpoint = ?mount_mp, "rdpdr nfs: mount_nfs failed");
+                }
+            });
+
+            if let Err(e) = listener.handle_forever().await {
+                warn!(error = %e, "rdpdr nfs: server loop ended");
             }
         });
-        Self { state }
+
+        Self {
+            mountpoint: Some(mountpoint),
+            serve: Some(serve),
+        }
     }
 }
 
 impl Drop for Surface {
     fn drop(&mut self) {
-        let (temp_dir, ids) = {
-            let mut s = self.state.lock().unwrap();
-            (s.temp_dir.take(), std::mem::take(&mut s.presenter_ids))
-        };
-        // Remove presenters on the runloop thread, then delete the temp dir.
-        let drained: Vec<SendRetained<RdpdrPresenter>> = {
-            let mut live = live_presenters().lock().unwrap();
-            let mut reg = registry().lock().unwrap();
-            ids.iter()
-                .filter_map(|id| {
-                    reg.remove(id);
-                    live.remove(id)
-                })
-                .collect()
-        };
-        runloop_thread::submit(move || unsafe {
-            for p in &drained {
-                let proto: &ProtocolObject<dyn NSFilePresenter> = ProtocolObject::from_ref(&*p.0);
-                NSFileCoordinator::removeFilePresenter(proto);
-            }
-        });
-        if let Some(dir) = temp_dir {
-            let _ = std::fs::remove_dir_all(&dir);
-            debug!(?dir, "rdpdr surface: cleaned up temp dir");
+        if let Some(h) = self.serve.take() {
+            h.abort();
+        }
+        if let Some(mp) = self.mountpoint.take() {
+            // Unmount + remove the mountpoint off the async runtime (umount can
+            // block briefly). Detached: cleanup is best-effort on disconnect.
+            std::thread::spawn(move || {
+                let status = std::process::Command::new("/sbin/umount")
+                    .arg("-f")
+                    .arg(&mp)
+                    .status();
+                if !matches!(status, Ok(s) if s.success()) {
+                    debug!(mountpoint = ?mp, ?status, "rdpdr nfs: umount returned nonzero");
+                }
+                let _ = std::fs::remove_dir(&mp);
+                // Best-effort prune of the per-pid parent (only succeeds once
+                // empty, so it's safe while other drives are still mounted).
+                if let Some(parent) = mp.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+                debug!(mountpoint = ?mp, "rdpdr nfs: cleaned up mount");
+            });
         }
     }
 }
 
-async fn build_surface(
-    handle: RdpdrHandle,
-    device_id: u32,
-    label: &str,
-    state: Arc<Mutex<SurfaceState>>,
-    rt: Handle,
-) -> anyhow::Result<()> {
-    let entries = handle.list_dir(device_id, "\\").await?;
-
-    let root = std::env::temp_dir().join(format!("macrdp-rdpdr-{}", std::process::id()));
-    let drive_dir = root.join(label);
-    std::fs::create_dir_all(&drive_dir)?;
-    state.lock().unwrap().temp_dir = Some(root.clone());
-
-    let mut to_register: Vec<(u64, SendRetained<RdpdrPresenter>)> = Vec::new();
-    for e in &entries {
-        let dst = drive_dir.join(&e.name);
-        if e.is_dir {
-            // Show subdirectories as (empty) folders; lazy enumeration of their
-            // contents is a follow-on.
-            let _ = std::fs::create_dir_all(&dst);
-            continue;
-        }
-        // Pre-size the placeholder so Finder shows the real size before fetch.
-        if let Err(err) = std::fs::File::create(&dst).and_then(|f| f.set_len(e.size)) {
-            warn!(?dst, "rdpdr surface: pre-allocate failed: {err}");
-            continue;
-        }
-        let Some(dst_str) = dst.to_str() else {
-            continue;
-        };
-        let url = unsafe { NSURL::fileURLWithPath(&NSString::from_str(dst_str)) };
-        let queue = unsafe { NSOperationQueue::new() };
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        registry().lock().unwrap().insert(
-            id,
-            Arc::new(PresenterState {
-                url,
-                queue,
-                dst,
-                handle: handle.clone(),
-                device_id,
-                remote_path: format!("\\{}", e.name),
-                rt: rt.clone(),
-                fetched: Mutex::new(false),
-            }),
-        );
-        let presenter: Retained<RdpdrPresenter> =
-            unsafe { msg_send_id![RdpdrPresenter::class(), new] };
-        unsafe {
-            let ivars_ptr = (*presenter).ivars() as *const Ivars as *mut Ivars;
-            (*ivars_ptr).id = id;
-        }
-        to_register.push((id, SendRetained(presenter)));
-    }
-
-    let ids: Vec<u64> = to_register.iter().map(|(id, _)| *id).collect();
-    state.lock().unwrap().presenter_ids = ids;
-    let count = to_register.len();
-
-    runloop_thread::submit(move || {
-        for (id, presenter) in to_register {
-            unsafe {
-                let proto: &ProtocolObject<dyn NSFilePresenter> =
-                    ProtocolObject::from_ref(&*presenter.0);
-                NSFileCoordinator::addFilePresenter(proto);
-            }
-            live_presenters().lock().unwrap().insert(id, presenter);
-        }
-    });
-
-    info!(
-        device_id,
-        files = count,
-        dir = ?drive_dir,
-        "rdpdr surface: drive mirrored — opening in Finder"
+/// Mount the loopback NFS export at `mountpoint`. Read-only, NFSv3 over TCP,
+/// large rsize to keep the open/read/close RDPDR round-trips per NFS read low.
+/// Verified to need no root for a `localhost` mount onto a user-owned dir.
+fn run_mount(port: u16, mountpoint: &Path) -> bool {
+    let opts = format!(
+        "nolocks,vers=3,tcp,rdonly,rsize=1048576,wsize=1048576,port={port},mountport={port},actimeo=5"
     );
-    // Open the folder in Finder.
-    let _ = std::process::Command::new("/usr/bin/open")
-        .arg(&drive_dir)
-        .spawn();
-    Ok(())
+    match std::process::Command::new("/sbin/mount_nfs")
+        .arg("-o")
+        .arg(&opts)
+        .arg("localhost:/")
+        .arg(mountpoint)
+        .status()
+    {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            warn!(code = ?s.code(), "rdpdr nfs: mount_nfs exited nonzero");
+            false
+        }
+        Err(e) => {
+            warn!(error = %e, "rdpdr nfs: could not spawn mount_nfs");
+            false
+        }
+    }
 }
 
-/// Make a drive label safe for a single path component (no `/`, no `:` etc.).
+/// Pick + create an empty mountpoint for `label`, preferring `/Volumes/<label>`
+/// (so it shows as a real volume in Finder's sidebar). Appends a numeric suffix
+/// on collision, and falls back to a temp dir if `/Volumes` isn't writable.
+fn prepare_mountpoint(label: &str) -> std::io::Result<PathBuf> {
+    let base = Path::new("/Volumes");
+    let mut candidate = base.join(label);
+    let mut n = 1;
+    while candidate.exists() && n < 50 {
+        candidate = base.join(format!("{label}-{n}"));
+        n += 1;
+    }
+    match std::fs::create_dir(&candidate) {
+        Ok(()) => Ok(candidate),
+        Err(_) => {
+            let tmp = std::env::temp_dir()
+                .join(format!("macrdp-rdpdr-{}", std::process::id()))
+                .join(label);
+            std::fs::create_dir_all(&tmp)?;
+            Ok(tmp)
+        }
+    }
+}
+
+/// Make a drive label safe for a single path component (no `/`, `:` etc.).
 fn sanitize_label(label: &str) -> String {
     let trimmed = label.trim().trim_end_matches(':');
     let cleaned: String = trimmed

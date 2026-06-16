@@ -4,10 +4,12 @@
 //! Mac (server) browses/reads the client's files.
 //!
 //! Done: the MS-RDPEFS init handshake (1a), device I/O — `list_dir` /
-//! `read_file` via the [`RdpdrHandle`] (1b) — and the macOS Finder temp-folder
-//! surface (1c), which mirrors the client's drive root into a temp folder and
-//! streams files on demand when Finder reads them.
-//! Opt-in via `--enable-drive-redirection`.
+//! `read_file` via the [`RdpdrHandle`] (1b) — and the macOS surface: a real
+//! NFS mount (Phase 2). An in-process NFSv3 server backed by the `RdpdrHandle`
+//! is mounted at `/Volumes/<label>` via the built-in `mount_nfs` (no root, no
+//! kext), so the client's drive appears as a proper Finder volume with lazy
+//! subdirectory navigation and on-demand reads.
+//! Opt-in via `--enable-drive-redirection`. Read-only.
 
 #[cfg(target_os = "macos")]
 mod surface;
@@ -55,8 +57,8 @@ impl RdpdrBackendFactory for MacRdpdr {
 impl RdpdrServerFactory for MacRdpdr {}
 
 /// Backend for the RDPDR server processor. Logs announced devices and, on
-/// macOS, mounts the first redirected filesystem as a Finder temp-folder
-/// surface (dropped — and cleaned up — when the connection ends).
+/// macOS, mounts the first redirected filesystem as a real NFS volume
+/// (dropped — and unmounted — when the connection ends).
 #[derive(Debug)]
 struct MacRdpdrHandler {
     handle: Option<RdpdrHandle>,
@@ -90,7 +92,7 @@ impl RdpdrServerHandler for MacRdpdrHandler {
                         .iter()
                         .find(|d| d.device_type == DeviceType::Filesystem),
                 ) {
-                    info!(device_id = dev.device_id, name = %dev.name, "drive redirection: mounting client drive in Finder");
+                    info!(device_id = dev.device_id, name = %dev.name, "drive redirection: mounting client drive as NFS volume");
                     self.surface = Some(surface::Surface::start(handle, dev.device_id, &dev.name));
                 }
             }

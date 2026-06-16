@@ -29,7 +29,20 @@ same co-signed helper and edits the same `config.env` — no re-permissioning.
 | `make-app.sh` | Build → assemble bundle → co-sign helper + bundle → install. |
 | `install-launchagent.sh` | Seed config, render plist, bootstrap the agent. |
 | `notarize.sh` | Notarize + staple a `.app`/`.dmg`/`.pkg` (used by the build scripts). |
-| `make-dmg.sh` | Wrap signed apps into a signed + notarized distribution DMG. |
+| `make-dmg.sh` | Wrap signed apps into a signed + notarized distribution DMG (styled icon layout). |
+| `make-icns.sh` | Build `AppIcon.icns` from a square PNG (used by the build scripts). |
+
+### App icon & DMG styling
+
+Drop a square (1024×1024) **`packaging/icon.png`** and the build bakes it into
+both bundles' `AppIcon.icns` + `CFBundleIconFile`. Per-app overrides:
+`packaging/macrdp.png` (server) and `packaging/macrdpController.png` (controller);
+each falls back to `icon.png`. No icon file → bundles use the default (generic) icon.
+
+`make-dmg.sh` lays out the DMG window (positioned app + controller + `/Applications`
+drop-link) via Finder automation — **best-effort**: if the build process lacks
+Finder automation permission it falls back to an unstyled but functional DMG.
+Optional **`packaging/dmg-background.png`** sets a window background.
 
 ## One-time setup
 

@@ -54,6 +54,18 @@ PLIST
 cp "$BIN" "$STAGE/Contents/MacOS/macrdptray"
 chmod +x "$STAGE/Contents/MacOS/macrdptray"
 
+# App icon (optional): packaging/macrdpController.png or packaging/icon.png.
+ICON_SRC=""
+for c in "$REPO_ROOT/packaging/macrdpController.png" "$REPO_ROOT/packaging/icon.png"; do
+    [ -f "$c" ] && { ICON_SRC="$c"; break; }
+done
+if [ -n "$ICON_SRC" ]; then
+    "$REPO_ROOT/packaging/make-icns.sh" "$ICON_SRC" "$STAGE/Contents/Resources/AppIcon.icns"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string AppIcon' "$STAGE/Contents/Info.plist" \
+        2>/dev/null || /usr/libexec/PlistBuddy -c 'Set :CFBundleIconFile AppIcon' "$STAGE/Contents/Info.plist"
+    echo "==> app icon: $(basename "$ICON_SRC")"
+fi
+
 # Ad-hoc ("-") can't use a secure timestamp; a real Developer ID must
 # (notarization requires it).
 if [ "$IDENTITY" = "-" ]; then TS="--timestamp=none"; else TS="--timestamp"; fi

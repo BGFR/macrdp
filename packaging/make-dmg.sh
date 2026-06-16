@@ -52,9 +52,54 @@ mkdir -p "$STAGE"
 for a in "${apps[@]}"; do cp -R "$a" "$STAGE/"; done
 ln -s /Applications "$STAGE/Applications"   # drag-to-install target
 
-echo "==> hdiutil create"
 rm -f "$DMG"
-hdiutil create -volname "$VOL_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+# Build a read-write DMG, lay out the icons in Finder (best-effort — needs the
+# build process to have Finder automation permission; falls back to an unstyled
+# but functional layout if that's denied), then convert to compressed read-only.
+# Optional background: packaging/dmg-background.png.
+RW="$WORK/rw.dmg"
+echo "==> hdiutil create (rw)"
+hdiutil create -volname "$VOL_NAME" -srcfolder "$STAGE" -ov -format UDRW "$RW" >/dev/null
+BG="$REPO_ROOT/packaging/dmg-background.png"
+MOUNT="$(hdiutil attach "$RW" -nobrowse -noverify -noautoopen 2>/dev/null | grep -o '/Volumes/.*' | head -1 || true)"
+if [ -n "$MOUNT" ]; then
+    echo "==> styling DMG window (best-effort)"
+    bg_clause=""
+    if [ -f "$BG" ]; then
+        mkdir -p "$MOUNT/.background"
+        cp "$BG" "$MOUNT/.background/bg.png"
+        bg_clause='set background picture of theViewOptions to file ".background:bg.png"'
+    fi
+    osascript >/dev/null 2>&1 <<OSA || echo "   (Finder styling skipped — automation not permitted)"
+tell application "Finder"
+  tell disk "$VOL_NAME"
+    open
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    set the bounds of container window to {200, 120, 800, 520}
+    set theViewOptions to the icon view options of container window
+    set arrangement of theViewOptions to not arranged
+    set icon size of theViewOptions to 96
+    $bg_clause
+    try
+      set position of item "macrdp.app" of container window to {150, 150}
+    end try
+    try
+      set position of item "macrdpController.app" of container window to {150, 320}
+    end try
+    set position of item "Applications" of container window to {450, 230}
+    update without registering applications
+    delay 1
+    close
+  end tell
+end tell
+OSA
+    sync
+    hdiutil detach "$MOUNT" >/dev/null 2>&1 || hdiutil detach "$MOUNT" -force >/dev/null 2>&1 || true
+fi
+echo "==> hdiutil convert (compressed)"
+hdiutil convert "$RW" -format UDZO -o "$DMG" >/dev/null
 
 if [ "$IDENTITY" != "-" ]; then
     echo "==> codesign DMG (secure timestamp)"

@@ -52,6 +52,18 @@ cp "$BIN" "$STAGE/Contents/MacOS/macrdp"
 cp "$PKG_DIR/macrdp-launch" "$STAGE/Contents/Resources/macrdp-launch"
 chmod +x "$STAGE/Contents/MacOS/macrdp" "$STAGE/Contents/Resources/macrdp-launch"
 
+# 2b. App icon (optional): drop packaging/macrdp.png or packaging/icon.png
+#     (square, ideally 1024×1024) to brand the bundle. Done before signing so
+#     the icon + Info.plist key are sealed.
+ICON_SRC=""
+for c in "$PKG_DIR/macrdp.png" "$PKG_DIR/icon.png"; do [ -f "$c" ] && { ICON_SRC="$c"; break; }; done
+if [ -n "$ICON_SRC" ]; then
+    "$PKG_DIR/make-icns.sh" "$ICON_SRC" "$STAGE/Contents/Resources/AppIcon.icns"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string AppIcon' "$STAGE/Contents/Info.plist" \
+        2>/dev/null || /usr/libexec/PlistBuddy -c 'Set :CFBundleIconFile AppIcon' "$STAGE/Contents/Info.plist"
+    echo "==> app icon: $(basename "$ICON_SRC")"
+fi
+
 # 3. Sign the Mach-O executable, then the bundle (which seals Info.plist + the
 #    Resources, including the wrapper script). Ad-hoc ("-") can't use a secure
 #    timestamp; a real Developer ID must (notarization requires it).

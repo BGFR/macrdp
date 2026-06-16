@@ -101,14 +101,18 @@ vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in via
 
 vendor/ironrdp-acceptor/  Local fork of ironrdp-acceptor 0.8.0 (added
                           2026-06-12, same upstream rev as the git pins).
-                          Single divergence: honor_client_desktop_size —
+                          Two divergences: (1) honor_client_desktop_size —
                           adopt the client's requested desktop size from its
                           GCC Client Core Data BEFORE Demand Active, which
                           is what powers the default client-resolution
-                          auto-adopt (--no-client-resolution opts out). See
-                          vendor/ironrdp-acceptor/CLAUDE.md and the
-                          client-resolution quirk note for why this cannot
-                          be done from server-side code.
+                          auto-adopt (--no-client-resolution opts out); and
+                          (2) expose the client's keyboard-layout id (KLID)
+                          from the same core data on AcceptorResult, which
+                          powers default non-US keyboard auto-detect (the
+                          vendor server publishes it; input.rs auto-selects
+                          the layout). See vendor/ironrdp-acceptor/CLAUDE.md
+                          and the client-resolution / keyboard-layout quirk
+                          notes for why these can't be done from server code.
 
 (vendor/ironrdp-egfx/     DELETED 2026-05-25. The CapabilitySet::decode
                           tolerance fix was merged upstream as PR #1298

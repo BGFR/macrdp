@@ -8,6 +8,12 @@ use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 #[cfg(not(target_os = "macos"))]
 use tracing::trace;
 
+/// Shared cell the vendored server fills with the connected client's Windows
+/// keyboard-layout identifier (KLID); 0 = unknown / not announced. Read by the
+/// input handler to auto-select a non-US layout when `--keyboard-layout` isn't
+/// given. Mirrors the `display_suppressed` shared-flag pattern.
+pub type SharedKeyboardLayout = std::sync::Arc<std::sync::atomic::AtomicU32>;
+
 pub struct MacInputHandler {
     /// Live session desktop size, shared with `CaptureDisplay`. Read per
     /// mouse event (not copied at construction) so coordinate scaling stays
@@ -34,13 +40,19 @@ impl MacInputHandler {
         target_display_id: Option<u32>,
         click_signal: Option<crate::capture::ClickSignal>,
         keyboard_layout: Option<String>,
+        keyboard_layout_klid: Option<SharedKeyboardLayout>,
     ) -> anyhow::Result<Self> {
         #[cfg(target_os = "macos")]
-        let inner = macos::Inner::new(target_display_id, keyboard_layout.as_deref())?;
+        let inner = macos::Inner::new(
+            target_display_id,
+            keyboard_layout.as_deref(),
+            keyboard_layout_klid,
+        )?;
         #[cfg(not(target_os = "macos"))]
         {
             let _ = target_display_id;
             let _ = keyboard_layout;
+            let _ = keyboard_layout_klid;
         }
         Ok(Self {
             desktop_size,
@@ -443,10 +455,21 @@ mod macos {
         // translated to characters against this layout and posted as Unicode
         // strings instead of positional keycodes. `None` → keycode path only.
         layout: Option<crate::keyboard_layout::KeyboardLayout>,
+        // Auto-detect plumbing: when no explicit --keyboard-layout was given,
+        // `auto_layout` is true and we (re)resolve `layout` from the client's
+        // announced KLID published in `klid_handle`, re-checking when it changes
+        // (e.g. a reconnect from a differently-configured client).
+        klid_handle: Option<super::SharedKeyboardLayout>,
+        last_klid: u32,
+        auto_layout: bool,
     }
 
     impl Inner {
-        pub fn new(target_display_id: Option<u32>, keyboard_layout: Option<&str>) -> Result<Self> {
+        pub fn new(
+            target_display_id: Option<u32>,
+            keyboard_layout: Option<&str>,
+            klid_handle: Option<super::SharedKeyboardLayout>,
+        ) -> Result<Self> {
             // Two sources because macOS has two independent modifier-state
             // machines and different consumers read from different ones:
             //
@@ -474,9 +497,23 @@ mod macos {
             // not just our Cmd+Tab commits. Idempotent — only one thread
             // is ever spawned across handler reconstructions.
             start_workspace_mru_poller();
-            let layout = keyboard_layout.and_then(crate::keyboard_layout::KeyboardLayout::resolve);
+            // Layout selection precedence:
+            //   --keyboard-layout <spec>  → force that layout (no auto-detect)
+            //   --keyboard-layout none/off → force positional keycodes
+            //   (unset) + a KLID handle    → auto-detect from the client
+            let explicit = keyboard_layout.map(str::trim);
+            let disabled = matches!(explicit, Some("none") | Some("off") | Some(""));
+            let (layout, auto_layout) = if disabled {
+                (None, false)
+            } else if let Some(spec) = explicit {
+                (crate::keyboard_layout::KeyboardLayout::resolve(spec), false)
+            } else {
+                (None, klid_handle.is_some())
+            };
             if let Some(l) = &layout {
                 tracing::info!(layout = %l.label(), "non-US keyboard layout translation active");
+            } else if auto_layout {
+                tracing::info!("keyboard layout will auto-detect from the connecting client");
             }
             Ok(Self {
                 source,
@@ -493,6 +530,9 @@ mod macos {
                 click_middle: None,
                 consumed_keys: HashSet::new(),
                 layout,
+                klid_handle,
+                last_klid: 0,
+                auto_layout,
             })
         }
 
@@ -539,11 +579,49 @@ mod macos {
             }
         }
 
+        /// When auto-detecting (no explicit `--keyboard-layout`), (re)resolve
+        /// the translation layout from the client's announced KLID. Cheap when
+        /// unchanged (one atomic load); only re-resolves on a new KLID, so a
+        /// reconnect from a differently-configured client is picked up. US
+        /// English (0x0409) and unknown (0) keep the positional keycode path.
+        fn refresh_auto_layout(&mut self) {
+            if !self.auto_layout {
+                return;
+            }
+            let Some(handle) = &self.klid_handle else {
+                return;
+            };
+            let klid = handle.load(std::sync::atomic::Ordering::Relaxed);
+            if klid == self.last_klid {
+                return;
+            }
+            self.last_klid = klid;
+            self.layout = if klid != 0 && (klid & 0xFFFF) != 0x0409 {
+                let spec = format!("0x{:04x}", klid & 0xFFFF);
+                let resolved = crate::keyboard_layout::KeyboardLayout::resolve(&spec);
+                match &resolved {
+                    Some(l) => tracing::info!(
+                        klid = format!("0x{klid:04X}"),
+                        layout = %l.label(),
+                        "auto-selected the client's keyboard layout"
+                    ),
+                    None => tracing::warn!(
+                        klid = format!("0x{klid:04X}"),
+                        "client announced a keyboard layout with no installed macOS match; using positional keycodes"
+                    ),
+                }
+                resolved
+            } else {
+                None
+            };
+        }
+
         fn key(&mut self, scancode: u8, extended: bool, down: bool) {
             let Some(vk) = scancode_to_cgkeycode(scancode, extended) else {
                 tracing::debug!(scancode, extended, down, "unmapped scancode");
                 return;
             };
+            self.refresh_auto_layout();
 
             // Modifier path: update per-side state and emit FlagsChanged
             // mirrored to both sources. We do this BEFORE any of the

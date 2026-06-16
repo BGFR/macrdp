@@ -42,3 +42,18 @@ vendor dir until divergence (1) is upstreamed AND released.
     prefer exposing the raw core-data size in `AcceptorResult` instead and
     leaving adoption to the server crate — either works for macrdp, adapt
     on review.
+
+(2) Expose the client's keyboard-layout id from Client Core Data (NOT
+    upstreamed; added 2026-06-16): `Acceptor` gains a private
+    `client_keyboard_layout: u32` (captured in `BasicSettingsWaitInitial`
+    from `gcc_blocks.core.keyboard_layout`, alongside the size read in (1),
+    but UNCONDITIONALLY — it's free and harmless), carried across
+    `new_deactivation_reactivation`, and surfaced as a new
+    `pub keyboard_layout: u32` field on `AcceptorResult` (0 = not sent).
+    Consumed by `vendor/ironrdp-server` divergence (10), which publishes it
+    to a shared cell macrdp's input handler reads to auto-select a non-US
+    keyboard layout (`src/keyboard_layout.rs`). Purely additive (a new struct
+    field + a new private field), so trivially upstreamable — offer alongside
+    (1), since exposing core-data fields on `AcceptorResult` is the same shape
+    CBenoit floated for the desktop size. See the keyboard-layout quirk note
+    in docs/known-quirks.md.

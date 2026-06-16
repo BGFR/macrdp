@@ -2,7 +2,7 @@ use core::net::SocketAddr;
 use core::time::Duration;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
@@ -325,6 +325,12 @@ pub struct RdpServer {
     /// before Demand Active is sent. See
     /// [`Self::set_honor_client_desktop_size`].
     honor_client_desktop_size: bool,
+    /// (vendored) Optional shared cell the server writes with the client's
+    /// announced keyboard-layout identifier (KLID, from the acceptor result)
+    /// when a client connects. The input backend (e.g. `macrdp`'s
+    /// `MacInputHandler`) holds a clone and auto-selects a matching layout, so
+    /// non-US clients type correctly with no manual configuration. 0 = unknown.
+    keyboard_layout: Option<Arc<AtomicU32>>,
 }
 
 #[derive(Debug)]
@@ -413,6 +419,7 @@ impl RdpServer {
             autodetect: None,
             connection_handler,
             display_suppressed: Arc::new(AtomicBool::new(false)),
+            keyboard_layout: None,
             honor_client_desktop_size: false,
         }
     }
@@ -459,6 +466,15 @@ impl RdpServer {
     /// client connects.
     pub fn set_honor_client_desktop_size(&mut self, honor: bool) {
         self.honor_client_desktop_size = honor;
+    }
+
+    /// (vendored) Share a cell the server fills with the client's announced
+    /// keyboard-layout identifier (KLID) when a client connects. The input
+    /// backend holds a clone and can auto-select a matching layout so non-US
+    /// clients type the right characters with no manual configuration. Must be
+    /// called before any client connects.
+    pub fn set_keyboard_layout_handle(&mut self, handle: Arc<AtomicU32>) {
+        self.keyboard_layout = Some(handle);
     }
 
     /// Returns the shared ECHO server handle for runtime probe requests and RTT measurements.
@@ -1238,6 +1254,13 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Client accepted");
+
+        // (vendored) Publish the client's announced keyboard layout so the
+        // input backend can auto-select a matching layout for non-US clients.
+        if let Some(handle) = &self.keyboard_layout {
+            handle.store(result.keyboard_layout, Ordering::Relaxed);
+            debug!(klid = result.keyboard_layout, "client keyboard layout announced");
+        }
 
         if !result.input_events.is_empty() {
             debug!("Handling input event backlog from acceptor sequence");

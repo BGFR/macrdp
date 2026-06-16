@@ -49,6 +49,11 @@ pub struct Acceptor {
     /// usual `RdpServerDisplay::request_initial_size` call (the echoed
     /// Confirm Active size now equals the adopted size).
     honor_client_desktop_size: bool,
+    /// (vendored) The Windows keyboard-layout identifier (KLID) the client
+    /// announced in its GCC Client Core Data, captured in
+    /// `BasicSettingsWaitInitial` and surfaced on `AcceptorResult` so the
+    /// server can serve the client's keyboard layout. 0 = unknown / not sent.
+    client_keyboard_layout: u32,
 }
 
 #[derive(Debug)]
@@ -59,6 +64,9 @@ pub struct AcceptorResult {
     pub user_channel_id: u16,
     pub io_channel_id: u16,
     pub reactivation: bool,
+    /// (vendored) The client's announced keyboard-layout identifier (KLID)
+    /// from its GCC Client Core Data; 0 if the client didn't send one.
+    pub keyboard_layout: u32,
     /// Credentials received from the client during SecureSettingsExchange.
     ///
     /// Present for TLS-mode connections where the client sends credentials
@@ -90,6 +98,7 @@ impl Acceptor {
             received_credentials: None,
             reactivation: false,
             honor_client_desktop_size: false,
+            client_keyboard_layout: 0,
         }
     }
 
@@ -140,6 +149,7 @@ impl Acceptor {
             received_credentials: consumed.received_credentials,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
+            client_keyboard_layout: consumed.client_keyboard_layout,
         })
     }
 
@@ -194,6 +204,7 @@ impl Acceptor {
                 io_channel_id: self.io_channel_id,
                 reactivation: self.reactivation,
                 credentials: self.received_credentials.take(),
+                keyboard_layout: self.client_keyboard_layout,
             }),
             previous_state => {
                 self.state = previous_state;
@@ -448,6 +459,11 @@ impl Sequence for Acceptor {
 
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
+
+                // (vendored) Capture the client's keyboard-layout identifier so
+                // the server can serve a non-US layout. Always recorded (it's
+                // free); whether to act on it is the server's choice.
+                self.client_keyboard_layout = gcc_blocks.core.keyboard_layout;
 
                 // (vendored) Adopt the client's requested desktop size from
                 // its Client Core Data before the server's Demand Active is

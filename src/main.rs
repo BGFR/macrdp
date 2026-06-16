@@ -1317,11 +1317,16 @@ async fn async_main() -> Result<()> {
         display_suppressed: Some(display_suppressed.clone()),
     };
 
+    // Shared cell the server fills with the connecting client's keyboard-layout
+    // id, for auto-detecting a non-US layout when --keyboard-layout isn't given.
+    let keyboard_layout_klid: crate::input::SharedKeyboardLayout =
+        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let input_handler = MacInputHandler::new(
         desktop_size.clone(),
         capture_display_id,
         click_signal,
         args.keyboard_layout.clone(),
+        Some(keyboard_layout_klid.clone()),
     )?;
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> = {
         #[cfg(target_os = "macos")]
@@ -1365,6 +1370,11 @@ async fn async_main() -> Result<()> {
     // reads from. Without this, the server uses an internally-created
     // flag the display never sees.
     server.set_display_suppressed_handle(display_suppressed);
+
+    // The acceptor records the client's announced keyboard-layout id (KLID) in
+    // its Client Core Data; the server publishes it here so the input handler
+    // can auto-select a matching non-US layout (when --keyboard-layout is unset).
+    server.set_keyboard_layout_handle(keyboard_layout_klid);
 
     // Client-resolution auto-adopt: the vendored acceptor reads the desktop
     // size the client requests in its GCC Client Core Data and negotiates

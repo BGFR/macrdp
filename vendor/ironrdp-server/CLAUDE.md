@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8) below are upstreamed AND
+vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10) below are upstreamed AND
 released — #1276 landing is NOT sufficient.
 
 (1) The original "keep newest queued waves on per-batch overflow"
@@ -137,3 +137,18 @@ released — #1276 landing is NOT sufficient.
     confirm-active echoed the server's 1512×982). macrdp wires this from
     its default-on client-resolution auto-adopt (`--no-client-resolution`
     opts out). Offer upstream together with the acceptor change.
+
+(10) Publish the client's keyboard-layout id to a shared cell (NOT
+    upstreamed; added 2026-06-16; pairs with `vendor/ironrdp-acceptor`
+    divergence (2)): `RdpServer` gains `keyboard_layout: Option<Arc<AtomicU32>>`
+    (default None) + setter `set_keyboard_layout_handle`, mirroring the
+    `display_suppressed` shared-flag pattern (divergence (5)). In
+    `client_accepted`, the server stores `result.keyboard_layout` (the KLID the
+    acceptor captured from Client Core Data) into the cell. macrdp hands the
+    same `Arc<AtomicU32>` to its `MacInputHandler`, which auto-selects a
+    matching non-US keyboard layout when `--keyboard-layout` isn't given
+    (`src/keyboard_layout.rs`; US 0x0409 / unknown 0 keep the positional
+    keycode path). Additive + matches the existing handle-setter pattern, so
+    upstreamable alongside the acceptor change. Verified live: sdl-freerdp
+    `/kbd:layout:0x040C` → server logs `client keyboard layout announced
+    klid=1036`, input handler logs `auto-selected … layout=com.apple.keylayout.French`.

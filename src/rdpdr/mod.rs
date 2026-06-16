@@ -16,6 +16,9 @@
 mod surface;
 
 #[cfg(target_os = "macos")]
+use std::collections::HashMap;
+
+#[cfg(target_os = "macos")]
 use ironrdp_rdpdr::pdu::efs::DeviceType;
 use ironrdp_server::{
     AnnouncedDevice, RdpdrBackendFactory, RdpdrHandle, RdpdrServerFactory, RdpdrServerHandler,
@@ -46,7 +49,7 @@ impl RdpdrBackendFactory for MacRdpdr {
         Box::new(MacRdpdrHandler {
             handle: None,
             #[cfg(target_os = "macos")]
-            surface: None,
+            surfaces: HashMap::new(),
         })
     }
 
@@ -58,13 +61,15 @@ impl RdpdrBackendFactory for MacRdpdr {
 impl RdpdrServerFactory for MacRdpdr {}
 
 /// Backend for the RDPDR server processor. Logs announced devices and, on
-/// macOS, mounts the first redirected filesystem as a real NFS volume
-/// (dropped — and unmounted — when the connection ends).
+/// macOS, mounts each redirected filesystem as its own real NFS volume
+/// (all dropped — and unmounted — when the connection ends).
 #[derive(Debug)]
 struct MacRdpdrHandler {
     handle: Option<RdpdrHandle>,
+    /// One live NFS mount per redirected filesystem device, keyed by device id
+    /// so a re-announce doesn't double-mount an already-mounted drive.
     #[cfg(target_os = "macos")]
-    surface: Option<surface::Surface>,
+    surfaces: HashMap<u32, surface::Surface>,
 }
 
 impl RdpdrServerHandler for MacRdpdrHandler {
@@ -82,19 +87,23 @@ impl RdpdrServerHandler for MacRdpdrHandler {
             );
         }
 
-        // Mount the first redirected filesystem in Finder (once — the client may
-        // re-announce the same device list several times during init).
+        // Mount every redirected filesystem in Finder, one volume each. The
+        // client may re-announce the same list several times during init (and
+        // may add drives later), so mount only device ids we aren't already
+        // surfacing.
         #[cfg(target_os = "macos")]
         {
-            if self.surface.is_none() {
-                if let (Some(handle), Some(dev)) = (
-                    self.handle.clone(),
-                    devices
-                        .iter()
-                        .find(|d| d.device_type == DeviceType::Filesystem),
-                ) {
+            if let Some(handle) = self.handle.clone() {
+                for dev in devices
+                    .iter()
+                    .filter(|d| d.device_type == DeviceType::Filesystem)
+                {
+                    if self.surfaces.contains_key(&dev.device_id) {
+                        continue;
+                    }
                     info!(device_id = dev.device_id, name = %dev.name, "drive redirection: mounting client drive as NFS volume");
-                    self.surface = Some(surface::Surface::start(handle, dev.device_id, &dev.name));
+                    let surface = surface::Surface::start(handle.clone(), dev.device_id, &dev.name);
+                    self.surfaces.insert(dev.device_id, surface);
                 }
             }
         }

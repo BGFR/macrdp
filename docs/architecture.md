@@ -37,7 +37,9 @@ src/rdpdr/        RDPDR drive redirection — the macrdp side of the server-side
                   client's drive is a proper Finder volume with lazy subdir
                   navigation. Read-write: NFS write/create/mkdir/remove/rename/
                   setattr map to RDPDR DeviceWrite / DeviceCreate /
-                  SetInformation. Surface::Drop unmounts on disconnect.
+                  SetInformation. Each redirected filesystem device gets its own
+                  mount (MacRdpdrHandler keeps a HashMap<device_id, Surface>).
+                  Surface::Drop unmounts on disconnect.
 src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB
                   + Mac↔Windows file copy via FileGroupDescriptorW
                   and FileContentsRequest streaming)

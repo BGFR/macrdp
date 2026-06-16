@@ -151,9 +151,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // first run, so it's always actionable (no Terminal step needed).
             menu.addItem(item(st.loaded ? "Start" : "Start (first run sets up)", #selector(start)))
         }
+        let cfg = readConfig()
+        // One-click recommended setup: a headless virtual display with the
+        // physical panel detached (so your real apps move onto the remote
+        // desktop) + H.264 — the responsive "remote into my Mac" config that's
+        // otherwise non-obvious to assemble. Shown until it's already applied.
+        let isRemoteDesktop = cfg["VIRTUAL_DISPLAY"] == "1" && cfg["PRIMARY_MODE"] == "detach"
+        if !isRemoteDesktop {
+            menu.addItem(item("Set Up Remote Desktop", #selector(presetRemoteDesktop)))
+        }
         menu.addItem(.separator())
 
-        let cfg = readConfig()
         let opts = NSMenu()
         opts.addItem(toggle("H.264 video", key: "ENABLE_H264", cfg: cfg, sel: #selector(toggleH264)))
         opts.addItem(toggle("AAC audio", key: "ENABLE_AAC", cfg: cfg, sel: #selector(toggleAAC)))
@@ -296,6 +304,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func restart() { start() }
+
+    /// One-click "remote into my Mac": headless virtual display + detach the
+    /// physical panel (apps move to the virtual display) + H.264, then start.
+    @objc func presetRemoteDesktop() {
+        writeConfig(key: "VIRTUAL_DISPLAY", value: "1")
+        writeConfig(key: "PRIMARY_MODE", value: "detach")
+        writeConfig(key: "CAPTURE_PRIMARY", value: "0")
+        writeConfig(key: "ENABLE_H264", value: "1")
+        let cfg = readConfig()
+        if cfg["VD_WIDTH"] == nil { writeConfig(key: "VD_WIDTH", value: "1920") }
+        if cfg["VD_HEIGHT"] == nil { writeConfig(key: "VD_HEIGHT", value: "1080") }
+        start() // self-install + password onboarding + launch
+    }
 
     func ensureLoaded() {
         guard !agentState().loaded, FileManager.default.fileExists(atPath: plistURL.path) else { return }

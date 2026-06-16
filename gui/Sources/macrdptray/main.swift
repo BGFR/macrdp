@@ -377,17 +377,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ]
         let fm = FileManager.default
         return candidates.first {
-            fm.fileExists(atPath: $0.appendingPathComponent("Contents/Resources/macrdp-launch").path)
+            fm.fileExists(atPath: $0.appendingPathComponent("Contents/MacOS/macrdp").path)
         }
     }
 
     /// Write + register the LaunchAgent plist pointing at the located server's
-    /// launch wrapper. Mirrors packaging/install-launchagent.sh, in-process.
+    /// SIGNED binary, run directly with `--config` (the binary reads config.env
+    /// itself). Mirrors packaging/install-launchagent.sh, in-process. Launching
+    /// the signed Mach-O — not an unsigned wrapper script — gives macOS
+    /// Background Task Management a stable identity to approve once.
     func installLaunchAgent(serverApp: URL) {
-        let launch = serverApp.appendingPathComponent("Contents/Resources/macrdp-launch").path
+        let bin = serverApp.appendingPathComponent("Contents/MacOS/macrdp").path
         let dict: [String: Any] = [
             "Label": label,
-            "ProgramArguments": [launch],
+            "ProgramArguments": [bin, "--config", configURL.path],
             "RunAtLoad": true,
             "KeepAlive": true,
             "StandardOutPath": logURL.path,

@@ -5,8 +5,11 @@
   install-launchagent.sh and the result is written to
   ~/Library/LaunchAgents/<label>.plist (label = $BUNDLE_PREFIX.macrdp).
 
-  This runs the wrapper (which reads config.env and execs the signed binary),
-  keeps it alive, and logs to ~/Library/Logs/macrdp.log.
+  This launches the SIGNED macrdp binary directly with `--config`, so macOS
+  Background Task Management identifies the agent by its stable Developer-ID
+  identity (approve once, survives rebuilds) rather than re-flagging an unsigned
+  wrapper script on every update. The binary reads config.env itself. Keeps the
+  job alive, and logs to ~/Library/Logs/macrdp.log.
 -->
 <plist version="1.0">
 <dict>
@@ -15,7 +18,9 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__APP_DIR__/macrdp.app/Contents/Resources/macrdp-launch</string>
+        <string>__APP_DIR__/macrdp.app/Contents/MacOS/macrdp</string>
+        <string>--config</string>
+        <string>__HOME__/Library/Application Support/macrdp/config.env</string>
     </array>
 
     <key>RunAtLoad</key>

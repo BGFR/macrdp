@@ -6,8 +6,15 @@ flag-driven server) — it's a **stable signed identity at a fixed path** so the
 Screen Recording / Accessibility TCC grants survive rebuilds, plus
 non-interactive autostart via the Keychain.
 
-This layout is also GUI-ready: a future menu-bar controller just spawns the
-same co-signed helper and edits the same `config.env` — no re-permissioning.
+The LaunchAgent runs the **signed binary directly** as
+`macrdp --config <config.env>` — the binary parses the same `key=value` file the
+menu-bar controller edits. (There used to be an unsigned `macrdp-launch` shell
+wrapper here; it was removed because macOS Background Task Management re-flagged
+it as a new "background item" on every rebuild — a signed Mach-O launch target
+is approved once and stays approved.)
+
+This layout is also GUI-ready: the menu-bar controller drives the same
+LaunchAgent and edits the same `config.env` — no re-permissioning.
 
 > **vs. `dist/install.sh`:** the repo's other auto-start path installs a *bare
 > binary* to `~/.local/bin/macrdp` under the launchd label `com.user.macrdp`.
@@ -23,8 +30,7 @@ same co-signed helper and edits the same `config.env` — no re-permissioning.
 | File | Role |
 |------|------|
 | `Info.plist` | Bundle metadata template (`__VERSION__` filled from `Cargo.toml`); `LSUIElement` agent, `NSAppleEventsUsageDescription`. |
-| `macrdp-launch` | Wrapper run by launchd: reads `config.env`, translates to flags, `exec`s the signed binary. |
-| `config.env.example` | Seed for `~/Library/Application Support/macrdp/config.env`. |
+| `config.env.example` | Seed for `~/Library/Application Support/macrdp/config.env`. The signed binary reads this directly via `macrdp --config`. |
 | `launchagent.plist.template` | LaunchAgent template (`__LABEL__`/`__APP_DIR__`/`__HOME__` filled at install). |
 | `make-app.sh` | Build → assemble bundle → co-sign helper + bundle → install. |
 | `install-launchagent.sh` | Seed config, render plist, bootstrap the agent. |
@@ -128,9 +134,9 @@ never disturb the code signature or the TCC grants.
   Verifying a notarized DMG: `xcrun stapler validate <dmg>` is definitive;
   `spctl` needs `--type open --context context:primary-signature` or it reports
   a misleading "Insufficient Context".
-- **TCC is keyed to the binary, not the wrapper.** The grants attach to
-  `Contents/MacOS/macrdp` (the process that calls ScreenCaptureKit / CGEventPost
-  after `exec`). Keep the install path stable and the grants persist.
+- **TCC is keyed to the binary.** The grants attach to `Contents/MacOS/macrdp`
+  (the process that calls ScreenCaptureKit / CGEventPost) — which is exactly the
+  process launchd now runs. Keep the install path stable and the grants persist.
 - **Re-signing on rebuild** keeps the same identity as long as the bundle ID,
   install path, and signing identity are unchanged — so re-running
   `make-app.sh` for an update does not reset permissions.

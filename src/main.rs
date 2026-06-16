@@ -447,6 +447,16 @@ struct Args {
     /// advertise QOI and are unaffected either way.
     #[arg(long)]
     qoi_force_rgb: bool,
+
+    /// Read all settings from a `key=value` config file (the same `config.env`
+    /// the menu-bar controller writes) instead of from individual flags. When
+    /// present, every other flag is ignored and the effective settings come
+    /// entirely from the file — this is what the LaunchAgent passes so launchd
+    /// runs THIS signed binary directly (stable Background-Task-Management
+    /// identity, no unsigned wrapper script). See packaging/config.env.example
+    /// for the recognized keys; unknown keys are ignored.
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -771,8 +781,111 @@ fn main() -> Result<()> {
     rt.block_on(async_main())
 }
 
+/// Translate a `config.env` (plain `key=value`, the format the menu-bar
+/// controller writes and `packaging/config.env.example` documents) into the
+/// equivalent CLI argv and parse it back into `Args`. This lets the LaunchAgent
+/// launch the *signed* `macrdp` binary directly with a single `--config <file>`
+/// argument — giving macOS Background Task Management a stable Developer-ID
+/// identity to approve once — instead of going through an unsigned wrapper
+/// script that BTM re-flags on every rebuild. Mirrors the old
+/// `packaging/macrdp-launch` translation exactly (same keys, same defaults).
+fn args_from_config(path: &Path) -> Result<Args> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading config file {}", path.display()))?;
+
+    let mut cfg: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Tolerate a leading `export ` (the file used to be shell-sourced).
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_string();
+        let mut val = val.trim();
+        // Strip one layer of matching surrounding quotes.
+        for q in ['"', '\''] {
+            if val.len() >= 2 && val.starts_with(q) && val.ends_with(q) {
+                val = &val[1..val.len() - 1];
+                break;
+            }
+        }
+        cfg.insert(key, val.to_string());
+    }
+
+    let on = |key: &str, default: bool| cfg.get(key).map(|v| v == "1").unwrap_or(default);
+    let get =
+        |key: &str, default: &str| cfg.get(key).cloned().unwrap_or_else(|| default.to_string());
+
+    let mut argv: Vec<String> = vec!["macrdp".to_string()];
+    argv.push("--bind".into());
+    argv.push(get("BIND", "127.0.0.1:3390"));
+
+    // USERNAME defaults to $USER, matching the wrapper.
+    let username = cfg
+        .get("USERNAME")
+        .cloned()
+        .unwrap_or_else(|| std::env::var("USER").unwrap_or_default());
+    if !username.is_empty() {
+        argv.push("--username".into());
+        argv.push(username);
+    }
+
+    if on("USE_KEYCHAIN", true) {
+        argv.push("--keychain".into());
+    }
+    if on("ENABLE_H264", false) {
+        argv.push("--enable-h264".into());
+    }
+    if on("ENABLE_AAC", false) {
+        argv.push("--enable-aac".into());
+    }
+    if on("HIDPI", false) {
+        argv.push("--hidpi".into());
+    }
+    if on("UNMINIMIZE", false) {
+        argv.push("--unminimize-on-switch".into());
+    }
+    if on("VIRTUAL_DISPLAY", false) {
+        argv.push("--virtual-display".into());
+        argv.push("--width".into());
+        argv.push(get("VD_WIDTH", "1920"));
+        argv.push("--height".into());
+        argv.push(get("VD_HEIGHT", "1080"));
+        // Back-compat: old configs set CAPTURE_PRIMARY=1 with no PRIMARY_MODE.
+        let mut primary_mode = get("PRIMARY_MODE", "none");
+        if primary_mode == "none" && on("CAPTURE_PRIMARY", false) {
+            primary_mode = "capture".to_string();
+        }
+        match primary_mode.as_str() {
+            "detach" => argv.push("--detach-primary".into()),
+            "capture" => argv.push("--capture-primary".into()),
+            _ => {}
+        }
+    }
+    // EXTRA_FLAGS: space-separated escape hatch, appended verbatim.
+    if let Some(extra) = cfg.get("EXTRA_FLAGS") {
+        for tok in extra.split_whitespace() {
+            argv.push(tok.to_string());
+        }
+    }
+
+    // Re-parse through clap so every value is validated exactly as a CLI arg
+    // would be (SocketAddr, numeric ranges, mutually-exclusive checks).
+    Args::try_parse_from(&argv)
+        .with_context(|| format!("config file {} produced invalid settings", path.display()))
+}
+
 async fn async_main() -> Result<()> {
     let mut args = Args::parse();
+    // If launched with `--config <file>` (the LaunchAgent path), the file is the
+    // sole source of truth — rebuild Args from it.
+    if let Some(cfg_path) = args.config.clone() {
+        args = args_from_config(&cfg_path)?;
+    }
 
     // RUST_LOG (if set) always wins. Otherwise: --verbose turns on debug
     // everywhere; without it we apply a targeted filter that quiets known
@@ -1277,5 +1390,101 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    fn write_temp(name: &str, body: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "macrdp-cfgtest-{}-{}.env",
+            std::process::id(),
+            name
+        ));
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn parses_full_config_into_flags() {
+        let path = write_temp(
+            "full",
+            "# a comment, then a blank line\n\
+             \n\
+             export BIND=0.0.0.0:3390\n\
+             USERNAME=alice\n\
+             ENABLE_H264=1\n\
+             ENABLE_AAC=0\n\
+             HIDPI=1\n\
+             UNMINIMIZE=1\n\
+             VIRTUAL_DISPLAY=1\n\
+             VD_WIDTH=2560\n\
+             VD_HEIGHT=1440\n\
+             PRIMARY_MODE=detach\n\
+             EXTRA_FLAGS=\"--fps 30\"\n",
+        );
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(args.bind.to_string(), "0.0.0.0:3390");
+        assert_eq!(args.username.as_deref(), Some("alice"));
+        assert!(args.enable_h264);
+        assert!(!args.enable_aac);
+        assert!(args.hidpi);
+        assert!(args.unminimize_on_switch);
+        assert!(args.virtual_display);
+        assert_eq!(args.width, Some(2560));
+        assert_eq!(args.height, Some(1440));
+        assert!(args.detach_primary);
+        assert!(!args.capture_primary);
+        // USE_KEYCHAIN defaults on (matches the old wrapper).
+        assert!(args.keychain);
+        // EXTRA_FLAGS is parsed as real CLI tokens.
+        assert_eq!(args.fps, Some(30));
+    }
+
+    #[test]
+    fn empty_config_matches_wrapper_defaults() {
+        let path = write_temp("empty", "\n# nothing set\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(args.bind.to_string(), "127.0.0.1:3390");
+        assert!(args.keychain);
+        assert!(!args.virtual_display);
+        assert!(!args.enable_h264);
+    }
+
+    #[test]
+    fn capture_primary_backcompat() {
+        let path = write_temp(
+            "bc",
+            "VIRTUAL_DISPLAY=1\n\
+             VD_WIDTH=1920\n\
+             VD_HEIGHT=1080\n\
+             CAPTURE_PRIMARY=1\n\
+             USE_KEYCHAIN=0\n",
+        );
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert!(args.capture_primary);
+        assert!(!args.detach_primary);
+        assert!(!args.keychain);
+    }
+
+    #[test]
+    fn primary_mode_wins_over_legacy_capture_primary() {
+        let path = write_temp(
+            "winner",
+            "VIRTUAL_DISPLAY=1\nVD_WIDTH=1920\nVD_HEIGHT=1080\nPRIMARY_MODE=detach\nCAPTURE_PRIMARY=1\n",
+        );
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert!(args.detach_primary);
+        assert!(!args.capture_primary);
     }
 }

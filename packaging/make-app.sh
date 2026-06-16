@@ -46,11 +46,11 @@ mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 sed -e "s/__VERSION__/$VERSION/g" -e "s#__BUNDLE_ID__#$BUNDLE_ID#g" \
     "$PKG_DIR/Info.plist" > "$STAGE/Contents/Info.plist"
 cp "$BIN" "$STAGE/Contents/MacOS/macrdp"
-# The wrapper goes in Resources/ (sealed as a resource by the bundle signature),
-# NOT MacOS/ — a script in MacOS/ is treated as nested code that needs its own
-# signature and breaks bundle signing.
-cp "$PKG_DIR/macrdp-launch" "$STAGE/Contents/Resources/macrdp-launch"
-chmod +x "$STAGE/Contents/MacOS/macrdp" "$STAGE/Contents/Resources/macrdp-launch"
+chmod +x "$STAGE/Contents/MacOS/macrdp"
+# No wrapper script: the LaunchAgent runs this signed binary directly with
+# `--config` (the binary reads config.env itself). That gives macOS Background
+# Task Management a stable Developer-ID identity to approve once, instead of an
+# unsigned wrapper it re-flags on every rebuild.
 
 # 2b. App icon (optional): drop packaging/macrdp.png or packaging/icon.png
 #     (square, ideally 1024×1024) to brand the bundle. Done before signing so
@@ -65,7 +65,7 @@ if [ -n "$ICON_SRC" ]; then
 fi
 
 # 3. Sign the Mach-O executable, then the bundle (which seals Info.plist + the
-#    Resources, including the wrapper script). Ad-hoc ("-") can't use a secure
+#    Resources, including the app icon). Ad-hoc ("-") can't use a secure
 #    timestamp; a real Developer ID must (notarization requires it).
 if [ "$IDENTITY" = "-" ]; then TS="--timestamp=none"; else TS="--timestamp"; fi
 echo "==> codesign (hardened runtime, ts: $TS)"

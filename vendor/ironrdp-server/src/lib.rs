@@ -35,7 +35,7 @@ pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle
 pub use handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 pub use rdpdr::{
     AnnouncedDevice, DirEntry, RdpdrBackendFactory, RdpdrHandle, RdpdrServer, RdpdrServerFactory, RdpdrServerHandler,
-    RdpdrServerMessage,
+    RdpdrServerMessage, RdpdrStatus,
 };
 #[cfg(feature = "helper")]
 pub use helper::TlsIdentityCtx;

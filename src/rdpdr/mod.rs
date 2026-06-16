@@ -6,10 +6,11 @@
 //! Done: the MS-RDPEFS init handshake (1a), device I/O — `list_dir` /
 //! `read_file` via the [`RdpdrHandle`] (1b) — and the macOS surface: a real
 //! NFS mount (Phase 2). An in-process NFSv3 server backed by the `RdpdrHandle`
-//! is mounted at `/Volumes/<label>` via the built-in `mount_nfs` (no root, no
-//! kext), so the client's drive appears as a proper Finder volume with lazy
-//! subdirectory navigation and on-demand reads.
-//! Opt-in via `--enable-drive-redirection`. Read-only.
+//! is mounted via the built-in `mount_nfs` (no root, no kext), so the client's
+//! drive appears as a proper Finder volume with lazy subdirectory navigation,
+//! on-demand reads, and writes (create / write / mkdir / rename / delete /
+//! truncate map to RDPDR DeviceWrite / DeviceCreate / SetInformation).
+//! Opt-in via `--enable-drive-redirection`. Read-write.
 
 #[cfg(target_os = "macos")]
 mod surface;

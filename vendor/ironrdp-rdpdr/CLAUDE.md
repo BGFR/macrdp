@@ -38,8 +38,19 @@ reused as-is; we only add the missing server-direction halves.
     `ServerDriveQueryDirectoryRequest` and `decode` for `FileDirectoryInformation`
     (the directory-entry class the server requests); the query-directory response
     is decoded inline in the server's `RdpdrHandle::list_dir` (DeviceIoResponse +
-    Length + one entry per response, looped until NO_MORE_FILES). Still pending:
-    write support (`DeviceWriteRequest`/`Response`) for Phase 2.
+    Length + one entry per response, looped until NO_MORE_FILES).
+
+    Phase 2 (writes) added the server-direction halves for the write path:
+    `encode` for `DeviceWriteRequest` and `ServerDriveSetInformationRequest`,
+    `decode` for `DeviceWriteResponse`, `encode` for the set-information buffers
+    `FileEndOfFileInformation` / `FileDispositionInformation` /
+    `FileRenameInformation` / `FileAllocationInformation` (upstream had only
+    their `decode`), the matching `FileInformationClass::encode` arms + a
+    `FileInformationClass::level()` helper (maps a buffer to its
+    `FileInformationClassLevel`), and the `DeviceWriteRequest` /
+    `ServerDriveSetInformationRequest` arms in `ServerDriveIoRequest`'s
+    `Encode`/`size` dispatch (`pdu/mod.rs`). `DeviceCreateRequest::encode`
+    (Phase 1b) already carries the create-disposition, so create/mkdir reuse it.
 
     Upstreamable as a `SvcServerProcessor` peer to the client `Rdpdr` (offer the
     decode halves + the server processor together). De-vendor once a published

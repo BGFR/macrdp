@@ -26,12 +26,14 @@ use ironrdp_core::{impl_as_any, ReadCursor};
 use ironrdp_pdu::gcc::ChannelName;
 use ironrdp_pdu::{decode_err, PduResult};
 use ironrdp_rdpdr::pdu::efs::{
-    Capabilities, ClientDeviceListAnnounce, ClientNameRequest, CoreCapability, CoreCapabilityKind, CreateDisposition,
-    CreateOptions, DeviceCloseRequest, DeviceCreateRequest, DeviceCreateResponse, DeviceIoRequest, DeviceIoResponse,
-    DeviceReadRequest, DeviceReadResponse, DeviceType, DesiredAccess, FileAttributes, FileDirectoryInformation,
-    FileInformationClassLevel, MajorFunction, MinorFunction, NtStatus, ServerDeviceAnnounceResponse,
-    ServerDriveIoRequest, ServerDriveQueryDirectoryRequest, SharedAccess, VersionAndIdPdu, VersionAndIdPduKind,
-    VERSION_MAJOR, VERSION_MINOR_RDP51,
+    Boolean, Capabilities, ClientDeviceListAnnounce, ClientNameRequest, CoreCapability, CoreCapabilityKind,
+    CreateDisposition, CreateOptions, DeviceCloseRequest, DeviceCreateRequest, DeviceCreateResponse, DeviceIoRequest,
+    DeviceIoResponse, DeviceReadRequest, DeviceReadResponse, DeviceType, DesiredAccess, DeviceWriteRequest,
+    DeviceWriteResponse, FileAttributes, FileDirectoryInformation, FileDispositionInformation,
+    FileEndOfFileInformation, FileInformationClass, FileInformationClassLevel, FileRenameInformation, MajorFunction,
+    MinorFunction, NtStatus, ServerDeviceAnnounceResponse, ServerDriveIoRequest, ServerDriveQueryDirectoryRequest,
+    ServerDriveSetInformationRequest, SharedAccess, VersionAndIdPdu, VersionAndIdPduKind, VERSION_MAJOR,
+    VERSION_MINOR_RDP51,
 };
 use ironrdp_rdpdr::pdu::{PacketId, RdpdrPdu, SharedHeader};
 use ironrdp_svc::{CompressionCondition, SvcMessage, SvcProcessor, SvcServerProcessor};
@@ -89,6 +91,26 @@ pub struct DirEntry {
     pub size: u64,
     pub is_dir: bool,
 }
+
+/// Error carrying the [`NtStatus`] the client returned for a failed device-I/O
+/// request. Callers can match on `status` to surface a precise error (e.g.
+/// `ACCESS_DENIED` → "permission denied", `OBJECT_NAME_COLLISION` → "exists")
+/// instead of a generic failure. Returned (boxed into `anyhow::Error`) by the
+/// [`RdpdrHandle`] ops; recover it with `err.downcast_ref::<RdpdrStatus>()`.
+#[derive(Debug, Clone)]
+pub struct RdpdrStatus {
+    /// The operation that failed, e.g. `create(\\foo.txt)` or `write`.
+    pub op: String,
+    pub status: NtStatus,
+}
+
+impl fmt::Display for RdpdrStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RDPDR {} failed: {:?}", self.op, self.status)
+    }
+}
+
+impl std::error::Error for RdpdrStatus {}
 
 /// Matches `DeviceIoCompletion` responses to the request awaiting them, keyed by
 /// completion id (the RDPDR analogue of clipboard's `DownloadRouter`). The
@@ -262,6 +284,151 @@ impl RdpdrHandle {
         Ok(entries)
     }
 
+    /// Open `path` for writing, write `data` at `offset`, and close — returning
+    /// the number of bytes written. The file must already exist (NFS creates it
+    /// via [`Self::create_file`] before writing).
+    pub async fn write_file(&self, device_id: u32, path: &str, offset: u64, data: &[u8]) -> Result<u64> {
+        let file_id = self
+            .open_with(
+                device_id,
+                path,
+                Self::file_write_access(),
+                CreateDisposition::FILE_OPEN,
+                CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_NON_DIRECTORY_FILE,
+            )
+            .await?;
+        let result = self.write(device_id, file_id, offset, data).await;
+        let _ = self.close(device_id, file_id).await;
+        result.map(u64::from)
+    }
+
+    /// Create a regular file at `path`. With `exclusive`, fails if it already
+    /// exists (FILE_CREATE); otherwise opens-or-creates (FILE_OPEN_IF).
+    pub async fn create_file(&self, device_id: u32, path: &str, exclusive: bool) -> Result<()> {
+        let disposition = if exclusive {
+            CreateDisposition::FILE_CREATE
+        } else {
+            CreateDisposition::FILE_OPEN_IF
+        };
+        let file_id = self
+            .open_with(
+                device_id,
+                path,
+                Self::file_write_access(),
+                disposition,
+                CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_NON_DIRECTORY_FILE,
+            )
+            .await?;
+        self.close(device_id, file_id).await
+    }
+
+    /// Create a directory at `path` (fails if it already exists).
+    pub async fn create_dir(&self, device_id: u32, path: &str) -> Result<()> {
+        let file_id = self
+            .open_with(
+                device_id,
+                path,
+                Self::file_write_access(),
+                CreateDisposition::FILE_CREATE,
+                CreateOptions::FILE_DIRECTORY_FILE,
+            )
+            .await?;
+        self.close(device_id, file_id).await
+    }
+
+    /// Delete the file/directory at `path` (open with DELETE access, set the
+    /// disposition's delete-pending flag, close to commit). A directory must be
+    /// empty.
+    pub async fn remove(&self, device_id: u32, path: &str, is_dir: bool) -> Result<()> {
+        let options = if is_dir {
+            CreateOptions::FILE_DIRECTORY_FILE
+        } else {
+            CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_NON_DIRECTORY_FILE
+        };
+        let file_id = self
+            .open_with(
+                device_id,
+                path,
+                DesiredAccess::DELETE | DesiredAccess::SYNCHRONIZE,
+                CreateDisposition::FILE_OPEN,
+                options,
+            )
+            .await?;
+        let result = self
+            .set_information(
+                device_id,
+                file_id,
+                FileInformationClass::Disposition(FileDispositionInformation { delete_pending: 1 }),
+            )
+            .await;
+        let _ = self.close(device_id, file_id).await;
+        result
+    }
+
+    /// Rename / move the file/dir at `from` to `to` (both Windows backslash paths
+    /// relative to the drive root).
+    pub async fn rename(&self, device_id: u32, from: &str, to: &str, replace: bool) -> Result<()> {
+        let file_id = self
+            .open_with(
+                device_id,
+                from,
+                DesiredAccess::DELETE | DesiredAccess::SYNCHRONIZE,
+                CreateDisposition::FILE_OPEN,
+                CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+            .await?;
+        let result = self
+            .set_information(
+                device_id,
+                file_id,
+                FileInformationClass::Rename(FileRenameInformation {
+                    replace_if_exists: if replace { Boolean::True } else { Boolean::False },
+                    file_name: to.to_owned(),
+                }),
+            )
+            .await;
+        let _ = self.close(device_id, file_id).await;
+        result
+    }
+
+    /// Truncate/extend the file at `path` to `size` bytes (FileEndOfFileInformation).
+    pub async fn set_len(&self, device_id: u32, path: &str, size: u64) -> Result<()> {
+        let file_id = self
+            .open_with(
+                device_id,
+                path,
+                Self::file_write_access(),
+                CreateDisposition::FILE_OPEN,
+                CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_NON_DIRECTORY_FILE,
+            )
+            .await?;
+        let end_of_file = i64::try_from(size).unwrap_or(i64::MAX);
+        let result = self
+            .set_information(
+                device_id,
+                file_id,
+                FileInformationClass::EndOfFile(FileEndOfFileInformation { end_of_file }),
+            )
+            .await;
+        let _ = self.close(device_id, file_id).await;
+        result
+    }
+
+    /// The `FILE_GENERIC_WRITE`-ish access set for opening a file to write. Like
+    /// [`Self::file_read_access`] it requests SYNCHRONIZE (synchronous I/O) and
+    /// keeps read rights so an open handle can be both read and written.
+    fn file_write_access() -> DesiredAccess {
+        DesiredAccess::FILE_READ_DATA_OR_FILE_LIST_DIRECTORY
+            | DesiredAccess::FILE_WRITE_DATA_OR_FILE_ADD_FILE
+            | DesiredAccess::FILE_APPEND_DATA_OR_FILE_ADD_SUBDIRECTORY
+            | DesiredAccess::FILE_READ_ATTRIBUTES
+            | DesiredAccess::FILE_WRITE_ATTRIBUTES
+            | DesiredAccess::FILE_READ_EA
+            | DesiredAccess::FILE_WRITE_EA
+            | DesiredAccess::READ_CONTROL
+            | DesiredAccess::SYNCHRONIZE
+    }
+
     fn send(&self, req: ServerDriveIoRequest) -> Result<()> {
         let msg = SvcMessage::from(req);
         self.sender
@@ -293,11 +460,27 @@ impl RdpdrHandle {
             | DesiredAccess::SYNCHRONIZE
     }
 
+    /// Open `path` with `CreateDisposition::FILE_OPEN` (the file/dir must exist).
     async fn create_with(
         &self,
         device_id: u32,
         path: &str,
         desired_access: DesiredAccess,
+        create_options: CreateOptions,
+    ) -> Result<u32> {
+        self.open_with(device_id, path, desired_access, CreateDisposition::FILE_OPEN, create_options)
+            .await
+    }
+
+    /// General IRP_MJ_CREATE: open `path` with an explicit `create_disposition`
+    /// (FILE_OPEN to require existence, FILE_CREATE to create-or-fail,
+    /// FILE_OPEN_IF to open-or-create, …).
+    async fn open_with(
+        &self,
+        device_id: u32,
+        path: &str,
+        desired_access: DesiredAccess,
+        create_disposition: CreateDisposition,
         create_options: CreateOptions,
     ) -> Result<u32> {
         let (completion_id, rx) = self.router.register();
@@ -312,14 +495,18 @@ impl RdpdrHandle {
             shared_access: SharedAccess::FILE_SHARE_READ
                 | SharedAccess::FILE_SHARE_WRITE
                 | SharedAccess::FILE_SHARE_DELETE,
-            create_disposition: CreateDisposition::FILE_OPEN,
+            create_disposition,
             create_options,
             path: path.to_owned(),
         }))?;
         let body = rx.await.context("RDPDR create: connection closed")?;
         let resp = DeviceCreateResponse::decode(&mut ReadCursor::new(&body)).map_err(|e| anyhow!("{e}"))?;
         if resp.device_io_reply.io_status != NtStatus::SUCCESS {
-            return Err(anyhow!("RDPDR create({path}) failed: {:?}", resp.device_io_reply.io_status));
+            return Err(RdpdrStatus {
+                op: format!("create({path})"),
+                status: resp.device_io_reply.io_status,
+            }
+            .into());
         }
         Ok(resp.file_id)
     }
@@ -336,7 +523,11 @@ impl RdpdrHandle {
         let body = rx.await.context("RDPDR read: connection closed")?;
         let resp = DeviceReadResponse::decode(&mut ReadCursor::new(&body)).map_err(|e| anyhow!("{e}"))?;
         if resp.device_io_reply.io_status != NtStatus::SUCCESS {
-            return Err(anyhow!("RDPDR read failed: {:?}", resp.device_io_reply.io_status));
+            return Err(RdpdrStatus {
+                op: "read".to_owned(),
+                status: resp.device_io_reply.io_status,
+            }
+            .into());
         }
         Ok(resp.read_data)
     }
@@ -349,6 +540,51 @@ impl RdpdrHandle {
             device_io_request: header,
         }))?;
         let _ = rx.await; // ignore close status
+        Ok(())
+    }
+
+    async fn write(&self, device_id: u32, file_id: u32, offset: u64, data: &[u8]) -> Result<u32> {
+        let (completion_id, rx) = self.router.register();
+        let mut header = self.io_header(device_id, completion_id, MajorFunction::Write);
+        header.file_id = file_id;
+        self.send(ServerDriveIoRequest::DeviceWriteRequest(DeviceWriteRequest {
+            device_io_request: header,
+            offset,
+            write_data: data.to_vec(),
+        }))?;
+        let body = rx.await.context("RDPDR write: connection closed")?;
+        let resp = DeviceWriteResponse::decode(&mut ReadCursor::new(&body)).map_err(|e| anyhow!("{e}"))?;
+        if resp.device_io_reply.io_status != NtStatus::SUCCESS {
+            return Err(RdpdrStatus {
+                op: "write".to_owned(),
+                status: resp.device_io_reply.io_status,
+            }
+            .into());
+        }
+        Ok(resp.length)
+    }
+
+    async fn set_information(&self, device_id: u32, file_id: u32, info: FileInformationClass) -> Result<()> {
+        let (completion_id, rx) = self.router.register();
+        let mut header = self.io_header(device_id, completion_id, MajorFunction::SetInformation);
+        header.file_id = file_id;
+        self.send(ServerDriveIoRequest::ServerDriveSetInformationRequest(
+            ServerDriveSetInformationRequest {
+                device_io_request: header,
+                set_buffer: info,
+            },
+        ))?;
+        let body = rx.await.context("RDPDR set-info: connection closed")?;
+        // Only the DeviceIoResponse status matters (the response's Length echoes
+        // the request); decode the header and check it succeeded.
+        let io = DeviceIoResponse::decode(&mut ReadCursor::new(&body)).map_err(|e| anyhow!("{e}"))?;
+        if io.io_status != NtStatus::SUCCESS {
+            return Err(RdpdrStatus {
+                op: "set-info".to_owned(),
+                status: io.io_status,
+            }
+            .into());
+        }
         Ok(())
     }
 }

@@ -2407,11 +2407,29 @@ impl FileInformationClass {
             Self::FullDirectory(f) => f.encode(dst),
             Self::Names(f) => f.encode(dst),
             Self::Directory(f) => f.encode(dst),
-            _ => Err(unsupported_value_err!(
-                "FileInformationClass::encode",
-                "FileInformationClass",
-                self.to_string()
-            )),
+            // (vendored) server-direction set-information buffers
+            Self::EndOfFile(f) => f.encode(dst),
+            Self::Disposition(f) => f.encode(dst),
+            Self::Rename(f) => f.encode(dst),
+            Self::Allocation(f) => f.encode(dst),
+        }
+    }
+
+    /// (vendored) The [`FileInformationClassLevel`] that tags this buffer in a
+    /// set/query request.
+    pub fn level(&self) -> FileInformationClassLevel {
+        match self {
+            Self::Basic(_) => FileInformationClassLevel::FILE_BASIC_INFORMATION,
+            Self::Standard(_) => FileInformationClassLevel::FILE_STANDARD_INFORMATION,
+            Self::AttributeTag(_) => FileInformationClassLevel::FILE_ATTRIBUTE_TAG_INFORMATION,
+            Self::BothDirectory(_) => FileInformationClassLevel::FILE_BOTH_DIRECTORY_INFORMATION,
+            Self::FullDirectory(_) => FileInformationClassLevel::FILE_FULL_DIRECTORY_INFORMATION,
+            Self::Names(_) => FileInformationClassLevel::FILE_NAMES_INFORMATION,
+            Self::Directory(_) => FileInformationClassLevel::FILE_DIRECTORY_INFORMATION,
+            Self::EndOfFile(_) => FileInformationClassLevel::FILE_END_OF_FILE_INFORMATION,
+            Self::Disposition(_) => FileInformationClassLevel::FILE_DISPOSITION_INFORMATION,
+            Self::Rename(_) => FileInformationClassLevel::FILE_RENAME_INFORMATION,
+            Self::Allocation(_) => FileInformationClassLevel::FILE_ALLOCATION_INFORMATION,
         }
     }
 
@@ -3766,6 +3784,23 @@ impl DeviceWriteRequest {
             write_data,
         })
     }
+
+    /// (vendored) Server-direction encode — the inverse of [`Self::decode`], for
+    /// a server issuing IRP_MJ_WRITE (write bytes into an open handle).
+    pub fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(ctx: "DeviceWriteRequest", in: dst, size: self.size());
+        self.device_io_request.encode(dst)?;
+        let length = cast_length!("DeviceWriteRequest", "Length", self.write_data.len())?;
+        dst.write_u32(length);
+        dst.write_u64(self.offset);
+        write_padding!(dst, 20);
+        dst.write_slice(&self.write_data);
+        Ok(())
+    }
+
+    pub fn size(&self) -> usize {
+        self.device_io_request.size() + Self::FIXED_PART_SIZE + self.write_data.len()
+    }
 }
 
 impl Debug for DeviceWriteRequest {
@@ -3800,6 +3835,16 @@ impl DeviceWriteResponse {
         dst.write_u32(self.length);
         write_padding!(dst, 1); // Padding
         Ok(())
+    }
+
+    /// (vendored) Server-direction decode — the inverse of [`Self::encode`], for
+    /// a server reading the client's IRP_MJ_WRITE completion. The trailing 1-byte
+    /// Padding is optional on the wire, so only the Length is required.
+    pub fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        let device_io_reply = DeviceIoResponse::decode(src)?;
+        ensure_size!(ctx: Self::NAME, in: src, size: 4);
+        let length = src.read_u32();
+        Ok(Self { device_io_reply, length })
     }
 
     pub fn size(&self) -> usize {
@@ -3852,6 +3897,23 @@ impl ServerDriveSetInformationRequest {
             set_buffer,
         })
     }
+
+    /// (vendored) Server-direction encode — the inverse of [`Self::decode`], for
+    /// a server issuing IRP_MJ_SET_INFORMATION (truncate / delete / rename).
+    pub fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(ctx: "ServerDriveSetInformationRequest", in: dst, size: self.size());
+        self.device_io_request.encode(dst)?;
+        dst.write_u32(self.set_buffer.level().into());
+        let length = cast_length!("ServerDriveSetInformationRequest", "Length", self.set_buffer.size())?;
+        dst.write_u32(length);
+        write_padding!(dst, 24);
+        self.set_buffer.encode(dst)?;
+        Ok(())
+    }
+
+    pub fn size(&self) -> usize {
+        self.device_io_request.size() + Self::FIXED_PART_SIZE + self.set_buffer.size()
+    }
 }
 
 /// 2.4.13 FileEndOfFileInformation
@@ -3869,6 +3931,13 @@ impl FileEndOfFileInformation {
         ensure_fixed_part_size!(in: src);
         let end_of_file = src.read_i64();
         Ok(Self { end_of_file })
+    }
+
+    /// (vendored) Server-direction encode.
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(ctx: "FileEndOfFileInformation", in: dst, size: Self::size());
+        dst.write_i64(self.end_of_file);
+        Ok(())
     }
 
     fn size() -> usize {
@@ -3896,6 +3965,13 @@ impl FileDispositionInformation {
             1
         };
         Ok(Self { delete_pending })
+    }
+
+    /// (vendored) Server-direction encode.
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(ctx: "FileDispositionInformation", in: dst, size: Self::size());
+        dst.write_u8(self.delete_pending);
+        Ok(())
     }
 
     fn size() -> usize {
@@ -3931,6 +4007,21 @@ impl FileRenameInformation {
         })
     }
 
+    /// (vendored) Server-direction encode. `RootDirectory` is always 0 (the
+    /// `file_name` is a full path relative to the share root).
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(ctx: "FileRenameInformation", in: dst, size: self.size());
+        dst.write_u8(u8::from(self.replace_if_exists));
+        dst.write_u8(0); // RootDirectory
+        let file_name_length = cast_length!(
+            "FileRenameInformation",
+            "FileNameLength",
+            encoded_str_len(&self.file_name, CharacterSet::Unicode, true)
+        )?;
+        dst.write_u32(file_name_length);
+        write_string_to_cursor(dst, &self.file_name, CharacterSet::Unicode, true)
+    }
+
     fn size(&self) -> usize {
         Self::FIXED_PART_SIZE + encoded_str_len(&self.file_name, CharacterSet::Unicode, true)
     }
@@ -3951,6 +4042,13 @@ impl FileAllocationInformation {
         ensure_fixed_part_size!(in: src);
         let allocation_size = src.read_i64();
         Ok(Self { allocation_size })
+    }
+
+    /// (vendored) Server-direction encode.
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(ctx: "FileAllocationInformation", in: dst, size: Self::size());
+        dst.write_i64(self.allocation_size);
+        Ok(())
     }
 
     fn size() -> usize {

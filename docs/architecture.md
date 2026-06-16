@@ -23,7 +23,7 @@ src/keyboard_layout.rs  Optional non-US layout translation
                   are platform-independent and unit-tested.
 src/rdpdr/        RDPDR drive redirection — the macrdp side of the server-side
                   RDPDR static channel (--enable-drive-redirection, opt-in,
-                  read-only). The protocol state machine (handshake + device
+                  read-write). The protocol state machine (handshake + device
                   discovery) lives in the vendored ironrdp-server::rdpdr; this
                   module is the MacRdpdr factory + RdpdrServerHandler backend.
                   1a: handshake + drive discovery. 1b: device I/O — the backend
@@ -35,7 +35,9 @@ src/rdpdr/        RDPDR drive redirection — the macrdp side of the server-side
                   with a path<->fileid cache); an in-process NFSv3 server is
                   mounted via the built-in mount_nfs (no root, no kext) so the
                   client's drive is a proper Finder volume with lazy subdir
-                  navigation. Surface::Drop unmounts on disconnect. Read-only.
+                  navigation. Read-write: NFS write/create/mkdir/remove/rename/
+                  setattr map to RDPDR DeviceWrite / DeviceCreate /
+                  SetInformation. Surface::Drop unmounts on disconnect.
 src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB
                   + Mac↔Windows file copy via FileGroupDescriptorW
                   and FileContentsRequest streaming)

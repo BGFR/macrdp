@@ -12,8 +12,9 @@
 //!
 //! No kext / FUSE / app-extension: the mount uses only the built-in `mount_nfs`
 //! against `localhost`, and (verified) needs **no root** for a loopback NFS
-//! mount onto a user-created mountpoint. Read-only for now — every write-side
-//! NFS op returns `NFS3ERR_ROFS`, and the mount itself is `-o rdonly`.
+//! mount onto a user-created mountpoint. **Read-write:** writes map to RDPDR
+//! `DeviceWrite` (`write`), set-information (`set_len`/`remove`/`rename`), and
+//! create (`create`/`mkdir`).
 //!
 //! Cleaned up (unmount + remove mountpoint + stop the server) when the
 //! connection's backend drops.
@@ -26,9 +27,10 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use ironrdp_server::{DirEntry as RdpEntry, RdpdrHandle};
+use ironrdp_rdpdr::pdu::efs::NtStatus;
+use ironrdp_server::{DirEntry as RdpEntry, RdpdrHandle, RdpdrStatus};
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3,
+    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfsstring, nfstime3, sattr3, set_size3,
 };
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry as NfsDirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
@@ -107,6 +109,21 @@ impl FsCache {
         self.path_to_id.insert(path.to_owned(), id);
         id
     }
+
+    /// Drop a node from the cache (used after a successful delete/rename of the
+    /// old path).
+    fn forget(&mut self, id: fileid3) {
+        if let Some(n) = self.id_to_node.remove(&id) {
+            self.path_to_id.remove(&n.remote_path);
+        }
+    }
+
+    /// Update a node's cached size (after a write/truncate).
+    fn set_size(&mut self, id: fileid3, size: u64) {
+        if let Some(n) = self.id_to_node.get_mut(&id) {
+            n.size = size;
+        }
+    }
 }
 
 /// Join a child `name` onto a Windows backslash `dir` path.
@@ -116,6 +133,26 @@ fn join_remote(dir: &str, name: &str) -> String {
     } else {
         format!("{dir}\\{name}")
     }
+}
+
+/// Map an `RdpdrHandle` error to the closest NFS status, logging the cause. When
+/// the client returned a concrete [`NtStatus`] (e.g. `ACCESS_DENIED` for a write
+/// to a protected location like `C:\`), translate it so Finder reports the right
+/// thing ("you don't have permission") instead of a generic I/O error. These are
+/// routine client-side outcomes, so they log at debug, not warn.
+fn nfs_err(context: &str, e: &anyhow::Error) -> nfsstat3 {
+    let status = e.downcast_ref::<RdpdrStatus>().map(|s| s.status);
+    let mapped = match status {
+        Some(s) if s == NtStatus::ACCESS_DENIED => nfsstat3::NFS3ERR_ACCES,
+        Some(s) if s == NtStatus::OBJECT_NAME_COLLISION => nfsstat3::NFS3ERR_EXIST,
+        Some(s) if s == NtStatus::NO_SUCH_FILE => nfsstat3::NFS3ERR_NOENT,
+        Some(s) if s == NtStatus::NOT_A_DIRECTORY => nfsstat3::NFS3ERR_NOTDIR,
+        Some(s) if s == NtStatus::DIRECTORY_NOT_EMPTY => nfsstat3::NFS3ERR_NOTEMPTY,
+        Some(s) if s == NtStatus::NOT_SUPPORTED => nfsstat3::NFS3ERR_NOTSUPP,
+        _ => nfsstat3::NFS3ERR_IO,
+    };
+    debug!(error = %e, "rdpdr nfs: {context}");
+    mapped
 }
 
 // ---------------------------------------------------------------------------
@@ -155,7 +192,7 @@ impl RdpdrFs {
         if is_dir {
             fattr3 {
                 ftype: ftype3::NF3DIR,
-                mode: 0o555,
+                mode: 0o755,
                 nlink: 2,
                 size: 4096,
                 used: 4096,
@@ -168,7 +205,7 @@ impl RdpdrFs {
         } else {
             fattr3 {
                 ftype: ftype3::NF3REG,
-                mode: 0o444,
+                mode: 0o644,
                 nlink: 1,
                 size,
                 used: size,
@@ -196,10 +233,7 @@ impl RdpdrFs {
             .handle
             .list_dir(self.device_id, &dir_path)
             .await
-            .map_err(|e| {
-                warn!(error = %e, dir = %dir_path, "rdpdr nfs: list_dir failed");
-                nfsstat3::NFS3ERR_IO
-            })?;
+            .map_err(|e| nfs_err("list_dir failed", &e))?;
         let mut out = Vec::with_capacity(entries.len());
         let mut c = self.cache.lock().unwrap();
         for e in entries {
@@ -209,12 +243,23 @@ impl RdpdrFs {
         }
         Ok(out)
     }
+
+    /// Resolve a directory fileid to its remote path (errors if unknown or not a
+    /// directory).
+    fn dir_path_of(&self, dirid: fileid3) -> Result<String, nfsstat3> {
+        let c = self.cache.lock().unwrap();
+        let n = c.id_to_node.get(&dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        if !n.is_dir {
+            return Err(nfsstat3::NFS3ERR_NOTDIR);
+        }
+        Ok(n.remote_path.clone())
+    }
 }
 
 #[async_trait]
 impl NFSFileSystem for RdpdrFs {
     fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadOnly
+        VFSCapabilities::ReadWrite
     }
 
     fn root_dir(&self) -> fileid3 {
@@ -290,10 +335,7 @@ impl NFSFileSystem for RdpdrFs {
             .handle
             .read_file(self.device_id, &remote_path, offset, count)
             .await
-            .map_err(|e| {
-                warn!(error = %e, path = %remote_path, "rdpdr nfs: read_file failed");
-                nfsstat3::NFS3ERR_IO
-            })?;
+            .map_err(|e| nfs_err("read_file failed", &e))?;
         let eof = offset + data.len() as u64 >= size;
         Ok((data, eof))
     }
@@ -331,47 +373,174 @@ impl NFSFileSystem for RdpdrFs {
         Ok(ReadDirResult { entries, end })
     }
 
-    // ---- read-only: every write-side op is rejected ----
-    async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        let (remote_path, is_dir) = {
+            let c = self.cache.lock().unwrap();
+            let n = c.id_to_node.get(&id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            (n.remote_path.clone(), n.is_dir)
+        };
+        // Only a size change (truncate/extend) maps to RDPDR; mode/uid/gid/times
+        // are accepted as no-ops since we don't model them.
+        if let set_size3::size(new_size) = setattr.size {
+            if !is_dir {
+                self.handle
+                    .set_len(self.device_id, &remote_path, new_size)
+                    .await
+                    .map_err(|e| nfs_err("set_len failed", &e))?;
+                self.cache.lock().unwrap().set_size(id, new_size);
+            }
+        }
+        let size = {
+            let c = self.cache.lock().unwrap();
+            c.id_to_node.get(&id).map(|n| n.size).unwrap_or(0)
+        };
+        Ok(self.attr(id, is_dir, size))
     }
-    async fn write(&self, _id: fileid3, _offset: u64, _data: &[u8]) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+
+    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        let (remote_path, is_dir) = {
+            let c = self.cache.lock().unwrap();
+            let n = c.id_to_node.get(&id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            (n.remote_path.clone(), n.is_dir)
+        };
+        if is_dir {
+            return Err(nfsstat3::NFS3ERR_ISDIR);
+        }
+        self.handle
+            .write_file(self.device_id, &remote_path, offset, data)
+            .await
+            .map_err(|e| nfs_err("write_file failed", &e))?;
+        let new_size = {
+            let mut c = self.cache.lock().unwrap();
+            let cur = c.id_to_node.get(&id).map(|n| n.size).unwrap_or(0);
+            let ns = cur.max(offset + data.len() as u64);
+            c.set_size(id, ns);
+            ns
+        };
+        Ok(self.attr(id, false, new_size))
     }
+
     async fn create(
         &self,
-        _dirid: fileid3,
-        _filename: &filename3,
+        dirid: fileid3,
+        filename: &filename3,
         _attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let dir_path = self.dir_path_of(dirid)?;
+        let name = String::from_utf8_lossy(&filename.0).into_owned();
+        let child = join_remote(&dir_path, &name);
+        self.handle
+            .create_file(self.device_id, &child, false)
+            .await
+            .map_err(|e| nfs_err("create_file failed", &e))?;
+        let id = self.cache.lock().unwrap().intern(dirid, &child, false, 0);
+        Ok((id, self.attr(id, false, 0)))
     }
+
     async fn create_exclusive(
         &self,
-        _dirid: fileid3,
-        _filename: &filename3,
+        dirid: fileid3,
+        filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let dir_path = self.dir_path_of(dirid)?;
+        let name = String::from_utf8_lossy(&filename.0).into_owned();
+        let child = join_remote(&dir_path, &name);
+        self.handle
+            .create_file(self.device_id, &child, true)
+            .await
+            .map_err(|e| nfs_err("create_exclusive failed", &e))?;
+        Ok(self.cache.lock().unwrap().intern(dirid, &child, false, 0))
     }
+
     async fn mkdir(
         &self,
-        _dirid: fileid3,
-        _dirname: &filename3,
+        dirid: fileid3,
+        dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let dir_path = self.dir_path_of(dirid)?;
+        let name = String::from_utf8_lossy(&dirname.0).into_owned();
+        let child = join_remote(&dir_path, &name);
+        self.handle
+            .create_dir(self.device_id, &child)
+            .await
+            .map_err(|e| nfs_err("create_dir failed", &e))?;
+        let id = self.cache.lock().unwrap().intern(dirid, &child, true, 0);
+        Ok((id, self.attr(id, true, 0)))
     }
-    async fn remove(&self, _dirid: fileid3, _filename: &filename3) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+
+    async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+        let dir_path = self.dir_path_of(dirid)?;
+        let name = String::from_utf8_lossy(&filename.0).into_owned();
+        let child = join_remote(&dir_path, &name);
+        // Resolve the target's id + kind; enumerate the parent if not yet cached.
+        let mut resolved = {
+            let c = self.cache.lock().unwrap();
+            c.path_to_id
+                .get(&child)
+                .copied()
+                .and_then(|id| c.id_to_node.get(&id).map(|n| (id, n.is_dir)))
+        };
+        if resolved.is_none() {
+            self.list_and_cache(dirid).await?;
+            resolved = {
+                let c = self.cache.lock().unwrap();
+                c.path_to_id
+                    .get(&child)
+                    .copied()
+                    .and_then(|id| c.id_to_node.get(&id).map(|n| (id, n.is_dir)))
+            };
+        }
+        let (id, is_dir) = resolved.ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        self.handle
+            .remove(self.device_id, &child, is_dir)
+            .await
+            .map_err(|e| nfs_err("remove failed", &e))?;
+        self.cache.lock().unwrap().forget(id);
+        Ok(())
     }
+
     async fn rename(
         &self,
-        _from_dirid: fileid3,
-        _from_filename: &filename3,
-        _to_dirid: fileid3,
-        _to_filename: &filename3,
+        from_dirid: fileid3,
+        from_filename: &filename3,
+        to_dirid: fileid3,
+        to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let from_dir = self.dir_path_of(from_dirid)?;
+        let to_dir = self.dir_path_of(to_dirid)?;
+        let from_name = String::from_utf8_lossy(&from_filename.0).into_owned();
+        let to_name = String::from_utf8_lossy(&to_filename.0).into_owned();
+        let from_path = join_remote(&from_dir, &from_name);
+        let to_path = join_remote(&to_dir, &to_name);
+
+        let mut src = {
+            let c = self.cache.lock().unwrap();
+            c.path_to_id
+                .get(&from_path)
+                .copied()
+                .and_then(|id| c.id_to_node.get(&id).map(|n| (id, n.is_dir, n.size)))
+        };
+        if src.is_none() {
+            self.list_and_cache(from_dirid).await?;
+            src = {
+                let c = self.cache.lock().unwrap();
+                c.path_to_id
+                    .get(&from_path)
+                    .copied()
+                    .and_then(|id| c.id_to_node.get(&id).map(|n| (id, n.is_dir, n.size)))
+            };
+        }
+        let (src_id, is_dir, size) = src.ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        self.handle
+            .rename(self.device_id, &from_path, &to_path, true)
+            .await
+            .map_err(|e| nfs_err("rename failed", &e))?;
+        let mut c = self.cache.lock().unwrap();
+        c.forget(src_id);
+        c.intern(to_dirid, &to_path, is_dir, size);
+        Ok(())
     }
+
     async fn symlink(
         &self,
         _dirid: fileid3,
@@ -485,12 +654,12 @@ impl Drop for Surface {
     }
 }
 
-/// Mount the loopback NFS export at `mountpoint`. Read-only, NFSv3 over TCP,
-/// large rsize to keep the open/read/close RDPDR round-trips per NFS read low.
-/// Verified to need no root for a `localhost` mount onto a user-owned dir.
+/// Mount the loopback NFS export at `mountpoint`. Read-write, NFSv3 over TCP,
+/// large rsize/wsize to keep the open/read/close RDPDR round-trips per NFS op
+/// low. Verified to need no root for a `localhost` mount onto a user-owned dir.
 fn run_mount(port: u16, mountpoint: &Path) -> bool {
     let opts = format!(
-        "nolocks,vers=3,tcp,rdonly,rsize=1048576,wsize=1048576,port={port},mountport={port},actimeo=5"
+        "nolocks,vers=3,tcp,rsize=1048576,wsize=1048576,port={port},mountport={port},actimeo=5"
     );
     match std::process::Command::new("/sbin/mount_nfs")
         .arg("-o")

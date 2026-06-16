@@ -162,7 +162,14 @@ AND released — #1276 landing is NOT sufficient.
     responses back to the waiting caller by completion id. `RdpdrHandle` exposes
     `read_file` (create→read→close) and `list_dir` (create→query-directory loop
     until NO_MORE_FILES→close, returning `DirEntry`s).
-    Read-only; macrdp gates it behind `--enable-drive-redirection`.
+    Phase 2 added the **write** half of `RdpdrHandle`: `write_file`
+    (open→`DeviceWrite`→close), `create_file`/`create_dir` (`DeviceCreate` with
+    FILE_OPEN_IF/FILE_CREATE), `remove`/`rename`/`set_len` (open→`SetInformation`
+    FileDisposition/FileRename/FileEndOfFile→close), plus a generalized
+    `open_with` (explicit `CreateDisposition`; `create_with` now delegates with
+    FILE_OPEN) and a `file_write_access()` rights set. These depend on the
+    `ironrdp-rdpdr` Phase-2 encode halves (divergence (1) there).
+    Read-write; macrdp gates it behind `--enable-drive-redirection`.
     Upstreamable as the server counterpart to the client `Rdpdr`.
 
 (10) Publish the client's keyboard-layout id to a shared cell (NOT

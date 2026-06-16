@@ -155,8 +155,8 @@ impl RdpdrHandle {
             .create_with(
                 device_id,
                 path,
-                DesiredAccess::GENERIC_READ,
-                CreateOptions::FILE_NON_DIRECTORY_FILE,
+                Self::file_read_access(),
+                CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_NON_DIRECTORY_FILE,
             )
             .await?;
         let data = self.read(device_id, file_id, offset, length).await;
@@ -174,8 +174,8 @@ impl RdpdrHandle {
             .create_with(
                 device_id,
                 path,
-                DesiredAccess::GENERIC_READ,
-                CreateOptions::FILE_NON_DIRECTORY_FILE,
+                Self::file_read_access(),
+                CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_NON_DIRECTORY_FILE,
             )
             .await?;
         let result = (|| async {
@@ -279,6 +279,20 @@ impl RdpdrHandle {
         }
     }
 
+    /// The `FILE_GENERIC_READ` access set for opening a file to read. Real
+    /// Windows/mstsc honors the requested rights strictly — a bare
+    /// `GENERIC_READ` (which FreeRDP tolerated) leaves the handle without the
+    /// SYNCHRONIZE right a synchronous `IRP_MJ_READ` needs, yielding
+    /// STATUS_ACCESS_DENIED. This mirrors what a normal `CreateFile(GENERIC_READ)`
+    /// expands to.
+    fn file_read_access() -> DesiredAccess {
+        DesiredAccess::FILE_READ_DATA_OR_FILE_LIST_DIRECTORY
+            | DesiredAccess::FILE_READ_ATTRIBUTES
+            | DesiredAccess::FILE_READ_EA
+            | DesiredAccess::READ_CONTROL
+            | DesiredAccess::SYNCHRONIZE
+    }
+
     async fn create_with(
         &self,
         device_id: u32,
@@ -292,7 +306,12 @@ impl RdpdrHandle {
             desired_access,
             allocation_size: 0,
             file_attributes: FileAttributes::empty(),
-            shared_access: SharedAccess::FILE_SHARE_READ,
+            // Broad share access so we can open files the OS (or another
+            // process) already holds open for reading/writing — common for
+            // C:\ system files; a narrow FILE_SHARE_READ would SHARING_VIOLATION.
+            shared_access: SharedAccess::FILE_SHARE_READ
+                | SharedAccess::FILE_SHARE_WRITE
+                | SharedAccess::FILE_SHARE_DELETE,
             create_disposition: CreateDisposition::FILE_OPEN,
             create_options,
             path: path.to_owned(),

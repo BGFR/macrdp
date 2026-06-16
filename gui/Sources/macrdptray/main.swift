@@ -67,9 +67,54 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func refreshGlyph() {
         let st = agentState()
-        statusItem.button?.toolTip = st.pid != nil
+        let running = st.pid != nil
+        // Dim the menu-bar icon when the server isn't running so state is
+        // glanceable without opening the menu.
+        statusItem.button?.alphaValue = running ? 1.0 : 0.4
+        statusItem.button?.toolTip = running
             ? "macrdp: running (pid \(st.pid!))"
             : (st.loaded ? "macrdp: stopped" : "macrdp: not installed")
+    }
+
+    // MARK: - Server status (parsed from the log)
+
+    /// Last ~32 KB of the server log split into lines (oldest first).
+    func logTail() -> [String] {
+        guard let h = try? FileHandle(forReadingFrom: logURL) else { return [] }
+        defer { try? h.close() }
+        let size = (try? h.seekToEnd()) ?? 0
+        let window: UInt64 = 32 * 1024
+        try? h.seek(toOffset: size > window ? size - window : 0)
+        let data = (try? h.readToEnd()) ?? Data()
+        return (String(data: data, encoding: .utf8) ?? "")
+            .split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+    }
+
+    /// Latest TCC grant state the server logged (nil = not seen in recent log).
+    /// The server logs "<X> permission already granted" / "<X> permission NOT
+    /// granted" at startup; we can't query another process's TCC directly.
+    func permissionStatus() -> (screen: Bool?, accessibility: Bool?) {
+        var screen: Bool?
+        var ax: Bool?
+        for line in logTail() { // later lines win → most recent startup
+            if line.contains("Screen Recording permission already granted") { screen = true } else if line
+                .contains("Screen Recording permission NOT granted") { screen = false }
+            if line.contains("Accessibility permission already granted") { ax = true } else if line
+                .contains("Accessibility permission NOT granted") { ax = false }
+        }
+        return (screen, ax)
+    }
+
+    /// Most recent error worth surfacing (auth failure / port in use / panic).
+    func lastServerError() -> String? {
+        for raw in logTail().reversed() {
+            let line = raw.replacingOccurrences(
+                of: "\u{1b}\\[[0-9;]*m", with: "", options: .regularExpression)
+            if line.contains("authentication failed") { return "Login failed — check the account password" }
+            if line.contains("Address already in use") { return "Port in use — another server is bound to :3390" }
+            if line.contains("panicked") { return "Server crashed — see Open Logs" }
+        }
+        return nil
     }
 
     // MARK: - Menu
@@ -88,6 +133,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let h = NSMenuItem(title: header, action: nil, keyEquivalent: "")
         h.isEnabled = false
         menu.addItem(h)
+        // Surface a server error (auth/port/crash) right under the header so a
+        // silent crash-loop isn't invisible.
+        if st.pid == nil, let err = lastServerError() {
+            let e = NSMenuItem(title: "⚠️ \(err)", action: nil, keyEquivalent: "")
+            e.isEnabled = false
+            menu.addItem(e)
+        }
         menu.addItem(.separator())
 
         let running = st.pid != nil
@@ -175,12 +227,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         menu.addItem(item("Open Logs", #selector(openLogs)))
+        // Permissions with live status parsed from the server log (✓ / needs
+        // grant / unknown). Clicking opens the relevant System Settings pane.
+        let ps = permissionStatus()
         let perm = NSMenu()
-        perm.addItem(item("Screen Recording…", #selector(openScreenRecording)))
-        perm.addItem(item("Accessibility…", #selector(openAccessibility)))
-        let permItem = NSMenuItem(title: "Permissions", action: nil, keyEquivalent: "")
-        permItem.submenu = perm
-        menu.addItem(permItem)
+        perm.addItem(permItem("Screen Recording", ps.screen, #selector(openScreenRecording)))
+        perm.addItem(permItem("Accessibility", ps.accessibility, #selector(openAccessibility)))
+        let permRoot = NSMenuItem(title: "Permissions", action: nil, keyEquivalent: "")
+        permRoot.submenu = perm
+        menu.addItem(permRoot)
         menu.addItem(.separator())
 
         menu.addItem(item("Quit Controller", #selector(quit)))
@@ -195,6 +250,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func toggle(_ title: String, key: String, cfg: [String: String], sel: Selector) -> NSMenuItem {
         let i = item(title, sel)
         i.state = (cfg[key] == "1") ? .on : .off
+        return i
+    }
+
+    /// A permission row with live status (✓ granted / needs grant / unknown).
+    /// Always clickable — opens the relevant System Settings pane.
+    func permItem(_ name: String, _ granted: Bool?, _ sel: Selector) -> NSMenuItem {
+        let mark: String
+        switch granted {
+        case .some(true): mark = "✓"
+        case .some(false): mark = "✗ needs grant"
+        case .none: mark = "— open to grant"
+        }
+        let i = item("\(name): \(mark)", sel)
+        i.state = (granted == true) ? .on : .off
         return i
     }
 
@@ -229,10 +298,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func restart() { start() }
 
     func ensureLoaded() {
-        if !agentState().loaded && FileManager.default.fileExists(atPath: plistURL.path) {
+        guard !agentState().loaded, FileManager.default.fileExists(atPath: plistURL.path) else { return }
+        // `launchctl bootstrap` intermittently fails with EIO ("Bootstrap
+        // failed: 5: Input/output error") right after a bootout; retry a few
+        // times until the service registers.
+        for _ in 0..<5 {
             _ = run("/bin/launchctl", ["bootstrap", domain, plistURL.path])
-            _ = run("/bin/launchctl", ["enable", service])
+            if agentState().loaded { break }
+            Thread.sleep(forTimeInterval: 0.5)
         }
+        _ = run("/bin/launchctl", ["enable", service])
     }
 
     // MARK: - Headless entry (scripted/MDM deploy + testing)

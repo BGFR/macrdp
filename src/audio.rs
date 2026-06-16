@@ -70,6 +70,14 @@ pub struct MacRdpsnd {
     /// Target AAC bitrate in bits/sec (`--aac-bitrate`, default 128_000).
     /// Used both to size the advertised format and to configure the encoder.
     aac_bitrate: u32,
+    /// Display the audio SCStream binds its content filter to — the SAME
+    /// display the video path captures. `Some(id)` for a virtual display,
+    /// `None` for the primary panel. Critical for `--detach-primary` /
+    /// `--capture-primary`: binding to a physical display that those modes
+    /// then disable/capture kills the audio stream's content source. The
+    /// virtual display survives both, so audio must follow it, not
+    /// `displays.first()` (which is the physical primary).
+    target_display_id: Option<u32>,
 }
 
 impl MacRdpsnd {
@@ -78,6 +86,7 @@ impl MacRdpsnd {
         mute_on_minimize: bool,
         enable_aac: bool,
         aac_bitrate: u32,
+        target_display_id: Option<u32>,
     ) -> Self {
         Self {
             sender: Arc::new(Mutex::new(None)),
@@ -87,6 +96,7 @@ impl MacRdpsnd {
             mute_on_minimize,
             enable_aac,
             aac_bitrate,
+            target_display_id,
         }
     }
 }
@@ -116,6 +126,7 @@ impl SoundServerFactory for MacRdpsnd {
             display_suppressed: self.display_suppressed.clone(),
             mute_on_minimize: self.mute_on_minimize,
             aac_bitrate: self.aac_bitrate,
+            target_display_id: self.target_display_id,
         })
     }
 
@@ -173,6 +184,8 @@ struct MacRdpsndBackend {
     /// Target AAC bitrate (bits/sec); only consulted when the negotiated
     /// format is `WAVE_FORMAT_AAC_MS`.
     aac_bitrate: u32,
+    /// Display the audio SCStream binds to — see [`MacRdpsnd::target_display_id`].
+    target_display_id: Option<u32>,
 }
 
 impl RdpsndServerHandler for MacRdpsndBackend {
@@ -245,6 +258,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         let display_suppressed = self.display_suppressed.clone();
         let mute_on_minimize = self.mute_on_minimize;
         let aac_bitrate = self.aac_bitrate;
+        let target_display_id = self.target_display_id;
         // Dedicated OS thread at USER_INTERACTIVE QoS for the entire
         // capture / resample / channel-send pipeline. Tokio workers ride
         // USER_INITIATED (see main.rs::boost_thread_qos) which a cargo
@@ -278,6 +292,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
                         mute_on_minimize,
                         use_aac,
                         aac_bitrate,
+                        target_display_id,
                     )
                     .await
                     {
@@ -330,6 +345,7 @@ async fn capture_loop(
     mute_on_minimize: bool,
     use_aac: bool,
     aac_bitrate: u32,
+    target_display_id: Option<u32>,
 ) -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
     use rubato::Resampler;
@@ -340,7 +356,32 @@ async fn capture_loop(
         .await
         .map_err(|e| anyhow!("SCShareableContent for audio: {e:?}"))?;
     let displays = content.displays();
-    let display = displays.first().context("no displays for audio capture")?;
+    // Bind to the SAME display the video path captures. With --detach-primary /
+    // --capture-primary the physical primary is disabled/captured once a client
+    // connects, so binding the audio stream to it (the old `displays.first()`)
+    // killed the stream's content source — audio cut out, or the restart loop
+    // thrashed it in and out. The virtual display survives both, so follow it.
+    // Falls back to the first display if the id isn't enumerated (transient).
+    let display = match target_display_id {
+        Some(id) => displays
+            .iter()
+            .find(|d| d.display_id() == id)
+            .or_else(|| {
+                warn!(
+                    target_id = id,
+                    "audio: no SCK display with that id; using the first display"
+                );
+                displays.first()
+            })
+            .context("no displays for audio capture")?,
+        None => displays.first().context("no displays for audio capture")?,
+    };
+    let bound_display_id = display.display_id();
+    tracing::debug!(
+        bound_display_id,
+        requested = ?target_display_id,
+        "audio: SCStream content filter bound to display"
+    );
 
     let filter = SCContentFilter::create()
         .with_display(display)
@@ -738,6 +779,7 @@ async fn capture_loop(
     _mute_on_minimize: bool,
     _use_aac: bool,
     _aac_bitrate: u32,
+    _target_display_id: Option<u32>,
 ) -> anyhow::Result<()> {
     Ok(())
 }

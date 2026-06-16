@@ -1343,6 +1343,10 @@ async fn async_main() -> Result<()> {
         !args.no_mute_on_minimize,
         args.enable_aac,
         args.aac_bitrate,
+        // Bind audio to the same display the video captures so --detach-primary
+        // / --capture-primary (which disable/capture the physical panel) don't
+        // kill the audio stream's content source.
+        capture_display_id,
     ));
 
     // with_hybrid advertises HYBRID | HYBRID_EX so clients run CredSSP/NLA

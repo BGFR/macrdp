@@ -3,8 +3,8 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10) below are upstreamed AND
-released — #1276 landing is NOT sufficient.
+vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11) below are upstreamed
+AND released — #1276 landing is NOT sufficient.
 
 (1) The original "keep newest queued waves on per-batch overflow"
     direction-flip LANDED upstream (PR #1276, merged 2026-05-21) — do NOT
@@ -137,6 +137,25 @@ released — #1276 landing is NOT sufficient.
     confirm-active echoed the server's 1512×982). macrdp wires this from
     its default-on client-resolution auto-adopt (`--no-client-resolution`
     opts out). Offer upstream together with the acceptor change.
+
+(11) Server-side RDPDR (drive redirection) static channel (NOT upstreamed;
+    added 2026-06-16; depends on vendored `ironrdp-rdpdr` divergence (1)):
+    a new `src/rdpdr.rs` houses `RdpdrServer` (a `SvcServerProcessor` peer to
+    the client `Rdpdr`) that drives the MS-RDPEFS init handshake (Server
+    Announce → capability exchange → Client-ID Confirm → User-Logged-On) and
+    surfaces the client's announced devices to a `RdpdrServerHandler` backend,
+    plus the `RdpdrServerFactory`/`RdpdrBackendFactory` traits + `AnnouncedDevice`
+    (exported from `lib.rs`). Wiring mirrors cliprdr/rdpsnd exactly: a
+    `rdpdr_factory: Option<Box<dyn RdpdrServerFactory>>` field on `RdpServer`, a
+    `RdpServer::new` param with `set_sender` wiring, attachment in
+    `attach_channels` **right after rdpsnd** (MS-RDPEFS requires rdpdr be
+    co-advertised with rdpsnd), and `RdpServerBuilder::with_rdpdr_factory`.
+    `ironrdp-rdpdr` added to Cargo.toml deps for the wire types. The server's
+    static-channel `start()` dispatch (`client_accepted`) already ships the
+    Server Announce — no extra send path needed for the handshake; Phase 1b
+    adds a `ServerEvent::Rdpdr` arm for server-initiated device-I/O requests.
+    Read-only; macrdp gates it behind `--enable-drive-redirection`.
+    Upstreamable as the server counterpart to the client `Rdpdr`.
 
 (10) Publish the client's keyboard-layout id to a shared cell (NOT
     upstreamed; added 2026-06-16; pairs with `vendor/ironrdp-acceptor`

@@ -21,6 +21,13 @@ src/keyboard_layout.rs  Optional non-US layout translation
                   keycode path; dead keys compose via UCKeyTranslate state.
                   macOS-only (Carbon); the translatable-key set + spec parsing
                   are platform-independent and unit-tested.
+src/rdpdr/        RDPDR drive redirection — the macrdp side of the server-side
+                  RDPDR static channel (--enable-drive-redirection, opt-in,
+                  read-only). The protocol state machine (handshake + device
+                  discovery) lives in the vendored ironrdp-server::rdpdr; this
+                  module is the MacRdpdr factory + RdpdrServerHandler backend.
+                  Phase 1a: handshake + log the client's announced drives.
+                  Device I/O (file read) + a temp-folder Finder surface follow.
 src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB
                   + Mac↔Windows file copy via FileGroupDescriptorW
                   and FileContentsRequest streaming)
@@ -113,6 +120,16 @@ vendor/ironrdp-acceptor/  Local fork of ironrdp-acceptor 0.8.0 (added
                           the layout). See vendor/ironrdp-acceptor/CLAUDE.md
                           and the client-resolution / keyboard-layout quirk
                           notes for why these can't be done from server code.
+
+vendor/ironrdp-rdpdr/     Local fork of ironrdp-rdpdr 0.5.0 (added 2026-06-16,
+                          same upstream rev). Upstream is client-only
+                          (SvcClientProcessor); the fork adds the
+                          server-direction decode halves the PDUs lack
+                          (ClientName/DeviceListAnnounce/DeviceAnnounceHeader)
+                          so a server can read what the client sends. The
+                          server-side RdpdrServer processor itself lives in
+                          vendor/ironrdp-server/src/rdpdr.rs. See
+                          vendor/ironrdp-rdpdr/CLAUDE.md.
 
 (vendor/ironrdp-egfx/     DELETED 2026-05-25. The CapabilitySet::decode
                           tolerance fix was merged upstream as PR #1298

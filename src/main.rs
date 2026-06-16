@@ -13,6 +13,7 @@ mod file_promise_lazy;
 mod h264;
 mod input;
 mod keyboard_layout;
+mod rdpdr;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
 mod videotoolbox;
@@ -407,6 +408,13 @@ struct Args {
     /// the encoder.
     #[arg(long, default_value_t = 128_000)]
     aac_bitrate: u32,
+
+    /// Enable RDPDR drive redirection (MS-RDPEFS): the connecting client can
+    /// redirect its local drive and the Mac browses/reads the client's files.
+    /// Off by default; read-only. The client must opt in too (mstsc: Local
+    /// Resources → Drives; FreeRDP: /drive:NAME,PATH).
+    #[arg(long)]
+    enable_drive_redirection: bool,
 
     /// Don't adopt the client's requested desktop resolution. By default —
     /// when mirroring the primary display without --width/--height/--hidpi —
@@ -862,6 +870,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     }
     if on("UNMINIMIZE", false) {
         argv.push("--unminimize-on-switch".into());
+    }
+    if on("ENABLE_DRIVE_REDIRECTION", false) {
+        argv.push("--enable-drive-redirection".into());
     }
     if on("VIRTUAL_DISPLAY", false) {
         argv.push("--virtual-display".into());
@@ -1358,6 +1369,15 @@ async fn async_main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let gfx_factory: Option<Box<dyn ironrdp_server::GfxServerFactory>> = None;
 
+    // RDPDR drive redirection is opt-in (--enable-drive-redirection): the
+    // client redirects its local drive and the Mac can browse/read it.
+    let rdpdr_factory: Option<Box<dyn ironrdp_server::RdpdrServerFactory>> =
+        if args.enable_drive_redirection {
+            Some(Box::new(rdpdr::MacRdpdr::new()))
+        } else {
+            None
+        };
+
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
         .with_hybrid(tls, spki_der)
@@ -1365,6 +1385,7 @@ async fn async_main() -> Result<()> {
         .with_display_handler(display)
         .with_cliprdr_factory(Some(cliprdr))
         .with_sound_factory(Some(sound))
+        .with_rdpdr_factory(rdpdr_factory)
         .with_bitmap_codecs(bitmap_codecs())
         .with_gfx_factory(gfx_factory)
         .build();

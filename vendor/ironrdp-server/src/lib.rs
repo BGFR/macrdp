@@ -18,6 +18,7 @@ mod gfx;
 mod handler;
 #[cfg(feature = "helper")]
 mod helper;
+mod rdpdr;
 mod server;
 mod sound;
 
@@ -32,6 +33,7 @@ pub use echo::{EchoDvcBridge, EchoRoundTripMeasurement, EchoServerHandle, EchoSe
 #[cfg(feature = "egfx")]
 pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
 pub use handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+pub use rdpdr::{AnnouncedDevice, RdpdrBackendFactory, RdpdrServer, RdpdrServerFactory, RdpdrServerHandler};
 #[cfg(feature = "helper")]
 pub use helper::TlsIdentityCtx;
 pub use server::{

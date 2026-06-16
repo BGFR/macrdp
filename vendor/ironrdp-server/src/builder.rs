@@ -10,7 +10,7 @@ use super::display::{DesktopSize, RdpServerDisplay};
 use super::gfx::GfxServerFactory;
 use super::handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use super::server::{ConnectionHandler, RdpServer, RdpServerOptions, RdpServerSecurity};
-use crate::{DisplayUpdate, RdpServerDisplayUpdates, SoundServerFactory};
+use crate::{DisplayUpdate, RdpServerDisplayUpdates, RdpdrServerFactory, SoundServerFactory};
 
 pub struct WantsAddr {}
 pub struct WantsSecurity {
@@ -34,6 +34,7 @@ pub struct BuilderDone {
     display: Box<dyn RdpServerDisplay>,
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
+    rdpdr_factory: Option<Box<dyn RdpdrServerFactory>>,
     connection_handler: Option<Box<dyn ConnectionHandler>>,
     #[cfg(feature = "egfx")]
     gfx_factory: Option<Box<dyn GfxServerFactory>>,
@@ -129,6 +130,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 display: Box::new(display),
                 sound_factory: None,
                 cliprdr_factory: None,
+                rdpdr_factory: None,
                 connection_handler: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
                 max_request_size: RdpServerOptions::DEFAULT_MAX_REQUEST_SIZE,
@@ -147,6 +149,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 display: Box::new(NoopDisplay),
                 sound_factory: None,
                 cliprdr_factory: None,
+                rdpdr_factory: None,
                 connection_handler: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
                 max_request_size: RdpServerOptions::DEFAULT_MAX_REQUEST_SIZE,
@@ -165,6 +168,13 @@ impl RdpServerBuilder<BuilderDone> {
 
     pub fn with_sound_factory(mut self, sound: Option<Box<dyn SoundServerFactory>>) -> Self {
         self.state.sound_factory = sound;
+        self
+    }
+
+    /// Configure RDPDR (drive redirection). The client's redirected drive is
+    /// surfaced to the [`RdpdrServerHandler`](crate::RdpdrServerHandler) backend.
+    pub fn with_rdpdr_factory(mut self, rdpdr_factory: Option<Box<dyn RdpdrServerFactory>>) -> Self {
+        self.state.rdpdr_factory = rdpdr_factory;
         self
     }
 
@@ -210,6 +220,7 @@ impl RdpServerBuilder<BuilderDone> {
             self.state.display,
             self.state.sound_factory,
             self.state.cliprdr_factory,
+            self.state.rdpdr_factory,
             self.state.connection_handler,
             #[cfg(feature = "egfx")]
             self.state.gfx_factory,

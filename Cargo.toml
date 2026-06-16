@@ -44,6 +44,10 @@ ironrdp-pdu = "0.7"
 ironrdp-cliprdr = "0.5"
 ironrdp-core = "0.1"
 ironrdp-rdpsnd = "0.7"
+# RDPDR drive redirection (gated at runtime by --enable-drive-redirection).
+# Vendored locally for the server-direction encode/decode halves — see
+# vendor/ironrdp-rdpdr/CLAUDE.md.
+ironrdp-rdpdr = "0.5"
 # EGFX / H.264 video pipeline (gated at runtime by --enable-h264).
 ironrdp-egfx = "0.1"
 ironrdp-dvc = "0.5"
@@ -80,6 +84,14 @@ ironrdp-server = { path = "vendor/ironrdp-server" }
 # the honor-client-desktop-size divergence — serve the resolution the client
 # requests. See vendor/ironrdp-acceptor/CLAUDE.md.
 ironrdp-acceptor = { path = "vendor/ironrdp-acceptor" }
+# ironrdp-rdpdr is vendored (same upstream rev) for the server-direction RDPDR
+# encode/decode halves the client-oriented upstream crate lacks. See
+# vendor/ironrdp-rdpdr/CLAUDE.md.
+ironrdp-rdpdr = { path = "vendor/ironrdp-rdpdr" }
+# ironrdp-error isn't depended on directly by macrdp, but the vendored
+# ironrdp-rdpdr names it as a crates.io dep; pin it to the same git rev as the
+# rest so it unifies with the copy the other ironrdp crates pull transitively.
+ironrdp-error            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }

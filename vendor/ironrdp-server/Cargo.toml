@@ -52,6 +52,7 @@ ironrdp-tokio = { version = "0.8", features = ["reqwest"] }
 ironrdp-acceptor = "0.8" # public
 ironrdp-graphics = "0.7" # public
 ironrdp-rdpsnd = "0.7" # public
+ironrdp-rdpdr = "0.5" # public (vendored — server-direction RDPDR)
 tracing = { version = "0.1", features = ["log"] }
 x509-cert = { version = "0.2.5", optional = true }
 rustls-pemfile = { version = "2.2.0", optional = true }

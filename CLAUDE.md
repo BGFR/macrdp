@@ -39,7 +39,7 @@ Functional v0. RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) can:
   - `--virtual-display ... --capture-primary`: takes exclusive `CGDisplayCapture` of every physical display once a client connects AND forces each panel's gamma LUT to map every input to black via `CGSetDisplayTransferByFormula(_, 0,0,1, 0,0,1, 0,0,1)`. Capture alone doesn't visually blank modern macOS panels (the "fill with black on capture" semantic disappeared around 10.10) — the gamma trick is what actually makes the panel render solid black while the WindowServer keeps compositing the desktop to it. Backlight stays on, cursor sunk by the capture. Both gamma changes and capture tokens are process-scoped, so SIGKILL / panic auto-restores. Uses only public CG symbols — no private SkyLight surface, no `CGError 1001` window.
   Either way, the original layout is restored the moment the last client disconnects; local Mac usage is normal whenever no one is connected.
 
-Not yet implemented: multi-monitor (client-side multi-display), drive/printer redirection. (Non-US keyboard layouts work, **auto-detected from the client by default** — `--keyboard-layout` overrides, `none` disables.)
+Not yet implemented: multi-monitor (client-side multi-display), printer redirection. (Non-US keyboard layouts work, **auto-detected from the client by default** — `--keyboard-layout` overrides, `none` disables.) **Drive redirection (RDPDR) is in progress** behind `--enable-drive-redirection` (opt-in, read-only): Phase 1a — the MS-RDPEFS handshake completes and the client's redirected drives are logged (verified on FreeRDP); device I/O (file read) + a Finder surface are the next phases. See the vendored `ironrdp-rdpdr` / `ironrdp-server` divergence logs.
 
 ## Project goal
 
@@ -107,6 +107,11 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   automatic for clients without AAC decode. Adds ~40-50 ms
                           #   latency, so off by default.
 --aac-bitrate BPS         # AAC target bitrate (default 128000; only with --enable-aac)
+--enable-drive-redirection # RDPDR drive redirection (opt-in, read-only, in
+                          #   progress): the client redirects its local drive
+                          #   and the Mac can access the client's files. The
+                          #   client must opt in too (mstsc Local Resources →
+                          #   Drives; FreeRDP /drive:NAME,PATH).
 --no-lazy-paste           # Opt out of lazy Windows→Mac file paste (default ON).
                           #   Lazy streams bytes on Cmd-V (NSFilePresenter) with native
                           #   "Preparing to paste" progress and lower chunk parallelism;

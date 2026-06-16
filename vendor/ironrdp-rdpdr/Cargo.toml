@@ -1,0 +1,33 @@
+[package]
+name = "ironrdp-rdpdr"
+version = "0.5.0"
+readme = "README.md"
+description = "RDPDR channel implementation."
+# Vendored copy of upstream master ironrdp-rdpdr (copied 2026-06-16 from
+# Devolutions/IronRDP@879ffed, same rev as the git pins in the root Cargo.toml).
+# Workspace-inherited fields are inlined below because we're not inside the
+# IronRDP cargo workspace, and the server-direction encode/decode halves needed
+# for a server-side RDPDR are added here. See CLAUDE.md for the divergence log.
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/Devolutions/IronRDP"
+repository = "https://github.com/Devolutions/IronRDP"
+authors = ["Devolutions Inc. <infos@devolutions.net>"]
+keywords = ["rdp", "remote-desktop", "network", "client", "protocol"]
+categories = ["network-programming"]
+
+[lib]
+doctest = false
+test = false
+
+[dependencies]
+# path = "../ironrdp-*" entries dropped — we live outside the upstream
+# workspace, so cargo resolves these via the root macrdp Cargo.toml's
+# [patch.crates-io] redirects (git pin to upstream master).
+ironrdp-core = { version = "0.1" } # public
+ironrdp-error = { version = "0.1" } # public
+ironrdp-pdu = "0.7" # public
+ironrdp-svc = "0.6" # public
+tracing = { version = "0.1", features = ["log"] }
+bitflags = "2.11"

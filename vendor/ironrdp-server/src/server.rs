@@ -289,6 +289,7 @@ pub struct RdpServer {
     static_channels: StaticChannelSet,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
+    rdpdr_factory: Option<Box<dyn crate::RdpdrServerFactory>>,
     echo_handle: EchoServerHandle,
     #[cfg(feature = "egfx")]
     gfx_factory: Option<Box<dyn GfxServerFactory>>,
@@ -378,6 +379,7 @@ impl RdpServer {
         display: Box<dyn RdpServerDisplay>,
         mut sound_factory: Option<Box<dyn SoundServerFactory>>,
         mut cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
+        mut rdpdr_factory: Option<Box<dyn crate::RdpdrServerFactory>>,
         connection_handler: Option<Box<dyn ConnectionHandler>>,
         #[cfg(feature = "egfx")] mut gfx_factory: Option<Box<dyn GfxServerFactory>>,
     ) -> Self {
@@ -395,6 +397,9 @@ impl RdpServer {
             snd.set_sender(ev_sender.clone());
             snd.set_audio_sender(audio_sender);
         }
+        if let Some(rdpdr) = rdpdr_factory.as_mut() {
+            rdpdr.set_sender(ev_sender.clone());
+        }
         #[cfg(feature = "egfx")]
         if let Some(gfx) = gfx_factory.as_mut() {
             gfx.set_sender(ev_sender.clone());
@@ -406,6 +411,7 @@ impl RdpServer {
             static_channels: StaticChannelSet::new(),
             sound_factory,
             cliprdr_factory,
+            rdpdr_factory,
             echo_handle: EchoServerHandle::new(ev_sender.clone()),
             #[cfg(feature = "egfx")]
             gfx_factory,
@@ -526,6 +532,14 @@ impl RdpServer {
             let backend = factory.build_backend();
 
             acceptor.attach_static_channel(RdpsndServer::new(backend));
+        }
+
+        // RDPDR (drive redirection). MS-RDPEFS requires it be co-advertised with
+        // rdpsnd, so it's attached right after the sound channel.
+        if let Some(factory) = self.rdpdr_factory.as_deref() {
+            let backend = factory.build_backend();
+            let computer_name = factory.computer_name();
+            acceptor.attach_static_channel(crate::RdpdrServer::new(backend, computer_name));
         }
 
         let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));

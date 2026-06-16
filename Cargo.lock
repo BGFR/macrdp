@@ -1663,6 +1663,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-rdpdr"
+version = "0.5.0"
+dependencies = [
+ "bitflags 2.11.1",
+ "ironrdp-core",
+ "ironrdp-error",
+ "ironrdp-pdu",
+ "ironrdp-svc",
+ "tracing",
+]
+
+[[package]]
 name = "ironrdp-rdpsnd"
 version = "0.7.0"
 source = "git+https://github.com/Devolutions/IronRDP.git?rev=879ffed866c32748d30d26b54f9d667ad001c51c#879ffed866c32748d30d26b54f9d667ad001c51c"
@@ -1692,6 +1704,7 @@ dependencies = [
  "ironrdp-egfx",
  "ironrdp-graphics",
  "ironrdp-pdu",
+ "ironrdp-rdpdr",
  "ironrdp-rdpsnd",
  "ironrdp-svc",
  "ironrdp-tokio",
@@ -1866,6 +1879,7 @@ dependencies = [
  "ironrdp-dvc",
  "ironrdp-egfx",
  "ironrdp-pdu",
+ "ironrdp-rdpdr",
  "ironrdp-rdpsnd",
  "ironrdp-server",
  "ironrdp-svc",

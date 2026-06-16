@@ -169,6 +169,12 @@ AND released — #1276 landing is NOT sufficient.
     `open_with` (explicit `CreateDisposition`; `create_with` now delegates with
     FILE_OPEN) and a `file_write_access()` rights set. These depend on the
     `ironrdp-rdpdr` Phase-2 encode halves (divergence (1) there).
+    `read_file`/`write_file` reuse a kept-open handle via an LRU `HandleCache`
+    (`acquire`/`invalidate`/`evict_path`, cap `MAX_OPEN_HANDLES`, keyed by
+    `(device_id, path, Read|Write)`) so sequential I/O is ~1 open + N ops instead
+    of N×(open+act+close); `evict_path` closes cached handles before
+    `remove`/`rename`. `RdpdrHandle` failures carry the `NtStatus` (`RdpdrStatus`)
+    so the surface can map ACCESS_DENIED → permission-denied etc.
     Read-write; macrdp gates it behind `--enable-drive-redirection`.
     Upstreamable as the server counterpart to the client `Rdpdr`.
 

@@ -27,9 +27,11 @@ src/rdpdr/        RDPDR drive redirection — the macrdp side of the server-side
                   discovery) lives in the vendored ironrdp-server::rdpdr; this
                   module is the MacRdpdr factory + RdpdrServerHandler backend.
                   1a: handshake + drive discovery. 1b: device I/O — the backend
-                  browses/reads the client drive via RdpdrHandle::{list_dir,
-                  read_file} (create/query-dir/read/close, matched by a
-                  completion-id router in the vendored server). Surface
+                  browses/reads/writes the client drive via RdpdrHandle
+                  (list_dir/read_file/write_file/create/remove/rename, matched
+                  by a completion-id router in the vendored server; file
+                  read/write reuse an LRU kept-open handle cache so sequential
+                  transfers don't re-open per chunk). Surface
                   (Phase 2, surface.rs): a real NFS mount. RdpdrFs implements
                   nfsserve's NFSFileSystem over RdpdrHandle (list_dir/read_file,
                   with a path<->fileid cache); an in-process NFSv3 server is

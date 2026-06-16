@@ -18,7 +18,7 @@ use core::fmt;
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context as _, Result};
@@ -150,12 +150,50 @@ impl IoRouter {
     }
 }
 
+/// Upper bound on simultaneously-cached open file handles per connection.
+/// Sequential I/O on one file reuses a single handle; the LRU evicts the
+/// least-recently-used once a workload touches more distinct files than this.
+const MAX_OPEN_HANDLES: usize = 16;
+
+/// Which access a cached handle was opened with — a read and a write of the same
+/// file are cached separately (a read-only file can't be opened for write).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum AccessKind {
+    Read,
+    Write,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct HandleKey {
+    device_id: u32,
+    path: String,
+    kind: AccessKind,
+}
+
+struct CachedHandle {
+    file_id: u32,
+    /// Monotonic LRU stamp drawn from [`HandleCache::tick`].
+    last_used: u64,
+}
+
+/// LRU cache of open RDPDR file handles. Consecutive reads/writes on the same
+/// file reuse one open→…→close instead of paying create+close per NFS chunk —
+/// the lever that makes large sequential transfers one round-trip per chunk
+/// instead of three.
+#[derive(Default)]
+struct HandleCache {
+    map: Mutex<HashMap<HandleKey, CachedHandle>>,
+    tick: AtomicU64,
+}
+
 /// Async handle for issuing device-I/O to the client over the rdpdr channel.
-/// Cheap to clone; backends keep one to read the client's files on demand.
+/// Cheap to clone (the file-handle cache is shared across clones); backends keep
+/// one to read/write the client's files on demand.
 #[derive(Clone)]
 pub struct RdpdrHandle {
     sender: mpsc::UnboundedSender<ServerEvent>,
     router: IoRouter,
+    cache: Arc<HandleCache>,
 }
 
 impl fmt::Debug for RdpdrHandle {
@@ -166,25 +204,27 @@ impl fmt::Debug for RdpdrHandle {
 
 impl RdpdrHandle {
     fn new(sender: mpsc::UnboundedSender<ServerEvent>, router: IoRouter) -> Self {
-        Self { sender, router }
+        Self {
+            sender,
+            router,
+            cache: Arc::new(HandleCache::default()),
+        }
     }
 
-    /// Open `path` on `device_id`, read up to `length` bytes from `offset`, and
-    /// close — returning the bytes read. Path uses Windows backslash separators
-    /// relative to the redirected drive root (e.g. `\\readme.txt`).
+    /// Read up to `length` bytes from `offset` of `path` on `device_id`, reusing a
+    /// cached open handle (opening one on a miss) so consecutive chunk reads don't
+    /// re-open. Path uses Windows backslash separators relative to the redirected
+    /// drive root (e.g. `\\readme.txt`).
     pub async fn read_file(&self, device_id: u32, path: &str, offset: u64, length: u32) -> Result<Vec<u8>> {
-        let file_id = self
-            .create_with(
-                device_id,
-                path,
-                Self::file_read_access(),
-                CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_NON_DIRECTORY_FILE,
-            )
-            .await?;
-        let data = self.read(device_id, file_id, offset, length).await;
-        // Best-effort close even if the read failed, so the client releases the handle.
-        let _ = self.close(device_id, file_id).await;
-        data
+        let file_id = self.acquire(device_id, path, AccessKind::Read).await?;
+        match self.read(device_id, file_id, offset, length).await {
+            Ok(data) => Ok(data),
+            Err(e) => {
+                // The cached handle may be stale; drop it so the next read re-opens.
+                self.invalidate(device_id, path, AccessKind::Read);
+                Err(e)
+            }
+        }
     }
 
     /// Open `path`, stream it to `dst` on disk in chunks (open once, read until
@@ -284,22 +324,18 @@ impl RdpdrHandle {
         Ok(entries)
     }
 
-    /// Open `path` for writing, write `data` at `offset`, and close — returning
-    /// the number of bytes written. The file must already exist (NFS creates it
-    /// via [`Self::create_file`] before writing).
+    /// Write `data` at `offset` of `path`, reusing a cached open write handle
+    /// (opening one on a miss) so consecutive chunk writes don't re-open. The file
+    /// must already exist (NFS creates it via [`Self::create_file`] before writing).
     pub async fn write_file(&self, device_id: u32, path: &str, offset: u64, data: &[u8]) -> Result<u64> {
-        let file_id = self
-            .open_with(
-                device_id,
-                path,
-                Self::file_write_access(),
-                CreateDisposition::FILE_OPEN,
-                CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_NON_DIRECTORY_FILE,
-            )
-            .await?;
-        let result = self.write(device_id, file_id, offset, data).await;
-        let _ = self.close(device_id, file_id).await;
-        result.map(u64::from)
+        let file_id = self.acquire(device_id, path, AccessKind::Write).await?;
+        match self.write(device_id, file_id, offset, data).await {
+            Ok(n) => Ok(u64::from(n)),
+            Err(e) => {
+                self.invalidate(device_id, path, AccessKind::Write);
+                Err(e)
+            }
+        }
     }
 
     /// Create a regular file at `path`. With `exclusive`, fails if it already
@@ -340,6 +376,9 @@ impl RdpdrHandle {
     /// disposition's delete-pending flag, close to commit). A directory must be
     /// empty.
     pub async fn remove(&self, device_id: u32, path: &str, is_dir: bool) -> Result<()> {
+        // Release any cached handle first — a still-open handle would defer the
+        // delete-on-close (the file would linger until that handle dropped).
+        self.evict_path(device_id, path).await;
         let options = if is_dir {
             CreateOptions::FILE_DIRECTORY_FILE
         } else {
@@ -368,6 +407,10 @@ impl RdpdrHandle {
     /// Rename / move the file/dir at `from` to `to` (both Windows backslash paths
     /// relative to the drive root).
     pub async fn rename(&self, device_id: u32, from: &str, to: &str, replace: bool) -> Result<()> {
+        // Release any cached handles on both paths before moving (an open handle
+        // on the source can block the rename; a stale one on the dest is wrong).
+        self.evict_path(device_id, from).await;
+        self.evict_path(device_id, to).await;
         let file_id = self
             .open_with(
                 device_id,
@@ -586,6 +629,111 @@ impl RdpdrHandle {
             .into());
         }
         Ok(())
+    }
+
+    // ---- open-handle cache ----
+
+    /// Return a cached open handle for `(device_id, path, kind)`, opening and
+    /// caching one on a miss. Bumps the entry's LRU stamp.
+    async fn acquire(&self, device_id: u32, path: &str, kind: AccessKind) -> Result<u32> {
+        let key = HandleKey {
+            device_id,
+            path: path.to_owned(),
+            kind,
+        };
+        // Cache hit.
+        {
+            let mut map = self.cache.map.lock().unwrap();
+            if let Some(h) = map.get_mut(&key) {
+                h.last_used = self.cache.tick.fetch_add(1, Ordering::Relaxed);
+                return Ok(h.file_id);
+            }
+        }
+        // Miss: open (no lock held across the await).
+        let (access, options) = match kind {
+            AccessKind::Read => (
+                Self::file_read_access(),
+                CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_NON_DIRECTORY_FILE,
+            ),
+            AccessKind::Write => (
+                Self::file_write_access(),
+                CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_NON_DIRECTORY_FILE,
+            ),
+        };
+        let file_id = self
+            .open_with(device_id, path, access, CreateDisposition::FILE_OPEN, options)
+            .await?;
+
+        // Install it; reconcile with a concurrent acquire and enforce the cap.
+        let mut to_close: Vec<(u32, u32)> = Vec::new();
+        let resolved = {
+            let mut map = self.cache.map.lock().unwrap();
+            if let Some(h) = map.get_mut(&key) {
+                // Another task opened the same handle first; use theirs, close ours.
+                h.last_used = self.cache.tick.fetch_add(1, Ordering::Relaxed);
+                to_close.push((device_id, file_id));
+                h.file_id
+            } else {
+                map.insert(
+                    key,
+                    CachedHandle {
+                        file_id,
+                        last_used: self.cache.tick.fetch_add(1, Ordering::Relaxed),
+                    },
+                );
+                if map.len() > MAX_OPEN_HANDLES {
+                    if let Some(evk) = map.iter().min_by_key(|(_, h)| h.last_used).map(|(k, _)| k.clone()) {
+                        if let Some(ev) = map.remove(&evk) {
+                            to_close.push((evk.device_id, ev.file_id));
+                        }
+                    }
+                }
+                file_id
+            }
+        };
+        for (dev, fid) in to_close {
+            self.spawn_close(dev, fid);
+        }
+        Ok(resolved)
+    }
+
+    /// Drop a cached handle (after a failed op on it) and close it off-path.
+    fn invalidate(&self, device_id: u32, path: &str, kind: AccessKind) {
+        let key = HandleKey {
+            device_id,
+            path: path.to_owned(),
+            kind,
+        };
+        let fid = self.cache.map.lock().unwrap().remove(&key).map(|h| h.file_id);
+        if let Some(fid) = fid {
+            self.spawn_close(device_id, fid);
+        }
+    }
+
+    /// Close + remove every cached handle (any access kind) for `path`, awaiting
+    /// the closes so the client has released the handles before a delete/rename.
+    async fn evict_path(&self, device_id: u32, path: &str) {
+        let fids: Vec<u32> = {
+            let mut map = self.cache.map.lock().unwrap();
+            let keys: Vec<HandleKey> = map
+                .keys()
+                .filter(|k| k.device_id == device_id && k.path == path)
+                .cloned()
+                .collect();
+            keys.iter().filter_map(|k| map.remove(k)).map(|h| h.file_id).collect()
+        };
+        for fid in fids {
+            let _ = self.close(device_id, fid).await;
+        }
+    }
+
+    /// Close a handle in a detached task (used for LRU eviction / invalidation,
+    /// where the caller shouldn't block on the round-trip).
+    fn spawn_close(&self, device_id: u32, file_id: u32) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _ = this.close(device_id, file_id).await;
+        });
     }
 }
 

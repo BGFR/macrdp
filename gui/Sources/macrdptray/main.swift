@@ -168,6 +168,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         opts.addItem(toggle("HiDPI capture", key: "HIDPI", cfg: cfg, sel: #selector(toggleHiDPI)))
         opts.addItem(toggle(
             "Un-minimize on Cmd+Tab", key: "UNMINIMIZE", cfg: cfg, sel: #selector(toggleUnminimize)))
+        // Keyboard layout (radio) — translate the client's keys against a
+        // non-US layout without changing the Mac's own input source.
+        let curLayout = cfg["KEYBOARD_LAYOUT"] ?? ""
+        let kbMenu = NSMenu()
+        for (spec, label) in Self.keyboardLayouts {
+            let mi = NSMenuItem(title: label, action: #selector(setKeyboardLayout(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = spec
+            mi.state = (curLayout == spec) ? .on : .off
+            kbMenu.addItem(mi)
+        }
+        let kbItem = NSMenuItem(title: "Keyboard layout", action: nil, keyEquivalent: "")
+        kbItem.submenu = kbMenu
+        opts.addItem(kbItem)
         opts.addItem(.separator())
         let bind = cfg["BIND"] ?? "127.0.0.1:3390"
         let net = item("Allow network connections", #selector(toggleNetwork))
@@ -510,6 +524,31 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         (2560, 1440, "2560 × 1440 (1440p)"),
     ]
 
+    /// (config value, menu label) for the keyboard-layout picker. The empty
+    /// value = no translation (positional keycodes / US ANSI). Values match the
+    /// short names `--keyboard-layout` accepts.
+    static let keyboardLayouts: [(String, String)] = [
+        ("", "US / default (no translation)"),
+        ("british", "British"),
+        ("french", "French (AZERTY)"),
+        ("german", "German (QWERTZ)"),
+        ("swissgerman", "Swiss German"),
+        ("spanish", "Spanish"),
+        ("italian", "Italian"),
+        ("portuguese", "Portuguese"),
+        ("brazilian", "Portuguese (Brazil)"),
+        ("dutch", "Dutch"),
+        ("belgian", "Belgian"),
+        ("swedish", "Swedish"),
+        ("norwegian", "Norwegian"),
+        ("danish", "Danish"),
+        ("finnish", "Finnish"),
+        ("russian", "Russian"),
+        ("polish", "Polish"),
+        ("czech", "Czech"),
+        ("hungarian", "Hungarian"),
+    ]
+
     @objc func toggleVirtualDisplay() {
         let on = readConfig()["VIRTUAL_DISPLAY"] == "1"
         writeConfig(key: "VIRTUAL_DISPLAY", value: on ? "0" : "1")
@@ -540,6 +579,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard parts.count == 2 else { return }
         writeConfig(key: "VD_WIDTH", value: String(parts[0]))
         writeConfig(key: "VD_HEIGHT", value: String(parts[1]))
+        applyIfRunning()
+    }
+
+    /// Pick the keyboard layout the server interprets the client's keys as.
+    /// Empty value = no translation (US ANSI / positional keycodes).
+    @objc func setKeyboardLayout(_ sender: NSMenuItem) {
+        guard let spec = sender.representedObject as? String else { return }
+        writeConfig(key: "KEYBOARD_LAYOUT", value: spec)
         applyIfRunning()
     }
 

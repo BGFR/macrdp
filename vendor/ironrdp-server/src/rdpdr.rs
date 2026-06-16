@@ -16,6 +16,8 @@
 
 use core::fmt;
 use std::collections::HashMap;
+use std::io::Write as _;
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -161,6 +163,40 @@ impl RdpdrHandle {
         // Best-effort close even if the read failed, so the client releases the handle.
         let _ = self.close(device_id, file_id).await;
         data
+    }
+
+    /// Open `path`, stream it to `dst` on disk in chunks (open once, read until
+    /// EOF, close), and return the number of bytes written. Used by the Finder
+    /// surface to materialize a file on demand.
+    pub async fn read_to_file(&self, device_id: u32, path: &str, dst: &Path) -> Result<u64> {
+        const CHUNK: u32 = 1024 * 1024; // 1 MiB reads
+        let file_id = self
+            .create_with(
+                device_id,
+                path,
+                DesiredAccess::GENERIC_READ,
+                CreateOptions::FILE_NON_DIRECTORY_FILE,
+            )
+            .await?;
+        let result = (|| async {
+            let mut file = std::fs::File::create(dst).map_err(|e| anyhow!("create {dst:?}: {e}"))?;
+            let mut offset = 0u64;
+            loop {
+                let data = self.read(device_id, file_id, offset, CHUNK).await?;
+                if data.is_empty() {
+                    break;
+                }
+                file.write_all(&data).map_err(|e| anyhow!("write {dst:?}: {e}"))?;
+                offset += data.len() as u64;
+                if (data.len() as u32) < CHUNK {
+                    break; // short read = EOF
+                }
+            }
+            Ok(offset)
+        })()
+        .await;
+        let _ = self.close(device_id, file_id).await;
+        result
     }
 
     /// List the entries of directory `dir_path` (Windows backslash path relative

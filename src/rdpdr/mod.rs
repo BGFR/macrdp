@@ -3,18 +3,23 @@
 //! `ironrdp-server::rdpdr`). The RDP *client* redirects its local drive; the
 //! Mac (server) browses/reads the client's files.
 //!
-//! Done: the MS-RDPEFS init handshake (1a) and device I/O — the backend can
-//! `list_dir` and `read_file` the client's drive via the [`RdpdrHandle`] (1b).
-//! The macOS Finder temp-folder surface (1c) is the remaining piece.
+//! Done: the MS-RDPEFS init handshake (1a), device I/O — `list_dir` /
+//! `read_file` via the [`RdpdrHandle`] (1b) — and the macOS Finder temp-folder
+//! surface (1c), which mirrors the client's drive root into a temp folder and
+//! streams files on demand when Finder reads them.
 //! Opt-in via `--enable-drive-redirection`.
 
+#[cfg(target_os = "macos")]
+mod surface;
+
+#[cfg(target_os = "macos")]
 use ironrdp_rdpdr::pdu::efs::DeviceType;
 use ironrdp_server::{
     AnnouncedDevice, RdpdrBackendFactory, RdpdrHandle, RdpdrServerFactory, RdpdrServerHandler,
     ServerEvent, ServerEventSender,
 };
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Factory for the RDPDR static channel (mirrors `MacCliprdr` / `MacRdpsnd`).
 #[derive(Debug, Default)]
@@ -35,7 +40,11 @@ impl ServerEventSender for MacRdpdr {
 
 impl RdpdrBackendFactory for MacRdpdr {
     fn build_backend(&self) -> Box<dyn RdpdrServerHandler> {
-        Box::new(MacRdpdrHandler { handle: None })
+        Box::new(MacRdpdrHandler {
+            handle: None,
+            #[cfg(target_os = "macos")]
+            surface: None,
+        })
     }
 
     fn computer_name(&self) -> String {
@@ -45,12 +54,14 @@ impl RdpdrBackendFactory for MacRdpdr {
 
 impl RdpdrServerFactory for MacRdpdr {}
 
-/// Backend for the RDPDR server processor. Logs announced devices; later phases
-/// drive the temp-folder Finder surface from here. The `RdpdrHandle` is used to
-/// read the client's files on demand.
+/// Backend for the RDPDR server processor. Logs announced devices and, on
+/// macOS, mounts the first redirected filesystem as a Finder temp-folder
+/// surface (dropped — and cleaned up — when the connection ends).
 #[derive(Debug)]
 struct MacRdpdrHandler {
     handle: Option<RdpdrHandle>,
+    #[cfg(target_os = "macos")]
+    surface: Option<surface::Surface>,
 }
 
 impl RdpdrServerHandler for MacRdpdrHandler {
@@ -68,58 +79,24 @@ impl RdpdrServerHandler for MacRdpdrHandler {
             );
         }
 
-        // Phase 1b verification hooks (read-only, no Finder surface yet): on the
-        // first redirected filesystem, MACRDP_RDPDR_TEST_LIST=1 lists the root and
-        // MACRDP_RDPDR_TEST_READ=<path> reads that path, logging the result. The
-        // Finder surface (Phase 1c) is what drives these in normal use.
-        let (Some(handle), Some(dev)) = (
-            self.handle.clone(),
-            devices
-                .iter()
-                .find(|d| d.device_type == DeviceType::Filesystem),
-        ) else {
-            return;
-        };
-        let device_id = dev.device_id;
-
-        if std::env::var("MACRDP_RDPDR_TEST_LIST").is_ok() {
-            let handle = handle.clone();
-            tokio::spawn(async move {
-                match handle.list_dir(device_id, "\\").await {
-                    Ok(entries) => {
-                        info!(
-                            device_id,
-                            count = entries.len(),
-                            "drive redirection: list_dir(\\) OK"
-                        );
-                        for e in &entries {
-                            info!(name = %e.name, size = e.size, is_dir = e.is_dir, "drive redirection:   entry");
-                        }
-                    }
-                    Err(e) => warn!(device_id, error = %e, "drive redirection: list_dir failed"),
+        // Mount the first redirected filesystem in Finder (once — the client may
+        // re-announce the same device list several times during init).
+        #[cfg(target_os = "macos")]
+        {
+            if self.surface.is_none() {
+                if let (Some(handle), Some(dev)) = (
+                    self.handle.clone(),
+                    devices
+                        .iter()
+                        .find(|d| d.device_type == DeviceType::Filesystem),
+                ) {
+                    info!(device_id = dev.device_id, name = %dev.name, "drive redirection: mounting client drive in Finder");
+                    self.surface = Some(surface::Surface::start(handle, dev.device_id, &dev.name));
                 }
-            });
+            }
         }
-
-        if let Ok(path) = std::env::var("MACRDP_RDPDR_TEST_READ") {
-            tokio::spawn(async move {
-                match handle.read_file(device_id, &path, 0, 4096).await {
-                    Ok(bytes) => {
-                        let n = bytes.len().min(160);
-                        info!(
-                            device_id,
-                            path = %path,
-                            bytes = bytes.len(),
-                            preview = %String::from_utf8_lossy(&bytes[..n]),
-                            "drive redirection: read_file OK"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(device_id, path = %path, error = %e, "drive redirection: read_file failed")
-                    }
-                }
-            });
-        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = &self.handle;
     }
 }
 

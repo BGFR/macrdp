@@ -29,8 +29,11 @@ src/rdpdr/        RDPDR drive redirection — the macrdp side of the server-side
                   1a: handshake + drive discovery. 1b: device I/O — the backend
                   browses/reads the client drive via RdpdrHandle::{list_dir,
                   read_file} (create/query-dir/read/close, matched by a
-                  completion-id router in the vendored server). 1c (remaining):
-                  a temp-folder Finder surface driven by those calls.
+                  completion-id router in the vendored server). 1c: surface.rs
+                  mirrors the drive root into a temp folder (pre-sized
+                  placeholders + per-file NSFilePresenter, reusing runloop_thread)
+                  opened in Finder, streaming on demand via read_to_file;
+                  Surface::Drop cleans up on disconnect. Read-only, top-level.
 src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB
                   + Mac↔Windows file copy via FileGroupDescriptorW
                   and FileContentsRequest streaming)

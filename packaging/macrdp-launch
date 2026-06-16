@@ -31,6 +31,7 @@ USE_KEYCHAIN=1        # read the password from the login Keychain (non-interacti
 ENABLE_H264=0
 ENABLE_AAC=0
 HIDPI=0
+UNMINIMIZE=0          # Cmd+Tab also un-minimizes the target app's window
 VIRTUAL_DISPLAY=0     # serve a headless virtual display instead of mirroring
 # Physical screen handling while a client is connected (only with VIRTUAL_DISPLAY=1):
 #   none    - leave it on; your apps stay on it and the virtual desktop is empty
@@ -54,6 +55,7 @@ args=( --bind "$BIND" --username "$USERNAME" )
 [ "${ENABLE_H264}" = "1" ] && args+=( --enable-h264 )
 [ "${ENABLE_AAC}" = "1" ]  && args+=( --enable-aac )
 [ "${HIDPI}" = "1" ]       && args+=( --hidpi )
+[ "${UNMINIMIZE}" = "1" ]  && args+=( --unminimize-on-switch )
 if [ "${VIRTUAL_DISPLAY}" = "1" ]; then
     # --virtual-display requires --width/--height; --detach-primary /
     # --capture-primary require --virtual-display and are mutually exclusive.

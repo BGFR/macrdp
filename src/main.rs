@@ -429,6 +429,13 @@ struct Args {
     #[arg(long)]
     stretch: bool,
 
+    /// On Cmd+Tab, un-minimize the target app's window (bring it back from the
+    /// Dock) instead of just activating the app. Off by default, which matches
+    /// native macOS — Cmd+Tab activates a minimized app but doesn't restore its
+    /// window. macOS-only.
+    #[arg(long = "unminimize-on-switch")]
+    unminimize_on_switch: bool,
+
     /// Force QOI BitmapUpdates to be encoded with `Channels::Rgb` instead of
     /// `Channels::Rgba`. The default (off) emits RGBA per the underlying
     /// PixelFormat, matching upstream `ironrdp-server`. Upstream
@@ -1116,6 +1123,7 @@ async fn async_main() -> Result<()> {
     }
 
     ironrdp_server::set_qoi_force_rgb(args.qoi_force_rgb);
+    crate::input::set_unminimize_on_switch(args.unminimize_on_switch);
 
     // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
     // clone drives the builder's GfxServerFactory (protocol side); another

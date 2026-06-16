@@ -172,6 +172,17 @@ mod coord_tests {
     }
 }
 
+/// When true, Cmd+Tab un-minimizes the target app's window (sets `AXMinimized`
+/// to false) instead of leaving it minimized in the Dock. Off by default, which
+/// matches native macOS Cmd+Tab (it activates the app but doesn't restore a
+/// minimized window). Set once at startup from `--unminimize-on-switch`.
+static UNMINIMIZE_ON_SWITCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_unminimize_on_switch(on: bool) {
+    UNMINIMIZE_ON_SWITCH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::collections::HashSet;
@@ -1332,8 +1343,9 @@ mod macos {
     /// released, and lazily from cycle_apps when the grace timeout
     /// has elapsed.
     fn commit_cycle_session() {
-        let mut guard = CYCLE_SESSION.lock().expect("cycle session mutex poisoned");
-        if let Some(session) = guard.take() {
+        let cursor_pid = {
+            let mut guard = CYCLE_SESSION.lock().expect("cycle session mutex poisoned");
+            let Some(session) = guard.take() else { return };
             if let Some((bundle, _, _)) = session
                 .snapshot
                 .iter()
@@ -1341,6 +1353,14 @@ mod macos {
             {
                 promote_bundle_to_front(bundle);
             }
+            session.cursor_pid
+        };
+        // On commit (Cmd release), un-minimize the app the user landed on, if
+        // enabled. The app was already activated by the last cycle step; this
+        // just restores its window from the Dock. Doing it here (not per step)
+        // avoids un-minimizing every minimized app cycled through.
+        if super::UNMINIMIZE_ON_SWITCH.load(std::sync::atomic::Ordering::Relaxed) {
+            ax_make_frontmost(cursor_pid, true);
         }
     }
 
@@ -1731,7 +1751,13 @@ mod macos {
                     *lie = Some(workspace_front_pid);
                 }
             }
-            let ax_err = ax_make_frontmost(target_pid);
+            // Force-show: un-minimize the target on each cycle step too (when
+            // enabled), so a minimized app pops open as you Cmd+Tab to it rather
+            // than only on release. A brief de-miniaturize flicker is expected.
+            let ax_err = ax_make_frontmost(
+                target_pid,
+                super::UNMINIMIZE_ON_SWITCH.load(std::sync::atomic::Ordering::Relaxed),
+            );
             if ax_err == AX_ERROR_SUCCESS {
                 *LAST_AX_ACTIVATED_PID
                     .lock()
@@ -1799,6 +1825,7 @@ mod macos {
         ) -> u8;
         fn CFRelease(cf: *const std::ffi::c_void);
         fn CFEqual(a: *const std::ffi::c_void, b: *const std::ffi::c_void) -> u8;
+        fn CFBooleanGetValue(boolean: core_foundation::base::CFTypeRef) -> u8;
         fn CFArrayGetCount(arr: *const std::ffi::c_void) -> isize;
         fn CFArrayGetValueAtIndex(
             arr: *const std::ffi::c_void,
@@ -1818,7 +1845,7 @@ mod macos {
     /// last. Without this the user perceives the cycle as "switching
     /// between two VSCodes" because the cycle keeps activating the
     /// same app but a different window pops up each time.
-    fn ax_make_frontmost(pid: libc::pid_t) -> i32 {
+    fn ax_make_frontmost(pid: libc::pid_t, unminimize: bool) -> i32 {
         use core_foundation::base::{CFTypeRef, TCFType};
         use core_foundation::boolean::CFBoolean;
         use core_foundation::string::CFString;
@@ -1854,7 +1881,40 @@ mod macos {
         // window stacking for apps where AXRaise alone is a no-op (Electron —
         // VSCode/Slack/etc.). All best-effort: the caller only cares that the
         // process was activated.
+        // `unminimize` (true only on the commit path — Cmd release): restore a
+        // minimized window before raising. AXRaise does NOT de-miniaturize, so
+        // without this Cmd+Tab to an all-minimized app shows nothing (native
+        // behavior). Done only on commit, not per cycle step, or every minimized
+        // app cycled *through* flickers open mid-animation. AXMinimized=false is
+        // idempotent on a non-minimized window.
+        let min_attr = CFString::from_static_string("AXMinimized");
         let raise_and_main = |win: *mut c_void| unsafe {
+            // Is this window minimized?
+            let mut mv: CFTypeRef = ptr::null();
+            let is_min =
+                AXUIElementCopyAttributeValue(win, min_attr.as_concrete_TypeRef().cast(), &mut mv)
+                    == AX_ERROR_SUCCESS
+                    && !mv.is_null()
+                    && CFBooleanGetValue(mv) != 0;
+            if !mv.is_null() {
+                CFRelease(mv.cast());
+            }
+            if is_min {
+                // A minimized window can't be raised — AXRaise on it just
+                // flickers. On the commit path (Cmd release) de-miniaturize it
+                // and then raise; on intermediate cycle steps leave it alone.
+                if unminimize {
+                    let false_val = CFBoolean::false_value();
+                    AXUIElementSetAttributeValue(
+                        win,
+                        min_attr.as_concrete_TypeRef().cast(),
+                        false_val.as_CFTypeRef() as CFTypeRef,
+                    );
+                    let raise = CFString::from_static_string("AXRaise");
+                    AXUIElementPerformAction(win, raise.as_concrete_TypeRef().cast());
+                }
+                return;
+            }
             let raise = CFString::from_static_string("AXRaise");
             AXUIElementPerformAction(win, raise.as_concrete_TypeRef().cast());
             let main_attr = CFString::from_static_string("AXMain");

@@ -106,6 +106,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         opts.addItem(toggle("H.264 video", key: "ENABLE_H264", cfg: cfg, sel: #selector(toggleH264)))
         opts.addItem(toggle("AAC audio", key: "ENABLE_AAC", cfg: cfg, sel: #selector(toggleAAC)))
         opts.addItem(toggle("HiDPI capture", key: "HIDPI", cfg: cfg, sel: #selector(toggleHiDPI)))
+        opts.addItem(toggle(
+            "Un-minimize on Cmd+Tab", key: "UNMINIMIZE", cfg: cfg, sel: #selector(toggleUnminimize)))
         opts.addItem(.separator())
         let bind = cfg["BIND"] ?? "127.0.0.1:3390"
         let net = item("Allow network connections", #selector(toggleNetwork))
@@ -368,6 +370,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleH264() { flip("ENABLE_H264") }
     @objc func toggleAAC() { flip("ENABLE_AAC") }
     @objc func toggleHiDPI() { flip("HIDPI") }
+    @objc func toggleUnminimize() { flip("UNMINIMIZE") }
 
     func flip(_ key: String) {
         let cfg = readConfig()
@@ -514,6 +517,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ENABLE_H264=0
             ENABLE_AAC=0
             HIDPI=0
+            UNMINIMIZE=0
             VIRTUAL_DISPLAY=0
             PRIMARY_MODE=none
             VD_WIDTH=1920

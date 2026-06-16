@@ -89,6 +89,10 @@ auto-start paths are **mutually exclusive** (both bind `:3390` and share the
                           centered picture. Pass this for the old fill-and-distort
                           behavior. No effect with --width/--height or at a
                           matching aspect ratio. See "Display".
+--unminimize-on-switch    On Cmd+Tab, un-minimize the target app's window (bring
+                          it back from the Dock) instead of just activating the
+                          app. Off by default (matches native macOS, which leaves
+                          a minimized window minimized). macOS-only.
 --fps N                   Frame rate cap (default 15, or 60 with --enable-h264
                           — see "Video" for why H.264 wants the higher rate)
 --enable-h264             Stream the display as H.264 over EGFX (AVC420),

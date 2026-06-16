@@ -409,10 +409,12 @@ struct Args {
     #[arg(long, default_value_t = 128_000)]
     aac_bitrate: u32,
 
-    /// Enable RDPDR drive redirection (MS-RDPEFS): the connecting client can
-    /// redirect its local drive and the Mac browses/reads the client's files.
-    /// Off by default; read-only. The client must opt in too (mstsc: Local
-    /// Resources → Drives; FreeRDP: /drive:NAME,PATH).
+    /// Enable RDPDR drive redirection (MS-RDPEFS): the connecting client
+    /// redirects its local drive(s) and the Mac mounts each as a real
+    /// read-write NFS volume (an in-process NFSv3 server + the built-in
+    /// mount_nfs; no root/kext/FUSE), browsable in Finder. Off by default. The
+    /// client must opt in too (mstsc: Local Resources → Drives; FreeRDP:
+    /// /drive:NAME,PATH). macOS-only.
     #[arg(long)]
     enable_drive_redirection: bool,
 
@@ -458,15 +460,16 @@ struct Args {
     qoi_force_rgb: bool,
 
     /// Keyboard layout to interpret the client's keystrokes as, for non-US
-    /// clients. Without this, keys are posted as positional keycodes that
-    /// macOS turns into characters using the Mac's *active* input source, so a
-    /// French/German/etc. client on a US-configured Mac gets the wrong letters.
-    /// With it, macrdp translates each key against the named layout via
-    /// `UCKeyTranslate` and posts the correct character — without changing the
-    /// Mac's own input source. Cmd/Ctrl shortcuts stay on the keycode path.
-    /// Accepts a macOS input-source id (`com.apple.keylayout.French`), a short
-    /// name (`french`, `de`, `azerty`, `swissgerman`), or a Windows KLID
-    /// (`0x040C`). The layout must be installed on the Mac. macOS-only.
+    /// clients. By default the layout is **auto-detected** from the client's
+    /// announced KLID (US/unknown keep the plain positional-keycode path, so
+    /// the US majority is unaffected); pass this only to force a specific
+    /// layout, or `none`/`off` to disable translation entirely. macrdp
+    /// translates each key against the layout via `UCKeyTranslate` and posts
+    /// the resulting character — without changing the Mac's own input source.
+    /// Cmd/Ctrl shortcuts stay on the keycode path. Accepts a macOS
+    /// input-source id (`com.apple.keylayout.French`), a short name (`french`,
+    /// `de`, `azerty`, `swissgerman`), or a Windows KLID (`0x040C`). The layout
+    /// must be installed on the Mac. macOS-only.
     #[arg(long)]
     keyboard_layout: Option<String>,
 

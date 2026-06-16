@@ -93,6 +93,15 @@ auto-start paths are **mutually exclusive** (both bind `:3390` and share the
                           it back from the Dock) instead of just activating the
                           app. Off by default (matches native macOS, which leaves
                           a minimized window minimized). macOS-only.
+--keyboard-layout SPEC    Force a keyboard layout for non-US clients instead of
+                          auto-detecting it from the client. By default the
+                          layout is auto-detected from the client's announced
+                          KLID (US/unknown keep the positional keycode path);
+                          pass a name (`french`, `de`, `azerty`), a Windows KLID
+                          (`0x040C`), or a macOS input-source id to force one, or
+                          `none` to disable translation. Keys are translated via
+                          UCKeyTranslate and posted as Unicode; the Mac's own
+                          input source is untouched. macOS-only.
 --fps N                   Frame rate cap (default 15, or 60 with --enable-h264
                           — see "Video" for why H.264 wants the higher rate)
 --enable-h264             Stream the display as H.264 over EGFX (AVC420),
@@ -128,6 +137,12 @@ auto-start paths are **mutually exclusive** (both bind `:3390` and share the
                           to fall back to the eager path (downloads everything
                           on copy, auto-fires Cmd-V into Finder when done).
                           See "Windows → Mac file copy" below.
+--enable-drive-redirection  Let the connecting client redirect its local
+                          drive(s) (mstsc: Local Resources → Drives; FreeRDP:
+                          /drive:NAME,PATH); the Mac mounts each as a real
+                          read-write volume in Finder (in-process NFS + built-in
+                          mount_nfs, no root/kext/FUSE). Off by default. See
+                          "Drive redirection" below. macOS-only.
 --no-mute-on-minimize     Opt out of muting audio while the client window is
                           minimized (default ON). When the client sends the
                           standard `SuppressOutput` PDU on minimize, the server
@@ -298,6 +313,31 @@ Bidirectional via MS-RDPECLIP. Both directions support single files and folder t
 
 - **`Ctrl-C` on a *folder* in Windows Explorer doesn't reach the Mac.** Explorer puts only the Shell IDList format on the clipboard and delay-renders `FileGroupDescriptorW`, which `mstsc` doesn't request — so nothing is forwarded over the RDP clipboard channel and you'll hear a beep on `Cmd-V`. Windows + mstsc behavior, not fixable server-side. **Workaround:** open the folder in Explorer, `Ctrl-A` to select its contents, then `Ctrl-C` — that path uses `FileGroupDescriptorW` directly and folder structure is preserved.
 - **Some Windows shell extensions silently swallow specific files from the clipboard.** Archive tools (7-Zip, WinRAR, built-in Compressed Folders) commonly hook extensions like `.zip`, `.gz`, `.7z`, `.bz`, `.bz2`, `.rar`, `.tar` and intercept Explorer's clipboard so `Ctrl-C` either sends no `FileGroupDescriptorW` to mstsc or sends none at all. The Mac side detects the clipboard transition and clears the pasteboard, so `Cmd-V` in Finder beeps clearly instead of silently re-pasting the previous file. **Workaround:** rename the file to a neutral extension (e.g. `.bin`) and Windows will publish it normally.
+
+## Drive redirection
+
+Opt-in with **`--enable-drive-redirection`** (off by default). The connecting
+client redirects its **local** drive(s) and the Mac mounts each as a real
+**read-write volume** in Finder — the inverse of file copy: instead of moving
+bytes through the clipboard, you browse the client's filesystem live. Enable it
+on the client too (mstsc: *Local Resources → More → Drives*; FreeRDP:
+`/drive:NAME,PATH`).
+
+Under the hood each redirected drive is served by an **in-process NFSv3 server**
+that translates NFS operations into RDPDR (MS-RDPEFS) requests, mounted via the
+built-in `mount_nfs` — **no root, no kext, no FUSE**. The kernel drives lazy
+lookups as you browse, so full subdirectory navigation works, and reads/writes
+reuse a kept-open handle so large sequential transfers don't re-open per chunk.
+Reading, editing, creating, `mkdir`, rename, and delete all work where the
+**redirected Windows user has permission** — e.g. write to `Users\<you>\Documents`,
+not the `C:\` root (which an unelevated mstsc session can't write; that surfaces
+as a normal "permission denied", not an error). Mounts are torn down when the
+client disconnects.
+
+> macOS-only. Every redirected filesystem device gets its own volume.
+> `/Volumes` isn't writable without root on a stock Mac, so the mountpoint
+> falls back to a per-session folder under `$TMPDIR` (it still shows as a
+> volume in Finder).
 
 ## Reason why this was made
 

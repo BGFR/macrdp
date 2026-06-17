@@ -654,12 +654,24 @@ impl Drop for Surface {
     }
 }
 
-/// Mount the loopback NFS export at `mountpoint`. Read-write, NFSv3 over TCP,
-/// large rsize/wsize to keep the open/read/close RDPDR round-trips per NFS op
-/// low. Verified to need no root for a `localhost` mount onto a user-owned dir.
+/// Mount the loopback NFS export at `mountpoint`. Read-write, NFSv3 over TCP.
+/// Verified to need no root for a `localhost` mount onto a user-owned dir.
+///
+/// **`rsize`/`wsize` = 256 KiB and `readahead` = 4 are deliberately modest**, not
+/// the NFS maximum. RDPDR shares the one RDP TCP connection — and the server's
+/// single socket-writer mutex + single-threaded client loop — with the EGFX
+/// video and RDPSND audio streams. A 1 MiB transfer unit (the old value) makes
+/// each RDPDR data PDU monopolize that writer long enough to stall audio (whose
+/// lag model then *drops* stale waves → choppy) and back up video; a deep
+/// readahead fires a big burst of concurrent reads that saturates the shared
+/// connection. Smaller PDUs + a shallow readahead keep the per-PDU critical
+/// section short so A/V interleave cleanly. The cost is lower peak drive
+/// throughput (more round-trips) — the right trade for an interactive remote
+/// desktop, where smooth audio/video beats fast bulk file transfer. (Each NFS op
+/// is still one RDPDR open→act→close, mitigated by the kept-open handle cache.)
 fn run_mount(port: u16, mountpoint: &Path) -> bool {
     let opts = format!(
-        "nolocks,vers=3,tcp,rsize=1048576,wsize=1048576,port={port},mountport={port},actimeo=5"
+        "nolocks,vers=3,tcp,rsize=262144,wsize=262144,readahead=4,port={port},mountport={port},actimeo=5"
     );
     match std::process::Command::new("/sbin/mount_nfs")
         .arg("-o")

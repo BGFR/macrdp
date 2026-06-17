@@ -1,0 +1,24 @@
+# macrdp's own PC/SC IFD handler — a standalone cdylib loaded by macOS's
+# SmartCardServices (com.apple.ifdreader.slotd). It implements the public
+# IFDHandler v3.0 C ABI and bridges every operation to the macrdp process over a
+# small loopback-socket protocol. Written from scratch (MIT/Apache) so we don't
+# ship the GPL `vpcd` from vsmartcard.
+#
+# NOT part of the macrdp package's build — built separately and packaged into
+# `ifd-macrdp.bundle` by packaging/. std-only, no dependencies.
+[package]
+name = "ifd-macrdp"
+version = "0.1.0"
+edition = "2021"
+description = "macrdp PC/SC IFD handler — bridges a redirected smart card to macrdp over a local socket"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "ifd_macrdp"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = "symbols"

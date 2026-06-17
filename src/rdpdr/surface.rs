@@ -23,8 +23,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use ironrdp_rdpdr::pdu::efs::NtStatus;
@@ -43,6 +43,16 @@ use tracing::{debug, info, warn};
 
 /// The root directory's NFS fileid (1 by NFS convention).
 const ROOT_ID: fileid3 = 1;
+
+/// Delay the `mount_nfs` + Finder open after a device is announced, to keep them
+/// off the connect-time critical path. With `--virtual-display` +
+/// `--detach-primary`/`--capture-primary`, mounting a volume and opening Finder
+/// the instant the client connects collides with WindowServer reflowing the
+/// desktop onto the virtual display — the desktop renders half-blank and app
+/// windows never migrate. Deferring past that window (plus opening Finder in the
+/// background, `open -g`, so it can't steal focus mid-reflow) avoids it; the cost
+/// is only that the redirected drive appears a few seconds after connect.
+const MOUNT_DEFER: Duration = Duration::from_secs(4);
 
 /// One known node in the redirected tree.
 #[derive(Clone)]
@@ -597,16 +607,28 @@ impl Surface {
                 }
             };
             let port = listener.get_listen_port();
-            info!(port, mountpoint = ?mp, "rdpdr nfs: server listening; mounting");
+            info!(port, mountpoint = ?mp, "rdpdr nfs: server listening");
 
-            // The listener is already accepting (bind queues the SYN in the
-            // backlog), so run the blocking mount concurrently while the accept
-            // loop below picks it up.
+            // Defer the macOS-side mount + Finder open off the connect-time
+            // critical path (see MOUNT_DEFER) so they don't collide with the
+            // desktop reflowing onto the virtual display. The sleep is inside
+            // this task, so a disconnect during the wait aborts it via
+            // Surface::Drop (no orphaned mount). The bind already happened, so
+            // mount_nfs's connection queues in the backlog until handle_forever
+            // (below) accepts it.
+            tokio::time::sleep(MOUNT_DEFER).await;
             let mount_mp = mp.clone();
             tokio::task::spawn_blocking(move || {
                 if run_mount(port, &mount_mp) {
-                    info!(mountpoint = ?mount_mp, "rdpdr nfs: drive mounted — opening in Finder");
+                    // Track it so a signal-exit (process::exit skips Drop) can
+                    // still unmount it — see shutdown_cleanup().
+                    register_mount(&mount_mp);
+                    info!(mountpoint = ?mount_mp, "rdpdr nfs: drive mounted — opening in Finder (background)");
+                    // `-g`: open the window WITHOUT bringing Finder to the
+                    // foreground — foregrounding it mid-reflow steals focus and
+                    // breaks the desktop's migration to the virtual display.
                     let _ = std::process::Command::new("/usr/bin/open")
+                        .arg("-g")
                         .arg(&mount_mp)
                         .spawn();
                 } else {
@@ -635,22 +657,72 @@ impl Drop for Surface {
             // Unmount + remove the mountpoint off the async runtime (umount can
             // block briefly). Detached: cleanup is best-effort on disconnect.
             std::thread::spawn(move || {
-                let status = std::process::Command::new("/sbin/umount")
-                    .arg("-f")
-                    .arg(&mp)
-                    .status();
-                if !matches!(status, Ok(s) if s.success()) {
-                    debug!(mountpoint = ?mp, ?status, "rdpdr nfs: umount returned nonzero");
-                }
-                let _ = std::fs::remove_dir(&mp);
-                // Best-effort prune of the per-pid parent (only succeeds once
-                // empty, so it's safe while other drives are still mounted).
-                if let Some(parent) = mp.parent() {
-                    let _ = std::fs::remove_dir(parent);
-                }
-                debug!(mountpoint = ?mp, "rdpdr nfs: cleaned up mount");
+                unmount_at(&mp);
+                // Already handled here, so shutdown_cleanup needn't touch it.
+                unregister_mount(&mp);
             });
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mount registry — for unmounting on signal-exit, which skips Surface::Drop
+// ---------------------------------------------------------------------------
+
+/// Mountpoints currently mounted by live `Surface`s. A `Surface` registers its
+/// mountpoint on a successful mount and removes it in `Drop`; [`shutdown_cleanup`]
+/// unmounts whatever remains when the process is killed by a signal (where
+/// `std::process::exit` skips `Drop`).
+static LIVE_MOUNTS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+
+fn live_mounts() -> &'static Mutex<Vec<PathBuf>> {
+    LIVE_MOUNTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_mount(mp: &Path) {
+    live_mounts().lock().unwrap().push(mp.to_path_buf());
+}
+
+fn unregister_mount(mp: &Path) {
+    live_mounts().lock().unwrap().retain(|p| p != mp);
+}
+
+/// `umount -f` the mountpoint, remove it, and prune the empty per-pid parent.
+/// Shared by `Surface::Drop` (disconnect) and [`shutdown_cleanup`] (signal exit).
+/// `umount` of an already-unmounted path is harmless, so double-calls are safe.
+fn unmount_at(mp: &Path) {
+    let status = std::process::Command::new("/sbin/umount")
+        .arg("-f")
+        .arg(mp)
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        debug!(mountpoint = ?mp, ?status, "rdpdr nfs: umount returned nonzero");
+    }
+    let _ = std::fs::remove_dir(mp);
+    // Prune the per-pid parent (only succeeds once empty, so it's safe while
+    // other drives are still mounted under it).
+    if let Some(parent) = mp.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    debug!(mountpoint = ?mp, "rdpdr nfs: cleaned up mount");
+}
+
+/// Unmount every still-live RDPDR NFS volume. Called from the signal handler
+/// just before `std::process::exit` (which bypasses `Surface::Drop`), so a
+/// SIGINT/SIGTERM stop — Ctrl-C, `kill`, `launchctl bootout`/`kickstart -k` —
+/// doesn't strand a mount pointing at the now-dead NFS server. Synchronous and
+/// best-effort; runs to completion before exit.
+pub fn shutdown_cleanup() {
+    let mounts: Vec<PathBuf> = std::mem::take(&mut *live_mounts().lock().unwrap());
+    if mounts.is_empty() {
+        return;
+    }
+    info!(
+        count = mounts.len(),
+        "rdpdr nfs: unmounting volumes on shutdown"
+    );
+    for mp in mounts {
+        unmount_at(&mp);
     }
 }
 

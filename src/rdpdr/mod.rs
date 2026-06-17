@@ -15,6 +15,17 @@
 #[cfg(target_os = "macos")]
 mod surface;
 
+/// Unmount any RDPDR NFS volumes still mounted at process exit. macrdp's signal
+/// handler `std::process::exit`s, which skips `Surface::Drop`, so without this a
+/// signal stop (Ctrl-C, `kill`, `launchctl bootout`/`kickstart -k`) would strand
+/// the mounts pointing at the now-dead server. Call it from the signal handler
+/// next to `file_promise_lazy::shutdown_cleanup()`. No-op when no drive was
+/// redirected, and off macOS.
+pub fn shutdown_cleanup() {
+    #[cfg(target_os = "macos")]
+    surface::shutdown_cleanup();
+}
+
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
 

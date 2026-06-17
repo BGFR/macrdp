@@ -1018,6 +1018,10 @@ async fn async_main() -> Result<()> {
         // MacCliprdr was never constructed.
         #[cfg(target_os = "macos")]
         file_promise_lazy::shutdown_cleanup();
+        // RDPDR NFS volumes are unmounted on disconnect by Surface::Drop, but
+        // process::exit (below) skips Drop — so unmount any still-mounted ones
+        // here, or a signal stop strands them pointing at the dead server.
+        rdpdr::shutdown_cleanup();
         std::process::exit(0);
     });
 

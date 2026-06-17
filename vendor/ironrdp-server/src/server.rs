@@ -870,23 +870,43 @@ impl RdpServer {
         // are independent channels on the wire, so moving clipboard
         // ahead of video within a batch does NOT violate any ordering
         // invariant on either channel.
+        // (Extended) RDPDR is a third, LOWEST-priority tier. A large drive
+        // transfer (a big DeviceWrite PDU when copying TO the redirected drive)
+        // would otherwise be written ahead of / interleaved with EGFX frames in
+        // the same batch, holding the shared socket writer and stuttering the
+        // video — the same starvation shape as the clipboard case above, but
+        // with video as the victim and RDPDR as the bulk hog. So order the batch
+        // clipboard → {EGFX + everything else} → RDPDR. RDPDR rides its own SVC
+        // channel, so reordering it within a batch breaks no on-wire ordering,
+        // and the partition stays STABLE within each tier (EGFX frames keep
+        // their sequential order for the inter-frame codec chain). Triggered
+        // whenever video shares a batch with clipboard and/or RDPDR.
         #[cfg(feature = "egfx")]
-        if events
-            .iter()
-            .any(|e| matches!(e, ServerEvent::Clipboard(_) | ServerEvent::ClipboardFileCopy(_)))
-            && events.iter().any(|e| matches!(e, ServerEvent::Egfx(_)))
         {
-            let mut clipboard: Vec<ServerEvent> = Vec::new();
-            let mut rest: Vec<ServerEvent> = Vec::with_capacity(events.len());
-            for ev in events.drain(..) {
-                if matches!(ev, ServerEvent::Clipboard(_) | ServerEvent::ClipboardFileCopy(_)) {
-                    clipboard.push(ev);
-                } else {
-                    rest.push(ev);
+            let has_egfx = events.iter().any(|e| matches!(e, ServerEvent::Egfx(_)));
+            let has_clip_or_rdpdr = events.iter().any(|e| {
+                matches!(
+                    e,
+                    ServerEvent::Clipboard(_) | ServerEvent::ClipboardFileCopy(_) | ServerEvent::Rdpdr(_)
+                )
+            });
+            if has_egfx && has_clip_or_rdpdr {
+                let mut clipboard: Vec<ServerEvent> = Vec::new();
+                let mut middle: Vec<ServerEvent> = Vec::with_capacity(events.len());
+                let mut rdpdr: Vec<ServerEvent> = Vec::new();
+                for ev in events.drain(..) {
+                    match ev {
+                        ServerEvent::Clipboard(_) | ServerEvent::ClipboardFileCopy(_) => {
+                            clipboard.push(ev)
+                        }
+                        ServerEvent::Rdpdr(_) => rdpdr.push(ev),
+                        _ => middle.push(ev),
+                    }
                 }
+                events.extend(clipboard); // 1: not starved by video
+                events.extend(middle); // 2: EGFX video + the rest
+                events.extend(rdpdr); // 3: bulk drive writes yield to video
             }
-            events.extend(clipboard);
-            events.extend(rest);
         }
         for event in events.drain(..) {
             trace!(?event, "Dispatching");

@@ -34,19 +34,29 @@ AND released — #1276 landing is NOT sufficient.
     live so the backlog is dropped to one `MAX_LAG_MS` of the freshest waves.
 
 (4) Per-batch dispatch priority (NOT upstreamed): in `dispatch_server_events`,
-    stably partition the drained batch so CLIPRDR events are written BEFORE any
-    EGFX video frames in that batch. Without this, with `--enable-h264` a
-    CLIPRDR FileContentsResponse queues behind dozens of large video frames
-    every batch, throttling clipboard file copies to a crawl and freezing
-    Windows Explorer's synchronous paste read. Audio is deliberately NOT part of
-    this batch at all — it ships per-wave in arrival order from the dedicated
-    `dispatch_audio` task (its own channel), preserving the natural ~21 ms
-    cadence; an earlier version of this patch lumped audio in with clipboard as
-    "non-EGFX" and burst-shipped each batch's waves in a clump, which made the
-    client's adaptive jitter buffer extend and added a few hundred ms of
-    steady-state playback latency. The clipboard/EGFX partition is stable (H.264
-    inter-frame sequence preserved); the audio wave-drop ordering is preserved
-    independently in `dispatch_audio`. Gated on the egfx feature.
+    stably partition the drained batch into THREE priority tiers —
+    **CLIPRDR → {EGFX video + everything else} → RDPDR** — so each tier is
+    written ahead of the lower ones over the shared socket writer. Two starvation
+    bugs, opposite directions, same fix:
+      • CLIPRDR first: without it, with `--enable-h264` a CLIPRDR
+        FileContentsResponse queues behind dozens of large video frames every
+        batch, throttling Mac→Windows file copies to a crawl and freezing
+        Explorer's synchronous paste read.
+      • RDPDR last (added 2026-06-18): a large drive transfer (a big DeviceWrite
+        PDU when copying TO the redirected drive) would otherwise hold the writer
+        ahead of the EGFX frames in the same batch and stutter the video — here
+        video is the victim, RDPDR the bulk hog. Reorder triggers when EGFX
+        shares a batch with CLIPRDR and/or RDPDR.
+    Audio is deliberately NOT part of this batch at all — it ships per-wave in
+    arrival order from the dedicated `dispatch_audio` task (its own channel),
+    preserving the natural ~21 ms cadence; an earlier version of this patch
+    lumped audio in with clipboard as "non-EGFX" and burst-shipped each batch's
+    waves in a clump, which made the client's adaptive jitter buffer extend and
+    added a few hundred ms of steady-state playback latency. The partition is
+    stable within each tier (H.264 inter-frame sequence preserved); the audio
+    wave-drop ordering is preserved independently in `dispatch_audio`. CLIPRDR
+    and RDPDR ride their own SVC channels, so reordering them relative to EGFX
+    within a batch breaks no on-wire ordering. Gated on the egfx feature.
 
 (5) SuppressOutput / RefreshRectangle handling (upstream PR #1319 ✅ MERGED
     2026-05-27, commit `aa7ff679` — not yet released; vendor stays until a

@@ -91,9 +91,12 @@ if [ -f "$IFD_DYLIB" ]; then
     codesign --force --options runtime $TS -s "$IDENTITY" "$IFD_BUNDLE"
     # Ship the privileged installer alongside it so DMG users can run
     #   /Applications/macrdp.app/Contents/Resources/install-ifd-handler.sh
+    # plus the USB-trigger picker the installer invokes (must sit next to it).
     cp "$PKG_DIR/install-ifd-handler.sh" "$STAGE/Contents/Resources/install-ifd-handler.sh"
-    chmod +x "$STAGE/Contents/Resources/install-ifd-handler.sh"
-    echo "==> embedded ifd-macrdp.bundle (smart-card IFD handler) + installer"
+    cp "$PKG_DIR/select-usb-trigger.sh" "$STAGE/Contents/Resources/select-usb-trigger.sh"
+    chmod +x "$STAGE/Contents/Resources/install-ifd-handler.sh" \
+             "$STAGE/Contents/Resources/select-usb-trigger.sh"
+    echo "==> embedded ifd-macrdp.bundle (smart-card IFD handler) + installer + USB picker"
 else
     echo "==> WARNING: ifd-handler dylib not found; smart-card handler NOT embedded (unset SKIP_BUILD?)" >&2
 fi

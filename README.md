@@ -437,21 +437,28 @@ GUI admin prompt, no manual `sudo`):
 packaging/install-ifd-handler.sh
 /Applications/macrdp.app/Contents/Resources/install-ifd-handler.sh   # DMG install
 
-# Bind the USB device that triggers the driver load (see caveat below):
-IFD_VID=0x2174 IFD_PID=0x2100 packaging/install-ifd-handler.sh
-
 packaging/install-ifd-handler.sh --uninstall                          # remove
+```
+
+Run interactively, the installer **lists your attached USB devices and lets you
+pick the one to use as the load trigger** (see the caveat below for why a trigger
+is needed). To bind one non-interactively instead — or just to look up a device's
+IDs — use the picker directly or pass them yourself:
+
+```bash
+packaging/select-usb-trigger.sh                       # list devices, print VID/PID
+IFD_VID=0x2174 IFD_PID=0x2100 packaging/install-ifd-handler.sh   # bind explicitly
 ```
 
 Then verify the reader registered with `system_profiler SPSmartCardsDataType`.
 
 > macOS-only. **macOS loads a third-party IFD driver only on a USB *hotplug***
 > matching the bundle's VID/PID, so a headless server needs a USB device
-> permanently attached (any stick works as the trigger — bind it with
-> `IFD_VID`/`IFD_PID`); after installing, unplug/replug it so `slotd` loads the
-> driver. The handler talks to macrdp on loopback port 40242 (`MACRDP_SCARD_PORT`).
-> No physical card needed to try it: create a Windows **TPM virtual smart card**
-> (`tpmvscmgr create …`) and redirect that.
+> permanently attached (any stick works as the trigger — pick it during install
+> or bind it with `IFD_VID`/`IFD_PID`); after installing, unplug/replug it so
+> `slotd` loads the driver. The handler talks to macrdp on loopback port 40242
+> (`MACRDP_SCARD_PORT`). No physical card needed to try it: create a Windows
+> **TPM virtual smart card** (`tpmvscmgr create …`) and redirect that.
 
 > **Reloading after an upgrade.** `slotd` keeps the loaded handler in memory for
 > its whole lifetime and ignores `SIGTERM`, so simply replacing the bundle on disk

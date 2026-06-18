@@ -35,7 +35,8 @@ LaunchAgent and edits the same `config.env` — no re-permissioning.
 | `make-app.sh` | Build → assemble bundle → co-sign helper + bundle (incl. the embedded smart-card IFD handler) → install. |
 | `install-launchagent.sh` | Seed config, render plist, bootstrap the agent. |
 | `ifd-Info.plist` | Info.plist template for the embedded `ifd-macrdp.bundle` (smart-card IFD handler); `__VERSION__`/`__BUNDLE_ID__` filled by `make-app.sh`. |
-| `install-ifd-handler.sh` | Privileged install of the IFD handler into `/usr/local/libexec/SmartCardServices/drivers` (one GUI admin prompt). Also embedded in the app at `Contents/Resources/`. |
+| `install-ifd-handler.sh` | Privileged install of the IFD handler into `/usr/local/libexec/SmartCardServices/drivers` (one GUI admin prompt). Run interactively it offers the USB-trigger picker below. Also embedded in the app at `Contents/Resources/`. |
+| `select-usb-trigger.sh` | List attached USB devices and pick one as the IFD-handler load trigger; prints its `VID PID` (and a ready-to-paste `IFD_VID=.. IFD_PID=..` install line). Invoked by `install-ifd-handler.sh` interactively; runnable standalone. Embedded in the app next to the installer. |
 | `notarize.sh` | Notarize + staple a `.app`/`.dmg`/`.pkg` (used by the build scripts). |
 | `make-dmg.sh` | Wrap signed apps into a signed + notarized distribution DMG (styled icon layout). |
 | `make-icns.sh` | Build `AppIcon.icns` from a square PNG (used by the build scripts). |

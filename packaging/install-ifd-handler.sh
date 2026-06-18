@@ -78,6 +78,16 @@ if [ -z "$SRC" ]; then
 fi
 echo "==> Source bundle: $SRC"
 
+# 1b. If no trigger was given explicitly and we're interactive, offer to pick an
+#     attached USB device (the helper lists them + prints the VID/PID). Skipping
+#     it (or running non-interactively) keeps the bundle's default trigger.
+if [ -z "${IFD_VID:-}" ] && [ -z "${IFD_PID:-}" ] && [ -t 0 ] && [ -x "$SELF_DIR/select-usb-trigger.sh" ]; then
+    if SEL="$("$SELF_DIR/select-usb-trigger.sh")"; then
+        IFD_VID="${SEL%% *}"
+        IFD_PID="${SEL##* }"
+    fi
+fi
+
 # 2. Optionally rebind the USB trigger VID/PID (patch a temp copy + re-sign, so
 #    we don't mutate the signed, read-only app resource).
 if [ -n "${IFD_VID:-}" ] || [ -n "${IFD_PID:-}" ]; then
@@ -92,11 +102,17 @@ if [ -n "${IFD_VID:-}" ] || [ -n "${IFD_PID:-}" ]; then
     echo "==> USB trigger rebound: VID=${IFD_VID:-(unchanged)} PID=${IFD_PID:-(unchanged)}"
 fi
 
-# 3. Hint: which USB devices are attached (the trigger must match one of these).
-echo "==> Attached USB devices (the driver loads on a hotplug matching its VID/PID):"
-ioreg -r -c IOUSBHostDevice 2>/dev/null \
-    | grep -E '"(USB Vendor Name|idVendor|USB Product Name|idProduct)"' \
-    | sed 's/^[[:space:]]*/      /' | head -40 || true
+# 3. Hint (non-interactive only): which USB devices are attached, so a headless
+#    caller knows what VID/PID to pass. Interactive runs already chose above via
+#    select-usb-trigger.sh, so skip the raw dump there.
+if [ -z "${IFD_VID:-}" ] && [ -z "${IFD_PID:-}" ]; then
+    echo "==> Using the bundle's default USB trigger. To bind a specific device, pass"
+    echo "    IFD_VID=0x.. IFD_PID=0x.. (find them with packaging/select-usb-trigger.sh)."
+    echo "==> Attached USB devices (the driver loads on a hotplug matching its VID/PID):"
+    ioreg -r -c IOUSBHostDevice 2>/dev/null \
+        | grep -E '"(USB Vendor Name|idVendor|USB Product Name|idProduct)"' \
+        | sed 's/^[[:space:]]*/      /' | head -40 || true
+fi
 
 # 4. Stage the bundle into /tmp first. The repo / app may live under ~/Documents
 #    (or another TCC-protected location), and the root `cp` spawned by osascript

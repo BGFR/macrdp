@@ -389,6 +389,16 @@ Then verify the reader registered with `system_profiler SPSmartCardsDataType`.
 > No physical card needed to try it: create a Windows **TPM virtual smart card**
 > (`tpmvscmgr create …`) and redirect that.
 
+> **Reloading after an upgrade.** `slotd` keeps the loaded handler in memory for
+> its whole lifetime and ignores `SIGTERM`, so simply replacing the bundle on disk
+> does nothing — a rebuilt or upgraded handler isn't picked up until `slotd` is
+> killed with `SIGKILL` and the trigger device is replugged. Just **re-run the
+> installer**: it restarts `slotd` correctly (`sudo pkill -9 -f com.apple.ifdreader`)
+> and verifies the new bundle landed. Then unplug/replug the trigger so the fresh
+> `slotd` loads the new driver. (If you ever do it by hand, note that
+> `killall com.apple.ifdreader` won't match — the process name is truncated past
+> 15 chars; use `pkill -9 -f`.)
+
 ## Reason why this was made
 
 This was done to scratch an itch.  There are practically no active open source RDP servers for MacOS.  The closest project that does this functionality is xrdp; however this program only runs on Linux/Unix machines, and has no homebrew equivalent on Macs. Done in a few hours with the help of Claude and runs pretty well. Multi-monitor support is on the list when I'm bored or need a distraction from real life.

@@ -9,7 +9,7 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 ## Status
 
-v0 — daily-driver usable on a trusted LAN. **Latest release: [v0.7.0](https://github.com/clintcan/macrdp/releases/latest)** — adds read-write [drive redirection](#drive-redirection). On `main` since: [smart-card redirection](#smart-card-redirection). See [CLAUDE.md](CLAUDE.md) for what's wired up, what isn't, and known quirks.
+v0 — daily-driver usable on a trusted LAN. **Latest release: [v0.8.0](https://github.com/clintcan/macrdp/releases/latest)** — adds [smart-card redirection](#smart-card-redirection) (and the [release `.app`](#release-artifacts) now bundles its IFD handler). See [CLAUDE.md](CLAUDE.md) for what's wired up, what isn't, and known quirks.
 
 ## Quick start
 

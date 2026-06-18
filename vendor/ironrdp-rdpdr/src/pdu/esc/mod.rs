@@ -1862,12 +1862,55 @@ impl rpce::HeaderlessEncode for GetReaderIconReturn {
 // are encoded/decoded as UTF-16.
 // ===========================================================================
 
+impl ScardCall {
+    /// (server-direction) Marshal this call as the RPCE input buffer of a
+    /// DR_CONTROL_REQ. Only the variants the server issues are encodable.
+    pub fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        match self {
+            ScardCall::EstablishContextCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
+            ScardCall::ContextCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
+            ScardCall::ListReadersCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
+            ScardCall::GetStatusChangeCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
+            ScardCall::ConnectCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
+            ScardCall::HCardAndDispositionCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
+            ScardCall::StatusCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
+            ScardCall::TransmitCall(c) => ironrdp_core::Encode::encode(&rpce::Pdu(c.clone()), dst),
+            _ => Err(other_err!("ScardCall::encode: unsupported call variant")),
+        }
+    }
+
+    /// The marshaled size of [`Self::encode`] (the DR_CONTROL_REQ input buffer length).
+    pub fn size(&self) -> usize {
+        match self {
+            ScardCall::EstablishContextCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
+            ScardCall::ContextCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
+            ScardCall::ListReadersCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
+            ScardCall::GetStatusChangeCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
+            ScardCall::ConnectCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
+            ScardCall::HCardAndDispositionCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
+            ScardCall::StatusCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
+            ScardCall::TransmitCall(c) => ironrdp_core::Encode::size(&rpce::Pdu(c.clone())),
+            _ => 0,
+        }
+    }
+}
+
 impl From<Scope> for u32 {
     #[expect(
         clippy::as_conversions,
         reason = "guarantees discriminant layout, and as is the only way to cast enum -> primitive"
     )]
     fn from(val: Scope) -> Self {
+        val as u32
+    }
+}
+
+impl From<ScardIoCtlCode> for u32 {
+    #[expect(
+        clippy::as_conversions,
+        reason = "guarantees discriminant layout, and as is the only way to cast enum -> primitive"
+    )]
+    fn from(val: ScardIoCtlCode) -> Self {
         val as u32
     }
 }

@@ -81,11 +81,24 @@ reused as-is; we only add the missing server-direction halves.
     Byte-exactness is proven offline by `server_direction_tests` (18 round-trips:
     `*Call` = our encode -> upstream decode; `*Return` = upstream encode -> our
     decode). The server uses the **W (Unicode)** IOCTL variants, so reader/string
-    fields marshal as UTF-16. STILL TODO for the live path (not in this crate
-    yet): encode `DeviceControlRequest<ScardIoCtlCode>` as an `SvcMessage`
-    (mirror `ServerDriveIoRequest` in `pdu/mod.rs`) + a `ScardCall` IOCTL-dispatch,
-    and the server-side `ScardHandle`/router in
-    `vendor/ironrdp-server/src/rdpdr.rs`.
+    fields marshal as UTF-16.
+
+    The IOCTL envelope is also here now: `ScardCall::encode`/`size` (dispatch the
+    chosen variant's RPCE `Pdu`) and **`ScardControlRequest`** in `pdu/mod.rs` — a
+    server-direction DR_CONTROL_REQ (`IRP_MJ_DEVICE_CONTROL`) that prepends the
+    `PAKID_CORE_DEVICE_IOREQUEST` `SharedHeader` + `DeviceIoRequest`, then
+    Output/Input buffer lengths + `IoControlCode` + 20 reserved bytes + the
+    marshaled call, and impls `Encode + SvcEncode` so it ships as an `SvcMessage`
+    (peer to `ServerDriveIoRequest`). `From<ScardIoCtlCode> for u32` added.
+    `scard_control_request_tests` proves the full envelope round-trips through the
+    decode chain (`SharedHeader` -> `DeviceIoRequest` ->
+    `DeviceControlRequest<ScardIoCtlCode>` -> `ScardCall`).
+
+    STILL TODO for the live path (NOT in this crate — belongs in
+    `vendor/ironrdp-server/src/rdpdr.rs`): the server-side `ScardHandle` (peer to
+    `RdpdrHandle`) that allocates a completion id, ships a `ScardControlRequest`,
+    and routes the matching `DeviceIoCompletion` back by completion id, decoding
+    the `*Return` for the waiting caller.
 
 Cargo notes: the de-worked `Cargo.toml` inlines the workspace-inherited fields
 (edition 2024, rust-version, license, …) and drops the `path = "../ironrdp-*"`

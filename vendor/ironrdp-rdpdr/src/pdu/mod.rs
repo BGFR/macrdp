@@ -1,18 +1,20 @@
 use core::fmt::{self, Display};
 
 use ironrdp_core::{
-    Decode, DecodeError, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_size, invalid_field_err,
-    unsupported_value_err,
+    Decode, DecodeError, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_size,
+    invalid_field_err, unsupported_value_err,
 };
+use ironrdp_pdu::write_padding;
 use ironrdp_svc::SvcEncode;
 
 use self::efs::{
     ClientDeviceListAnnounce, ClientDeviceListRemove, ClientDriveQueryDirectoryResponse,
     ClientDriveQueryInformationResponse, ClientDriveQueryVolumeInformationResponse, ClientDriveSetInformationResponse,
     ClientNameRequest, CoreCapability, CoreCapabilityKind, DeviceCloseResponse, DeviceControlResponse,
-    DeviceCreateResponse, DeviceIoRequest, DeviceReadResponse, DeviceWriteResponse, ServerDeviceAnnounceResponse,
-    ServerDriveIoRequest, VersionAndIdPdu, VersionAndIdPduKind,
+    DeviceCreateResponse, DeviceIoRequest, DeviceReadResponse, DeviceWriteResponse, MajorFunction, MinorFunction,
+    ServerDeviceAnnounceResponse, ServerDriveIoRequest, VersionAndIdPdu, VersionAndIdPduKind,
 };
+use self::esc::{ScardCall, ScardIoCtlCode};
 
 pub mod efs;
 pub mod esc;
@@ -258,6 +260,83 @@ impl Encode for ServerDriveIoRequest {
 }
 
 impl SvcEncode for ServerDriveIoRequest {}
+
+/// (vendored, server-direction) A Device Control Request (DR_CONTROL_REQ,
+/// `IRP_MJ_DEVICE_CONTROL`) carrying an MS-RDPESC [`ScardCall`] as its RPCE input
+/// buffer. Upstream's `DeviceControlRequest` is decode-only (the client parses
+/// these); this lets the macrdp **server** emit a smart-card IOCTL. Emitted as an
+/// [`SvcEncode`] message — it prepends the `PAKID_CORE_DEVICE_IOREQUEST`
+/// [`SharedHeader`], then the `DeviceIoRequest`, the
+/// Output/Input buffer lengths + `IoControlCode` + 20 reserved bytes, then the
+/// marshaled call. The smart-card device has no file handle, so `FileId` is 0.
+#[derive(Debug)]
+pub struct ScardControlRequest {
+    pub device_id: u32,
+    pub completion_id: u32,
+    pub io_control_code: ScardIoCtlCode,
+    pub call: ScardCall,
+    /// `OutputBufferLength` — the maximum response size the client should allocate.
+    pub output_buffer_length: u32,
+}
+
+impl ScardControlRequest {
+    /// OutputBufferLength + InputBufferLength + IoControlCode + 20 reserved bytes.
+    const CONTROL_FIXED_PART_SIZE: usize = size_of::<u32>() * 3 + 20;
+
+    pub fn new(
+        device_id: u32,
+        completion_id: u32,
+        io_control_code: ScardIoCtlCode,
+        call: ScardCall,
+        output_buffer_length: u32,
+    ) -> Self {
+        Self {
+            device_id,
+            completion_id,
+            io_control_code,
+            call,
+            output_buffer_length,
+        }
+    }
+
+    fn device_io_request(&self) -> DeviceIoRequest {
+        DeviceIoRequest {
+            device_id: self.device_id,
+            file_id: 0,
+            completion_id: self.completion_id,
+            major_function: MajorFunction::DeviceControl,
+            minor_function: MinorFunction::from(0),
+        }
+    }
+}
+
+impl Encode for ScardControlRequest {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(ctx: "DR_CONTROL_REQ(Scard)", in: dst, size: self.size());
+        SharedHeader {
+            component: Component::RdpdrCtypCore,
+            packet_id: PacketId::CoreDeviceIoRequest,
+        }
+        .encode(dst)?;
+        self.device_io_request().encode(dst)?;
+        let input_buffer_length: u32 = cast_length!("ScardControlRequest", "input_buffer_length", self.call.size())?;
+        dst.write_u32(self.output_buffer_length);
+        dst.write_u32(input_buffer_length);
+        dst.write_u32(self.io_control_code.into());
+        write_padding!(dst, 20);
+        self.call.encode(dst)
+    }
+
+    fn name(&self) -> &'static str {
+        "DR_CONTROL_REQ(Scard)"
+    }
+
+    fn size(&self) -> usize {
+        SharedHeader::SIZE + self.device_io_request().size() + Self::CONTROL_FIXED_PART_SIZE + self.call.size()
+    }
+}
+
+impl SvcEncode for ScardControlRequest {}
 
 impl fmt::Debug for RdpdrPdu {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -514,5 +593,52 @@ impl From<PacketId> for u16 {
     )]
     fn from(packet_id: PacketId) -> Self {
         packet_id as u16
+    }
+}
+
+#[cfg(test)]
+mod scard_control_request_tests {
+    //! Encode a server-direction DR_CONTROL_REQ and parse it back through the
+    //! same chain the client/server decode path uses, proving the IOCTL envelope
+    //! + RPCE body marshal correctly end-to-end.
+    use ironrdp_core::{ReadCursor, encode_vec};
+
+    use super::efs::DeviceControlRequest;
+    use super::esc::{ConnectCall, ConnectCommon, EstablishContextCall, ScardContext, Scope};
+    use super::*;
+
+    fn roundtrip(io_control_code: ScardIoCtlCode, call: ScardCall) -> ScardCall {
+        let req = ScardControlRequest::new(0x07, 0x42, io_control_code, call, 2048);
+        let bytes = encode_vec(&req).unwrap();
+        let mut src = ReadCursor::new(&bytes);
+
+        let header = SharedHeader::decode(&mut src).unwrap();
+        assert_eq!(header.packet_id, PacketId::CoreDeviceIoRequest);
+        let dev_io = DeviceIoRequest::decode(&mut src).unwrap();
+        assert_eq!(dev_io.major_function, MajorFunction::DeviceControl);
+        assert_eq!(dev_io.device_id, 0x07);
+        assert_eq!(dev_io.completion_id, 0x42);
+        let ctrl = DeviceControlRequest::<ScardIoCtlCode>::decode(dev_io, &mut src).unwrap();
+        assert_eq!(ctrl.io_control_code, io_control_code);
+        ScardCall::decode(ctrl.io_control_code, &mut src).unwrap()
+    }
+
+    #[test]
+    fn establish_context_control_request_roundtrip() {
+        let call = ScardCall::EstablishContextCall(EstablishContextCall { scope: Scope::System });
+        assert_eq!(roundtrip(ScardIoCtlCode::EstablishContext, call.clone()), call);
+    }
+
+    #[test]
+    fn connect_control_request_roundtrip() {
+        let call = ScardCall::ConnectCall(ConnectCall {
+            reader: "macrdp".to_string(),
+            common: ConnectCommon {
+                context: ScardContext::new(0x0102_0304),
+                share_mode: 2,
+                preferred_protocols: super::esc::CardProtocol::SCARD_PROTOCOL_T1,
+            },
+        });
+        assert_eq!(roundtrip(ScardIoCtlCode::ConnectW, call.clone()), call);
     }
 }

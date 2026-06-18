@@ -3,13 +3,13 @@
 [![Latest release](https://img.shields.io/github/v/release/clintcan/macrdp?sort=semver&label=release)](https://github.com/clintcan/macrdp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, Mac↔Windows file copy, **read-write drive redirection** (mount the client's drives in Finder), system audio forwarding, and optional H.264 video (EGFX/AVC420, hardware-encoded). NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
+A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, Mac↔Windows file copy, **read-write drive redirection** (mount the client's drives in Finder), **smart-card redirection** (use the client's smart card from macOS apps), system audio forwarding, and optional H.264 video (EGFX/AVC420, hardware-encoded). NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
 
 This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 ## Status
 
-v0 — daily-driver usable on a trusted LAN. **Latest: [v0.7.0](https://github.com/clintcan/macrdp/releases/latest)** — adds read-write [drive redirection](#drive-redirection). See [CLAUDE.md](CLAUDE.md) for what's wired up, what isn't, and known quirks.
+v0 — daily-driver usable on a trusted LAN. **Latest release: [v0.7.0](https://github.com/clintcan/macrdp/releases/latest)** — adds read-write [drive redirection](#drive-redirection). On `main` since: [smart-card redirection](#smart-card-redirection). See [CLAUDE.md](CLAUDE.md) for what's wired up, what isn't, and known quirks.
 
 ## Quick start
 
@@ -146,6 +146,13 @@ auto-start paths are **mutually exclusive** (both bind `:3390` and share the
                           read-write volume in Finder (in-process NFS + built-in
                           mount_nfs, no root/kext/FUSE). Off by default. See
                           "Drive redirection" below. macOS-only.
+--enable-smartcard-redirection  Let the connecting client redirect its
+                          smart-card reader (mstsc: Local Resources → More →
+                          Smart cards; FreeRDP: /smartcard) so macOS apps can use
+                          the card through it (MS-RDPESC). Off by default.
+                          Requires installing the PC/SC IFD handler once + a USB
+                          trigger device — see "Smart-card redirection" below.
+                          macOS-only.
 --no-mute-on-minimize     Opt out of muting audio while the client window is
                           minimized (default ON). When the client sends the
                           standard `SuppressOutput` PDU on minimize, the server
@@ -341,6 +348,46 @@ client disconnects.
 > `/Volumes` isn't writable without root on a stock Mac, so the mountpoint
 > falls back to a per-session folder under `$TMPDIR` (it still shows as a
 > volume in Finder).
+
+## Smart-card redirection
+
+Opt-in with **`--enable-smartcard-redirection`** (off by default). The connecting
+client redirects its **smart-card reader** and macOS PC/SC apps can use the card
+through it — the standard RDP direction (MS-RDPESC), so the card stays on the
+client while the Mac in the session reads it. Enable it on the client too
+(mstsc: *Local Resources → More → Smart cards*; FreeRDP: `/smartcard`).
+
+On the macOS side macrdp ships **its own PC/SC IFD handler** — a small reader
+driver loaded by `com.apple.ifdreader` that presents the redirected card as a
+real Finder/PC/SC reader and bridges every PC/SC call to the client over
+MS-RDPESC. It's written from scratch (MIT/Apache), so there's **no GPL `vpcd`**
+dependency. The whole chain is verified end-to-end on `mstsc` against a card,
+including a full APDU transceive.
+
+**One-time setup** — the IFD handler installs into a root-owned system directory,
+so it can't be done by drag-to-Applications; run the bundled installer once (one
+GUI admin prompt, no manual `sudo`):
+
+```bash
+# From a checkout, or from an installed app's Resources:
+packaging/install-ifd-handler.sh
+/Applications/macrdp.app/Contents/Resources/install-ifd-handler.sh   # DMG install
+
+# Bind the USB device that triggers the driver load (see caveat below):
+IFD_VID=0x2174 IFD_PID=0x2100 packaging/install-ifd-handler.sh
+
+packaging/install-ifd-handler.sh --uninstall                          # remove
+```
+
+Then verify the reader registered with `system_profiler SPSmartCardsDataType`.
+
+> macOS-only. **macOS loads a third-party IFD driver only on a USB *hotplug***
+> matching the bundle's VID/PID, so a headless server needs a USB device
+> permanently attached (any stick works as the trigger — bind it with
+> `IFD_VID`/`IFD_PID`); after installing, unplug/replug it so `slotd` loads the
+> driver. The handler talks to macrdp on loopback port 40242 (`MACRDP_SCARD_PORT`).
+> No physical card needed to try it: create a Windows **TPM virtual smart card**
+> (`tpmvscmgr create …`) and redirect that.
 
 ## Reason why this was made
 

@@ -187,6 +187,23 @@ AND released — #1276 landing is NOT sufficient.
     so the surface can map ACCESS_DENIED → permission-denied etc.
     Read-write; macrdp gates it behind `--enable-drive-redirection`.
     Upstreamable as the server counterpart to the client `Rdpdr`.
+    Smart-card phase (2026-06-18, for `--enable-smartcard-redirection`): the same
+    `RdpdrServer`/`IoRouter` plumbing now also drives **MS-RDPESC**. `RdpdrHandle`
+    gained `scard_*` methods (`scard_establish_context` / `release_context` /
+    `list_readers` / `get_status_change` / `connect` / `status` / `transmit` /
+    `disconnect`) that ship a `ScardControlRequest` (the vendored `ironrdp-rdpdr`
+    divergence (2) DR_CONTROL_REQ), await the completion via the existing router,
+    and decode the `*Return` — surfacing the PC/SC `ReturnCode` (distinct from the
+    transport `NtStatus`) as an error unless `Success`. Methods live on
+    `RdpdrHandle` (not a separate handle) because the completion-id space + event
+    sender are shared with drive I/O, and esc already owns the name `ScardHandle`
+    (the PC/SC card handle). `SCARD_SHARE_*` / `SCARD_*_CARD` constants are
+    re-exported from `lib.rs`. The `CoreDeviceIoCompletion` router already routes
+    these (a smart-card IOCTL completion is just another `DeviceIoResponse`).
+    Made `LongReturn`/`EstablishContextReturn` fields `pub` in `ironrdp-rdpdr` so
+    the handle can read them. STILL TODO (macrdp side, not vendored): a backend
+    that discovers the `Smartcard` device id + the socket bridge to the IFD
+    handler behind `--enable-smartcard-redirection`.
 
 (10) Publish the client's keyboard-layout id to a shared cell (NOT
     upstreamed; added 2026-06-16; pairs with `vendor/ironrdp-acceptor`

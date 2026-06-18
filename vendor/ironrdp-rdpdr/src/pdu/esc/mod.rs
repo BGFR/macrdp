@@ -398,7 +398,7 @@ impl ScardAccessStartedEventCall {
 /// [2.2.3.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/e77a1365-2379-4037-99c4-d30d14ba10fc
 #[derive(Debug, PartialEq, Clone)]
 pub struct LongReturn {
-    return_code: ReturnCode,
+    pub return_code: ReturnCode,
 }
 
 impl LongReturn {
@@ -645,8 +645,8 @@ impl TryFrom<u32> for Scope {
 /// [2.2.3.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/9135d95f-3740-411b-bdca-34ac7571fddc
 #[derive(Debug, PartialEq, Clone)]
 pub struct EstablishContextReturn {
-    return_code: ReturnCode,
-    context: ScardContext,
+    pub return_code: ReturnCode,
+    pub context: ScardContext,
 }
 
 impl EstablishContextReturn {

@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context as _, Result};
 use ironrdp_core::{impl_as_any, ReadCursor};
 use ironrdp_pdu::gcc::ChannelName;
+use ironrdp_pdu::utils::CharacterSet;
 use ironrdp_pdu::{decode_err, PduResult};
 use ironrdp_rdpdr::pdu::efs::{
     Boolean, Capabilities, ClientDeviceListAnnounce, ClientNameRequest, CoreCapability, CoreCapabilityKind,
@@ -35,7 +36,14 @@ use ironrdp_rdpdr::pdu::efs::{
     ServerDriveSetInformationRequest, SharedAccess, VersionAndIdPdu, VersionAndIdPduKind, VERSION_MAJOR,
     VERSION_MINOR_RDP51,
 };
-use ironrdp_rdpdr::pdu::{PacketId, RdpdrPdu, SharedHeader};
+use ironrdp_rdpdr::pdu::esc::{
+    CardProtocol, CardStateFlags, ConnectCall, ConnectCommon, ConnectReturn, ContextCall, EstablishContextCall,
+    EstablishContextReturn, GetStatusChangeCall, GetStatusChangeReturn, HCardAndDispositionCall, ListReadersCall,
+    ListReadersReturn, LongReturn, ReaderState, ReaderStateCommonCall, ReturnCode, SCardIORequest, ScardCall,
+    ScardContext, ScardHandle as ScardCardHandle, ScardIoCtlCode, Scope, StatusCall, StatusReturn, TransmitCall,
+    TransmitReturn,
+};
+use ironrdp_rdpdr::pdu::{PacketId, RdpdrPdu, ScardControlRequest, SharedHeader};
 use ironrdp_svc::{CompressionCondition, SvcMessage, SvcProcessor, SvcServerProcessor};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -734,6 +742,221 @@ impl RdpdrHandle {
         tokio::spawn(async move {
             let _ = this.close(device_id, file_id).await;
         });
+    }
+}
+
+/// SCARD share modes (`dwShareMode`) for [`RdpdrHandle::scard_connect`].
+pub const SCARD_SHARE_EXCLUSIVE: u32 = 1;
+pub const SCARD_SHARE_SHARED: u32 = 2;
+pub const SCARD_SHARE_DIRECT: u32 = 3;
+/// SCARD dispositions (`dwDisposition`) for [`RdpdrHandle::scard_disconnect`].
+pub const SCARD_LEAVE_CARD: u32 = 0;
+pub const SCARD_RESET_CARD: u32 = 1;
+pub const SCARD_UNPOWER_CARD: u32 = 2;
+pub const SCARD_EJECT_CARD: u32 = 3;
+
+/// Smart-card redirection (MS-RDPESC over the RDPDR `Smartcard` device). These
+/// drive the client's reader/card by issuing `SCARD_IOCTL_*` device-control
+/// IOCTLs (RPCE-marshaled `ScardCall`s) and decoding the `*Return`s the client
+/// sends back. `device_id` is the announced Smartcard device. All use the W
+/// (Unicode) IOCTL variants. The PC/SC `ReturnCode` inside each return (distinct
+/// from the transport `NtStatus`) is surfaced as an error unless `Success`.
+impl RdpdrHandle {
+    /// `SCardEstablishContext(SCARD_SCOPE_SYSTEM)` — a resource-manager context.
+    pub async fn scard_establish_context(&self, device_id: u32) -> Result<ScardContext> {
+        let call = ScardCall::EstablishContextCall(EstablishContextCall { scope: Scope::System });
+        let buf = self.scard_call(device_id, ScardIoCtlCode::EstablishContext, call, 256).await?;
+        let ret = EstablishContextReturn::decode(&mut ReadCursor::new(&buf)).map_err(|e| anyhow!("{e}"))?;
+        scard_ok(ret.return_code, "establish_context")?;
+        Ok(ret.context)
+    }
+
+    /// `SCardReleaseContext`.
+    pub async fn scard_release_context(&self, device_id: u32, context: ScardContext) -> Result<()> {
+        let call = ScardCall::ContextCall(ContextCall { context });
+        let buf = self.scard_call(device_id, ScardIoCtlCode::ReleaseContext, call, 256).await?;
+        let ret = LongReturn::decode(&mut ReadCursor::new(&buf)).map_err(|e| anyhow!("{e}"))?;
+        scard_ok(ret.return_code, "release_context")
+    }
+
+    /// `SCardListReaders(mszGroups = NULL)` — every reader the client redirected.
+    pub async fn scard_list_readers(&self, device_id: u32, context: ScardContext) -> Result<Vec<String>> {
+        let call = ScardCall::ListReadersCall(ListReadersCall {
+            context,
+            groups_ptr_length: 0,
+            groups_length: 0,
+            groups_ptr: 0,
+            groups: Vec::new(),
+            readers_is_null: false,
+            readers_size: 0xFFFF_FFFF, // SCARD_AUTOALLOCATE
+        });
+        let buf = self.scard_call(device_id, ScardIoCtlCode::ListReadersW, call, 4096).await?;
+        let ret = ListReadersReturn::decode(&mut ReadCursor::new(&buf)).map_err(|e| anyhow!("{e}"))?;
+        scard_ok(ret.return_code, "list_readers")?;
+        Ok(ret.readers)
+    }
+
+    /// `SCardGetStatusChange` over `readers` — used to read presence + ATR. Each
+    /// returned [`ReaderStateCommonCall`] carries the reader's current state flags
+    /// (e.g. `SCARD_STATE_PRESENT`) and, when a card is present, its ATR.
+    pub async fn scard_get_status_change(
+        &self,
+        device_id: u32,
+        context: ScardContext,
+        readers: &[String],
+        timeout_ms: u32,
+    ) -> Result<Vec<ReaderStateCommonCall>> {
+        let states: Vec<ReaderState> = readers
+            .iter()
+            .map(|r| ReaderState {
+                reader: r.clone(),
+                common: ReaderStateCommonCall {
+                    current_state: CardStateFlags::SCARD_STATE_UNAWARE,
+                    event_state: CardStateFlags::empty(),
+                    atr_length: 0,
+                    atr: [0u8; 36],
+                },
+            })
+            .collect();
+        let states_len = u32::try_from(states.len()).unwrap_or(u32::MAX);
+        let call = ScardCall::GetStatusChangeCall(GetStatusChangeCall {
+            context,
+            timeout: timeout_ms,
+            states_ptr_length: states_len,
+            states_ptr: 0,
+            states_length: states_len,
+            states,
+        });
+        let buf = self.scard_call(device_id, ScardIoCtlCode::GetStatusChangeW, call, 4096).await?;
+        let ret = GetStatusChangeReturn::decode(&mut ReadCursor::new(&buf)).map_err(|e| anyhow!("{e}"))?;
+        scard_ok(ret.return_code, "get_status_change")?;
+        Ok(ret.reader_states)
+    }
+
+    /// `SCardConnect` — returns the card handle and the negotiated protocol.
+    pub async fn scard_connect(
+        &self,
+        device_id: u32,
+        context: ScardContext,
+        reader: &str,
+        share_mode: u32,
+        preferred_protocols: CardProtocol,
+    ) -> Result<(ScardCardHandle, CardProtocol)> {
+        let call = ScardCall::ConnectCall(ConnectCall {
+            reader: reader.to_owned(),
+            common: ConnectCommon {
+                context,
+                share_mode,
+                preferred_protocols,
+            },
+        });
+        let buf = self.scard_call(device_id, ScardIoCtlCode::ConnectW, call, 2048).await?;
+        let ret = ConnectReturn::decode(&mut ReadCursor::new(&buf)).map_err(|e| anyhow!("{e}"))?;
+        scard_ok(ret.return_code, "connect")?;
+        Ok((ret.handle, ret.active_protocol))
+    }
+
+    /// `SCardStatus` — reader name(s), card state, active protocol, and ATR.
+    pub async fn scard_status(&self, device_id: u32, handle: ScardCardHandle) -> Result<StatusReturn> {
+        let call = ScardCall::StatusCall(StatusCall {
+            handle,
+            reader_names_is_null: false,
+            reader_length: 0xFFFF_FFFF, // SCARD_AUTOALLOCATE
+            atr_length: 32,
+        });
+        let buf = self.scard_call(device_id, ScardIoCtlCode::StatusW, call, 4096).await?;
+        let ret = StatusReturn::decode(&mut ReadCursor::new(&buf), CharacterSet::Unicode).map_err(|e| anyhow!("{e}"))?;
+        scard_ok(ret.return_code, "status")?;
+        Ok(ret)
+    }
+
+    /// `SCardTransmit` — send one command APDU and return the card's response.
+    pub async fn scard_transmit(
+        &self,
+        device_id: u32,
+        handle: ScardCardHandle,
+        send_protocol: CardProtocol,
+        apdu: &[u8],
+    ) -> Result<Vec<u8>> {
+        let send_length = u32::try_from(apdu.len()).context("APDU too large")?;
+        let call = ScardCall::TransmitCall(TransmitCall {
+            handle,
+            send_pci: SCardIORequest {
+                protocol: send_protocol,
+                extra_bytes_length: 0,
+                extra_bytes: Vec::new(),
+            },
+            send_length,
+            send_buffer: apdu.to_vec(),
+            recv_pci: None,
+            recv_buffer_is_null: false,
+            recv_length: 0x1_0000, // 64 KiB — covers extended-length responses
+        });
+        let buf = self
+            .scard_call(device_id, ScardIoCtlCode::Transmit, call, 0x1_0000 + 1024)
+            .await?;
+        let ret = TransmitReturn::decode(&mut ReadCursor::new(&buf)).map_err(|e| anyhow!("{e}"))?;
+        scard_ok(ret.return_code, "transmit")?;
+        Ok(ret.recv_buffer)
+    }
+
+    /// `SCardDisconnect` with one of the `SCARD_*_CARD` dispositions.
+    pub async fn scard_disconnect(&self, device_id: u32, handle: ScardCardHandle, disposition: u32) -> Result<()> {
+        let call = ScardCall::HCardAndDispositionCall(HCardAndDispositionCall { handle, disposition });
+        let buf = self.scard_call(device_id, ScardIoCtlCode::Disconnect, call, 256).await?;
+        let ret = LongReturn::decode(&mut ReadCursor::new(&buf)).map_err(|e| anyhow!("{e}"))?;
+        scard_ok(ret.return_code, "disconnect")
+    }
+
+    fn send_scard(&self, req: ScardControlRequest) -> Result<()> {
+        let msg = SvcMessage::from(req);
+        self.sender
+            .send(ServerEvent::Rdpdr(RdpdrServerMessage::SendMessages(vec![msg])))
+            .map_err(|_| anyhow!("RDPDR event channel closed"))
+    }
+
+    /// Ship a DR_CONTROL_REQ carrying `call`, await the matching completion, check
+    /// the transport `NtStatus`, skip the `OutputBufferLength`, and return the
+    /// RPCE return buffer for the caller to decode.
+    async fn scard_call(
+        &self,
+        device_id: u32,
+        io_ctl_code: ScardIoCtlCode,
+        call: ScardCall,
+        output_buffer_length: u32,
+    ) -> Result<Vec<u8>> {
+        let (completion_id, rx) = self.router.register();
+        self.send_scard(ScardControlRequest::new(
+            device_id,
+            completion_id,
+            io_ctl_code,
+            call,
+            output_buffer_length,
+        ))?;
+        let body = rx.await.context("RDPDR scard: connection closed")?;
+        let mut src = ReadCursor::new(&body);
+        let resp = DeviceIoResponse::decode(&mut src).map_err(|e| anyhow!("{e}"))?;
+        if resp.io_status != NtStatus::SUCCESS {
+            return Err(RdpdrStatus {
+                op: format!("scard {io_ctl_code:?}"),
+                status: resp.io_status,
+            }
+            .into());
+        }
+        if src.remaining().len() < size_of::<u32>() {
+            return Err(anyhow!("scard {io_ctl_code:?}: response missing OutputBufferLength"));
+        }
+        let _output_buffer_length = src.read_u32();
+        Ok(src.remaining().to_vec())
+    }
+}
+
+/// Map a PC/SC `ReturnCode` to a `Result`, surfacing any non-`Success` as an error.
+fn scard_ok(return_code: ReturnCode, op: &str) -> Result<()> {
+    if return_code == ReturnCode::Success {
+        Ok(())
+    } else {
+        Err(anyhow!("smart card {op}: SCARD error {return_code:?}"))
     }
 }
 

@@ -40,12 +40,15 @@ launchctl kickstart -k gui/$UID/com.user.macrdp    # restart
 launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
 ```
 
-## App bundle (`.app`)
+## Building the full app
 
 `dist/install.sh` above installs a **bare binary**. If you'd rather have a
 proper **signed `macrdp.app`** — a stable bundle identity at a fixed path (so
-TCC grants survive rebuilds), an `LSUIElement` background agent, and a layout a
-future menu-bar GUI could drive — use `packaging/` instead:
+TCC grants survive rebuilds), an `LSUIElement` background agent, the menu-bar
+**controller** app, and the **embedded smart-card IFD handler** + its installer
+— build it with `packaging/`. The GitHub release artifacts are only the bare CLI
+binary, so the full app is a **local build** (it assumes your signing identity
+lives on the build Mac).
 
 ```bash
 packaging/make-app.sh                                 # build + sign + install to /Applications
@@ -53,12 +56,49 @@ security add-generic-password -s macrdp -a "$(id -un)" -w 'YOUR_PASSWORD'
 packaging/install-launchagent.sh                      # load LaunchAgent (label com.clintcan.macrdp)
 ```
 
-Toggle features (H.264/AAC/HiDPI), bind address, and an `EXTRA_FLAGS` escape
-hatch live in `~/Library/Application Support/macrdp/config.env` — outside the
-bundle, so edits never disturb the signature or the TCC grants. See
-[packaging/README.md](packaging/README.md) for the full guide. The two
-auto-start paths are **mutually exclusive** (both bind `:3390` and share the
-`macrdp` Keychain entry) — pick one.
+`make-app.sh` does the whole thing: builds the release binary **and** the
+`ifd-handler` cdylib, assembles `macrdp.app`, embeds `ifd-macrdp.bundle` (the
+smart-card IFD handler) plus `install-ifd-handler.sh` under `Contents/Resources/`,
+co-signs everything, and installs to `/Applications`.
+
+**Signing.** By default it **ad-hoc signs** (local use only — fine for your own
+Mac). For a build you can distribute, sign with your Developer ID and notarize:
+
+```bash
+CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+  NOTARIZE=1 NOTARY_PROFILE=macrdp-notary \
+  packaging/make-app.sh
+```
+
+(`NOTARY_PROFILE` is a `notarytool` keychain profile you set up once with
+`xcrun notarytool store-credentials`.) Override the bundle identifier with
+`BUNDLE_PREFIX=com.acme`.
+
+**Distribution DMG.** To wrap the signed app(s) into a styled, signed +
+notarized `.dmg`:
+
+```bash
+NOTARIZE=1 NOTARY_PROFILE=macrdp-notary packaging/make-dmg.sh
+```
+
+**Smart-card redirection** needs one extra privileged step after the app is
+installed — the IFD handler has to be copied into a root-owned system directory.
+Run the embedded installer once (one GUI admin prompt):
+
+```bash
+/Applications/macrdp.app/Contents/Resources/install-ifd-handler.sh
+```
+
+See [Smart-card redirection](#smart-card-redirection) for the USB-trigger caveat
+and verification.
+
+**Config.** Toggle features (H.264/AAC/HiDPI), bind address, and an `EXTRA_FLAGS`
+escape hatch live in `~/Library/Application Support/macrdp/config.env` — outside
+the bundle, so edits never disturb the signature or the TCC grants. The two
+auto-start paths (LaunchAgent vs the controller app) are **mutually exclusive**
+(both bind `:3390` and share the `macrdp` Keychain entry) — pick one. See
+[packaging/README.md](packaging/README.md) for the full guide (icons, controller
+app, per-script options, TCC notes).
 
 ## CLI
 

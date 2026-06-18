@@ -890,10 +890,14 @@ impl RdpdrHandle {
             send_buffer: apdu.to_vec(),
             recv_pci: None,
             recv_buffer_is_null: false,
-            recv_length: 0x1_0000, // 64 KiB — covers extended-length responses
+            // The recv buffer the client should allocate for the response APDU.
+            // 64 KiB (0x10000) is rejected by real Windows with
+            // SCARD_E_INVALID_PARAMETER; 8 KiB is ample for any short-APDU
+            // response (larger payloads are read in chained <256-byte pieces).
+            recv_length: 0x2000,
         });
         let buf = self
-            .scard_call(device_id, ScardIoCtlCode::Transmit, call, 0x1_0000 + 1024)
+            .scard_call(device_id, ScardIoCtlCode::Transmit, call, 0x2000 + 1024)
             .await?;
         let ret = TransmitReturn::decode(&mut ReadCursor::new(&buf)).map_err(|e| anyhow!("{e}"))?;
         scard_ok(ret.return_code, "transmit")?;
@@ -926,13 +930,8 @@ impl RdpdrHandle {
         output_buffer_length: u32,
     ) -> Result<Vec<u8>> {
         let (completion_id, rx) = self.router.register();
-        self.send_scard(ScardControlRequest::new(
-            device_id,
-            completion_id,
-            io_ctl_code,
-            call,
-            output_buffer_length,
-        ))?;
+        let req = ScardControlRequest::new(device_id, completion_id, io_ctl_code, call, output_buffer_length);
+        self.send_scard(req)?;
         let body = rx.await.context("RDPDR scard: connection closed")?;
         let mut src = ReadCursor::new(&body);
         let resp = DeviceIoResponse::decode(&mut src).map_err(|e| anyhow!("{e}"))?;

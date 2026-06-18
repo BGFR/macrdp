@@ -201,9 +201,14 @@ AND released — #1276 landing is NOT sufficient.
     re-exported from `lib.rs`. The `CoreDeviceIoCompletion` router already routes
     these (a smart-card IOCTL completion is just another `DeviceIoResponse`).
     Made `LongReturn`/`EstablishContextReturn` fields `pub` in `ironrdp-rdpdr` so
-    the handle can read them. STILL TODO (macrdp side, not vendored): a backend
-    that discovers the `Smartcard` device id + the socket bridge to the IFD
-    handler behind `--enable-smartcard-redirection`.
+    the handle can read them. `scard_transmit`'s `cbRecvLength` is 0x2000 (8 KiB):
+    real Windows rejects 0x10000 (64 KiB) with SCARD_E_INVALID_PARAMETER. The
+    macrdp-side backend + IFD socket bridge live in `src/rdpdr/{mod,smartcard}.rs`.
+    **VERIFIED end-to-end 2026-06-18 on mstsc** with a TPM virtual smart card:
+    establish-context / list-readers / get-status-change (ATR) / connect / a full
+    APDU transceive (GIDS SELECT → FCI + `90 00`) all round-trip through the
+    redirected reader to macOS PC/SC. The NDR conformance fixes that made it work
+    are in `ironrdp-rdpdr` divergence (2).
 
 (10) Publish the client's keyboard-layout id to a shared cell (NOT
     upstreamed; added 2026-06-16; pairs with `vendor/ironrdp-acceptor`

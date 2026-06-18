@@ -26,6 +26,7 @@ use ironrdp_rdpdr::pdu::esc::{
     CardProtocol, CardStateFlags, ScardContext, ScardHandle as ScardCardHandle,
 };
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::time::{Duration, Instant};
 
 use ironrdp_server::{RdpdrHandle, SCARD_LEAVE_CARD, SCARD_SHARE_SHARED};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -98,6 +99,7 @@ async fn serve(handle: RdpdrHandle, device_id: u32, listen_port: u16) -> Result<
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted.map_err(|e| anyhow!("accept: {e}"))?;
+                debug!("smart card: IFD handler connected");
                 let handle = handle.clone();
                 sessions.spawn(async move {
                     let mut session = Session::new(handle, device_id);
@@ -113,6 +115,15 @@ async fn serve(handle: RdpdrHandle, device_id: u32, listen_port: u16) -> Result<
     }
 }
 
+/// How long a presence result is cached. macOS CryptoTokenKit/slotd polls
+/// `IFDHICCPresence` extremely fast (tens of times per second) — with a hardware
+/// reader the I/O latency throttles that, but our loopback bridge answers
+/// instantly, so without a cache every poll becomes a `GetStatusChange`
+/// round-trip to the client over RDP, flooding the shared channel and competing
+/// with EGFX video / RDPSND audio. Card insert/remove is a human-timescale event,
+/// so caching presence for this long is invisible to the user.
+const PRESENCE_TTL: Duration = Duration::from_millis(300);
+
 /// Per-handler-connection PC/SC state. The IFD handler keeps one connection and
 /// serializes its calls, so a `Session` is single-threaded in practice.
 struct Session {
@@ -121,6 +132,8 @@ struct Session {
     context: Option<ScardContext>,
     reader: Option<String>,
     card: Option<(ScardCardHandle, CardProtocol)>,
+    /// Last presence result + when it was observed (see [`PRESENCE_TTL`]).
+    presence_cache: Option<(Instant, bool)>,
 }
 
 impl Session {
@@ -131,6 +144,7 @@ impl Session {
             context: None,
             reader: None,
             card: None,
+            presence_cache: None,
         }
     }
 
@@ -144,7 +158,13 @@ impl Session {
             };
             match cmd {
                 CMD_PRESENCE => {
-                    let present = self.presence().await.unwrap_or(false);
+                    let present = match self.presence().await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            debug!(error = %e, "smart card: presence failed (reporting no card)");
+                            false
+                        }
+                    };
                     stream.write_u8(u8::from(present)).await?;
                 }
                 CMD_POWER_ON => match self.power_on().await {
@@ -194,14 +214,19 @@ impl Session {
     /// Lazily establish a PC/SC context and pick the first redirected reader.
     async fn ensure_session(&mut self) -> Result<(ScardContext, String)> {
         if self.context.is_none() {
-            self.context = Some(self.handle.scard_establish_context(self.device_id).await?);
+            debug!("smart card: establishing context");
+            let ctx = self.handle.scard_establish_context(self.device_id).await?;
+            debug!(context = ctx.value, "smart card: established context");
+            self.context = Some(ctx);
         }
         let context = self.context.expect("context just set");
         if self.reader.is_none() {
+            debug!("smart card: listing readers");
             let readers = self
                 .handle
                 .scard_list_readers(self.device_id, context)
                 .await?;
+            debug!(count = readers.len(), readers = ?readers, "smart card: list_readers result");
             let reader = readers
                 .into_iter()
                 .next()
@@ -213,20 +238,36 @@ impl Session {
     }
 
     async fn presence(&mut self) -> Result<bool> {
+        // Serve rapid repeat polls from cache to avoid flooding RDP (see PRESENCE_TTL).
+        if let Some((observed, present)) = self.presence_cache {
+            if observed.elapsed() < PRESENCE_TTL {
+                return Ok(present);
+            }
+        }
         let (context, reader) = self.ensure_session().await?;
         let states = self
             .handle
             .scard_get_status_change(self.device_id, context, std::slice::from_ref(&reader), 0)
             .await?;
-        Ok(states
+        for s in &states {
+            debug!(
+                current_state = ?s.current_state,
+                event_state = ?s.event_state,
+                atr_length = s.atr_length,
+                "smart card: get_status_change state"
+            );
+        }
+        let present = states
             .iter()
-            .any(|s| s.event_state.contains(CardStateFlags::SCARD_STATE_PRESENT)))
+            .any(|s| s.event_state.contains(CardStateFlags::SCARD_STATE_PRESENT));
+        self.presence_cache = Some((Instant::now(), present));
+        Ok(present)
     }
 
     async fn power_on(&mut self) -> Result<Vec<u8>> {
         let (context, reader) = self.ensure_session().await?;
         if self.card.is_none() {
-            let (card, protocol) = self
+            let (mut card, protocol) = self
                 .handle
                 .scard_connect(
                     self.device_id,
@@ -236,14 +277,35 @@ impl Session {
                     CardProtocol::SCARD_PROTOCOL_T0 | CardProtocol::SCARD_PROTOCOL_T1,
                 )
                 .await?;
+            // Connect_Return carries the handle with an EMPTY embedded context
+            // (Windows omits it — it already knows which context we connected on).
+            // But a REDIR_SCARDHANDLE in a *request* (Transmit/Status/Disconnect)
+            // must carry the real context, or the client-side redirector faults on
+            // the missing context and tears down the whole channel. Fill it in.
+            card.context = context;
+            debug!(protocol = ?protocol, "smart card: connected to card");
             self.card = Some((card, protocol));
         }
-        let (card, _) = self.card.clone().expect("card just connected");
-        let status = self.handle.scard_status(self.device_id, card).await?;
-        let atr_len = usize::try_from(status.atr_length)
-            .unwrap_or(0)
-            .min(status.atr.len());
-        Ok(status.atr[..atr_len].to_vec())
+        // SCardStatus's parameters are finicky over MS-RDPESC — real Windows
+        // rejects some combinations with SCARD_E_INVALID_PARAMETER — and we only
+        // need the ATR. GetStatusChange reliably carries the ATR for a present
+        // card, so read it from there.
+        let states = self
+            .handle
+            .scard_get_status_change(self.device_id, context, std::slice::from_ref(&reader), 0)
+            .await?;
+        let atr = states
+            .iter()
+            .find(|s| {
+                s.event_state.contains(CardStateFlags::SCARD_STATE_PRESENT) && s.atr_length > 0
+            })
+            .map(|s| {
+                let n = usize::try_from(s.atr_length).unwrap_or(0).min(s.atr.len());
+                s.atr[..n].to_vec()
+            })
+            .ok_or_else(|| anyhow!("card present but no ATR reported"))?;
+        debug!(atr = ?atr, "smart card: ATR");
+        Ok(atr)
     }
 
     async fn transmit(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {

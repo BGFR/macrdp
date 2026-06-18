@@ -418,6 +418,16 @@ struct Args {
     #[arg(long)]
     enable_drive_redirection: bool,
 
+    /// Enable RDPDR smart-card redirection (MS-RDPESC): the connecting client
+    /// redirects its smart-card reader and macOS apps can use the card through
+    /// it. Requires macrdp's PC/SC IFD handler bundle to be installed
+    /// (`ifd-macrdp.bundle` in /usr/local/libexec/SmartCardServices/drivers) and
+    /// a USB device present to trigger its load. Off by default. The client must
+    /// opt in too (mstsc: Local Resources → More → Smart cards; FreeRDP:
+    /// /smartcard). macOS-only.
+    #[arg(long)]
+    enable_smartcard_redirection: bool,
+
     /// Don't adopt the client's requested desktop resolution. By default —
     /// when mirroring the primary display without --width/--height/--hidpi —
     /// macrdp reads the resolution the client asked for while connecting
@@ -876,6 +886,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     }
     if on("ENABLE_DRIVE_REDIRECTION", false) {
         argv.push("--enable-drive-redirection".into());
+    }
+    if on("ENABLE_SMARTCARD_REDIRECTION", false) {
+        argv.push("--enable-smartcard-redirection".into());
     }
     if on("VIRTUAL_DISPLAY", false) {
         argv.push("--virtual-display".into());
@@ -1376,11 +1389,16 @@ async fn async_main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let gfx_factory: Option<Box<dyn ironrdp_server::GfxServerFactory>> = None;
 
-    // RDPDR drive redirection is opt-in (--enable-drive-redirection): the
-    // client redirects its local drive and the Mac can browse/read it.
+    // RDPDR is opt-in. Drive redirection (--enable-drive-redirection) lets the
+    // Mac browse/read the client's redirected drive; smart-card redirection
+    // (--enable-smartcard-redirection) lets macOS apps use the client's reader.
+    // Both ride the one RDPDR channel, so attach the factory if either is on.
     let rdpdr_factory: Option<Box<dyn ironrdp_server::RdpdrServerFactory>> =
-        if args.enable_drive_redirection {
-            Some(Box::new(rdpdr::MacRdpdr::new()))
+        if args.enable_drive_redirection || args.enable_smartcard_redirection {
+            Some(Box::new(rdpdr::MacRdpdr::new(
+                args.enable_drive_redirection,
+                args.enable_smartcard_redirection,
+            )))
         } else {
             None
         };

@@ -13,6 +13,8 @@
 //! Opt-in via `--enable-drive-redirection`. Read-write.
 
 #[cfg(target_os = "macos")]
+mod smartcard;
+#[cfg(target_os = "macos")]
 mod surface;
 
 /// Unmount any RDPDR NFS volumes still mounted at process exit. macrdp's signal
@@ -39,12 +41,20 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 /// Factory for the RDPDR static channel (mirrors `MacCliprdr` / `MacRdpsnd`).
+/// The one channel carries both drive redirection and smart-card redirection;
+/// the flags select which the backend acts on.
 #[derive(Debug, Default)]
-pub struct MacRdpdr;
+pub struct MacRdpdr {
+    enable_drive: bool,
+    enable_smartcard: bool,
+}
 
 impl MacRdpdr {
-    pub fn new() -> Self {
-        Self
+    pub fn new(enable_drive: bool, enable_smartcard: bool) -> Self {
+        Self {
+            enable_drive,
+            enable_smartcard,
+        }
     }
 }
 
@@ -57,10 +67,18 @@ impl ServerEventSender for MacRdpdr {
 
 impl RdpdrBackendFactory for MacRdpdr {
     fn build_backend(&self) -> Box<dyn RdpdrServerHandler> {
+        #[cfg(not(target_os = "macos"))]
+        let _ = (self.enable_drive, self.enable_smartcard);
         Box::new(MacRdpdrHandler {
             handle: None,
             #[cfg(target_os = "macos")]
+            enable_drive: self.enable_drive,
+            #[cfg(target_os = "macos")]
+            enable_smartcard: self.enable_smartcard,
+            #[cfg(target_os = "macos")]
             surfaces: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            smartcard: None,
         })
     }
 
@@ -77,10 +95,17 @@ impl RdpdrServerFactory for MacRdpdr {}
 #[derive(Debug)]
 struct MacRdpdrHandler {
     handle: Option<RdpdrHandle>,
+    #[cfg(target_os = "macos")]
+    enable_drive: bool,
+    #[cfg(target_os = "macos")]
+    enable_smartcard: bool,
     /// One live NFS mount per redirected filesystem device, keyed by device id
     /// so a re-announce doesn't double-mount an already-mounted drive.
     #[cfg(target_os = "macos")]
     surfaces: HashMap<u32, surface::Surface>,
+    /// The smart-card IFD bridge, started once for the first redirected reader.
+    #[cfg(target_os = "macos")]
+    smartcard: Option<smartcard::SmartcardBridge>,
 }
 
 impl RdpdrServerHandler for MacRdpdrHandler {
@@ -98,13 +123,17 @@ impl RdpdrServerHandler for MacRdpdrHandler {
             );
         }
 
-        // Mount every redirected filesystem in Finder, one volume each. The
-        // client may re-announce the same list several times during init (and
-        // may add drives later), so mount only device ids we aren't already
-        // surfacing.
         #[cfg(target_os = "macos")]
         {
-            if let Some(handle) = self.handle.clone() {
+            let Some(handle) = self.handle.clone() else {
+                return;
+            };
+
+            // Drive redirection: mount every redirected filesystem in Finder, one
+            // volume each. The client may re-announce the same list several times
+            // during init (and may add drives later), so mount only device ids we
+            // aren't already surfacing.
+            if self.enable_drive {
                 for dev in devices
                     .iter()
                     .filter(|d| d.device_type == DeviceType::Filesystem)
@@ -115,6 +144,19 @@ impl RdpdrServerHandler for MacRdpdrHandler {
                     info!(device_id = dev.device_id, name = %dev.name, "drive redirection: mounting client drive as NFS volume");
                     let surface = surface::Surface::start(handle.clone(), dev.device_id, &dev.name);
                     self.surfaces.insert(dev.device_id, surface);
+                }
+            }
+
+            // Smart-card redirection: the first redirected reader gets the IFD
+            // bridge (one virtual macOS reader on the fixed loopback port, so a
+            // single bridge for the session — additional readers map onto it).
+            if self.enable_smartcard && self.smartcard.is_none() {
+                if let Some(dev) = devices
+                    .iter()
+                    .find(|d| d.device_type == DeviceType::Smartcard)
+                {
+                    info!(device_id = dev.device_id, name = %dev.name, "smart card: starting IFD bridge for redirected reader");
+                    self.smartcard = Some(smartcard::SmartcardBridge::start(handle, dev.device_id));
                 }
             }
         }

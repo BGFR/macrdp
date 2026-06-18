@@ -15,10 +15,13 @@
 //! `127.0.0.1:MACRDP_SCARD_PORT`:
 //!   POWER_ON  (1)            → [status:u8]; if 0: [atr_len:u8][atr…]  (1 = no card)
 //!   POWER_OFF (2)            → [status:u8]
-//!   TRANSMIT  (3)[len:u16][apdu…] → [status:u8]; if 0: [len:u16][resp…]
+//!   TRANSMIT  (3)[send_len:u32][apdu…][recv_len:u32] → [status:u8]; if 0: [resp_len:u32][resp…]
 //!   PRESENCE  (4)            → [present:u8]   (1 = card present)
-//! (u16 lengths are big-endian.) When macrdp isn't listening (no client / no
-//! redirected reader) connects fail and we report "no card".
+//! (multi-byte lengths are big-endian.) `recv_len` is the caller's recv-buffer
+//! size (`*RxLength`), forwarded so the server requests exactly that much from
+//! the client's card instead of a fixed cap — needed for extended-length APDU
+//! responses. When macrdp isn't listening (no client / no redirected reader)
+//! connects fail and we report "no card".
 
 #![allow(non_snake_case)]
 
@@ -139,10 +142,10 @@ fn read_u8(s: &mut TcpStream) -> std::io::Result<u8> {
     Ok(b[0])
 }
 
-fn read_u16(s: &mut TcpStream) -> std::io::Result<u16> {
-    let mut b = [0u8; 2];
+fn read_u32(s: &mut TcpStream) -> std::io::Result<u32> {
+    let mut b = [0u8; 4];
     s.read_exact(&mut b)?;
-    Ok(u16::from_be_bytes(b))
+    Ok(u32::from_be_bytes(b))
 }
 
 fn read_vec(s: &mut TcpStream, len: usize) -> std::io::Result<Vec<u8>> {
@@ -325,7 +328,10 @@ pub extern "C" fn IFDHTransmitToICC(
     if RxLength.is_null() {
         return IFD_COMMUNICATION_ERROR;
     }
-    let cap = unsafe { *RxLength } as usize;
+    // Caller's recv-buffer capacity; forwarded so the server requests exactly
+    // this much from the card (extended responses need more than a fixed cap).
+    let recv_cap: u32 = unsafe { *RxLength };
+    let cap = recv_cap as usize;
     let apdu: Vec<u8> = if TxLength == 0 || TxBuffer.is_null() {
         Vec::new()
     } else {
@@ -334,16 +340,17 @@ pub extern "C" fn IFDHTransmitToICC(
 
     let mut s = state().lock().unwrap();
     let result = with_conn(&mut s, |c| {
-        let mut req = Vec::with_capacity(3 + apdu.len());
+        let mut req = Vec::with_capacity(9 + apdu.len());
         req.push(CMD_TRANSMIT);
-        req.extend_from_slice(&(apdu.len() as u16).to_be_bytes());
+        req.extend_from_slice(&(apdu.len() as u32).to_be_bytes()); // send_len
         req.extend_from_slice(&apdu);
+        req.extend_from_slice(&recv_cap.to_be_bytes()); // recv_len
         c.write_all(&req)?;
         let status = read_u8(c)?;
         if status != 0 {
             return Ok(None);
         }
-        let len = read_u16(c)? as usize;
+        let len = read_u32(c)? as usize;
         Ok(Some(read_vec(c, len)?))
     });
 

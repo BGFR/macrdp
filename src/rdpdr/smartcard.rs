@@ -8,11 +8,11 @@
 //! MS-RDPESC call to the client's reader via [`RdpdrHandle`]'s `scard_*` methods
 //! and hands the result back.
 //!
-//! Wire protocol (handler → bridge request / bridge → handler reply), `u16`
+//! Wire protocol (handler → bridge request / bridge → handler reply), multi-byte
 //! lengths big-endian — must stay in lockstep with `ifd-handler/src/lib.rs`:
 //!   POWER_ON  (1)                → `[status:u8]`; if 0: `[atr_len:u8][atr…]`  (1 = no card)
 //!   POWER_OFF (2)                → `[status:u8]`
-//!   TRANSMIT  (3)[len:u16][apdu…] → `[status:u8]`; if 0: `[len:u16][resp…]`
+//!   TRANSMIT  (3)[send_len:u32][apdu…][recv_len:u32] → `[status:u8]`; if 0: `[resp_len:u32][resp…]`
 //!   PRESENCE  (4)                → `[present:u8]`  (1 = card present)
 //!
 //! One [`SmartcardBridge`] per connection (the device id comes from the announced
@@ -180,18 +180,16 @@ impl Session {
                     }
                 },
                 CMD_TRANSMIT => {
-                    let len = stream.read_u16().await? as usize;
-                    let mut apdu = vec![0u8; len];
+                    let send_len = stream.read_u32().await? as usize;
+                    let mut apdu = vec![0u8; send_len];
                     stream.read_exact(&mut apdu).await?;
-                    match self.transmit(&apdu).await {
-                        Ok(resp) if resp.len() <= usize::from(u16::MAX) => {
+                    let recv_len = stream.read_u32().await?; // caller's recv-buffer size
+                    match self.transmit(&apdu, recv_len).await {
+                        Ok(resp) => {
+                            let n = u32::try_from(resp.len()).unwrap_or(u32::MAX);
                             stream.write_u8(0).await?;
-                            stream.write_u16(resp.len() as u16).await?;
-                            stream.write_all(&resp).await?;
-                        }
-                        Ok(_) => {
-                            warn!("smart card: transmit response exceeds 64 KiB; dropping");
-                            stream.write_u8(1).await?;
+                            stream.write_u32(n).await?;
+                            stream.write_all(&resp[..n as usize]).await?;
                         }
                         Err(e) => {
                             debug!(error = %e, "smart card: transmit failed");
@@ -308,13 +306,13 @@ impl Session {
         Ok(atr)
     }
 
-    async fn transmit(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
+    async fn transmit(&mut self, apdu: &[u8], recv_len: u32) -> Result<Vec<u8>> {
         let (card, protocol) = self
             .card
             .clone()
             .ok_or_else(|| anyhow!("no card connected"))?;
         self.handle
-            .scard_transmit(self.device_id, card, protocol, apdu)
+            .scard_transmit(self.device_id, card, protocol, apdu, recv_len)
             .await
     }
 

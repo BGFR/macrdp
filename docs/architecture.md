@@ -41,7 +41,19 @@ src/rdpdr/        RDPDR drive redirection — the macrdp side of the server-side
                   setattr map to RDPDR DeviceWrite / DeviceCreate /
                   SetInformation. Each redirected filesystem device gets its own
                   mount (MacRdpdrHandler keeps a HashMap<device_id, Surface>).
-                  Surface::Drop unmounts on disconnect.
+                  Surface::Drop unmounts on disconnect. smartcard.rs: the
+                  smart-card bridge (--enable-smartcard-redirection). When a
+                  Smartcard device is announced, binds 127.0.0.1:40242 and serves
+                  macrdp's own PC/SC IFD handler (ifd-handler/ cdylib, loaded by
+                  com.apple.ifdreader), mapping its POWER_ON/OFF/TRANSMIT/PRESENCE
+                  protocol to RdpdrHandle::scard_* (MS-RDPESC) calls on the
+                  client's reader. Presence cached briefly; dropped on disconnect.
+ifd-handler/      Standalone cdylib (NOT in the macrdp cargo package) — macrdp's
+                  PC/SC IFD handler, the IFDHandler v3.0 C ABI macOS
+                  SmartCardServices loads. Bridges every card op to macrdp over
+                  loopback TCP (src/rdpdr/smartcard.rs). From scratch (MIT/Apache)
+                  so smart-card redirection ships no GPL vpcd. Built + embedded in
+                  macrdp.app by packaging/; installed by install-ifd-handler.sh.
 src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB
                   + Mac↔Windows file copy via FileGroupDescriptorW
                   and FileContentsRequest streaming)

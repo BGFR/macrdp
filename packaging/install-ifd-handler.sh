@@ -33,9 +33,15 @@ run_admin() {
     /usr/bin/osascript -e "do shell script \"$1\" with administrator privileges" >/dev/null
 }
 
-# Restart the PC/SC reader daemon so it rescans drivers. (It still only *loads*
-# our driver on the next matching USB hotplug — replug the trigger device.)
-RESTART_SLOTD="killall -SIGKILL -m '.*com.apple.ifdreader' 2>/dev/null; true"
+# Restart the PC/SC reader daemon so it drops any cached driver dylib (slotd
+# keeps loaded IFD drivers in memory for its whole lifetime, so just replacing
+# the file on disk isn't enough — it must be restarted). launchd respawns it.
+# MUST be SIGKILL (-9): slotd ignores SIGTERM, so a plain `pkill`/`killall`
+# leaves it running with the stale dylib. `-f` matches the full path, since the
+# process `comm` is truncated past 15 chars so `killall com.apple.ifdreader`
+# never matches. Best-effort (`|| true`) so it doesn't abort the install chain,
+# but it does NOT mask a failed copy — that's a separate `&&`-guarded step.
+RESTART_SLOTD="{ pkill -9 -f com.apple.ifdreader 2>/dev/null || true; }"
 
 if [ "${1:-}" = "--uninstall" ]; then
     echo "==> Removing $DEST (admin required)"
@@ -92,9 +98,26 @@ ioreg -r -c IOUSBHostDevice 2>/dev/null \
     | grep -E '"(USB Vendor Name|idVendor|USB Product Name|idProduct)"' \
     | sed 's/^[[:space:]]*/      /' | head -40 || true
 
-# 4. Install (privileged): copy in, fix ownership, restart slotd.
+# 4. Stage the bundle into /tmp first. The repo / app may live under ~/Documents
+#    (or another TCC-protected location), and the root `cp` spawned by osascript
+#    can't read those — it would silently create an empty bundle. /tmp is always
+#    readable by root with no TCC gate.
+STAGE_DIR="$(mktemp -d)"
+STAGED="$STAGE_DIR/ifd-macrdp.bundle"
+cp -R "$SRC" "$STAGED"
+
+# 5. Install (privileged): copy in, fix ownership, restart slotd. The copy/chown
+#    are &&-guarded (a failure aborts and surfaces via osascript's nonzero exit —
+#    NOT masked); only the slotd restart is best-effort.
 echo "==> Installing to $DEST (admin required)"
-run_admin "mkdir -p '$DRIVERS' && rm -rf '$DEST' && cp -R '$SRC' '$DEST' && chown -R root:wheel '$DEST' && $RESTART_SLOTD"
+run_admin "mkdir -p '$DRIVERS' && rm -rf '$DEST' && cp -R '$STAGED' '$DEST' && chown -R root:wheel '$DEST' && $RESTART_SLOTD"
+rm -rf "$STAGE_DIR"
+
+# Verify the copy actually landed (osascript can mask some failures).
+[ -f "$DEST/Contents/MacOS/libifd_macrdp.dylib" ] || {
+    echo "ERROR: install did not land $DEST/Contents/MacOS/libifd_macrdp.dylib" >&2
+    exit 1
+}
 
 cat <<EOF
 

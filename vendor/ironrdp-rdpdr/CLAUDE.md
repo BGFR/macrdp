@@ -56,6 +56,37 @@ reused as-is; we only add the missing server-direction halves.
     decode halves + the server processor together). De-vendor once a published
     ironrdp-rdpdr carries a server-side path.
 
+(2) Server-direction MS-RDPESC (smart-card) halves in `pdu/esc/` (NOT
+    upstreamed) — the smart-card analogue of (1), for the
+    `--enable-smartcard-redirection` path. Upstream `pdu::esc` is client-oriented
+    (decode `*Call`, encode `*Return`); macrdp is the server, so it needs the
+    mirror halves. Added, all in `pdu/esc/`:
+    - `rpce::HeaderlessEncode` for the `*Call` set the server sends:
+      `EstablishContextCall`, `ContextCall` (release/cancel/is-valid),
+      `ListReadersCall`, `GetStatusChangeCall`, `ConnectCall`,
+      `HCardAndDispositionCall` (begin/end-transaction, disconnect), `StatusCall`,
+      `TransmitCall`.
+    - `rpce::HeaderlessDecode` + a `decode()` for the matching `*Return` set:
+      `LongReturn`, `EstablishContextReturn`, `ListReadersReturn`,
+      `GetStatusChangeReturn`, `ConnectReturn`, `StatusReturn`, `TransmitReturn`.
+    - Supporting NDR encoders the encode side needs: `ndr::Encode` for
+      `ConnectCommon` and `ReaderState`, plus `ndr::write_string_to_cursor` /
+      `ndr::string_size` (the conformant+varying string *writer* mirroring
+      `read_string_from_cursor` — MaximumCount/Offset/ActualCount + NUL-terminated
+      string + 4-byte tail pad; the pad is position-based on write but, since
+      every MS-RDPESC string field starts 4-byte aligned, equals
+      `region.next_multiple_of(4)` for sizing).
+    - `TryFrom<u32>` for `ReturnCode` and `CardState`, and `From<Scope> for u32`
+      (the reverse conversions upstream only had one direction of).
+    Byte-exactness is proven offline by `server_direction_tests` (18 round-trips:
+    `*Call` = our encode -> upstream decode; `*Return` = upstream encode -> our
+    decode). The server uses the **W (Unicode)** IOCTL variants, so reader/string
+    fields marshal as UTF-16. STILL TODO for the live path (not in this crate
+    yet): encode `DeviceControlRequest<ScardIoCtlCode>` as an `SvcMessage`
+    (mirror `ServerDriveIoRequest` in `pdu/mod.rs`) + a `ScardCall` IOCTL-dispatch,
+    and the server-side `ScardHandle`/router in
+    `vendor/ironrdp-server/src/rdpdr.rs`.
+
 Cargo notes: the de-worked `Cargo.toml` inlines the workspace-inherited fields
 (edition 2024, rust-version, license, …) and drops the `path = "../ironrdp-*"`
 deps, resolving them through the root `[patch.crates-io]` git pins — same shape

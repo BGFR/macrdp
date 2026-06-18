@@ -94,11 +94,31 @@ reused as-is; we only add the missing server-direction halves.
     decode chain (`SharedHeader` -> `DeviceIoRequest` ->
     `DeviceControlRequest<ScardIoCtlCode>` -> `ScardCall`).
 
-    STILL TODO for the live path (NOT in this crate — belongs in
-    `vendor/ironrdp-server/src/rdpdr.rs`): the server-side `ScardHandle` (peer to
-    `RdpdrHandle`) that allocates a completion id, ships a `ScardControlRequest`,
-    and routes the matching `DeviceIoCompletion` back by completion id, decoding
-    the `*Return` for the waiting caller.
+    Live-Windows conformance fixes (2026-06-18, found verifying against mstsc +
+    a TPM virtual smart card — the offline round-trips couldn't catch these
+    because they encode/decode symmetrically; real 64-bit Windows exercises NDR
+    edges our own encoder never produced):
+    - **Variable-length context/handle.** `ScardContext`/`ScardHandle` `value`
+      changed from `u32` to `u64` + a `length: u8` (was hardcoded 4). Real 64-bit
+      Windows `SCARDCONTEXT`/`SCARDHANDLE` are pointer-sized (8 bytes); the old
+      decode rejected them with "unsupported value length". `read_cb` caps at 8.
+    - **NULL-referent handling on every `[unique]` pointer's value section.** A
+      NULL referent means NO deferred conformant array — reading a `MaximumCount`
+      unconditionally consumes the next field's bytes. Fixed in: `StatusReturn`
+      (Windows returns NULL `mszReaderNames` — ATR-only Status), `SCardIORequest`
+      (empty `pbExtraBytes` → NULL referent, no deferred), `TransmitReturn` (NULL
+      `pbRecvBuffer` when the card returns no data), and **`ScardContext`** (the
+      embedded Context of a returned handle is empty: `cbContext=0` + NULL
+      referent + no value). The `ScardContext` one was the killer: it made the
+      connect handle decode with `cbHandle=0`, so Transmit sent an empty handle.
+    Regression tests added for each (hand-built Windows-shaped bytes +
+    8-byte-handle round-trips); 27 tests total. **VERIFIED end-to-end on mstsc**:
+    full APDU transceive (GIDS SELECT → FCI + `90 00`) round-trips through the
+    redirected reader.
+
+    Server-side path (the "STILL TODO" below) is DONE — see
+    `vendor/ironrdp-server/src/rdpdr.rs` divergence (11) smart-card phase: the
+    `RdpdrHandle::scard_*` methods + completion router.
 
 Cargo notes: the de-worked `Cargo.toml` inlines the workspace-inherited fields
 (edition 2024, rust-version, license, …) and drops the `path = "../ironrdp-*"`

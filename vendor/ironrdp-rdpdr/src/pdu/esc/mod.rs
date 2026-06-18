@@ -116,29 +116,59 @@ impl ScardCall {
 /// [2.2.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/060abee1-e520-4149-9ef7-ce79eb500a59
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub struct ScardContext {
-    /// Shortcut: we always create 4-byte context values.
-    /// The spec allows this field to have variable length.
-    pub value: u32,
+    /// The opaque context value as a little-endian integer, `length` bytes wide.
+    /// Real Windows uses a pointer-sized `SCARDCONTEXT` (4 bytes on 32-bit, 8 on
+    /// 64-bit), so this must echo back whatever width the client sent — NOT a
+    /// hardcoded 4. (MS-RDPESC allows `cbContext` 0..16; [`read_cb`] caps us at
+    /// 8, which covers every real client.)
+    pub value: u64,
+    /// `cbContext` — the byte width of `value` on the wire (typically 4 or 8).
+    pub length: u8,
+}
+
+/// Maximum supported width of a `REDIR_SCARDCONTEXT`/`REDIR_SCARDHANDLE` value.
+/// The spec allows 0..16, but real clients use a pointer-sized handle (≤ 8).
+const SCARD_MAX_HANDLE_BYTES: usize = 8;
+
+/// Validate a wire `cbContext`/`cbHandle` and narrow it to `u8`.
+fn read_cb(len: u32, what: &'static str) -> DecodeResult<u8> {
+    u8::try_from(len)
+        .ok()
+        .filter(|&n| usize::from(n) <= SCARD_MAX_HANDLE_BYTES)
+        .ok_or_else(|| invalid_field_err!("decode", what, "context/handle length > 8 unsupported"))
 }
 
 impl ScardContext {
-    /// See [`ScardContext::value`]
-    const VALUE_LENGTH: u32 = 4;
-
     pub fn new(value: u32) -> Self {
-        Self { value }
+        Self {
+            value: u64::from(value),
+            length: 4,
+        }
     }
 }
 
 impl ndr::Encode for ScardContext {
     fn encode_ptr(&self, index: &mut u32, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ndr::encode_ptr(Some(Self::VALUE_LENGTH), index, dst)
+        if self.length == 0 {
+            // Empty context (e.g. the embedded Context of a returned handle):
+            // cbContext = 0 and a NULL pbContext referent, with no deferred value.
+            // A NULL referent consumes no referent id, so `index` is not advanced.
+            ensure_size!(in: dst, size: ndr::ptr_size(true));
+            dst.write_u32(0); // cbContext
+            dst.write_u32(0); // NULL pbContext referent
+            Ok(())
+        } else {
+            ndr::encode_ptr(Some(u32::from(self.length)), index, dst)
+        }
     }
 
     fn encode_value(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        if self.length == 0 {
+            return Ok(()); // NULL referent: no deferred conformant array
+        }
         ensure_size!(in: dst, size: self.size_value());
-        dst.write_u32(Self::VALUE_LENGTH);
-        dst.write_u32(self.value);
+        dst.write_u32(u32::from(self.length)); // conformant-array MaximumCount
+        dst.write_slice(&self.value.to_le_bytes()[..usize::from(self.length)]);
         Ok(())
     }
 
@@ -147,7 +177,11 @@ impl ndr::Encode for ScardContext {
     }
 
     fn size_value(&self) -> usize {
-        4 /* cbContext */ + 4 /* pbContext */
+        if self.length == 0 {
+            0
+        } else {
+            size_of::<u32>() /* cbContext */ + usize::from(self.length) /* pbContext */
+        }
     }
 }
 
@@ -157,31 +191,27 @@ impl ndr::Decode for ScardContext {
         Self: Sized,
     {
         ensure_size!(in: src, size: size_of::<u32>());
-        let length = src.read_u32();
-        if length != Self::VALUE_LENGTH {
-            error!(?length, "Unsupported value length in ScardContext");
-            return Err(invalid_field_err!(
-                "decode_ptr",
-                "unsupported value length in ScardContext"
-            ));
-        }
-
+        let length = read_cb(src.read_u32(), "ScardContext")?;
         let _ptr = ndr::decode_ptr(src, index)?;
-        Ok(Self { value: 0 })
+        Ok(Self { value: 0, length })
     }
 
     fn decode_value(&mut self, src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<()> {
         expect_no_charset(charset)?;
-        ensure_size!(in: src, size: size_of::<u32>() * 2);
-        let length = src.read_u32();
-        if length != Self::VALUE_LENGTH {
-            error!(?length, "Unsupported value length in ScardContext");
-            return Err(invalid_field_err!(
-                "decode_value",
-                "unsupported value length in ScardContext"
-            ));
+        if self.length == 0 {
+            // Empty context with a NULL referent (e.g. the embedded Context of a
+            // returned handle) has no deferred conformant array — reading a
+            // MaximumCount here would consume the *next* field's bytes.
+            return Ok(());
         }
-        self.value = src.read_u32();
+        ensure_size!(in: src, size: size_of::<u32>());
+        let length = read_cb(src.read_u32(), "ScardContext")?;
+        let n = usize::from(length);
+        ensure_size!(in: src, size: n);
+        let mut buf = [0u8; SCARD_MAX_HANDLE_BYTES];
+        buf[..n].copy_from_slice(src.read_slice(n));
+        self.value = u64::from_le_bytes(buf);
+        self.length = length;
         Ok(())
     }
 }
@@ -1039,17 +1069,21 @@ bitflags! {
 #[derive(Debug, PartialEq, Clone)]
 pub struct ScardHandle {
     pub context: ScardContext,
-    /// Shortcut: we always create 4-byte handle values.
-    /// The spec allows this field to have variable length.
-    pub value: u32,
+    /// The opaque handle value as a little-endian integer, `length` bytes wide.
+    /// Like [`ScardContext`], real Windows uses a pointer-sized `SCARDHANDLE`
+    /// (4 or 8 bytes); echo back whatever width the client sent.
+    pub value: u64,
+    /// `cbHandle` — the byte width of `value` on the wire (typically 4 or 8).
+    pub length: u8,
 }
 
 impl ScardHandle {
-    /// See [`ScardHandle::value`]
-    const VALUE_LENGTH: u32 = 4;
-
     pub fn new(context: ScardContext, value: u32) -> Self {
-        Self { context, value }
+        Self {
+            context,
+            value: u64::from(value),
+            length: 4,
+        }
     }
 }
 
@@ -1060,32 +1094,26 @@ impl ndr::Decode for ScardHandle {
     {
         let context = ScardContext::decode_ptr(src, index)?;
         ensure_size!(ctx: "ScardHandle::decode_ptr", in: src, size: size_of::<u32>());
-        let length = src.read_u32();
-        if length != Self::VALUE_LENGTH {
-            error!(?length, "Unsupported value length in ScardHandle");
-            return Err(invalid_field_err!(
-                "decode_ptr",
-                "unsupported value length in ScardHandle"
-            ));
-        }
+        let length = read_cb(src.read_u32(), "ScardHandle")?;
         let _ptr = ndr::decode_ptr(src, index)?;
-        Ok(Self { context, value: 0 })
+        Ok(Self {
+            context,
+            value: 0,
+            length,
+        })
     }
 
     fn decode_value(&mut self, src: &mut ReadCursor<'_>, charset: Option<CharacterSet>) -> DecodeResult<()> {
         expect_no_charset(charset)?;
         self.context.decode_value(src, None)?;
         ensure_size!(in: src, size: size_of::<u32>());
-        let length = src.read_u32();
-        if length != Self::VALUE_LENGTH {
-            error!(?length, "Unsupported value length in ScardHandle");
-            return Err(invalid_field_err!(
-                "decode_value",
-                "unsupported value length in ScardHandle"
-            ));
-        }
-        ensure_size!(in: src, size: size_of::<u32>());
-        self.value = src.read_u32();
+        let length = read_cb(src.read_u32(), "ScardHandle")?;
+        let n = usize::from(length);
+        ensure_size!(in: src, size: n);
+        let mut buf = [0u8; SCARD_MAX_HANDLE_BYTES];
+        buf[..n].copy_from_slice(src.read_slice(n));
+        self.value = u64::from_le_bytes(buf);
+        self.length = length;
         Ok(())
     }
 }
@@ -1093,15 +1121,15 @@ impl ndr::Decode for ScardHandle {
 impl ndr::Encode for ScardHandle {
     fn encode_ptr(&self, index: &mut u32, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         self.context.encode_ptr(index, dst)?;
-        ndr::encode_ptr(Some(Self::VALUE_LENGTH), index, dst)?;
+        ndr::encode_ptr(Some(u32::from(self.length)), index, dst)?;
         Ok(())
     }
 
     fn encode_value(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size_value());
         self.context.encode_value(dst)?;
-        dst.write_u32(Self::VALUE_LENGTH);
-        dst.write_u32(self.value);
+        dst.write_u32(u32::from(self.length)); // conformant-array MaximumCount
+        dst.write_slice(&self.value.to_le_bytes()[..usize::from(self.length)]);
         Ok(())
     }
 
@@ -1110,7 +1138,7 @@ impl ndr::Encode for ScardHandle {
     }
 
     fn size_value(&self) -> usize {
-        self.context.size_value() + 4 /* cbHandle */ + 4 /* pbHandle */
+        self.context.size_value() + size_of::<u32>() /* cbHandle */ + usize::from(self.length) /* pbHandle */
     }
 }
 
@@ -1288,7 +1316,19 @@ impl ndr::Encode for SCardIORequest {
         let extra_bytes_length = cast_length!("SCardIORequest", "extra_bytes_length", self.extra_bytes_length)?;
 
         dst.write_u32(self.protocol.bits());
-        ndr::encode_ptr(Some(extra_bytes_length), index, dst)
+        if self.extra_bytes.is_empty() {
+            // No extra PCI bytes: cbExtraBytes = 0 and a NULL pbExtraBytes
+            // referent. A non-NULL referent here would make the peer expect a
+            // deferred conformant array (MaximumCount + bytes) that isn't present,
+            // misaligning everything after it — real Windows rejects the whole
+            // Transmit_Call with STATUS_UNSUCCESSFUL. A NULL referent also
+            // consumes no referent id, so `index` is intentionally not advanced.
+            dst.write_u32(0); // cbExtraBytes
+            dst.write_u32(0); // NULL pbExtraBytes referent
+            Ok(())
+        } else {
+            ndr::encode_ptr(Some(extra_bytes_length), index, dst)
+        }
     }
 
     fn encode_value(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
@@ -2387,16 +2427,26 @@ impl rpce::HeaderlessDecode for StatusReturn {
         let charset = expect_charset(charset)?;
         ensure_size!(in: src, size: size_of::<u32>() * 2);
         let return_code = ReturnCode::try_from(src.read_u32())?;
-        let _reader_names_length = src.read_u32(); // MaximumCount
+        let _reader_names_length = src.read_u32(); // cBytes
         let mut index = 0;
-        let _ptr = ndr::decode_ptr(src, &mut index)?;
-        ensure_size!(in: src, size: size_of::<u32>() * 3 + 32 + size_of::<u32>() * 2);
+        let reader_names_ptr = ndr::decode_ptr(src, &mut index)?;
+        // Fixed part after the pointer: dwState, dwProtocol, pbAtr[32], cbAtrLen.
+        ensure_size!(in: src, size: size_of::<u32>() * 2 + 32 + size_of::<u32>());
         let state = CardState::try_from(src.read_u32())?;
         let protocol = CardProtocol::from_bits_retain(src.read_u32());
         let atr = src.read_array::<32>();
         let atr_length = src.read_u32();
-        let _reader_names_length2 = src.read_u32();
-        let reader_names = read_multistring_from_cursor(src, charset)?;
+        // The mszReaderNames conformant array (MaximumCount + chars) is present
+        // only when the referent is non-NULL. Real Windows often returns a NULL
+        // pointer here (ATR-only Status), so reading it unconditionally would
+        // overrun the buffer.
+        let reader_names = if reader_names_ptr != 0 {
+            ensure_size!(in: src, size: size_of::<u32>());
+            let _reader_names_length2 = src.read_u32(); // MaximumCount
+            read_multistring_from_cursor(src, charset)?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             return_code,
             reader_names,
@@ -2443,12 +2493,20 @@ impl rpce::HeaderlessDecode for TransmitReturn {
         };
 
         ensure_size!(in: src, size: size_of::<u32>());
-        let _recv_buffer_length = src.read_u32(); // MaximumCount
-        let _ptr = ndr::decode_ptr(src, &mut index)?;
-        ensure_size!(in: src, size: size_of::<u32>());
-        let recv_buffer_length = cast_length!("TransmitReturn", "recv_buffer_length", src.read_u32())?;
-        ensure_size!(in: src, size: recv_buffer_length);
-        let recv_buffer = src.read_slice(recv_buffer_length).to_vec();
+        let _cb_recv_length = src.read_u32(); // cbRecvLength
+        let recv_buffer_ptr = ndr::decode_ptr(src, &mut index)?;
+        // The pbRecvBuffer conformant array (MaximumCount + bytes) is present only
+        // when the referent is non-NULL. When the card returns no data (e.g. a
+        // failed transaction) real Windows sends a NULL pbRecvBuffer, so reading
+        // it unconditionally would overrun the buffer.
+        let recv_buffer = if recv_buffer_ptr != 0 {
+            ensure_size!(in: src, size: size_of::<u32>());
+            let recv_buffer_length = cast_length!("TransmitReturn", "recv_buffer_length", src.read_u32())?;
+            ensure_size!(in: src, size: recv_buffer_length);
+            src.read_slice(recv_buffer_length).to_vec()
+        } else {
+            Vec::new()
+        };
 
         Ok(Self {
             return_code,
@@ -2736,5 +2794,166 @@ mod server_direction_tests {
         let bytes = encode_vec(&pdu).unwrap();
         let decoded = TransmitReturn::decode(&mut ReadCursor::new(&bytes)).unwrap();
         assert_eq!(pdu.into_inner(), decoded);
+    }
+
+    // Regression: real 64-bit Windows returns pointer-sized (8-byte) SCARDCONTEXT
+    // / SCARDHANDLE. The old hardcoded-4 decode rejected those with
+    // "unsupported value length"; these lock in the variable-length handling.
+    fn ctx8() -> ScardContext {
+        ScardContext {
+            value: 0x1122_3344_5566_7788,
+            length: 8,
+        }
+    }
+
+    #[test]
+    fn establish_context_return_roundtrip_8byte_context() {
+        let pdu = EstablishContextReturn::new(ReturnCode::Success, ctx8());
+        let bytes = encode_vec(&pdu).unwrap();
+        let decoded = EstablishContextReturn::decode(&mut ReadCursor::new(&bytes)).unwrap();
+        assert_eq!(pdu.into_inner(), decoded);
+        assert_eq!(decoded.context, ctx8());
+    }
+
+    #[test]
+    fn connect_return_roundtrip_8byte_handle() {
+        let handle = ScardHandle {
+            context: ctx8(),
+            value: 0xAABB_CCDD_EEFF_0011,
+            length: 8,
+        };
+        let pdu = ConnectReturn::new(ReturnCode::Success, handle.clone(), CardProtocol::SCARD_PROTOCOL_T1);
+        let bytes = encode_vec(&pdu).unwrap();
+        let decoded = ConnectReturn::decode(&mut ReadCursor::new(&bytes)).unwrap();
+        assert_eq!(pdu.into_inner(), decoded);
+        assert_eq!(decoded.handle, handle);
+    }
+
+    #[test]
+    fn connect_return_decode_empty_handle_context() {
+        // Real Windows returns the handle with an EMPTY embedded context
+        // (cbContext=0, NULL pbContext referent → no deferred context value) and
+        // an 8-byte handle. The old decode read a context MaximumCount
+        // unconditionally, consuming the handle's bytes and leaving cbHandle=0.
+        use super::rpce::HeaderlessDecode;
+        let handle_bytes = [0u8, 0, 0, 0, 1, 0, 0, 0xea];
+        let mut body = Vec::new();
+        body.extend_from_slice(&u32::from(ReturnCode::Success).to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // cbContext = 0
+        body.extend_from_slice(&0u32.to_le_bytes()); // NULL pbContext referent
+        body.extend_from_slice(&8u32.to_le_bytes()); // cbHandle = 8
+        body.extend_from_slice(&0x0002_0000u32.to_le_bytes()); // pbHandle referent
+        body.extend_from_slice(&CardProtocol::SCARD_PROTOCOL_T1.bits().to_le_bytes());
+        body.extend_from_slice(&8u32.to_le_bytes()); // pbHandle MaximumCount
+        body.extend_from_slice(&handle_bytes);
+
+        let decoded = ConnectReturn::headerless_decode(&mut ReadCursor::new(&body), None).unwrap();
+        assert_eq!(decoded.return_code, ReturnCode::Success);
+        assert_eq!(decoded.active_protocol, CardProtocol::SCARD_PROTOCOL_T1);
+        assert_eq!(decoded.handle.context.length, 0);
+        assert_eq!(decoded.handle.length, 8);
+        assert_eq!(decoded.handle.value, u64::from_le_bytes(handle_bytes));
+    }
+
+    #[test]
+    fn transmit_call_roundtrip_empty_context_handle() {
+        // A handle whose embedded context is empty (length 0) — as returned by
+        // Connect — must re-encode with cbHandle intact (not clobbered to 0).
+        let handle = ScardHandle {
+            context: ScardContext { value: 0, length: 0 },
+            value: u64::from_le_bytes([0, 0, 0, 0, 1, 0, 0, 0xea]),
+            length: 8,
+        };
+        let send_buffer = vec![0x00, 0xa4, 0x04, 0x00, 0x00];
+        let call = TransmitCall {
+            handle,
+            send_pci: SCardIORequest {
+                protocol: CardProtocol::SCARD_PROTOCOL_T1,
+                extra_bytes_length: 0,
+                extra_bytes: Vec::new(),
+            },
+            send_length: send_buffer.len() as u32,
+            send_buffer,
+            recv_pci: None,
+            recv_buffer_is_null: false,
+            recv_length: 0x2000,
+        };
+        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
+        let decoded = TransmitCall::decode(&mut ReadCursor::new(&bytes)).unwrap();
+        assert_eq!(call, decoded);
+        assert_eq!(decoded.handle.length, 8);
+        assert_eq!(decoded.handle.context.length, 0);
+    }
+
+    #[test]
+    fn transmit_return_decode_null_recv_buffer() {
+        // When the card returns no data (e.g. a failed transaction) real Windows
+        // sends a NULL pbRecvBuffer (and NULL pioRecvPci) — 16 bytes, no deferred
+        // arrays. Reading the recv-buffer value unconditionally would overrun.
+        use super::rpce::HeaderlessDecode;
+        let mut body = Vec::new();
+        body.extend_from_slice(&u32::from(ReturnCode::Success).to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // pioRecvPci referent = NULL
+        body.extend_from_slice(&0u32.to_le_bytes()); // cbRecvLength = 0
+        body.extend_from_slice(&0u32.to_le_bytes()); // pbRecvBuffer referent = NULL
+
+        let decoded = TransmitReturn::headerless_decode(&mut ReadCursor::new(&body), None).unwrap();
+        assert_eq!(decoded.return_code, ReturnCode::Success);
+        assert!(decoded.recv_pci.is_none());
+        assert!(decoded.recv_buffer.is_empty());
+    }
+
+    #[test]
+    fn status_return_decode_null_reader_names() {
+        // Real Windows often returns Status_Return with a NULL mszReaderNames
+        // pointer (ATR-only). Hand-build that 56-byte headerless body (encode
+        // can't produce a NULL referent) and confirm the decode reads the ATR and
+        // yields empty reader names instead of overrunning.
+        use super::rpce::HeaderlessDecode;
+        let mut atr = [0u8; 32];
+        atr[..11].copy_from_slice(&[0x3b, 0x8d, 0x01, 0x80, 0xfb, 0xa0, 0x00, 0x00, 0x03, 0x97, 0x42]);
+        let mut body = Vec::new();
+        body.extend_from_slice(&u32::from(ReturnCode::Success).to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // cBytes = 0
+        body.extend_from_slice(&0u32.to_le_bytes()); // mszReaderNames referent = NULL
+        body.extend_from_slice(&u32::from(CardState::Present).to_le_bytes());
+        body.extend_from_slice(&CardProtocol::SCARD_PROTOCOL_T1.bits().to_le_bytes());
+        body.extend_from_slice(&atr);
+        body.extend_from_slice(&11u32.to_le_bytes()); // cbAtrLen
+
+        let decoded =
+            StatusReturn::headerless_decode(&mut ReadCursor::new(&body), Some(CharacterSet::Unicode)).unwrap();
+        assert_eq!(decoded.return_code, ReturnCode::Success);
+        assert_eq!(decoded.state, CardState::Present);
+        assert_eq!(decoded.protocol, CardProtocol::SCARD_PROTOCOL_T1);
+        assert_eq!(decoded.atr_length, 11);
+        assert_eq!(&decoded.atr[..11], &atr[..11]);
+        assert!(decoded.reader_names.is_empty());
+    }
+
+    #[test]
+    fn transmit_call_roundtrip_8byte_handle() {
+        // Exercises the *Call encode path (server direction) with an 8-byte handle.
+        let send_buffer = vec![0x00, 0xa4, 0x04, 0x00, 0x00];
+        let call = TransmitCall {
+            handle: ScardHandle {
+                context: ctx8(),
+                value: 0xAABB_CCDD_EEFF_0011,
+                length: 8,
+            },
+            send_pci: SCardIORequest {
+                protocol: CardProtocol::SCARD_PROTOCOL_T1,
+                extra_bytes_length: 0,
+                extra_bytes: Vec::new(),
+            },
+            send_length: send_buffer.len() as u32,
+            send_buffer,
+            recv_pci: None,
+            recv_buffer_is_null: false,
+            recv_length: 256,
+        };
+        let bytes = encode_vec(&rpce::Pdu(call.clone())).unwrap();
+        let decoded = TransmitCall::decode(&mut ReadCursor::new(&bytes)).unwrap();
+        assert_eq!(call, decoded);
     }
 }

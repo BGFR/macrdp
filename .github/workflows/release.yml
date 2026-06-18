@@ -150,10 +150,55 @@ jobs:
           echo "checksum=dist/${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
+      # The .app bundle: the bare binary plus the embedded smart-card IFD handler
+      # (ifd-macrdp.bundle) and its installer — i.e. the only release artifact that
+      # carries everything --enable-smartcard-redirection needs. Ad-hoc signed (no
+      # Developer ID / notarization in CI), so end users get a Gatekeeper "can't
+      # verify developer" prompt and open it via right-click -> Open; a notarized
+      # build needs a local `make-app.sh` with a Developer ID. See README.
+      - name: Build smart-card IFD handler (cdylib, for the .app)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --manifest-path ifd-handler/Cargo.toml
+
+      - name: Assemble macrdp.app (ad-hoc signed)
+        # SKIP_BUILD reuses the binary already built + signed above (so the app
+        # ships the identical Mach-O) and the IFD dylib from the step above.
+        # make-app.sh embeds the IFD bundle + installer and ad-hoc signs
+        # (CODESIGN_IDENTITY unset). APP_DIR is a throwaway dir so its final
+        # "install" copy lands somewhere writable; the canonical staged bundle is
+        # target/macrdp.app, which is what we package.
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          cp "target/${{ matrix.target }}/release/macrdp" target/release/macrdp
+          SKIP_BUILD=1 APP_DIR="$RUNNER_TEMP/appout" packaging/make-app.sh
+          test -f "target/macrdp.app/Contents/Resources/ifd-macrdp.bundle/Contents/MacOS/libifd_macrdp.dylib" \
+            || { echo "IFD handler not embedded in the app"; exit 1; }
+          codesign --verify --deep --strict target/macrdp.app
+
+      - name: Stage app artifact
+        id: stageapp
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.tag || github.ref_name }}"
+          NAME="macrdp-${VERSION}-${{ matrix.target }}-app"
+          mkdir -p dist
+          # ditto -k preserves the bundle's signature + symlinks (plain zip won't).
+          ditto -c -k --keepParent target/macrdp.app "dist/${NAME}.zip"
+          (cd dist && shasum -a 256 "${NAME}.zip" > "${NAME}.zip.sha256")
+          echo "archive=dist/${NAME}.zip" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${NAME}.zip.sha256" >> "$GITHUB_OUTPUT"
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
-          subject-path: ${{ steps.stage.outputs.archive }}
+          subject-path: |
+            ${{ steps.stage.outputs.archive }}
+            ${{ steps.stageapp.outputs.archive }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -162,6 +207,8 @@ jobs:
           path: |
             ${{ steps.stage.outputs.archive }}
             ${{ steps.stage.outputs.checksum }}
+            ${{ steps.stageapp.outputs.archive }}
+            ${{ steps.stageapp.outputs.checksum }}
           if-no-files-found: error
           retention-days: 7
 
@@ -190,8 +237,9 @@ jobs:
           set -euo pipefail
           mkdir -p out
           find artifacts -type f -name '*.tar.gz' -exec cp {} out/ \;
-          find artifacts -type f -name '*.tar.gz.sha256' -exec cp {} out/ \;
-          (cd out && cat *.tar.gz.sha256 > SHA256SUMS && rm *.tar.gz.sha256)
+          find artifacts -type f -name '*.zip'    -exec cp {} out/ \;
+          find artifacts -type f -name '*.sha256' -exec cp {} out/ \;
+          (cd out && cat *.sha256 > SHA256SUMS && rm *.sha256)
           cat out/SHA256SUMS
 
       - name: Create GitHub Release
@@ -203,4 +251,5 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             out/*.tar.gz
+            out/*.zip
             out/SHA256SUMS

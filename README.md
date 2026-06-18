@@ -44,11 +44,11 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
 
 `dist/install.sh` above installs a **bare binary**. If you'd rather have a
 proper **signed `macrdp.app`** — a stable bundle identity at a fixed path (so
-TCC grants survive rebuilds), an `LSUIElement` background agent, the menu-bar
-**controller** app, and the **embedded smart-card IFD handler** + its installer
-— build it with `packaging/`. The GitHub release artifacts are only the bare CLI
-binary, so the full app is a **local build** (it assumes your signing identity
-lives on the build Mac).
+TCC grants survive rebuilds), an `LSUIElement` background agent, and the
+**embedded smart-card IFD handler** + its installer — build it with `packaging/`.
+(A [GitHub release](#release-artifacts) already includes an ad-hoc-signed `.app`;
+build locally when you want a Developer-ID-signed + notarized one, or the
+menu-bar controller app, which CI doesn't produce.)
 
 ```bash
 packaging/make-app.sh                                 # build + sign + install to /Applications
@@ -99,6 +99,24 @@ auto-start paths (LaunchAgent vs the controller app) are **mutually exclusive**
 (both bind `:3390` and share the `macrdp` Keychain entry) — pick one. See
 [packaging/README.md](packaging/README.md) for the full guide (icons, controller
 app, per-script options, TCC notes).
+
+## Release artifacts
+
+Pushing a `v*` tag runs the [release workflow](.github/workflows/release.yml),
+which builds on an Apple-Silicon runner and attaches these to a draft GitHub
+Release (Apple Silicon / `aarch64-apple-darwin` only):
+
+| File | What it is |
+|------|------------|
+| `macrdp-<ver>-aarch64-apple-darwin.tar.gz` | the **bare CLI binary** + `LICENSE`/`README` |
+| `macrdp-<ver>-aarch64-apple-darwin-app.zip` | the full **`macrdp.app`**, with the embedded smart-card IFD handler (`ifd-macrdp.bundle`) + `install-ifd-handler.sh` — the only artifact that carries everything `--enable-smartcard-redirection` needs |
+| `SHA256SUMS` | checksums for both |
+
+Both are **ad-hoc signed, not notarized** — macOS Gatekeeper shows a "can't
+verify developer" prompt, so open the app once via **right-click → Open** (or
+`xattr -dr com.apple.quarantine macrdp.app`). For a Developer-ID-signed +
+notarized build, or the menu-bar **controller** app (neither is produced in CI),
+build locally with [`packaging/make-app.sh`](#building-the-full-app).
 
 ## CLI
 

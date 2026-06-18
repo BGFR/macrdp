@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Info.plist for ifd-macrdp.bundle — macrdp's PC/SC IFD handler, loaded by macOS
+  SmartCardServices (com.apple.ifdreader.slotd). make-app.sh fills __BUNDLE_ID__
+  and embeds the signed bundle in macrdp.app/Contents/Resources; install-ifd-handler.sh
+  copies it to /usr/local/libexec/SmartCardServices/drivers and can rewrite the
+  ifdVendorID/ifdProductID to match the USB device that triggers its load.
+
+  IMPORTANT: macOS loads a third-party IFD driver only on a USB *hotplug* whose
+  VID/PID match the values below. A headless server therefore needs a USB device
+  permanently attached; set ifdVendorID/ifdProductID to that device (or pass
+  IFD_VID=0x.. IFD_PID=0x.. to install-ifd-handler.sh). The defaults below are a
+  Transcend ESD310C SSD used during development.
+-->
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>libifd_macrdp.dylib</string>
+  <key>CFBundleIdentifier</key><string>__BUNDLE_ID__</string>
+  <key>CFBundleName</key><string>ifd-macrdp</string>
+  <key>CFBundlePackageType</key><string>BNDL</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleVersion</key><string>__VERSION__</string>
+  <key>CFBundleShortVersionString</key><string>__VERSION__</string>
+  <key>ifdCapabilities</key><string>0x00000000</string>
+  <key>ifdProtocolSupport</key><string>0x00000001</string>
+  <key>ifdVersionNumber</key><string>0x00000001</string>
+  <key>ifdManufacturerString</key><string>macrdp</string>
+  <key>ifdProductString</key><string>macrdp redirected reader</string>
+  <key>ifdVendorID</key><array><string>0x2174</string></array>
+  <key>ifdProductID</key><array><string>0x2100</string></array>
+  <key>ifdFriendlyName</key><array><string>macrdp</string></array>
+</dict></plist>

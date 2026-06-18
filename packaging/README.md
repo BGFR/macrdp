@@ -32,8 +32,10 @@ LaunchAgent and edits the same `config.env` — no re-permissioning.
 | `Info.plist` | Bundle metadata template (`__VERSION__` filled from `Cargo.toml`); `LSUIElement` agent, `NSAppleEventsUsageDescription`. |
 | `config.env.example` | Seed for `~/Library/Application Support/macrdp/config.env`. The signed binary reads this directly via `macrdp --config`. |
 | `launchagent.plist.template` | LaunchAgent template (`__LABEL__`/`__APP_DIR__`/`__HOME__` filled at install). |
-| `make-app.sh` | Build → assemble bundle → co-sign helper + bundle → install. |
+| `make-app.sh` | Build → assemble bundle → co-sign helper + bundle (incl. the embedded smart-card IFD handler) → install. |
 | `install-launchagent.sh` | Seed config, render plist, bootstrap the agent. |
+| `ifd-Info.plist` | Info.plist template for the embedded `ifd-macrdp.bundle` (smart-card IFD handler); `__VERSION__`/`__BUNDLE_ID__` filled by `make-app.sh`. |
+| `install-ifd-handler.sh` | Privileged install of the IFD handler into `/usr/local/libexec/SmartCardServices/drivers` (one GUI admin prompt). Also embedded in the app at `Contents/Resources/`. |
 | `notarize.sh` | Notarize + staple a `.app`/`.dmg`/`.pkg` (used by the build scripts). |
 | `make-dmg.sh` | Wrap signed apps into a signed + notarized distribution DMG (styled icon layout). |
 | `make-icns.sh` | Build `AppIcon.icns` from a square PNG (used by the build scripts). |
@@ -82,6 +84,32 @@ Edit feature toggles (H.264, AAC, HiDPI, un-minimize-on-Cmd+Tab), the headless v
 (`VIRTUAL_DISPLAY`/`PRIMARY_MODE`/`VD_WIDTH`/`VD_HEIGHT`), bind address, and
 an `EXTRA_FLAGS` escape hatch in `config.env`. It's outside the bundle, so edits
 never disturb the code signature or the TCC grants.
+
+## Smart-card redirection (optional)
+
+Lets the connecting client's smart-card reader be used by macOS apps. The
+macOS-side virtual reader is a PC/SC IFD handler that `make-app.sh` builds and
+**embeds in the app** (`Contents/Resources/ifd-macrdp.bundle`); it ships in the
+DMG. It must be installed once into the system driver directory (root-owned), so
+it needs a one-time admin prompt and **isn't** done by drag-to-Applications:
+
+```bash
+# Install the IFD handler (GUI admin prompt; no manual sudo). From a checkout:
+packaging/install-ifd-handler.sh
+# …or from an installed app (e.g. a DMG install):
+/Applications/macrdp.app/Contents/Resources/install-ifd-handler.sh
+
+# Bind the USB device that triggers the driver load (macOS loads IFD drivers
+# only on a matching USB hotplug — a headless server needs a permanent dongle):
+IFD_VID=0x2174 IFD_PID=0x2100 packaging/install-ifd-handler.sh
+
+# Uninstall:
+packaging/install-ifd-handler.sh --uninstall
+```
+
+Then set `ENABLE_SMARTCARD_REDIRECTION=1` in `config.env` (and have the client
+redirect its reader: mstsc → Local Resources → More → Smart cards). Verify the
+reader registered with `system_profiler SPSmartCardsDataType`.
 
 ## Notes & limits
 

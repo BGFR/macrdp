@@ -64,10 +64,42 @@ if [ -n "$ICON_SRC" ]; then
     echo "==> app icon: $(basename "$ICON_SRC")"
 fi
 
-# 3. Sign the Mach-O executable, then the bundle (which seals Info.plist + the
-#    Resources, including the app icon). Ad-hoc ("-") can't use a secure
-#    timestamp; a real Developer ID must (notarization requires it).
+# Signing timestamp flag: ad-hoc ("-") can't use a secure timestamp; a real
+# Developer ID must (notarization requires it). Shared by the IFD bundle + app.
 if [ "$IDENTITY" = "-" ]; then TS="--timestamp=none"; else TS="--timestamp"; fi
+
+# 2c. Embed the PC/SC IFD handler bundle (smart-card redirection,
+#     --enable-smartcard-redirection). It ships inside the app so it travels in
+#     the DMG; packaging/install-ifd-handler.sh later copies it (privileged) to
+#     /usr/local/libexec/SmartCardServices/drivers. Built from the standalone
+#     ifd-handler crate (not part of the macrdp cargo package).
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+    echo "==> cargo build --release (ifd-handler cdylib)"
+    ( cd "$REPO_ROOT" && cargo build --release --manifest-path ifd-handler/Cargo.toml )
+fi
+IFD_DYLIB="$REPO_ROOT/ifd-handler/target/release/libifd_macrdp.dylib"
+if [ -f "$IFD_DYLIB" ]; then
+    IFD_BUNDLE="$STAGE/Contents/Resources/ifd-macrdp.bundle"
+    mkdir -p "$IFD_BUNDLE/Contents/MacOS"
+    sed -e "s/__VERSION__/$VERSION/g" -e "s#__BUNDLE_ID__#$BUNDLE_ID.ifd#g" \
+        "$PKG_DIR/ifd-Info.plist" > "$IFD_BUNDLE/Contents/Info.plist"
+    cp "$IFD_DYLIB" "$IFD_BUNDLE/Contents/MacOS/libifd_macrdp.dylib"
+    # Sign the loadable dylib then the nested bundle with the app's identity +
+    # flags, so it passes notarization and slotd loads it (slotd loads
+    # third-party IFD drivers regardless of hardened-runtime/library-validation).
+    codesign --force --options runtime $TS -s "$IDENTITY" "$IFD_BUNDLE/Contents/MacOS/libifd_macrdp.dylib"
+    codesign --force --options runtime $TS -s "$IDENTITY" "$IFD_BUNDLE"
+    # Ship the privileged installer alongside it so DMG users can run
+    #   /Applications/macrdp.app/Contents/Resources/install-ifd-handler.sh
+    cp "$PKG_DIR/install-ifd-handler.sh" "$STAGE/Contents/Resources/install-ifd-handler.sh"
+    chmod +x "$STAGE/Contents/Resources/install-ifd-handler.sh"
+    echo "==> embedded ifd-macrdp.bundle (smart-card IFD handler) + installer"
+else
+    echo "==> WARNING: ifd-handler dylib not found; smart-card handler NOT embedded (unset SKIP_BUILD?)" >&2
+fi
+
+# 3. Sign the Mach-O executable, then the bundle (which seals Info.plist + the
+#    Resources, including the app icon + the embedded IFD bundle).
 echo "==> codesign (hardened runtime, ts: $TS)"
 codesign --force --options runtime $TS -s "$IDENTITY" "$STAGE/Contents/MacOS/macrdp"
 codesign --force --options runtime $TS -s "$IDENTITY" "$STAGE"

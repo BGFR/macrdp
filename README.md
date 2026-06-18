@@ -422,6 +422,12 @@ MS-RDPESC. It's written from scratch (MIT/Apache), so there's **no GPL `vpcd`**
 dependency. The whole chain is verified end-to-end on `mstsc` against a card,
 including a full APDU transceive.
 
+> **Why a user-space handler and not a kernel driver?** Redirection happens at
+> the PC/SC (APDU) layer, not raw USB, and macOS's smart-card stack is user-space
+> by design — the IFD handler is Apple's supported plug-in point, with no
+> entitlements, signing gymnastics, or reboot a kext would demand. See the
+> rationale in [docs/known-quirks.md](docs/known-quirks.md).
+
 **One-time setup** — the IFD handler installs into a root-owned system directory,
 so it can't be done by drag-to-Applications; run the bundled installer once (one
 GUI admin prompt, no manual `sudo`):

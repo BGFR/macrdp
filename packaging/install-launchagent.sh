@@ -37,9 +37,21 @@ sed -e "s#__LABEL__#$LABEL#g" -e "s#__APP_DIR__#$APP_DIR#g" -e "s#__HOME__#$HOME
     "$PKG_DIR/launchagent.plist.template" > "$PLIST"
 echo "==> wrote $PLIST"
 
-# 3. (Re)bootstrap the agent.
+# 3. (Re)bootstrap the agent. `bootstrap` immediately after `bootout` can fail
+#    with "Input/output error" (EIO, 5) while launchd is still tearing the old
+#    job down — a race that otherwise leaves the agent UNloaded (server doesn't
+#    come back). Retry a few times; the final attempt runs without suppressing
+#    stderr so a genuine failure is surfaced (and aborts via set -e).
 launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$UID_NUM" "$PLIST"
+bootstrapped=0
+for _ in 1 2 3 4 5; do
+    if launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>/dev/null; then
+        bootstrapped=1
+        break
+    fi
+    sleep 1
+done
+[ "$bootstrapped" = 1 ] || launchctl bootstrap "gui/$UID_NUM" "$PLIST"
 launchctl enable "gui/$UID_NUM/$LABEL"
 launchctl kickstart -k "gui/$UID_NUM/$LABEL"
 

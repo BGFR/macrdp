@@ -441,6 +441,36 @@ including a full APDU transceive.
 > entitlements, signing gymnastics, or reboot a kext would demand. See the
 > rationale in [docs/known-quirks.md](docs/known-quirks.md).
 
+<details>
+<summary><b>In plain terms: why this "reader hook" instead of USB passthrough (à la VirtualHere)?</b></summary>
+
+There are two ways to let a card plugged into the client be used by apps on the Mac:
+
+- **Fake the hardware (the VirtualHere route).** Pretend the whole USB card-reader
+  is physically plugged into the Mac. To make macOS believe a USB device is really
+  attached, you write a low-level driver (a DriverKit *system extension*) — which
+  needs Apple-granted permissions, a user-approved install, and a lot of plumbing
+  to emulate the USB gadget. It's like **shipping the physical reader across the
+  network and bolting a fake one onto the Mac's USB port.** Powerful and general
+  (works for *any* USB gadget), but heavy.
+
+- **Use the built-in slot (what macrdp does).** macOS already has a smart-card
+  system (PC/SC) with an official plug-in slot for "reader helpers." macrdp drops in
+  a tiny helper that says *"I'm a card reader,"* and whenever an app asks the card a
+  question, the helper **forwards it over the network to the real card on the client
+  and relays the answer back.** No fake USB device, no driver, no special
+  permissions — it installs as a small file in a folder. Think of it as a
+  **receptionist macOS already provides**, to whom we just hand a message-forwarder.
+
+Smart cards talk a simple **question-and-answer protocol**, so we don't need to fake
+any hardware — just pass the messages along, and macOS gives us the exact spot to
+plug that in. The USB-passthrough approach is the right tool for sharing *arbitrary*
+USB gadgets that have no such slot, but for smart cards it's massive overkill — all
+that driver/permission friction to end up at the **same place** the small helper
+reaches directly. Same result, far less machinery.
+
+</details>
+
 **One-time setup** — the IFD handler installs into a root-owned system directory,
 so it can't be done by drag-to-Applications; run the bundled installer once (one
 GUI admin prompt, no manual `sudo`):

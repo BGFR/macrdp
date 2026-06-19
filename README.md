@@ -9,7 +9,7 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 ## Status
 
-v0 — daily-driver usable on a trusted LAN. **Latest release: [v0.8.2](https://github.com/clintcan/macrdp/releases/latest)** — [smart-card redirection](#smart-card-redirection) (the [release `.app`](#release-artifacts) bundles its IFD handler + an interactive USB-trigger picker); H.264 `--keyframe-on-change` now defaults off for snappier typing + cleaner video. See [CLAUDE.md](CLAUDE.md) for what's wired up, what isn't, and known quirks.
+v0 — daily-driver usable on a trusted LAN. **Latest release: [v0.8.3](https://github.com/clintcan/macrdp/releases/latest)** — visual [app-switcher HUD](#cli) (`--app-switcher-hud`: a macOS-style icon row on the remote during Cmd+Tab), and the switcher now reliably brings the selected app to the front (un-minimizes / reopens / unhides). See [CLAUDE.md](CLAUDE.md) for what's wired up, what isn't, and known quirks.
 
 ## Quick start
 

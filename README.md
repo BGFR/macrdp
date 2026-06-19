@@ -154,6 +154,12 @@ build locally with [`packaging/make-app.sh`](#building-the-full-app).
                           it back from the Dock) instead of just activating the
                           app. Off by default (matches native macOS, which leaves
                           a minimized window minimized). macOS-only.
+--alt-tab-switch          Also accept Option+Tab (Alt+Tab from the client) as an
+                          app-switch trigger, in addition to Cmd+Tab. Off by
+                          default. For clients/configs that forward Alt+Tab but
+                          gate Win+Tab (e.g. mstsc's "Apply Windows key
+                          combinations" when windowed). Option+Shift+Tab cycles
+                          backward. macOS-only.
 --keyboard-layout SPEC    Force a keyboard layout for non-US clients instead of
                           auto-detecting it from the client. By default the
                           layout is auto-detected from the client's announced

@@ -460,6 +460,15 @@ struct Args {
     #[arg(long = "unminimize-on-switch")]
     unminimize_on_switch: bool,
 
+    /// Also accept Option+Tab (Alt+Tab from the client) as a trigger for the app
+    /// switcher, in addition to Cmd+Tab. Off by default. Useful for clients/
+    /// configs that forward Alt+Tab to the session but gate Win+Tab (e.g. mstsc's
+    /// "Apply Windows key combinations" when windowed). Same MRU cycle, committing
+    /// on Option release; Option+Shift+Tab cycles backward. When off, Option+Tab
+    /// reaches remote apps as a normal key. macOS-only.
+    #[arg(long = "alt-tab-switch")]
+    alt_tab_switch: bool,
+
     /// Force QOI BitmapUpdates to be encoded with `Channels::Rgb` instead of
     /// `Channels::Rgba`. The default (off) emits RGBA per the underlying
     /// PixelFormat, matching upstream `ironrdp-server`. Upstream
@@ -887,6 +896,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("UNMINIMIZE", false) {
         argv.push("--unminimize-on-switch".into());
     }
+    if on("ALT_TAB_SWITCH", false) {
+        argv.push("--alt-tab-switch".into());
+    }
     if on("ENABLE_DRIVE_REDIRECTION", false) {
         argv.push("--enable-drive-redirection".into());
     }
@@ -1291,6 +1303,7 @@ async fn async_main() -> Result<()> {
 
     ironrdp_server::set_qoi_force_rgb(args.qoi_force_rgb);
     crate::input::set_unminimize_on_switch(args.unminimize_on_switch);
+    crate::input::set_alt_tab_switch(args.alt_tab_switch);
 
     // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
     // clone drives the builder's GfxServerFactory (protocol side); another

@@ -199,6 +199,19 @@ pub fn set_unminimize_on_switch(on: bool) {
     UNMINIMIZE_ON_SWITCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// When true, Option+Tab (i.e. Alt+Tab forwarded from the client) is accepted as
+/// an *additional* trigger for the same app-cycle as Cmd+Tab — for clients/configs
+/// that pass Alt+Tab through to the session but gate Win+Tab (mstsc's "Apply
+/// Windows key combinations"). Opt-in via `--alt-tab-switch`; off by default so
+/// Option+Tab otherwise reaches remote apps as a normal key. Cmd+Tab is
+/// unaffected and always works. Reuses the same MRU session, committing on
+/// Option release instead of Cmd release.
+static ALT_TAB_SWITCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_alt_tab_switch(on: bool) {
+    ALT_TAB_SWITCH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::collections::HashSet;
@@ -654,8 +667,19 @@ mod macos {
                 // resumed. This replaces the old time-based grace,
                 // which falsely split sessions whenever the user
                 // paused mid-hold longer than 2 s.
-                if matches!(vk, VK_LCMD | VK_RCMD) && !down && !self.mods.l_cmd && !self.mods.r_cmd
-                {
+                let cmd_released = matches!(vk, VK_LCMD | VK_RCMD)
+                    && !down
+                    && !self.mods.l_cmd
+                    && !self.mods.r_cmd;
+                // With --alt-tab-switch, an Opt+Tab session commits on Option
+                // release, mirroring the Cmd path (same release-generation
+                // counter — you can't hold both switchers at once).
+                let opt_released = super::ALT_TAB_SWITCH.load(std::sync::atomic::Ordering::Relaxed)
+                    && matches!(vk, VK_LALT | VK_RALT)
+                    && !down
+                    && !self.mods.l_alt
+                    && !self.mods.r_alt;
+                if cmd_released || opt_released {
                     CMD_RELEASE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     commit_cycle_session();
                 }
@@ -782,6 +806,20 @@ mod macos {
             let shift = f.contains(CGEventFlags::CGEventFlagShift);
             let ctrl = f.contains(CGEventFlags::CGEventFlagControl);
             let opt = f.contains(CGEventFlags::CGEventFlagAlternate);
+
+            // Opt+Tab / Opt+Shift+Tab as an alternative app-cycle trigger
+            // (opt-in via --alt-tab-switch). Only plain Option (no Cmd/Ctrl) so
+            // it doesn't shadow Option-as-AltGr typing or Cmd shortcuts; the
+            // session commits on Option release (see the modifier-release block).
+            if super::ALT_TAB_SWITCH.load(std::sync::atomic::Ordering::Relaxed)
+                && opt
+                && !cmd
+                && !ctrl
+                && vk == VK_TAB
+            {
+                cycle_apps(shift);
+                return true;
+            }
 
             if !cmd {
                 return false;

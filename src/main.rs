@@ -297,29 +297,32 @@ struct Args {
     /// H.264 periodic keyframe (IDR) interval in seconds (only with
     /// --enable-h264). Default 2. This is a safety net for transient decode
     /// glitches on small changes (e.g. mstsc's lingering garbled text while
-    /// typing); large changes (window-to-front, scroll) already force an
-    /// immediate IDR on their own (see --keyframe-on-change). Lower self-heals
+    /// typing); large changes (window-to-front, scroll) can also force an
+    /// immediate IDR if --keyframe-on-change is set (off by default). Lower self-heals
     /// faster but frequent IDRs cost bandwidth/quality at a fixed bitrate and
     /// can stutter. Fractional values are allowed. First frame is a keyframe.
     #[arg(long, default_value_t = 2.0)]
     keyframe_interval: f32,
 
-    /// Disable on-change H.264 keyframes (only with --enable-h264). On-change
-    /// keyframes are ON by default: a keyframe is forced when a lot of the
+    /// Force on-change H.264 keyframes (only with --enable-h264). OFF by
+    /// default. When enabled, a keyframe (IDR) is forced when a lot of the
     /// screen changes at once — a window raised to front, a scroll, an app
     /// launch — and briefly after a mouse click, so large updates render
     /// immediately on clients (e.g. mstsc) that apply big P-frames cleanly only
-    /// on a keyframe. Pass this to turn it off (relies on --keyframe-interval
-    /// alone) to minimize IDRs on a very constrained link.
-    #[arg(long = "no-keyframe-on-change", action = clap::ArgAction::SetTrue)]
-    no_keyframe_on_change: bool,
+    /// on a keyframe. Left off (the default), the periodic --keyframe-interval
+    /// safety net plus the trailing flush-burst (--flush-frames) already drain
+    /// mstsc's presentation buffer, so the extra forced IDRs mostly just spend
+    /// bitrate/quality at a fixed bitrate for no typing benefit; enable it only
+    /// if large updates visibly lag on your client/link.
+    #[arg(long = "keyframe-on-change", action = clap::ArgAction::SetTrue)]
+    keyframe_on_change: bool,
 
-    /// Deprecated/no-op: on-change keyframes are now the default. Accepted so
-    /// existing command lines that pass --keyframe-on-change keep working; use
-    /// --no-keyframe-on-change to disable.
-    #[arg(long = "keyframe-on-change", action = clap::ArgAction::SetTrue, hide = true)]
+    /// Deprecated/no-op: on-change keyframes are now OFF by default, so this is
+    /// already the default. Accepted so existing command lines that pass
+    /// --no-keyframe-on-change keep working; use --keyframe-on-change to enable.
+    #[arg(long = "no-keyframe-on-change", action = clap::ArgAction::SetTrue, hide = true)]
     #[allow(dead_code)]
-    keyframe_on_change_compat: bool,
+    no_keyframe_on_change_compat: bool,
 
     /// Dirty-area threshold (percent of the frame) that triggers an on-change
     /// keyframe (only with --enable-h264 + on-change keyframes). Lower catches
@@ -1303,9 +1306,9 @@ async fn async_main() -> Result<()> {
         )
     });
 
-    // On-change keyframes are on by default; --no-keyframe-on-change opts out.
+    // On-change keyframes are off by default; --keyframe-on-change opts in.
     let keyframe_on_change = crate::capture::KeyframeOnChange {
-        enabled: !args.no_keyframe_on_change,
+        enabled: args.keyframe_on_change,
         change_pct: args.keyframe_change_pct,
         click_pct: args.keyframe_click_pct,
         click_window: std::time::Duration::from_millis(args.keyframe_click_window_ms),

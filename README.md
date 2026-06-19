@@ -9,7 +9,7 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 ## Status
 
-v0 — daily-driver usable on a trusted LAN. **Latest release: [v0.8.5](https://github.com/clintcan/macrdp/releases/latest)** — LaunchAgent install retries `launchctl bootstrap` so re-pointing/updating an install can't leave the agent unloaded; the menu-bar controller toggles for the app-switcher HUD / Option+Tab / drive + smart-card redirection landed in v0.8.4 and the visual [app-switcher HUD](#cli) (`--app-switcher-hud`) in v0.8.3. See [CLAUDE.md](CLAUDE.md) for what's wired up, what isn't, and known quirks.
+v0 — daily-driver usable on a trusted LAN. **Latest release: [v0.8.6](https://github.com/clintcan/macrdp/releases/latest)** — fixes the GUI "Install smart-card handler" falsely reporting failure (its osascript self-killed); the LaunchAgent bootstrap retry landed in v0.8.5, controller toggles in v0.8.4, and the visual [app-switcher HUD](#cli) (`--app-switcher-hud`) in v0.8.3. See [CLAUDE.md](CLAUDE.md) for what's wired up, what isn't, and known quirks.
 
 ## Quick start
 

@@ -168,6 +168,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         opts.addItem(toggle("HiDPI capture", key: "HIDPI", cfg: cfg, sel: #selector(toggleHiDPI)))
         opts.addItem(toggle(
             "Un-minimize on Cmd+Tab", key: "UNMINIMIZE", cfg: cfg, sel: #selector(toggleUnminimize)))
+        opts.addItem(toggle(
+            "App-switcher HUD", key: "APP_SWITCHER_HUD", cfg: cfg, sel: #selector(toggleAppSwitcherHud)))
+        opts.addItem(toggle(
+            "Option+Tab switches apps", key: "ALT_TAB_SWITCH", cfg: cfg, sel: #selector(toggleAltTabSwitch)))
+        opts.addItem(.separator())
+        // Redirection (the connecting client must opt in too).
+        opts.addItem(toggle(
+            "Drive redirection", key: "ENABLE_DRIVE_REDIRECTION", cfg: cfg,
+            sel: #selector(toggleDriveRedirection)))
+        opts.addItem(toggle(
+            "Smart-card redirection", key: "ENABLE_SMARTCARD_REDIRECTION", cfg: cfg,
+            sel: #selector(toggleSmartcardRedirection)))
+        opts.addItem(item("Install smart-card handler…", #selector(installSmartcardHandler)))
+        opts.addItem(.separator())
         // Keyboard layout (radio) — translate the client's keys against a
         // non-US layout without changing the Mac's own input source.
         let curLayout = cfg["KEYBOARD_LAYOUT"] ?? ""
@@ -484,6 +498,47 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleAAC() { flip("ENABLE_AAC") }
     @objc func toggleHiDPI() { flip("HIDPI") }
     @objc func toggleUnminimize() { flip("UNMINIMIZE") }
+    @objc func toggleAppSwitcherHud() { flip("APP_SWITCHER_HUD") }
+    @objc func toggleAltTabSwitch() { flip("ALT_TAB_SWITCH") }
+    @objc func toggleDriveRedirection() { flip("ENABLE_DRIVE_REDIRECTION") }
+    @objc func toggleSmartcardRedirection() { flip("ENABLE_SMARTCARD_REDIRECTION") }
+
+    /// One-time privileged install of the smart-card IFD handler (the toggle only
+    /// flips the server flag; the handler still has to be copied into the system
+    /// drivers dir). Runs macrdp.app's embedded installer, which prompts for admin
+    /// via its own GUI dialog. No USB picker here (no tty when launched from the
+    /// menu) — it uses the bundle's default trigger; advanced users can rebind via
+    /// the CLI installer with IFD_VID/IFD_PID.
+    @objc func installSmartcardHandler() {
+        func say(_ msg: String, _ info: String) {
+            let a = NSAlert()
+            a.messageText = msg
+            a.informativeText = info
+            a.addButton(withTitle: "OK")
+            NSApp.activate(ignoringOtherApps: true)
+            _ = a.runModal()
+        }
+        guard let app = locateServerApp() else {
+            say("macrdp.app not found", "Install macrdp.app first, then run this again.")
+            return
+        }
+        let installer = app.appendingPathComponent("Contents/Resources/install-ifd-handler.sh").path
+        guard FileManager.default.fileExists(atPath: installer) else {
+            say("Installer not found",
+                "This macrdp.app build doesn't bundle the smart-card handler installer.")
+            return
+        }
+        let out = run("/bin/bash", [installer])
+        if out.code == 0 {
+            say("Smart-card handler installed",
+                "Unplug/replug the USB trigger device so macOS loads the driver, and make sure "
+                    + "the connecting client redirects its smart card.")
+        } else {
+            say("Install failed",
+                out.stdout.isEmpty
+                    ? "The installer exited with code \(out.code)." : String(out.stdout.suffix(800)))
+        }
+    }
 
     func flip(_ key: String) {
         let cfg = readConfig()
@@ -664,6 +719,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ENABLE_AAC=0
             HIDPI=0
             UNMINIMIZE=0
+            APP_SWITCHER_HUD=0
+            ALT_TAB_SWITCH=0
+            ENABLE_DRIVE_REDIRECTION=0
+            ENABLE_SMARTCARD_REDIRECTION=0
             VIRTUAL_DISPLAY=0
             PRIMARY_MODE=none
             VD_WIDTH=1920

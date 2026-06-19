@@ -9,7 +9,7 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 ## Status
 
-v0 — daily-driver usable on a trusted LAN. **Latest release: [v0.8.7](https://github.com/clintcan/macrdp/releases/latest)** — docs-only: corrected the smart-card-vs-kext/DriverKit rationale note (generic USB-over-IP uses DriverKit, not a kext, on modern macOS). The GUI smart-card-installer self-kill fix landed in v0.8.6, LaunchAgent bootstrap retry in v0.8.5, controller toggles in v0.8.4, and the visual [app-switcher HUD](#cli) (`--app-switcher-hud`) in v0.8.3. See [CLAUDE.md](CLAUDE.md) for what's wired up, what isn't, and known quirks.
+v0 — daily-driver usable on a trusted LAN. **Latest release: [v0.8.8](https://github.com/clintcan/macrdp/releases/latest)** — docs-only: a generic-USB-redirection feasibility writeup ([`docs/usb-redirection-feasibility.md`](docs/usb-redirection-feasibility.md)) and a corrected account of how virtual USB devices are presented on macOS (user-space `IOUSBHostControllerInterface`/UserHCI, not a kext/DriverKit). The GUI smart-card-installer self-kill fix landed in v0.8.6 and the visual [app-switcher HUD](#cli) (`--app-switcher-hud`) in v0.8.3. See [CLAUDE.md](CLAUDE.md) for what's wired up, what isn't, and known quirks.
 
 ## Quick start
 

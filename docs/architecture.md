@@ -11,7 +11,23 @@ src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI by
                   toggle, AX-driven symbolic-hotkey workarounds
                   (Cmd+Tab app cycle, Cmd+` window cycle, Spotlight,
                   screencapture) since WindowServer's symbolic-hotkey
-                  dispatcher won't fire for CGEventPost
+                  dispatcher won't fire for CGEventPost. The Cmd+Tab cycle
+                  (also Option+Tab with --alt-tab-switch) makes the landing
+                  app always surface — un-minimize / reopen-windowless
+                  (open -b) / unhide, gated to the committed app — and, with
+                  --app-switcher-hud, drives the macrdphud overlay via
+                  src/switcher_hud.rs.
+src/switcher_hud.rs  App-switcher HUD IPC client (--app-switcher-hud). A bg
+                  thread pushes SHOW/ADVANCE/HIDE (opcode+len framing, like
+                  the smart-card bridge) over loopback to the macrdphud helper,
+                  best-effort/non-blocking (try_send) so the input path never
+                  stalls. input.rs calls it from cycle_apps/commit_cycle_session;
+                  main.rs auto-spawns the helper + sets the captured display id.
+                  The helper itself is gui/Sources/macrdphud/main.swift (a 2nd
+                  SwiftPM target alongside the menu-bar controller): a borderless
+                  non-activating NSPanel drawing an app-icon row that
+                  ScreenCaptureKit captures, so the remote sees the switcher.
+                  Cross-platform stub-free (pure std on the Rust side).
 src/keyboard_layout.rs  Optional non-US layout translation
                   (--keyboard-layout). Resolves a name/KLID/input-source-id
                   to a macOS UCKeyboardLayout via TIS and translates

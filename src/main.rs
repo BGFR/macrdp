@@ -16,6 +16,7 @@ mod keyboard_layout;
 mod rdpdr;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
+mod switcher_hud;
 mod videotoolbox;
 mod virtual_display;
 
@@ -469,6 +470,14 @@ struct Args {
     #[arg(long = "alt-tab-switch")]
     alt_tab_switch: bool,
 
+    /// Show a visual app-switcher overlay (icon row) on the remote during Cmd+Tab
+    /// / Option+Tab, like macOS's native switcher. Off by default. macrdp spawns a
+    /// small helper process that draws a real on-screen panel; ScreenCaptureKit
+    /// captures it, so the client sees it. The switch behaves identically with or
+    /// without this — it only adds the HUD. macOS-only.
+    #[arg(long = "app-switcher-hud")]
+    app_switcher_hud: bool,
+
     /// Force QOI BitmapUpdates to be encoded with `Channels::Rgb` instead of
     /// `Channels::Rgba`. The default (off) emits RGBA per the underlying
     /// PixelFormat, matching upstream `ironrdp-server`. Upstream
@@ -522,6 +531,69 @@ fn prevent_sleep() {
     match res {
         Ok(child) => info!(caffeinate_pid = child.id(), "preventing sleep / auto-lock"),
         Err(e) => warn!("could not spawn caffeinate to prevent sleep: {e}"),
+    }
+}
+
+/// Locate the `macrdphud` app-switcher overlay helper: `MACRDP_HUD_HELPER` env
+/// override, else the bundled copy next to us (`../Resources/macrdphud` from
+/// `Contents/MacOS/macrdp`), else the dev build (`gui/.build/release/macrdphud`
+/// up the repo tree from `target/<profile>/macrdp`).
+#[cfg(target_os = "macos")]
+fn locate_hud_helper() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("MACRDP_HUD_HELPER") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    // Bundled: .../macrdp.app/Contents/MacOS/macrdp -> .../Contents/Resources/macrdphud
+    if let Some(macos_dir) = exe.parent() {
+        let bundled = macos_dir.join("../Resources/macrdphud");
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+    }
+    // Dev: .../<repo>/target/<profile>/macrdp -> .../<repo>/gui/.build/release/macrdphud
+    let dev = exe
+        .ancestors()
+        .nth(3)
+        .map(|root| root.join("gui/.build/release/macrdphud"));
+    dev.filter(|p| p.is_file())
+}
+
+/// Spawn the app-switcher HUD helper. Passes the loopback port and our pid (so it
+/// self-exits if we die). Returns the child handle to hold for our lifetime.
+#[cfg(target_os = "macos")]
+fn spawn_hud_helper() -> Option<std::process::Child> {
+    let Some(path) = locate_hud_helper() else {
+        warn!(
+            "--app-switcher-hud set but the macrdphud helper was not found \
+             (set MACRDP_HUD_HELPER, or build it: gui/make-hud-helper.sh); \
+             the switcher works, just without the on-screen HUD"
+        );
+        return None;
+    };
+    let mut cmd = std::process::Command::new(&path);
+    cmd.env("MACRDP_HUD_PARENT", std::process::id().to_string());
+    if let Some(port) = std::env::var_os("MACRDP_HUD_PORT") {
+        cmd.env("MACRDP_HUD_PORT", port);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    match cmd.spawn() {
+        Ok(child) => {
+            info!(hud_pid = child.id(), helper = %path.display(), "app-switcher HUD helper spawned");
+            Some(child)
+        }
+        Err(e) => {
+            warn!(
+                "could not spawn app-switcher HUD helper {}: {e}",
+                path.display()
+            );
+            None
+        }
     }
 }
 
@@ -898,6 +970,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     }
     if on("ALT_TAB_SWITCH", false) {
         argv.push("--alt-tab-switch".into());
+    }
+    if on("APP_SWITCHER_HUD", false) {
+        argv.push("--app-switcher-hud".into());
     }
     if on("ENABLE_DRIVE_REDIRECTION", false) {
         argv.push("--enable-drive-redirection".into());
@@ -1304,6 +1379,20 @@ async fn async_main() -> Result<()> {
     ironrdp_server::set_qoi_force_rgb(args.qoi_force_rgb);
     crate::input::set_unminimize_on_switch(args.unminimize_on_switch);
     crate::input::set_alt_tab_switch(args.alt_tab_switch);
+    crate::input::set_app_switcher_hud(args.app_switcher_hud);
+
+    // App-switcher HUD overlay helper (macOS-only). Tell it which display to
+    // center on (the captured one) and spawn it; it idles until a Cmd+Tab. Held
+    // for the process lifetime; the helper also self-exits if we die.
+    #[cfg(target_os = "macos")]
+    let _hud_helper = if args.app_switcher_hud {
+        let did =
+            capture_display_id.unwrap_or_else(|| core_graphics::display::CGDisplay::main().id);
+        crate::switcher_hud::set_display_id(did);
+        spawn_hud_helper()
+    } else {
+        None
+    };
 
     // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
     // clone drives the builder's GfxServerFactory (protocol side); another

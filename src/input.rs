@@ -212,6 +212,16 @@ pub fn set_alt_tab_switch(on: bool) {
     ALT_TAB_SWITCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// When true, drive the `macrdphud` overlay helper so the remote client sees a
+/// visual app switcher during Cmd+Tab / Option+Tab. Opt-in via
+/// `--app-switcher-hud`; off by default. The switch itself works the same either
+/// way — this only adds the (best-effort) on-screen HUD.
+static APP_SWITCHER_HUD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_app_switcher_hud(on: bool) {
+    APP_SWITCHER_HUD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::collections::HashSet;
@@ -1526,6 +1536,10 @@ mod macos {
         let cursor_pid = {
             let mut guard = CYCLE_SESSION.lock().expect("cycle session mutex poisoned");
             let Some(session) = guard.take() else { return };
+            // A session existed → tear down the on-screen HUD (best-effort).
+            if super::APP_SWITCHER_HUD.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::switcher_hud::hide();
+            }
             if let Some((bundle, _, _)) = session
                 .snapshot
                 .iter()
@@ -1535,13 +1549,15 @@ mod macos {
             }
             session.cursor_pid
         };
-        // On commit (Cmd release), un-minimize the app the user landed on, if
-        // enabled. The app was already activated by the last cycle step; this
-        // just restores its window from the Dock. Doing it here (not per step)
-        // avoids un-minimizing every minimized app cycled through.
-        if super::UNMINIMIZE_ON_SWITCH.load(std::sync::atomic::Ordering::Relaxed) {
-            ax_make_frontmost(cursor_pid, true);
-        }
+        // On commit (Cmd release), re-assert the landed app and, if it has no
+        // window (e.g. Notes/Calendar/Mail with their window closed), reopen it so
+        // it surfaces — both gated to commit so apps merely cycled *through* aren't
+        // un-minimized or popped open. Un-minimize only when --unminimize-on-switch.
+        ax_make_frontmost(
+            cursor_pid,
+            super::UNMINIMIZE_ON_SWITCH.load(std::sync::atomic::Ordering::Relaxed),
+            true,
+        );
     }
 
     /// Cycle to the next (or previous) regular-policy running app and
@@ -1816,6 +1832,9 @@ mod macos {
 
             if snapshot.is_empty() {
                 *session_guard = None;
+                if super::APP_SWITCHER_HUD.load(std::sync::atomic::Ordering::Relaxed) {
+                    crate::switcher_hud::hide();
+                }
                 debug!("cycle_apps: nothing to cycle to (no regular apps)");
                 return;
             }
@@ -1855,6 +1874,20 @@ mod macos {
                 cmd_release_gen: current_release_gen,
             });
             drop(session_guard);
+
+            // Drive the optional on-screen HUD (best-effort; --app-switcher-hud).
+            // SHOW on a fresh session (full app list), ADVANCE within a hold.
+            if super::APP_SWITCHER_HUD.load(std::sync::atomic::Ordering::Relaxed) {
+                if continuing {
+                    crate::switcher_hud::advance(next_idx);
+                } else {
+                    let apps: Vec<(i32, String)> = snapshot
+                        .iter()
+                        .map(|(_, name, pid)| (*pid, name.clone()))
+                        .collect();
+                    crate::switcher_hud::show(apps, next_idx);
+                }
+            }
 
             // Pin the per-bundle MRU pid to the instance we're
             // activating, so if the user cycles away and back the
@@ -1934,9 +1967,12 @@ mod macos {
             // Force-show: un-minimize the target on each cycle step too (when
             // enabled), so a minimized app pops open as you Cmd+Tab to it rather
             // than only on release. A brief de-miniaturize flicker is expected.
+            // Per cycle step: do NOT reopen windowless apps (that's commit-only,
+            // so apps cycled *through* don't pop windows).
             let ax_err = ax_make_frontmost(
                 target_pid,
                 super::UNMINIMIZE_ON_SWITCH.load(std::sync::atomic::Ordering::Relaxed),
+                false,
             );
             if ax_err == AX_ERROR_SUCCESS {
                 *LAST_AX_ACTIVATED_PID
@@ -2025,7 +2061,24 @@ mod macos {
     /// last. Without this the user perceives the cycle as "switching
     /// between two VSCodes" because the cycle keeps activating the
     /// same app but a different window pops up each time.
-    fn ax_make_frontmost(pid: libc::pid_t, unminimize: bool) -> i32 {
+    /// Re-assert a just-un-minimized app to the front after its genie animation
+    /// finishes (~0.4 s). Setting AXMain/AXRaise synchronously right after
+    /// AXMinimized=false races the animation and can leave the window behind
+    /// others; a delayed second raise lands reliably. Runs on a detached thread so
+    /// it never blocks the input path; by then the window is no longer minimized,
+    /// so the re-call takes the normal raise+AXMain path. Only scheduled when we
+    /// actually un-minimized something, so it won't yank focus otherwise.
+    fn schedule_refront(pid: libc::pid_t) {
+        std::thread::Builder::new()
+            .name("macrdp-refront".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(420));
+                ax_make_frontmost(pid, false, false);
+            })
+            .ok();
+    }
+
+    fn ax_make_frontmost(pid: libc::pid_t, unminimize: bool, reopen_if_windowless: bool) -> i32 {
         use core_foundation::base::{CFTypeRef, TCFType};
         use core_foundation::boolean::CFBoolean;
         use core_foundation::string::CFString;
@@ -2035,6 +2088,23 @@ mod macos {
         let app_ref = unsafe { AXUIElementCreateApplication(pid) };
         if app_ref.is_null() {
             return AX_ERROR_ILLEGAL_ARGUMENT;
+        }
+
+        // Native Cmd+Tab unhides a hidden (Cmd+H) app when you switch to it.
+        // AXFrontmost activates the process/menu bar but does NOT surface a
+        // window of a hidden app, so it'd appear to "not come forward." Unhide
+        // first; no-op when not hidden. Also grab the bundle id for the
+        // windowless-reopen fallback below.
+        let mut bundle_id: Option<String> = None;
+        unsafe {
+            if let Some(running) =
+                NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            {
+                if running.isHidden() {
+                    running.unhide();
+                }
+                bundle_id = running.bundleIdentifier().map(|s| s.to_string());
+            }
         }
 
         let frontmost_attr = CFString::from_static_string("AXFrontmost");
@@ -2061,12 +2131,21 @@ mod macos {
         // window stacking for apps where AXRaise alone is a no-op (Electron —
         // VSCode/Slack/etc.). All best-effort: the caller only cares that the
         // process was activated.
-        // `unminimize` (true only on the commit path — Cmd release): restore a
-        // minimized window before raising. AXRaise does NOT de-miniaturize, so
-        // without this Cmd+Tab to an all-minimized app shows nothing (native
-        // behavior). Done only on commit, not per cycle step, or every minimized
-        // app cycled *through* flickers open mid-animation. AXMinimized=false is
-        // idempotent on a non-minimized window.
+        // Restore a minimized window before raising — AXRaise does NOT
+        // de-miniaturize, so without this, landing on an all-minimized app shows
+        // nothing. We un-minimize the landed window when EITHER --unminimize-on-
+        // switch is set (which also un-minimizes per cycle step) OR this is the
+        // commit/landing call (`reopen_if_windowless`): the app you release on
+        // should always surface — consistent with reopening a windowless app on
+        // landing. Per intermediate cycle steps we still leave minimized windows
+        // alone (no flag), so apps cycled *through* don't flicker open.
+        // AXMinimized=false is idempotent on a non-minimized window.
+        let effective_unminimize = unminimize || reopen_if_windowless;
+        // Set when we actually de-miniaturize a window: un-minimize is an async
+        // (genie) animation, so the AXRaise/AXMain we do immediately afterward
+        // races it and the window can land BEHIND others. We re-assert front once
+        // the animation has settled (see schedule_refront below).
+        let did_unminimize = std::cell::Cell::new(false);
         let min_attr = CFString::from_static_string("AXMinimized");
         let raise_and_main = |win: *mut c_void| unsafe {
             // Is this window minimized?
@@ -2080,20 +2159,22 @@ mod macos {
                 CFRelease(mv.cast());
             }
             if is_min {
-                // A minimized window can't be raised — AXRaise on it just
-                // flickers. On the commit path (Cmd release) de-miniaturize it
-                // and then raise; on intermediate cycle steps leave it alone.
-                if unminimize {
-                    let false_val = CFBoolean::false_value();
-                    AXUIElementSetAttributeValue(
-                        win,
-                        min_attr.as_concrete_TypeRef().cast(),
-                        false_val.as_CFTypeRef() as CFTypeRef,
-                    );
-                    let raise = CFString::from_static_string("AXRaise");
-                    AXUIElementPerformAction(win, raise.as_concrete_TypeRef().cast());
+                // On intermediate cycle steps, leave a minimized window alone
+                // (no flicker for apps merely cycled through).
+                if !effective_unminimize {
+                    return;
                 }
-                return;
+                // De-miniaturize, then fall through to the same raise + AXMain as a
+                // normal window. Un-minimizing alone (or AXRaise alone) leaves the
+                // window BEHIND others on some apps (e.g. Calendar) — AXMain=true is
+                // what actually moves it to the front of the stack.
+                let false_val = CFBoolean::false_value();
+                AXUIElementSetAttributeValue(
+                    win,
+                    min_attr.as_concrete_TypeRef().cast(),
+                    false_val.as_CFTypeRef() as CFTypeRef,
+                );
+                did_unminimize.set(true);
             }
             let raise = CFString::from_static_string("AXRaise");
             AXUIElementPerformAction(win, raise.as_concrete_TypeRef().cast());
@@ -2140,6 +2221,34 @@ mod macos {
             }
         }
         debug!(pid, raised_via, "ax_make_frontmost: window raise");
+
+        // If we de-miniaturized the landed window, re-assert front after the
+        // un-minimize animation settles — the immediate raise above races the
+        // genie animation and can leave the window behind others (Calendar).
+        if did_unminimize.get() && reopen_if_windowless {
+            schedule_refront(pid);
+        }
+
+        // Running app with NO window (Notes/Calendar/Mail et al. with their
+        // window closed): AXFrontmost activated the menu bar but there was
+        // nothing to raise, so the app appears "not to come forward." Trigger the
+        // app's reopen via LaunchServices (like clicking its Dock icon / what
+        // native Cmd+Tab does), which creates a window. Gated to the landing app
+        // (`reopen_if_windowless`, set only on commit) so apps merely *cycled
+        // through* don't pop windows; only fires when no window was found, so
+        // apps that already surfaced one are untouched. `open` re-launches a
+        // since-died bundle, but the user is switching *to* it, so that's fine.
+        if raised_via == "none" && reopen_if_windowless {
+            if let Some(b) = &bundle_id {
+                let _ = std::process::Command::new("/usr/bin/open")
+                    .args(["-b", b])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                debug!(pid, bundle = %b, "ax_make_frontmost: reopen windowless app via open -b");
+            }
+        }
 
         unsafe { CFRelease(app_ref as *const c_void) };
         frontmost_err

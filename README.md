@@ -160,6 +160,12 @@ build locally with [`packaging/make-app.sh`](#building-the-full-app).
                           gate Win+Tab (e.g. mstsc's "Apply Windows key
                           combinations" when windowed). Option+Shift+Tab cycles
                           backward. macOS-only.
+--app-switcher-hud        Show a visual app-switcher overlay (icon row, like
+                          macOS's native Cmd+Tab) on the remote during Cmd+Tab /
+                          Option+Tab. Off by default. macrdp spawns a small helper
+                          that draws a real on-screen panel, which ScreenCaptureKit
+                          captures — so the client sees it. The switch behaves the
+                          same with or without it. macOS-only.
 --keyboard-layout SPEC    Force a keyboard layout for non-US clients instead of
                           auto-detecting it from the client. By default the
                           layout is auto-detected from the client's announced

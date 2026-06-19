@@ -101,6 +101,24 @@ else
     echo "==> WARNING: ifd-handler dylib not found; smart-card handler NOT embedded (unset SKIP_BUILD?)" >&2
 fi
 
+# 2d. Embed the app-switcher HUD helper (--app-switcher-hud). A small Swift
+#     executable built from gui/; macrdp spawns it from Contents/Resources/macrdphud
+#     (see locate_hud_helper in src/main.rs). Signed before the outer bundle is
+#     sealed so the deep signature stays valid + it passes notarization.
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+    echo "==> swift build -c release (macrdphud)"
+    ( cd "$REPO_ROOT/gui" && swift build -c release --product macrdphud )
+fi
+HUD_BIN="$REPO_ROOT/gui/.build/release/macrdphud"
+if [ -f "$HUD_BIN" ]; then
+    cp "$HUD_BIN" "$STAGE/Contents/Resources/macrdphud"
+    chmod +x "$STAGE/Contents/Resources/macrdphud"
+    codesign --force --options runtime $TS -s "$IDENTITY" "$STAGE/Contents/Resources/macrdphud"
+    echo "==> embedded macrdphud (app-switcher HUD helper)"
+else
+    echo "==> WARNING: macrdphud not found; app-switcher HUD NOT embedded (unset SKIP_BUILD?)" >&2
+fi
+
 # 3. Sign the Mach-O executable, then the bundle (which seals Info.plist + the
 #    Resources, including the app icon + the embedded IFD bundle).
 echo "==> codesign (hardened runtime, ts: $TS)"

@@ -33,15 +33,27 @@ run_admin() {
     /usr/bin/osascript -e "do shell script \"$1\" with administrator privileges" >/dev/null
 }
 
-# Restart the PC/SC reader daemon so it drops any cached driver dylib (slotd
-# keeps loaded IFD drivers in memory for its whole lifetime, so just replacing
-# the file on disk isn't enough — it must be restarted). launchd respawns it.
-# MUST be SIGKILL (-9): slotd ignores SIGTERM, so a plain `pkill`/`killall`
-# leaves it running with the stale dylib. `-f` matches the full path, since the
-# process `comm` is truncated past 15 chars so `killall com.apple.ifdreader`
-# never matches. Best-effort (`|| true`) so it doesn't abort the install chain,
-# but it does NOT mask a failed copy — that's a separate `&&`-guarded step.
-RESTART_SLOTD="{ pkill -9 -f com.apple.ifdreader 2>/dev/null || true; }"
+# Restart the PC/SC reader daemon so it drops any cached driver dylib (slotd keeps
+# loaded IFD drivers in memory for its whole lifetime, so replacing the file isn't
+# enough — it must be restarted; launchd respawns it). MUST be SIGKILL: slotd
+# ignores SIGTERM, and `killall` can't match it (its process `comm` is truncated
+# past 15 chars).
+#
+# CRITICAL: do NOT run `pkill -f com.apple.ifdreader` inside the privileged
+# command. When the install runs via `osascript … do shell script "…" with
+# administrator privileges`, that osascript's OWN command line literally contains
+# the string "com.apple.ifdreader", so `pkill -f` matches and SIGKILLs its own
+# osascript (exit 137 → the install falsely reports failure even though the copy
+# already happened). Instead resolve slotd's PID(s) HERE with pgrep (which excludes
+# its own process and runs before any osascript exists) and SIGKILL those explicit
+# numeric PIDs in the privileged command — nothing there for it to self-match.
+# Best-effort + grouped so it never masks a failed copy (a separate `&&` step).
+SLOTD_PIDS="$(pgrep -f com.apple.ifdreader 2>/dev/null | tr '\n' ' ' || true)"
+if [ -n "${SLOTD_PIDS// /}" ]; then
+    RESTART_SLOTD="{ kill -9 $SLOTD_PIDS 2>/dev/null || true; }"
+else
+    RESTART_SLOTD="true"
+fi
 
 if [ "${1:-}" = "--uninstall" ]; then
     echo "==> Removing $DEST (admin required)"

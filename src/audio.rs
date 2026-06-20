@@ -19,10 +19,7 @@ use ironrdp_rdpsnd::server::RdpsndServerHandler;
 use ironrdp_rdpsnd::server::RdpsndServerMessage;
 use ironrdp_server::{AudioWave, ServerEvent, ServerEventSender, SoundServerFactory};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
-// `info!` is only used on the macOS capture path; unused in the Linux stub.
-#[cfg(target_os = "macos")]
-use tracing::info;
+use tracing::{debug, info, warn};
 
 // ScreenCaptureKit only honors 8000/16000/24000/48000 Hz, so we capture at
 // 48 kHz. The advertised RDPSND format, however, is 44.1 kHz: Windows audio

@@ -1,3 +1,13 @@
+// macrdp is a macOS app; the Linux build is only a compile-sanity stub (CI's
+// cross-compile check), where the `#[cfg(target_os = "macos")]` paths are gone and
+// a large amount of shared code/consts/helpers is naturally unused. Silence that
+// class of noise on non-macOS only — the macOS `clippy -D warnings` gate stays
+// fully strict (this never relaxes anything on the real build).
+#![cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, unused_imports, unused_variables, unused_mut)
+)]
+
 mod aac;
 mod audio;
 mod auth;

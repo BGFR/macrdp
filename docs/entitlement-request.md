@@ -34,8 +34,9 @@ blocks projects like `usbipd-mac`.)
 > Hello — I'd like to request access to the managed entitlement
 > **`com.apple.developer.usb.host-controller-interface`** for my team.
 >
-> **Team ID:** QGLA89KHM7
-> **Developer:** Clint Christopher Canada *(individual Apple Developer Program account)*
+> **Team ID:** [your 10-char Team ID — find it via `codesign -dv` on any signed
+> build, or developer.apple.com → Membership]
+> **Developer:** [your name] *(individual Apple Developer Program account)*
 >
 > **Product:** *macrdp* — an open-source, native **RDP server for macOS**
 > (functionally analogous to `xrdp` on Linux): RDP clients (Microsoft Remote

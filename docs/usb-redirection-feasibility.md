@@ -114,7 +114,7 @@ redirected device is in use.)
 ## What it would take for macrdp (concretely)
 
 1. **Request + obtain** `com.apple.developer.usb.host-controller-interface` for the
-   macrdp team (`QGLA89KHM7`). (Phase-0 spike — cheap, decisive.) A ready-to-paste
+   macrdp signing team. (Phase-0 spike — cheap, decisive.) A ready-to-paste
    Feedback Assistant draft is in [`docs/entitlement-request.md`](entitlement-request.md).
 2. **Provisioning profile.** macrdp currently signs with plain **Developer ID** (no
    profile). A managed entitlement must be embedded in a **provisioning profile**, so

@@ -2,6 +2,7 @@
 
 [![Latest release](https://img.shields.io/github/v/release/clintcan/macrdp?sort=semver&label=release)](https://github.com/clintcan/macrdp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-buy%20me%20a%20coffee-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/clintcan)
 
 A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, Mac↔Windows file copy, **read-write drive redirection** (mount the client's drives in Finder), **smart-card redirection** (use the client's smart card from macOS apps), system audio forwarding, and optional H.264 video (EGFX/AVC420, hardware-encoded). NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
 

@@ -375,12 +375,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func restart() { start() }
 
     /// One-click "remote into my Mac": headless virtual display + detach the
-    /// physical panel (apps move to the virtual display) + H.264, then start.
+    /// physical panel (apps move to the virtual display) + H.264 + the
+    /// app-switcher HUD, then start.
     @objc func presetRemoteDesktop() {
         writeConfig(key: "VIRTUAL_DISPLAY", value: "1")
         writeConfig(key: "PRIMARY_MODE", value: "detach")
         writeConfig(key: "CAPTURE_PRIMARY", value: "0")
         writeConfig(key: "ENABLE_H264", value: "1")
+        writeConfig(key: "APP_SWITCHER_HUD", value: "1")
         let cfg = readConfig()
         if cfg["VD_WIDTH"] == nil { writeConfig(key: "VD_WIDTH", value: "1920") }
         if cfg["VD_HEIGHT"] == nil { writeConfig(key: "VD_HEIGHT", value: "1080") }

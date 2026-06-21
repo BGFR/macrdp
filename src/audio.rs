@@ -456,6 +456,10 @@ async fn capture_loop(
     const RESTART_BACKOFF_BASE_MS: u64 = 250;
     const RESTART_BACKOFF_MAX_MS: u64 = 5000;
     let mut consecutive_failures: u32 = 0;
+    // Capped exponential backoff for capture (re)start failures (250ms→5s).
+    let backoff_ms = |failures: u32| {
+        RESTART_BACKOFF_MAX_MS.min(RESTART_BACKOFF_BASE_MS << failures.saturating_sub(1).min(5))
+    };
 
     let start_instant = std::time::Instant::now();
     // Set false at the top of every (re)connect so SCK's delivered format is
@@ -509,8 +513,7 @@ async fn capture_loop(
         let stream = AsyncSCStream::new(&filter, &config, 2, SCStreamOutputType::Audio);
         if let Err(e) = stream.start_capture() {
             consecutive_failures = consecutive_failures.saturating_add(1);
-            let backoff = RESTART_BACKOFF_MAX_MS
-                .min(RESTART_BACKOFF_BASE_MS << consecutive_failures.saturating_sub(1).min(5));
+            let backoff = backoff_ms(consecutive_failures);
             warn!(
                 attempt = consecutive_failures,
                 backoff_ms = backoff,
@@ -540,8 +543,7 @@ async fn capture_loop(
                 // of the session).
                 let _ = stream.stop_capture();
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                let backoff = RESTART_BACKOFF_MAX_MS
-                    .min(RESTART_BACKOFF_BASE_MS << consecutive_failures.saturating_sub(1).min(5));
+                let backoff = backoff_ms(consecutive_failures);
                 warn!(
                     attempt = consecutive_failures,
                     backoff_ms = backoff,

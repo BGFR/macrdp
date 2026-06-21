@@ -1161,8 +1161,7 @@ mod ffi {
                 if !not_sync.is_null() {
                     // A present "NotSync" attachment means this is a
                     // non-keyframe. (Apple's API encodes the negation.)
-                    is_keyframe = not_sync == kCFBooleanTrue;
-                    is_keyframe = !is_keyframe;
+                    is_keyframe = not_sync != kCFBooleanTrue;
                 }
             }
         }

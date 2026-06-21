@@ -169,13 +169,13 @@ fn nfs_err(context: &str, e: &anyhow::Error) -> nfsstat3 {
 // RdpdrFs — the NFS filesystem backed by the client's redirected drive
 // ---------------------------------------------------------------------------
 
-/// Read-only NFS filesystem over a redirected RDPDR drive. Every NFS op the
+/// Read-write NFS filesystem over a redirected RDPDR drive. Every NFS op the
 /// kernel issues is satisfied from the cache or via an RDPDR round-trip.
 pub struct RdpdrFs {
     handle: RdpdrHandle,
     device_id: u32,
-    /// A fixed timestamp (server start) reported for every node — read-only, so
-    /// the value only matters for the client's attribute cache.
+    /// A fixed timestamp (server start) reported for every node; the surface
+    /// doesn't model per-file times, so it only feeds the client's attr cache.
     created_secs: u32,
     cache: Mutex<FsCache>,
 }

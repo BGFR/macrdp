@@ -75,13 +75,13 @@ mod pam_impl {
         fn pam_strerror(handle: *mut c_void, errnum: c_int) -> *const c_char;
     }
 
-    /// PAM conversation: malloc one `PamResponse` per message, copying our
-    /// stored password (`appdata_ptr` points at a heap-allocated CString).
-    /// libpam will free both the array and each `resp` buffer.
-    /// PAM conversation callback. The `checkpw` service uses `use_first_pass`
+    /// PAM conversation callback. The `checkpw` service uses `use_first_pass`,
     /// so pam_opendirectory normally reads the password from PAM_AUTHTOK
-    /// (set in `authenticate`) and never invokes this — but other PAM
-    /// services we might switch to do prompt, so we keep the conv real.
+    /// (set in `authenticate`) and never invokes this — but other PAM services
+    /// we might switch to do prompt, so we keep it real: malloc one
+    /// `PamResponse` per message, copying our stored password (`appdata_ptr`
+    /// points at a heap-allocated CString). libpam frees both the array and
+    /// each `resp` buffer.
     extern "C" fn conv(
         num_msg: c_int,
         msgs: *mut *const PamMessage,

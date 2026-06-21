@@ -1741,6 +1741,15 @@ mod macos {
                 .find(|(_, _, p)| *p == session.cursor_pid)
             {
                 promote_bundle_to_front(bundle);
+                // Record the landed app as the current focus for the Ctrl→Cmd
+                // remap. Its `frontmost_is_excluded` reads LAST_FOCUS_BUNDLE
+                // first, and our own Cmd+Tab/Option+Tab AX activation doesn't
+                // reliably post an NSWorkspace activation — so without this,
+                // cycling from an excluded app (terminal/VSCode) to a normal one
+                // left the remap suppressed until the user clicked the new app.
+                if let Ok(mut g) = LAST_FOCUS_BUNDLE.lock() {
+                    *g = Some(bundle.clone());
+                }
             }
             session.cursor_pid
         };

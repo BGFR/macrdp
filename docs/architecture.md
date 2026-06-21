@@ -16,7 +16,17 @@ src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI by
                   app always surface — un-minimize / reopen-windowless
                   (open -b) / unhide, gated to the committed app — and, with
                   --app-switcher-hud, drives the macrdphud overlay via
-                  src/switcher_hud.rs.
+                  src/switcher_hud.rs. Also the optional Ctrl→Cmd
+                  Windows-shortcut remap (--map-ctrl-to-cmd): rewrites a
+                  curated key set Ctrl+<k>→Cmd+<k> (post_ctrl_as_cmd),
+                  suppressed when a terminal / --no-remap-apps app is
+                  frontmost. Frontmost detection merges three last-wins
+                  signals into LAST_FOCUS_BUNDLE — an NSWorkspace
+                  activation observer (init_focus_observer, on the
+                  runloop_thread), a mouse-down AX hit-test
+                  (update_focus_from_click, AXUIElementCopyElementAtPosition),
+                  and the AX MRU poll — because Electron apps take key
+                  focus without activating.
 src/switcher_hud.rs  App-switcher HUD IPC client (--app-switcher-hud). A bg
                   thread pushes SHOW/ADVANCE/HIDE (opcode+len framing, like
                   the smart-card bridge) over loopback to the macrdphud helper,

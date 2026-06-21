@@ -536,6 +536,13 @@ Then verify the reader registered with `system_profiler SPSmartCardsDataType`.
 
 This was done to scratch an itch.  There are practically no active open source RDP servers for MacOS.  The closest project that does this functionality is xrdp; however this program only runs on Linux/Unix machines, and has no homebrew equivalent on Macs. Done in a few hours with the help of Claude and runs pretty well. Multi-monitor support is on the list when I'm bored or need a distraction from real life.
 
+## Support this project
+
+macrdp is free and open source. If it's helped you out, you can buy me a coffee
+to help me get through the bumps — totally optional, no pressure.
+
+- ☕ **[Buy me a coffee on Ko-fi](https://ko-fi.com/clintcan)**
+
 ## License
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at

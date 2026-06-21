@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 // macrdp Controller: a menu-bar app that controls the macrdp LaunchAgent
 // (label com.clintcan.macrdp, installed by packaging/install-launchagent.sh)
@@ -172,6 +173,46 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "App-switcher HUD", key: "APP_SWITCHER_HUD", cfg: cfg, sel: #selector(toggleAppSwitcherHud)))
         opts.addItem(toggle(
             "Option+Tab switches apps", key: "ALT_TAB_SWITCH", cfg: cfg, sel: #selector(toggleAltTabSwitch)))
+        // Ctrl→Cmd Windows-shortcut remap + the per-app exclude list (apps where
+        // Ctrl stays Ctrl, e.g. editors with an embedded terminal so Ctrl+C =
+        // SIGINT). Standalone terminals are auto-excluded; this list is for the
+        // ones that can't be auto-detected.
+        opts.addItem(toggle(
+            "Windows shortcuts (Ctrl→Cmd)", key: "MAP_CTRL_TO_CMD", cfg: cfg,
+            sel: #selector(toggleMapCtrlToCmd)))
+        let excl = remapExcludeList(cfg)
+        let exclSet = Set(excl)
+        let exclMenu = NSMenu()
+        var shownBundles = Set<String>()
+        for (bundle, label) in Self.remapExcludeApps {
+            let mi = NSMenuItem(
+                title: label, action: #selector(toggleRemapExclude(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = bundle
+            mi.state = exclSet.contains(bundle) ? .on : .off
+            exclMenu.addItem(mi)
+            shownBundles.insert(bundle)
+        }
+        // Custom entries the user added that aren't in the curated list — shown so
+        // they can be unchecked/removed too.
+        let extras = excl.filter { !shownBundles.contains($0) }
+        if !extras.isEmpty {
+            exclMenu.addItem(.separator())
+            for bundle in extras {
+                let mi = NSMenuItem(
+                    title: bundle, action: #selector(toggleRemapExclude(_:)), keyEquivalent: "")
+                mi.target = self
+                mi.representedObject = bundle
+                mi.state = .on
+                exclMenu.addItem(mi)
+            }
+        }
+        exclMenu.addItem(.separator())
+        exclMenu.addItem(item("Add an app…", #selector(addRemapExcludeApp)))
+        if !excl.isEmpty { exclMenu.addItem(item("Clear list", #selector(clearRemapExclude))) }
+        let exclItem = NSMenuItem(title: "Keep Ctrl in (no remap)", action: nil, keyEquivalent: "")
+        exclItem.submenu = exclMenu
+        opts.addItem(exclItem)
         opts.addItem(.separator())
         // Redirection (the connecting client must opt in too).
         opts.addItem(toggle(
@@ -502,6 +543,62 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleAltTabSwitch() { flip("ALT_TAB_SWITCH") }
     @objc func toggleDriveRedirection() { flip("ENABLE_DRIVE_REDIRECTION") }
     @objc func toggleSmartcardRedirection() { flip("ENABLE_SMARTCARD_REDIRECTION") }
+    @objc func toggleMapCtrlToCmd() { flip("MAP_CTRL_TO_CMD") }
+
+    /// Parse NO_REMAP_APPS (comma-separated bundle ids) into an ordered list.
+    func remapExcludeList(_ cfg: [String: String]) -> [String] {
+        (cfg["NO_REMAP_APPS"] ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// Write the exclude list back to NO_REMAP_APPS (de-duped, order preserved).
+    func setRemapExcludeList(_ apps: [String]) {
+        var seen = Set<String>()
+        let deduped = apps.filter { !$0.isEmpty && seen.insert($0).inserted }
+        writeConfig(key: "NO_REMAP_APPS", value: deduped.joined(separator: ","))
+        applyIfRunning()
+    }
+
+    /// Add/remove a bundle id from the Ctrl→Cmd exclude list (checkable menu item).
+    @objc func toggleRemapExclude(_ sender: NSMenuItem) {
+        guard let bundle = sender.representedObject as? String else { return }
+        var list = remapExcludeList(readConfig())
+        if let idx = list.firstIndex(of: bundle) {
+            list.remove(at: idx)
+        } else {
+            list.append(bundle)
+        }
+        setRemapExcludeList(list)
+    }
+
+    /// Pick any .app and add its bundle id to the exclude list — reads the id off
+    /// the bundle, so the user never has to know or type it.
+    @objc func addRemapExcludeApp() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose an app to keep Ctrl unmapped in"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let bundle = Bundle(url: url)?.bundleIdentifier else {
+            alert(style: .warning, "Couldn't read that app",
+                  "macOS didn't report a bundle identifier for the selected app.")
+            return
+        }
+        var list = remapExcludeList(readConfig())
+        list.append(bundle)
+        setRemapExcludeList(list)
+    }
+
+    @objc func clearRemapExclude() {
+        writeConfig(key: "NO_REMAP_APPS", value: "")
+        applyIfRunning()
+    }
 
     /// One-time privileged install of the smart-card IFD handler (the toggle only
     /// flips the server flag; the handler still has to be copied into the system
@@ -577,6 +674,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         (1600, 900, "1600 × 900"),
         (1920, 1080, "1920 × 1080 (1080p)"),
         (2560, 1440, "2560 × 1440 (1440p)"),
+    ]
+
+    /// (bundle id, menu label) curated shortcuts for the Ctrl→Cmd exclude list —
+    /// common editors with an embedded terminal that can't be auto-detected.
+    /// Anything else is added via "Add an app…" (which reads the bundle id off the
+    /// chosen .app, so no need to know it).
+    static let remapExcludeApps: [(String, String)] = [
+        ("com.microsoft.VSCode", "Visual Studio Code"),
+        ("com.microsoft.VSCodeInsiders", "VS Code — Insiders"),
+        ("com.todesktop.230313mzl4w4u92", "Cursor"),
     ]
 
     /// (config value, menu label) for the keyboard-layout picker. The empty

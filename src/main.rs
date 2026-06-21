@@ -203,8 +203,10 @@ struct Args {
     #[arg(long)]
     username: Option<String>,
 
-    /// Password to use without an interactive prompt. Discouraged — leaving
-    /// this unset and entering at the prompt avoids shell-history leakage.
+    /// Password to use without an interactive prompt. Discouraged and kept only
+    /// for compatibility / scripted tests: a command-line password is visible to
+    /// any local user via `ps` and may be saved in shell history. Prefer
+    /// `--keychain` (headless) or leaving this unset to enter it at the prompt.
     #[arg(long)]
     password: Option<String>,
 
@@ -1280,6 +1282,11 @@ async fn async_main() -> Result<()> {
     let password: Zeroizing<String> = if args.keychain {
         read_password_from_keychain(&username)?
     } else if let Some(p) = args.password.take() {
+        warn!(
+            "--password is visible to any local user via `ps` and may be saved in \
+             shell history; prefer --keychain (headless) or the interactive prompt. \
+             Kept only for compatibility / scripted tests."
+        );
         Zeroizing::new(p)
     } else {
         Zeroizing::new(

@@ -222,6 +222,38 @@ pub fn set_app_switcher_hud(on: bool) {
     APP_SWITCHER_HUD.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// When true, rewrite a curated set of `Ctrl+<key>` editing shortcuts to
+/// `Cmd+<key>` so Windows muscle memory (Ctrl+C/V/X/…) drives macOS copy/paste.
+/// Opt-in via `--map-ctrl-to-cmd`; off by default (the default keeps Ctrl as Ctrl,
+/// so the US majority + Ctrl-based shortcuts are unaffected). Suppressed when a
+/// terminal app is frontmost (see `NO_REMAP_APPS`).
+static MAP_CTRL_TO_CMD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_map_ctrl_to_cmd(on: bool) {
+    MAP_CTRL_TO_CMD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bundle ids whose frontmost focus suppresses the Ctrl→Cmd remap, in ADDITION to
+/// the built-in standalone-terminal list. The lever for embedded terminals that the
+/// front-app check can't auto-detect (e.g. add `com.microsoft.VSCode`). Set once at
+/// startup from `--no-remap-apps`.
+static NO_REMAP_APPS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+pub fn set_no_remap_apps(bundles: Vec<String>) {
+    let _ = NO_REMAP_APPS.set(bundles);
+}
+
+/// Start the event-driven frontmost-app observer used by the Ctrl→Cmd remap's
+/// terminal/app suppression. Call once at startup when `--map-ctrl-to-cmd` is on.
+/// See `macos::init_focus_observer`.
+#[cfg(target_os = "macos")]
+pub fn init_focus_observer() {
+    macos::init_focus_observer();
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn init_focus_observer() {}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::collections::HashSet;
@@ -474,6 +506,10 @@ mod macos {
         // key-up gets swallowed too so the focused app doesn't see a bare
         // release with no preceding press.
         consumed_keys: HashSet<u16>,
+        // Virtual keycodes currently held that we remapped Ctrl→Cmd on the way
+        // down (--map-ctrl-to-cmd). The matching key-up is posted with the same
+        // Cmd swap + restores the real (Ctrl) modifier state.
+        remapped_keys: HashSet<u16>,
         // Optional non-US keyboard layout. When set, ordinary typing keys are
         // translated to characters against this layout and posted as Unicode
         // strings instead of positional keycodes. `None` → keycode path only.
@@ -552,6 +588,7 @@ mod macos {
                 click_right: None,
                 click_middle: None,
                 consumed_keys: HashSet::new(),
+                remapped_keys: HashSet::new(),
                 layout,
                 klid_handle,
                 last_klid: 0,
@@ -723,6 +760,31 @@ mod macos {
                 return;
             }
 
+            // Ctrl→Cmd remap (--map-ctrl-to-cmd): rewrite a curated set of editing
+            // shortcuts so Windows muscle memory (Ctrl+C/V/X/…) drives macOS
+            // copy/paste. The key-down swaps Ctrl→Cmd (with matching session
+            // FlagsChanged) so the app sees a clean Cmd+key; the matching key-up
+            // is posted the same way and restores the held-Ctrl state. Suppressed
+            // when a terminal / excluded app is frontmost so Ctrl+C stays SIGINT.
+            // Checked before the layout branch so a remapped key-up isn't swallowed
+            // there.
+            if !down && self.remapped_keys.remove(&vk) {
+                self.post_ctrl_as_cmd(vk, false);
+                return;
+            }
+            if down
+                && super::MAP_CTRL_TO_CMD.load(std::sync::atomic::Ordering::Relaxed)
+                && self.mods.has_ctrl()
+                && !self.mods.has_cmd()
+                && !self.mods.has_alt()
+                && is_remappable_shortcut(vk)
+                && !frontmost_is_excluded()
+            {
+                self.post_ctrl_as_cmd(vk, true);
+                self.remapped_keys.insert(vk);
+                return;
+            }
+
             // Non-US layout translation: for ordinary typing keys with no
             // Cmd/Ctrl held, produce the character this key yields in the
             // configured layout and post it as a Unicode string, leaving the
@@ -804,6 +866,47 @@ mod macos {
                 ev.set_flags(flags);
                 ev.set_type(CGEventType::FlagsChanged);
                 ev.post(CGEventTapLocation::HID);
+            }
+        }
+
+        /// Post a curated `Ctrl+<vk>` shortcut as `Cmd+<vk>` (--map-ctrl-to-cmd).
+        /// On **down**: present Cmd-held (not Ctrl) to both modifier views via a
+        /// FlagsChanged carrying the swapped flags, then post the key-down with
+        /// those flags — so the focused app sees a clean Cmd+key. On **up**: post
+        /// the key-up with the swapped flags, then restore the real (Ctrl) state
+        /// via `post_flags_changed` (the user is still physically holding Ctrl, so
+        /// `self.mods` already reflects it). Shift/Caps in `self.mods` carry
+        /// through unchanged, so `Ctrl+Shift+Z` → `Cmd+Shift+Z` (redo) works.
+        fn post_ctrl_as_cmd(&self, vk: u16, down: bool) {
+            // Swap Control→Command in both the public CGEventFlag bits and the
+            // device-dependent NX bits, leaving every other modifier intact.
+            let mut bits = self.mods.cg_flags().bits();
+            bits &= !CGEventFlags::CGEventFlagControl.bits();
+            bits &= !(NX_DEVICE_L_CTRL | NX_DEVICE_R_CTRL);
+            bits |= CGEventFlags::CGEventFlagCommand.bits();
+            bits |= NX_DEVICE_L_CMD;
+            let swapped = CGEventFlags::from_bits_retain(bits);
+
+            if down {
+                for source in [&self.source, &self.source_hid] {
+                    let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), VK_LCMD, true) else {
+                        warn!("CGEvent::new_keyboard_event failed (ctrl→cmd flags)");
+                        continue;
+                    };
+                    ev.set_flags(swapped);
+                    ev.set_type(CGEventType::FlagsChanged);
+                    ev.post(CGEventTapLocation::HID);
+                }
+            }
+            if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, down) {
+                ev.set_flags(swapped);
+                ev.post(CGEventTapLocation::HID);
+            } else {
+                warn!(vk, "CGEvent::new_keyboard_event failed (ctrl→cmd key)");
+            }
+            if !down {
+                // Restore the real modifier state (Ctrl still held).
+                self.post_flags_changed(VK_LCMD);
             }
         }
 
@@ -1026,6 +1129,15 @@ mod macos {
             };
             ev.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_count);
             ev.post(CGEventTapLocation::HID);
+
+            // On a button-down, record which app's window is under the cursor so
+            // the Ctrl→Cmd suppression knows the real focus target — the only way
+            // to catch an Electron app (VSCode) clicked into in a headless session,
+            // which takes key focus without activating. Gated to when the remap is
+            // on (the only consumer); the hit-test runs off-thread, best-effort.
+            if down && super::MAP_CTRL_TO_CMD.load(std::sync::atomic::Ordering::Relaxed) {
+                update_focus_from_click(self.last_x, self.last_y);
+            }
         }
 
         fn scroll(&self, vertical: i32, horizontal: i32) {
@@ -1456,11 +1568,254 @@ mod macos {
     /// `NSWorkspace.runningApplications()` which is cached and stale
     /// in our (non-Cocoa-runloop) process.
     fn bundle_identifier_for_pid(pid: libc::pid_t) -> Option<String> {
+        // Fast path: a normal app resolves directly via NSRunningApplication.
+        let direct = unsafe {
+            NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+                .and_then(|a| a.bundleIdentifier())
+                .map(|s| s.to_string())
+        };
+        if let Some(bid) = direct {
+            if !bid.is_empty() {
+                return Some(bid);
+            }
+        }
+        // Helper path: AXFocusedApplication hands us Electron *helper* process
+        // pids (VSCode's "Code Helper (Renderer)", Slack, etc.) that
+        // NSRunningApplication returns no bundle id for — so a focused Electron
+        // app would otherwise be invisible to both the focus poller and the
+        // Ctrl→Cmd exclusion check. Derive the OWNING app's bundle id from the
+        // process executable path's OUTERMOST `.app` bundle, so e.g. a focused
+        // VSCode resolves to `com.microsoft.VSCode` regardless of which helper
+        // holds focus.
+        bundle_id_from_pid_path(pid)
+    }
+
+    /// Resolve a pid to the bundle id of the outermost `.app` containing its
+    /// executable (via `proc_pidpath` + `NSBundle`). Used as the helper-process
+    /// fallback in `bundle_identifier_for_pid`. Returns None if the path can't be
+    /// read or isn't inside an app bundle.
+    fn bundle_id_from_pid_path(pid: libc::pid_t) -> Option<String> {
+        extern "C" {
+            fn proc_pidpath(
+                pid: libc::c_int,
+                buffer: *mut libc::c_void,
+                buffersize: u32,
+            ) -> libc::c_int;
+        }
+        // PROC_PIDPATHINFO_MAXSIZE = 4 * MAXPATHLEN.
+        let mut buf = vec![0u8; 4096];
+        let n = unsafe {
+            proc_pidpath(
+                pid as libc::c_int,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len() as u32,
+            )
+        };
+        if n <= 0 {
+            return None;
+        }
+        let path = std::str::from_utf8(&buf[..n as usize]).ok()?;
+        // The outermost app bundle is the FIRST ".app" component in the path
+        // (e.g. ".../Visual Studio Code.app/Contents/Frameworks/Code Helper.app/
+        // .../Code Helper" → ".../Visual Studio Code.app").
+        let idx = path.find(".app/")?;
+        let app_path = &path[..idx + 4];
         unsafe {
-            NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?
+            let ns = objc2_foundation::NSString::from_str(app_path);
+            let bundle = objc2_foundation::NSBundle::bundleWithPath(&ns)?;
+            bundle
                 .bundleIdentifier()
                 .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
         }
+    }
+
+    /// macOS virtual keycodes whose `Ctrl+<key>` combo is remapped to `Cmd+<key>`
+    /// under --map-ctrl-to-cmd: C V X A Z S F N T W O P R G (copy / paste / cut /
+    /// select-all / undo / save / find / new / new-tab / close / open / print /
+    /// reload / find-next). Deliberately EXCLUDES Q (`Cmd+Q` quits — a nasty
+    /// surprise from `Ctrl+Q`) and all nav keys (Mac word-nav is Option+arrow, not
+    /// Cmd+arrow). Windows redo (`Ctrl+Y`) is intentionally not here — Mac redo is
+    /// `Cmd+Shift+Z`, reachable via `Ctrl+Shift+Z` through the Z mapping.
+    fn is_remappable_shortcut(vk: u16) -> bool {
+        matches!(
+            vk,
+            0x08 // C
+                | 0x09 // V
+                | 0x07 // X
+                | 0x00 // A
+                | 0x06 // Z
+                | 0x01 // S
+                | 0x03 // F
+                | 0x2D // N
+                | 0x11 // T
+                | 0x0D // W
+                | 0x1F // O
+                | 0x23 // P
+                | 0x0F // R
+                | 0x05 // G
+        )
+    }
+
+    /// Standalone-terminal bundle ids where the Ctrl→Cmd remap is always
+    /// suppressed, so `Ctrl+C` keeps reaching the shell as SIGINT. Embedded
+    /// terminals (VSCode's integrated TTY etc.) can't be auto-detected — the
+    /// frontmost app is the IDE, not a terminal — so they're covered by the
+    /// user-extensible --no-remap-apps list instead.
+    const BUILTIN_TERMINAL_BUNDLES: &[&str] = &[
+        "com.apple.Terminal",
+        "com.googlecode.iterm2",
+        "io.alacritty",
+        "net.kovidgoyal.kitty",
+        "com.github.wez.wezterm",
+        "com.mitchellh.ghostty",
+        "co.zeit.hyper",
+        "dev.warp.Warp-Stable",
+    ];
+
+    /// The app the user is currently interacting with (bundle id), as the Ctrl→Cmd
+    /// suppression's primary "what's focused right now" signal. Updated, last-wins,
+    /// by TWO sources because no single macOS API covers every case in this
+    /// headless/virtual-display context:
+    ///   - the `NSWorkspace` activation observer (`init_focus_observer`) — fires on
+    ///     Cmd+Tab and on clicking apps that activate normally; and
+    ///   - a **click hit-test** (`update_focus_from_click`) — resolves the app whose
+    ///     window is under the cursor at mouse-down, which is the ONLY way to catch
+    ///     an Electron app (VSCode) clicked into in this setup: it takes key focus
+    ///     (keystrokes land in it) WITHOUT emitting an activation, so neither
+    ///     `AXFocusedApplication` nor `NSWorkspace` ever reports it.
+    static LAST_FOCUS_BUNDLE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    /// Register an `NSWorkspaceDidActivateApplicationNotification` observer so we
+    /// always know the current frontmost app. It fires on **every** activation
+    /// (including mouse-click focus and Electron apps), and the activated app is
+    /// carried in the notification's `userInfo` as an `NSRunningApplication`, whose
+    /// `bundleIdentifier` is the **main app** id (not an Electron helper). Runs on
+    /// the dedicated CFRunLoop thread because `NSWorkspace` notifications need a
+    /// live, pumped runloop — macrdp's main thread (owned by tokio) has none. The
+    /// observer token + block are leaked intentionally (process-lifetime).
+    ///
+    /// This replaces the unreliable AX-poll / MRU-front guess that the Ctrl→Cmd
+    /// suppression used before: AX polling never reported VSCode focused by click,
+    /// so the remap wrongly fired in its integrated terminal.
+    pub(super) fn init_focus_observer() {
+        crate::runloop_thread::submit(|| unsafe {
+            use objc2::rc::Retained;
+            use objc2::runtime::AnyObject;
+            use objc2_app_kit::{
+                NSWorkspace, NSWorkspaceApplicationKey,
+                NSWorkspaceDidActivateApplicationNotification,
+            };
+            use objc2_foundation::{NSNotification, NSString};
+            use std::ptr::NonNull;
+
+            let center = NSWorkspace::sharedWorkspace().notificationCenter();
+            let block = block2::RcBlock::new(move |notif: NonNull<NSNotification>| {
+                let notif: &NSNotification = notif.as_ref();
+                let Some(info) = notif.userInfo() else { return };
+                let key: &AnyObject = NSWorkspaceApplicationKey.as_ref();
+                // The value is the activated NSRunningApplication; read its
+                // bundleIdentifier directly (the main app id, not a helper).
+                let Some(obj) = info.objectForKey(key) else {
+                    return;
+                };
+                let bid: Option<Retained<NSString>> = objc2::msg_send_id![&*obj, bundleIdentifier];
+                if let Some(bid) = bid {
+                    let s = bid.to_string();
+                    if !s.is_empty() {
+                        debug!(bundle = %s, "ctrl→cmd activation focus");
+                        if let Ok(mut g) = LAST_FOCUS_BUNDLE.lock() {
+                            *g = Some(s);
+                        }
+                    }
+                }
+            });
+            let token = center.addObserverForName_object_queue_usingBlock(
+                Some(NSWorkspaceDidActivateApplicationNotification),
+                None,
+                None,
+                &block,
+            );
+            std::mem::forget(token);
+            std::mem::forget(block);
+            debug!("ctrl→cmd: NSWorkspace activation observer registered");
+        });
+    }
+
+    /// True when the frontmost app is a built-in terminal or appears in the user's
+    /// --no-remap-apps list — in which case the Ctrl→Cmd remap is suppressed (so
+    /// Ctrl+C stays SIGINT). Called on a remappable Ctrl-shortcut key-down.
+    ///
+    /// Frontmost resolution priority: (1) `LAST_FOCUS_BUNDLE` — the last-wins merge
+    /// of the `NSWorkspace` activation observer AND the click hit-test, which
+    /// together cover Cmd+Tab, normal click-activation, AND Electron click-focus;
+    /// (2) a direct `AXFocusedApplication` lookup (returns None on this input
+    /// thread, but kept as a belt-and-suspenders); (3) the MRU front
+    /// (`mru_bundles()[0]`) the focus poller maintains.
+    ///
+    /// Electron apps focused via a helper can surface a `.helper[.Renderer]`
+    /// suffixed id, so we match an exclusion entry by **equality OR a dotted-prefix**
+    /// (`<entry>.`) — listing `com.microsoft.VSCode` also covers its helpers; the
+    /// trailing dot keeps it from matching a sibling like `…VSCodeInsiders`.
+    fn frontmost_is_excluded() -> bool {
+        let bid = LAST_FOCUS_BUNDLE
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .or_else(|| ax_focused_application_pid().and_then(bundle_identifier_for_pid))
+            .or_else(|| mru_bundles().lock().ok().and_then(|m| m.first().cloned()));
+        let Some(bid) = bid else {
+            return false;
+        };
+        let matches = |entry: &str| bid == entry || bid.starts_with(&format!("{entry}."));
+        let excluded = BUILTIN_TERMINAL_BUNDLES.iter().any(|e| matches(e))
+            || super::NO_REMAP_APPS
+                .get()
+                .is_some_and(|list| list.iter().any(|e| matches(e)));
+        debug!(bundle = %bid, excluded, "ctrl→cmd frontmost check");
+        excluded
+    }
+
+    /// Update `LAST_FOCUS_BUNDLE` from a mouse-down at the given GLOBAL screen
+    /// point (top-left origin — the same space `input.rs` posts mouse events in).
+    /// Hit-tests the window under the cursor via `AXUIElementCopyElementAtPosition`
+    /// and resolves its owning app's bundle id. This is the only signal that
+    /// catches an Electron app (VSCode) clicked into in a headless/virtual-display
+    /// session: it takes key focus without emitting an activation, so the
+    /// activation observer and `AXFocusedApplication` never see it. Best-effort —
+    /// runs on the dedicated CFRunLoop thread (where AX is reliable, unlike the
+    /// input thread) and updates the cell before the user's next keystroke. Only
+    /// armed when `--map-ctrl-to-cmd` is on (the only consumer). No-op if AX can't
+    /// resolve a window/app at the point (menu bar, empty space).
+    fn update_focus_from_click(x: f64, y: f64) {
+        crate::runloop_thread::submit(move || unsafe {
+            use std::ffi::c_void;
+            let systemwide = AXUIElementCreateSystemWide();
+            if systemwide.is_null() {
+                return;
+            }
+            let mut element: *mut c_void = std::ptr::null_mut();
+            let err =
+                AXUIElementCopyElementAtPosition(systemwide, x as f32, y as f32, &mut element);
+            CFRelease(systemwide as *const c_void);
+            if err != AX_ERROR_SUCCESS || element.is_null() {
+                return;
+            }
+            let mut pid: libc::pid_t = 0;
+            let pid_err = AXUIElementGetPid(element, &mut pid);
+            CFRelease(element as *const c_void);
+            if pid_err != AX_ERROR_SUCCESS || pid <= 0 {
+                return;
+            }
+            if let Some(bundle) = bundle_identifier_for_pid(pid) {
+                if !bundle.is_empty() {
+                    debug!(pid, bundle = %bundle, "ctrl→cmd click focus");
+                    if let Ok(mut g) = LAST_FOCUS_BUNDLE.lock() {
+                        *g = Some(bundle);
+                    }
+                }
+            }
+        });
     }
 
     /// Find the pid of the first running app matching `bundle`. Walks
@@ -2020,6 +2375,12 @@ mod macos {
         fn AXUIElementCreateApplication(pid: libc::pid_t) -> *mut std::ffi::c_void;
         fn AXUIElementCreateSystemWide() -> *mut std::ffi::c_void;
         fn AXUIElementGetPid(element: *mut std::ffi::c_void, pid: *mut libc::pid_t) -> i32;
+        fn AXUIElementCopyElementAtPosition(
+            application: *mut std::ffi::c_void,
+            x: f32,
+            y: f32,
+            element: *mut *mut std::ffi::c_void,
+        ) -> i32;
         fn AXUIElementSetAttributeValue(
             element: *mut std::ffi::c_void,
             attribute: core_foundation::base::CFTypeRef,
@@ -2746,6 +3107,23 @@ mod macos {
             tm.tm_min,
             tm.tm_sec
         )
+    }
+
+    #[cfg(test)]
+    mod remap_tests {
+        use super::is_remappable_shortcut;
+
+        #[test]
+        fn curated_keys_remap_and_q_does_not() {
+            // Curated editing keys (C, V, X, A, Z, S) remap.
+            for vk in [0x08u16, 0x09, 0x07, 0x00, 0x06, 0x01] {
+                assert!(is_remappable_shortcut(vk), "vk {vk:#x} should remap");
+            }
+            // Q (0x0C) is deliberately excluded so Ctrl+Q can't become Cmd+Q.
+            assert!(!is_remappable_shortcut(0x0C));
+            // Arrows / nav keys are untouched (e.g. left arrow 0x7B).
+            assert!(!is_remappable_shortcut(0x7B));
+        }
     }
 }
 

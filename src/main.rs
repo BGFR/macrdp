@@ -488,6 +488,25 @@ struct Args {
     #[arg(long = "app-switcher-hud")]
     app_switcher_hud: bool,
 
+    /// Remap a curated set of Windows editing shortcuts from Ctrl to Cmd so
+    /// Windows muscle memory drives macOS: Ctrl+C/V/X/A/Z/S/F/N/T/W/O/P/R/G (and
+    /// Shift variants, e.g. Ctrl+Shift+Z → Cmd+Shift+Z redo) fire as the Cmd
+    /// equivalent. Off by default (then Ctrl reaches remote apps unchanged, so
+    /// macOS shortcuts need Cmd, i.e. the client's Windows/Super key). Cmd+Q is
+    /// deliberately NOT produced (Q is excluded); nav keys are untouched. Always
+    /// suppressed when a terminal is frontmost so Ctrl+C stays SIGINT. macOS-only.
+    #[arg(long = "map-ctrl-to-cmd")]
+    map_ctrl_to_cmd: bool,
+
+    /// Bundle ids (comma-separated) where --map-ctrl-to-cmd is suppressed, in
+    /// addition to the built-in terminal list. Use this for apps with an embedded
+    /// terminal that can't be auto-detected (the frontmost app is the IDE, not a
+    /// TTY), e.g. `--no-remap-apps com.microsoft.VSCode`. In a listed app, Ctrl
+    /// stays Ctrl (its integrated-terminal Ctrl+C = SIGINT works; editor copy is
+    /// Cmd+C, the app's native macOS copy). No effect without --map-ctrl-to-cmd.
+    #[arg(long = "no-remap-apps", value_delimiter = ',')]
+    no_remap_apps: Vec<String>,
+
     /// Force QOI BitmapUpdates to be encoded with `Channels::Rgb` instead of
     /// `Channels::Rgba`. The default (off) emits RGBA per the underlying
     /// PixelFormat, matching upstream `ironrdp-server`. Upstream
@@ -984,6 +1003,15 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("APP_SWITCHER_HUD", false) {
         argv.push("--app-switcher-hud".into());
     }
+    if on("MAP_CTRL_TO_CMD", false) {
+        argv.push("--map-ctrl-to-cmd".into());
+    }
+    if let Some(list) = cfg.get("NO_REMAP_APPS") {
+        if !list.is_empty() {
+            argv.push("--no-remap-apps".into());
+            argv.push(list.clone());
+        }
+    }
     if on("ENABLE_DRIVE_REDIRECTION", false) {
         argv.push("--enable-drive-redirection".into());
     }
@@ -1386,10 +1414,34 @@ async fn async_main() -> Result<()> {
         );
     }
 
+    // Video-path heads-up. With --enable-h264 the active vs AVC420-fallback cases
+    // are logged later (h264.rs, once the client's EGFX caps are known); the only
+    // gap is the h264-disabled case, which never reaches that code — so name the
+    // legacy path and point at the crisp option here. Answers the common "the
+    // picture is grainy / not sure what codec it negotiated" question.
+    if !args.enable_h264 {
+        info!(
+            "video codec: legacy bitmap path (RemoteFX/QOI/NSCodec/raw, client-negotiated). \
+             For crisp H.264 on capable clients (mstsc, Microsoft Remote Desktop, FreeRDP, \
+             Thincast) pass --enable-h264 (AVC420 over EGFX)."
+        );
+    }
+
     ironrdp_server::set_qoi_force_rgb(args.qoi_force_rgb);
     crate::input::set_unminimize_on_switch(args.unminimize_on_switch);
     crate::input::set_alt_tab_switch(args.alt_tab_switch);
     crate::input::set_app_switcher_hud(args.app_switcher_hud);
+    crate::input::set_map_ctrl_to_cmd(args.map_ctrl_to_cmd);
+    crate::input::set_no_remap_apps(args.no_remap_apps.clone());
+    if args.map_ctrl_to_cmd {
+        info!(
+            no_remap_apps = ?args.no_remap_apps,
+            "Ctrl→Cmd Windows-shortcut remap enabled (--map-ctrl-to-cmd)"
+        );
+        // Event-driven frontmost-app tracking for the terminal/app suppression
+        // (catches click-focus + Electron apps that AX polling misses).
+        crate::input::init_focus_observer();
+    }
 
     // App-switcher HUD overlay helper (macOS-only). Tell it which display to
     // center on (the captured one) and spawn it; it idles until a Cmd+Tab. Held

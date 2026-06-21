@@ -166,6 +166,19 @@ build locally with [`packaging/make-app.sh`](#building-the-full-app).
                           that draws a real on-screen panel, which ScreenCaptureKit
                           captures — so the client sees it. The switch behaves the
                           same with or without it. macOS-only.
+--map-ctrl-to-cmd         Remap Windows editing shortcuts from Ctrl to Cmd so
+                          Windows muscle memory works on macOS: Ctrl+C/V/X/A/Z/S/
+                          F/N/T/W/O/P/R/G (and Shift variants, e.g. Ctrl+Shift+Z =
+                          redo) fire as the Cmd equivalent. Off by default (then
+                          Ctrl reaches remote apps unchanged, so macOS shortcuts
+                          need the client's Win/Super key). Cmd+Q is never produced
+                          (Q excluded); nav keys untouched. Always suppressed when a
+                          terminal is frontmost so Ctrl+C stays SIGINT. macOS-only.
+--no-remap-apps LIST      Comma-separated bundle ids where --map-ctrl-to-cmd is
+                          suppressed, on top of the built-in terminal list. For
+                          apps with an embedded terminal that can't be auto-detected
+                          (front app is the IDE, not a TTY), e.g.
+                          --no-remap-apps com.microsoft.VSCode. macOS-only.
 --keyboard-layout SPEC    Force a keyboard layout for non-US clients instead of
                           auto-detecting it from the client. By default the
                           layout is auto-detected from the client's announced
@@ -288,8 +301,14 @@ Both restore the original layout when the last client disconnects, and both auto
 # Higher frame rate, custom cert dir.
 ./macrdp --fps 30 --cert-dir ~/.macrdp-certs
 
-# H.264 video over EGFX (much lower bandwidth than legacy bitmaps).
+# H.264 video over EGFX — much lower bandwidth AND crisper than legacy bitmaps.
+# Recommended for mstsc / Microsoft Remote Desktop / FreeRDP / Thincast: the
+# default legacy bitmap path looks grainy on those clients by comparison.
 ./macrdp --enable-h264
+
+# Make Windows shortcuts (Ctrl+C/V/X/…) drive macOS copy/paste; keep VSCode's
+# integrated terminal on real Ctrl.
+./macrdp --map-ctrl-to-cmd --no-remap-apps com.microsoft.VSCode
 
 # Verbose logs (DEBUG level).
 ./macrdp -v

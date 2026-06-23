@@ -36,6 +36,8 @@ use std::fs;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -50,7 +52,7 @@ use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 use x509_cert::Certificate;
 use zeroize::Zeroizing;
 
@@ -546,6 +548,318 @@ struct Args {
     /// for the recognized keys; unknown keys are ignored.
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// PROOF-OF-CONCEPT (mirror-primary only): run a thin supervisor that spawns
+    /// a fresh worker PROCESS per RDP connection (fork+exec of this same binary),
+    /// mirroring xrdp's per-connection-frontend model, instead of handling every
+    /// connection inside one long-lived process. Built to test whether
+    /// process-freshness fixes the mstsc H.264 reconnect blank. Incompatible with
+    /// --virtual-display / --capture-primary / --detach-primary (those need a
+    /// persistent display owner, out of PoC scope). The accepted socket fd is
+    /// handed to each worker via the internal MACRDP_WORKER_FD env var. macOS-only.
+    #[arg(long = "fork-workers")]
+    fork_workers: bool,
+}
+
+/// Env var the `--fork-workers` supervisor sets on each spawned worker, carrying
+/// the inherited (already-accepted) client socket fd. Its presence is what marks
+/// a process as a worker (survives `--config` re-expansion, unlike a CLI flag).
+const WORKER_FD_ENV: &str = "MACRDP_WORKER_FD";
+
+/// Phase-0 spike env var: the supervisor owns one `CGVirtualDisplay` and passes
+/// its `display_id` to each worker here. Its presence tells the worker to CAPTURE
+/// that supervisor-owned display (by id) instead of creating its own — proving
+/// cross-process vdisplay capture, the make-or-break unknown for productization.
+const WORKER_VD_ID_ENV: &str = "MACRDP_VD_ID";
+
+/// Max time the supervisor waits for the previous worker to fully exit before
+/// spawning the next one (see `run_fork_supervisor`). Bounds the rare case
+/// where an old connection lingers, so a reconnect can't hang indefinitely.
+const WORKER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// After the previous worker process dies, give ScreenCaptureKit's capture
+/// daemon a beat to release the capture slot before the next worker opens its
+/// own SCStream. Process death frees the client side synchronously, but the SCK
+/// server side (replayd) can lag — and a *blank* worker (one whose stream never
+/// delivered) appears to release more slowly, which is what produces an
+/// occasional pair of adjacent blank reconnects. Default chosen conservatively;
+/// override at runtime with `MACRDP_WORKER_SCK_SETTLE_MS` to tune the floor on a
+/// given machine without a rebuild.
+///
+/// Default 0: live testing showed the settle never helped (the residual blank is
+/// a client-side mstsc re-composite quirk, NOT a capture-slot overlap — the
+/// blank connection's capture/encode/ship logs are identical to a rendering
+/// one), and a *longer* settle made things WORSE. The serialization wait alone
+/// (draining the previous worker) is what matters. Knob kept for experimentation.
+const WORKER_SCK_SETTLE_DEFAULT: std::time::Duration = std::time::Duration::from_millis(0);
+
+/// Env var to override `WORKER_SCK_SETTLE_DEFAULT` (milliseconds).
+const WORKER_SCK_SETTLE_ENV: &str = "MACRDP_WORKER_SCK_SETTLE_MS";
+
+/// The `--fork-workers` supervisor: bind the listen address, then for every
+/// inbound connection `fork+exec` a fresh copy of this binary as a worker,
+/// handing it the already-accepted socket fd. The supervisor itself does NO
+/// capture/encode/TLS — it only accepts and hands off, so each connection is
+/// served by a brand-new process (xrdp's frontend model). Mirror-primary only.
+/// Headless-blanking mode the fork-workers supervisor engages on first connect
+/// and holds (continuous) for its lifetime. Mirrors the single-process flags.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlankMode {
+    None,
+    Detach,
+    Capture,
+    MakePrimary,
+}
+
+/// Install the chosen headless blanking off the supervisor's accept loop and
+/// stash the guard so it lives for the supervisor's lifetime. The install can
+/// block for seconds (CG / WindowServer), hence the spawned task. Guards are
+/// process-scoped, so they auto-restore when the supervisor dies.
+fn engage_headless_blank(
+    blank: BlankMode,
+    vd_id: u32,
+    detach_slot: Arc<std::sync::Mutex<Option<virtual_display::DetachedPrimary>>>,
+    capture_slot: Arc<std::sync::Mutex<Option<virtual_display::CapturedPrimary>>>,
+    primary_slot: Arc<std::sync::Mutex<Option<virtual_display::PrimaryOverride>>>,
+) {
+    tokio::spawn(async move {
+        match blank {
+            BlankMode::Detach => match virtual_display::DetachedPrimary::install(vd_id) {
+                Ok(g) => {
+                    info!(
+                        "supervisor: headless engaged via --detach-primary (physical \
+                         display disabled; restored when macrdp exits)"
+                    );
+                    *detach_slot.lock().expect("detach slot poisoned") = Some(g);
+                }
+                Err(e) => warn!("supervisor: could not engage --detach-primary: {e:#}"),
+            },
+            BlankMode::Capture => match virtual_display::CapturedPrimary::install(vd_id) {
+                Ok(g) => {
+                    info!(
+                        "supervisor: headless engaged via --capture-primary (physical \
+                         display blanked; restored when macrdp exits)"
+                    );
+                    *capture_slot.lock().expect("capture slot poisoned") = Some(g);
+                }
+                Err(e) => warn!("supervisor: could not engage --capture-primary: {e:#}"),
+            },
+            BlankMode::MakePrimary => match virtual_display::PrimaryOverride::install(vd_id) {
+                Ok(Some(g)) => {
+                    info!("supervisor: virtual display promoted to primary");
+                    *primary_slot.lock().expect("primary slot poisoned") = Some(g);
+                }
+                Ok(None) => {
+                    info!("supervisor: virtual display already primary — no override needed")
+                }
+                Err(e) => warn!("supervisor: could not promote virtual display to primary: {e:#}"),
+            },
+            BlankMode::None => {}
+        }
+    });
+}
+
+async fn run_fork_supervisor(
+    bind: SocketAddr,
+    // The supervisor-owned virtual display. Bound for the whole supervisor
+    // lifetime so the CGVirtualDisplay registration persists across worker
+    // reconnects; its id is handed to each worker via MACRDP_VD_ID. `None`
+    // = mirror-primary. The OS reaps the registration when the supervisor dies.
+    vd: Option<virtual_display::VirtualDisplay>,
+    // Headless blanking the supervisor owns (engaged on first connect, held until
+    // exit). Process-scoped, so it auto-restores when the supervisor dies.
+    blank: BlankMode,
+    // Own the single app-switcher HUD helper here (it LISTENS on :40243). Workers
+    // only push SHOW/ADVANCE/HIDE to it (the display id rides in each SHOW), so a
+    // per-worker helper would churn + contend on the port across reconnects.
+    app_switcher_hud: bool,
+) -> Result<()> {
+    let vd_id: Option<u32> = vd.as_ref().map(|v| v.display_id());
+    // Spawn the one persistent HUD helper (parent = supervisor, so it self-exits
+    // when the supervisor dies). Held for the supervisor's lifetime; workers push
+    // to it over loopback. macOS-only (no-op helper-locate elsewhere).
+    #[cfg(target_os = "macos")]
+    let _hud_helper = if app_switcher_hud {
+        spawn_hud_helper()
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = app_switcher_hud;
+    let exe = std::env::current_exe().context("resolve current exe for worker spawn")?;
+    // Original argv (minus argv[0]) so each worker gets the same config/flags;
+    // the worker takes the worker branch because MACRDP_WORKER_FD is set, so
+    // re-passing --fork-workers here does NOT recurse.
+    let base_args: Vec<String> = std::env::args().skip(1).collect();
+
+    // A plain forced-exit on signal is enough: the supervisor creates no
+    // SCStream, and its headless blanking (capture/detach/primary) is
+    // PROCESS-SCOPED — macOS auto-restores the physical display when the
+    // supervisor process dies (incl. SIGKILL/panic), so process::exit(0) here
+    // restores the user's layout without an explicit guard drop. Workers are
+    // separate processes that finish or die with their own connection.
+    tokio::spawn(async {
+        shutdown_signal().await;
+        info!(
+            "fork-workers supervisor: shutdown signal received — exiting (display auto-restores)"
+        );
+        std::process::exit(0);
+    });
+
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("bind {bind}"))?;
+    info!(
+        %bind,
+        "fork-workers supervisor listening — spawning a fresh worker process per connection (PoC)"
+    );
+
+    // The handle to the most-recently-spawned worker. macrdp mirror-primary is
+    // inherently single-session, so we serialize: before spawning the next
+    // worker we wait for the previous one to fully exit (+ a short SCK settle),
+    // guaranteeing the old capture stream is released before the new worker
+    // opens its own. This kills the intermittent reconnect-blank that remained
+    // after fixing the worker to process::exit — a fast reconnect could still
+    // overlap the new worker's capture with the dying worker's not-yet-released
+    // SCStream.
+    let mut prev_worker: Option<std::process::Child> = None;
+
+    // SCK capture-slot settle, env-overridable for hardware-in-the-loop tuning.
+    let sck_settle = std::env::var(WORKER_SCK_SETTLE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(WORKER_SCK_SETTLE_DEFAULT);
+    info!(
+        settle_ms = sck_settle.as_millis() as u64,
+        "fork-workers: inter-worker SCK settle"
+    );
+
+    // Headless blanking is engaged on the FIRST connection and HELD for the
+    // supervisor's lifetime (continuous — never disengaged between reconnects).
+    // Held in slots because the install can block for seconds (esp. --detach,
+    // which awaits a WindowServer commit), so it runs off the accept loop. All
+    // three mechanisms are process-scoped to the supervisor, so they auto-restore
+    // when it dies (incl. SIGKILL/panic) — no explicit teardown on the signal
+    // path. The slots just keep the guards alive so they aren't dropped (which
+    // would restore mid-session).
+    let detach_slot: Arc<std::sync::Mutex<Option<virtual_display::DetachedPrimary>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let capture_slot: Arc<std::sync::Mutex<Option<virtual_display::CapturedPrimary>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let primary_slot: Arc<std::sync::Mutex<Option<virtual_display::PrimaryOverride>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let mut headless_engaged = false;
+
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                error!(error = ?e, "supervisor accept failed");
+                continue;
+            }
+        };
+
+        // Engage headless blanking on the first connection (continuous).
+        if !headless_engaged && blank != BlankMode::None {
+            headless_engaged = true;
+            if let Some(id) = vd_id {
+                engage_headless_blank(
+                    blank,
+                    id,
+                    detach_slot.clone(),
+                    capture_slot.clone(),
+                    primary_slot.clone(),
+                );
+            }
+        }
+
+        // Drain the previous worker before this connection captures.
+        if let Some(prev) = prev_worker.take() {
+            let prev_pid = prev.id();
+            let waited = tokio::time::timeout(
+                WORKER_WAIT_TIMEOUT,
+                tokio::task::spawn_blocking(move || {
+                    let mut prev = prev;
+                    let _ = prev.wait();
+                }),
+            )
+            .await;
+            if waited.is_err() {
+                // Timed out: the old connection is still alive. The detached
+                // spawn_blocking keeps running and reaps it; proceed anyway so a
+                // genuinely stuck old session can't wedge reconnects forever.
+                warn!(
+                    worker_pid = prev_pid,
+                    "previous worker still alive after wait timeout; spawning next anyway"
+                );
+            } else {
+                debug!(
+                    worker_pid = prev_pid,
+                    "previous worker exited; capture slot freed"
+                );
+            }
+            // Let SCK's daemon release the capture slot before the next SCStream.
+            tokio::time::sleep(sck_settle).await;
+        }
+        // Take ownership of the raw fd and stop tokio/std from closing it; the
+        // child inherits it across fork, and we close the parent's copy after
+        // spawn. `into_std` then `into_raw_fd` detaches it from Rust's RAII.
+        let std_stream = match stream.into_std() {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = ?e, "supervisor: into_std failed");
+                continue;
+            }
+        };
+        let fd: RawFd = std_stream.into_raw_fd();
+
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&base_args).env(WORKER_FD_ENV, fd.to_string());
+        // Hand the supervisor-owned virtual display id to the worker so it
+        // captures that display by id instead of creating its own (Phase-0 spike).
+        if let Some(id) = vd_id {
+            cmd.env(WORKER_VD_ID_ENV, id.to_string());
+        }
+        // The fd must survive exec(): clear its close-on-exec flag in the child
+        // (between fork and exec) so the worker can adopt it by number.
+        unsafe {
+            cmd.pre_exec(move || {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                info!(
+                    ?peer,
+                    worker_pid = pid,
+                    fd,
+                    "spawned worker process for connection"
+                );
+                // Hold the child so the NEXT accept waits for it to exit before
+                // spawning (the serialization above) — that wait is also what
+                // reaps it, so it never becomes a lingering zombie.
+                prev_worker = Some(child);
+            }
+            Err(e) => error!(error = ?e, "failed to spawn worker process"),
+        }
+
+        // Parent no longer needs its copy of the connection fd (the child owns
+        // its own descriptor via fork). Leaving it open would leak fds and hold
+        // the socket half-open after the worker closes its side.
+        unsafe {
+            libc::close(fd);
+        }
+    }
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -1022,6 +1336,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ENABLE_SMARTCARD_REDIRECTION", false) {
         argv.push("--enable-smartcard-redirection".into());
     }
+    if on("FORK_WORKERS", false) {
+        argv.push("--fork-workers".into());
+    }
     if on("VIRTUAL_DISPLAY", false) {
         argv.push("--virtual-display".into());
         argv.push("--width".into());
@@ -1084,6 +1401,100 @@ async fn async_main() -> Result<()> {
         )
     };
     tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    // --fork-workers PoC. A process is a *worker* iff the supervisor set
+    // MACRDP_WORKER_FD (the already-accepted client socket); that takes
+    // precedence over --fork-workers so a re-passed flag can't recurse.
+    let worker_fd: Option<RawFd> = std::env::var(WORKER_FD_ENV)
+        .ok()
+        .and_then(|s| s.parse::<RawFd>().ok());
+    // Phase-0 spike: if set, this worker captures the SUPERVISOR-owned virtual
+    // display by this id instead of creating its own (see WORKER_VD_ID_ENV).
+    let supervisor_vd_id: Option<u32> = std::env::var(WORKER_VD_ID_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok());
+    if args.fork_workers && worker_fd.is_none() {
+        // Supervisor role.
+        //
+        // The SUPERVISOR owns the virtual display (created here, persisting across
+        // worker reconnects) — each worker captures it by id via MACRDP_VD_ID
+        // (validated by the Phase-0 spike: cross-process capture works, id stable).
+        // The supervisor ALSO owns the headless blanking (--capture-primary /
+        // --detach-primary / --make-primary) so it persists across reconnects;
+        // workers never touch it. Blanking is process-scoped to the supervisor, so
+        // it auto-restores when the supervisor dies (incl. SIGKILL/panic).
+        if (args.capture_primary || args.detach_primary || args.make_primary)
+            && !args.virtual_display
+        {
+            return Err(anyhow!(
+                "--capture-primary/--detach-primary/--make-primary require \
+                 --virtual-display (you'd be left with no usable display otherwise)"
+            ));
+        }
+        if args.capture_primary && args.detach_primary {
+            return Err(anyhow!(
+                "--capture-primary and --detach-primary are mutually exclusive \
+                 (pick one mechanism for going headless)"
+            ));
+        }
+        if args.enable_smartcard_redirection {
+            // Not gated off (it may work — workers are serialized so only one
+            // binds :40242 at a time), but it's UNVERIFIED under fork: the
+            // smart-card bridge is per-connection (the card lives on the client,
+            // the bridge talks to the live worker's RdpdrHandle), so the
+            // supervisor can't own it, and slotd's reconnect behavior across the
+            // worker boundary hasn't been validated with real hardware.
+            warn!(
+                "--enable-smartcard-redirection with --fork-workers is UNVERIFIED \
+                 (per-connection :40242 bridge; slotd reconnect across workers \
+                 untested). It may work or misbehave — verify with your reader."
+            );
+        }
+        let vd = if args.virtual_display {
+            let w = args
+                .width
+                .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
+            let h = args
+                .height
+                .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
+            let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
+                .context("supervisor: attaching virtual display")?;
+            info!(
+                display_id = vd.display_id(),
+                origin = ?vd.origin_pts(),
+                size = ?vd.size_pts(),
+                "supervisor: virtual display attached — workers capture it by id"
+            );
+            Some(vd)
+        } else {
+            None
+        };
+        let blank = if args.detach_primary {
+            BlankMode::Detach
+        } else if args.capture_primary {
+            BlankMode::Capture
+        } else if args.make_primary {
+            BlankMode::MakePrimary
+        } else {
+            BlankMode::None
+        };
+        // Prevent sleep at the SUPERVISOR level (one `caffeinate -w <supervisor
+        // pid>` for the whole session) rather than per-worker — an always-on
+        // headless server must stay awake across the brief gaps between worker
+        // reconnects too, and the workers skip their own prevent_sleep (gated
+        // below on worker_fd). caffeinate exits with the supervisor.
+        #[cfg(target_os = "macos")]
+        if !args.allow_sleep {
+            prevent_sleep();
+        }
+        return run_fork_supervisor(args.bind, vd, blank, args.app_switcher_hud).await;
+    }
+    if let Some(fd) = worker_fd {
+        info!(
+            fd,
+            "worker process: serving one connection on the inherited socket"
+        );
+    }
 
     if args.make_primary && !args.virtual_display {
         return Err(anyhow!(
@@ -1172,7 +1583,10 @@ async fn async_main() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        if !args.allow_sleep {
+        // Fork-workers: the SUPERVISOR already holds a `caffeinate` for the whole
+        // session, so workers skip their own (avoids per-reconnect caffeinate
+        // churn). Single-process (worker_fd None, non-fork) keeps it.
+        if !args.allow_sleep && worker_fd.is_none() {
             prevent_sleep();
         }
         ensure_screen_recording_access();
@@ -1196,29 +1610,35 @@ async fn async_main() -> Result<()> {
     // normal exit (signal-driven exit goes through std::process::exit
     // and skips Drop, but macOS reaps virtual displays when the owning
     // process dies, so cleanup still happens — just not via Drop).
-    let virtual_display: Option<virtual_display::VirtualDisplay> = if args.virtual_display {
-        let w = args
-            .width
-            .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
-        let h = args
-            .height
-            .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
-        // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
-        // metadata here (capture cadence is governed by --fps); pass a
-        // safe value so CGVirtualDisplay doesn't reject the mode.
-        let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
-            .context("attaching virtual display")?;
-        info!(
-            display_id = vd.display_id(),
-            origin = ?vd.origin_pts(),
-            size = ?vd.size_pts(),
-            "virtual display attached — the RDP session uses this surface; \
-             your primary panel is untouched"
-        );
-        Some(vd)
-    } else {
-        None
-    };
+    // When `supervisor_vd_id` is set we're a fork-worker capturing the
+    // supervisor-owned virtual display by id — do NOT create our own (it would
+    // be a second, redundant display that dies each reconnect; the whole point
+    // of the spike is to capture the persistent supervisor one). Geometry comes
+    // from the supervisor display's CGDisplayBounds in the size block below.
+    let virtual_display: Option<virtual_display::VirtualDisplay> =
+        if args.virtual_display && supervisor_vd_id.is_none() {
+            let w = args
+                .width
+                .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
+            let h = args
+                .height
+                .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
+            // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
+            // metadata here (capture cadence is governed by --fps); pass a
+            // safe value so CGVirtualDisplay doesn't reject the mode.
+            let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
+                .context("attaching virtual display")?;
+            info!(
+                display_id = vd.display_id(),
+                origin = ?vd.origin_pts(),
+                size = ?vd.size_pts(),
+                "virtual display attached — the RDP session uses this surface; \
+                 your primary panel is untouched"
+            );
+            Some(vd)
+        } else {
+            None
+        };
 
     // --detach-primary / --capture-primary are lazy: the headless
     // mechanism is only engaged once a client actually connects. A
@@ -1227,7 +1647,12 @@ async fn async_main() -> Result<()> {
     // flags subsume --make-primary (each puts the virtual display
     // at (0,0)), so if both are set, only the lazy path runs.
     let session_tracker = capture::SessionTracker::default();
-    if args.detach_primary {
+    if worker_fd.is_some() {
+        // Fork-worker: the SUPERVISOR owns headless blanking (it persists across
+        // reconnects and is engaged there). A worker has no virtual_display of
+        // its own — it captures the supervisor's by id — so the `.expect()`s
+        // below would panic. Skip entirely; blanking is not the worker's job.
+    } else if args.detach_primary {
         let vd_id = virtual_display
             .as_ref()
             .expect("checked above when --detach-primary")
@@ -1326,7 +1751,32 @@ async fn async_main() -> Result<()> {
     //   - primary panel, no --width/--height override: query SCK for
     //     native size and use CGDisplay::main() for the point-space bounds.
     //   - primary panel with override: use the override + main geometry.
-    let (width, height, capture_display_id, screen_size_pts) = if let Some(vd) = &virtual_display {
+    let (width, height, capture_display_id, screen_size_pts) = if let Some(vd_id) = supervisor_vd_id
+    {
+        // Phase-0 spike: capture the SUPERVISOR-owned virtual display by id.
+        // Geometry: requested w/h for the session; size_pts from the display's
+        // CGDisplayBounds (its origin is picked up by input.rs the same way).
+        let w = args
+            .width
+            .ok_or_else(|| anyhow!("--virtual-display requires --width"))?;
+        let h = args
+            .height
+            .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
+        #[cfg(target_os = "macos")]
+        let size = {
+            let b = core_graphics::display::CGDisplay::new(vd_id).bounds();
+            (b.size.width, b.size.height)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let size = (f64::from(w), f64::from(h));
+        info!(
+            width = w,
+            height = h,
+            display_id = vd_id,
+            "worker: capturing supervisor-owned virtual display (Phase-0 spike)"
+        );
+        (w, h, Some(vd_id), size)
+    } else if let Some(vd) = &virtual_display {
         // Both required earlier, so the unwraps can't fire.
         let w = args
             .width
@@ -1460,7 +1910,16 @@ async fn async_main() -> Result<()> {
         let did =
             capture_display_id.unwrap_or_else(|| core_graphics::display::CGDisplay::main().id);
         crate::switcher_hud::set_display_id(did);
-        spawn_hud_helper()
+        // Fork-workers: the SUPERVISOR owns the single persistent HUD helper
+        // (binds :40243); a worker only PUSHES to it (the display id rides in
+        // each SHOW), so it must NOT spawn its own — that would churn the helper
+        // process and contend on the port across reconnects. The single-process
+        // (non-fork) path still spawns + owns its own helper here.
+        if worker_fd.is_none() {
+            spawn_hud_helper()
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -1619,6 +2078,53 @@ async fn async_main() -> Result<()> {
         domain: None,
     }));
 
+    if let Some(fd) = worker_fd {
+        // --fork-workers worker: the supervisor already accepted the TCP
+        // connection and handed us its fd. Adopt it, serve exactly ONE
+        // connection, then exit — so every (re)connect is a brand-new process
+        // (xrdp's frontend model), the whole point of the PoC.
+        // SAFETY: `fd` is a live, owned socket fd inherited from the supervisor
+        // (CLOEXEC cleared before exec); we take sole ownership here.
+        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        std_stream
+            .set_nonblocking(true)
+            .context("set inherited worker socket non-blocking")?;
+        let stream = tokio::net::TcpStream::from_std(std_stream)
+            .context("adopt inherited worker socket into tokio")?;
+        info!(fd, user = %username, "worker: serving one connection on inherited socket");
+        let res = server.run_connection(stream).await;
+        // CRITICAL (fork-workers): force-exit the worker PROCESS here instead of
+        // returning and letting the runtime unwind. Once an SCStream is live,
+        // ScreenCaptureKit's framework threads keep the process from actually
+        // terminating on a normal return — the very hazard the SIGINT handler
+        // dodges with process::exit. A lingering worker holds its capture stream
+        // (and VideoToolbox session) open; after ~2 concurrent capturers macOS
+        // starves frame delivery to the newer ones, so the 3rd+ reconnect renders
+        // BLANK ("first two render, then blank"). Exiting tears down the
+        // SCStream/VT immediately (and the `caffeinate -w <pid>` child exits with
+        // us), so every reconnect's fresh worker captures cleanly.
+        let code = match &res {
+            Ok(()) => {
+                info!("worker: connection ended cleanly, exiting");
+                0
+            }
+            Err(e) => {
+                info!(error = ?e, "worker: connection ended with error, exiting");
+                1
+            }
+        };
+        // process::exit skips Drop, so run the per-connection cleanup explicitly
+        // (same as the signal handler): unmount any RDPDR NFS volumes and remove
+        // clipboard paste temp dirs. Without this a worker LEAKS a mount + temp
+        // dir on every reconnect (Drop normally handles it on a graceful return).
+        #[cfg(target_os = "macos")]
+        {
+            file_promise_lazy::shutdown_cleanup();
+            rdpdr::shutdown_cleanup();
+        }
+        std::process::exit(code);
+    }
+
     info!(
         addr = %args.bind,
         user = %username,
@@ -1683,6 +2189,7 @@ mod config_tests {
              VD_WIDTH=2560\n\
              VD_HEIGHT=1440\n\
              PRIMARY_MODE=detach\n\
+             FORK_WORKERS=1\n\
              EXTRA_FLAGS=\"--fps 30\"\n",
         );
         let args = args_from_config(&path).unwrap();
@@ -1699,6 +2206,7 @@ mod config_tests {
         assert_eq!(args.height, Some(1440));
         assert!(args.detach_primary);
         assert!(!args.capture_primary);
+        assert!(args.fork_workers);
         // USE_KEYCHAIN defaults on (matches the old wrapper).
         assert!(args.keychain);
         // EXTRA_FLAGS is parsed as real CLI tokens.
@@ -1715,6 +2223,7 @@ mod config_tests {
         assert!(args.keychain);
         assert!(!args.virtual_display);
         assert!(!args.enable_h264);
+        assert!(!args.fork_workers);
     }
 
     #[test]

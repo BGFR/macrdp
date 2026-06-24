@@ -139,6 +139,91 @@ I/O. Two layers map cleanly onto that:
      ratios, retransmit timers — as the *bulk* sender (video). The FreeRDP client
      shows the mechanism but not the tuning (its sender is lightly exercised).
 
+## Modular integration design (making the server hook elegant)
+
+The server-side integration (#4) sounds invasive, but the vendored `ironrdp-server`
+already has **the two seams** needed to keep it clean and quarantined — so the UDP
+machinery can live in small, separately-accessed files behind one trait, with the
+core touched only minimally.
+
+**Seam 1 — an established optional-provider pattern.** `RdpServer` already carries
+`sound_factory`, `cliprdr_factory`, `rdpdr_factory`, `gfx_factory`,
+`connection_handler` — all `Option<Box<dyn …>>`, set via the builder, default `None`
+(`server.rs:290–295`). A multitransport provider drops into the **same mold** — it's
+idiomatic, not bolted on.
+
+**Seam 2 — the writer is already an abstraction, cloned per channel.** In
+`client_loop` (`server.rs:1088–1091`):
+```rust
+let mut writer = SharedWriter::new(writer);   // the one TCP+TLS sink
+let mut display_writer = writer.clone();      // EGFX video  (migrates to UDP)
+let mut event_writer   = writer.clone();      // cliprdr/rdpdr (stays TCP)
+let mut audio_writer    = writer.clone();     // rdpsnd (stays TCP, or migrates)
+```
+Each dispatch task writes through its **own cloneable handle**, so routing
+granularity is **per-channel-class, not per-byte** — and EGFX (the thing that moves
+to UDP) already has its own task. No raw-byte inspection needed to route.
+
+**Proposed structure:**
+
+A. New **core-tier** crate `ironrdp-rdpeudp` (sans-I/O, no sockets — fits IronRDP's
+"core never does I/O" rule; unit-testable):
+```
+crates/ironrdp-rdpeudp/src/
+  pdu.rs          // RDPEUDP/EUDP2 + FEC + MS-RDPEMT PDU codecs (Decode/Encode)
+  reliability.rs  // pure state machine: step(datagram) -> (delivered, to_send)
+  lib.rs
+```
+
+B. New **I/O** module tree in the server `src/multitransport/` — all UDP-specific,
+small files, reached only through the trait:
+```
+multitransport/
+  mod.rs        // MultitransportProvider trait + config + the Option<Box<dyn>> field
+  listener.rs   // binds the UDP socket, accept loop, per-flow task, drives reliability.rs
+  session.rs    // cookie registry + Tunnel Create Request validation + flow<->session map
+  dtls.rs       // SecureDatagram trait + boring/openssl impl (memory-BIO pump); OPTIONAL
+  router.rs     // TransportRouter + per-channel writer handles + migrated-channel flags
+  migration.rs  // which channels migrate (drdynvc steering); flips the router on ready
+```
+
+C. The hook in `server.rs` — minimal and **behavior-preserving**:
+```rust
+// 1. one new optional field, mirroring the 4 existing factories (default None)
+multitransport: Option<Box<dyn MultitransportProvider>>,
+
+// 2. the ONLY hot-path touch: swap the writer construction for a router that is a
+//    ZERO-OVERHEAD PASSTHROUGH when no provider is present.
+let router = TransportRouter::new(writer, self.multitransport.as_deref());
+let display_writer = router.channel(Channel::Display);  // UDP-capable
+let event_writer   = router.channel(Channel::Events);   // stays TCP
+let audio_writer   = router.channel(Channel::Audio);
+
+// the trait — small, well-defined hooks; all UDP lives behind it
+trait MultitransportProvider {
+    fn offer(&mut self, ctx: &SessionCtx) -> Option<InitiateRequest>; // post-licensing
+    fn start(&mut self, sender: EventSender) -> MigrationHandle;       // spawn listener
+}
+```
+A `channel()` handle checks one atomic "migrated?" flag: `false` → write to the TCP
+`SharedWriter` (today's exact path); `true` → write to the UDP/DTLS sink. **No
+provider ⇒ flag never set, UDP sink never built ⇒ byte-for-byte current behavior.**
+
+Why this is elegant: it reuses the established factory pattern; quarantines all
+UDP/DTLS/FEC complexity behind one trait in separate files; the DTLS backend is
+itself swappable (`SecureDatagram` trait → `boring`/`openssl`, or **nothing** for the
+reliable-only Phase 1); and the core change is one construction site swapped for a
+passthrough wrapper plus two no-op-by-default hook calls.
+
+**Two caveats this design does NOT dissolve:**
+1. The writer-site swap is in a **working hot path** (`client_loop`, no unit tests).
+   Building these seams *before* a real transport exists is a hot-path control-flow
+   change with **zero functional payoff yet** — speculative future-proofing to avoid
+   (cf. the "don't refactor working hot-paths for cosmetics" rule). The router should
+   land **with** a working transport + real-client verification, not ahead of it.
+2. A `MultitransportProvider` trait is a clean, **upstream-worthy** extension point —
+   so land it **upstream with Devolutions**, not as a standalone vendor divergence.
+
 ## How much can be cribbed from FreeRDP
 
 - **Wire formats: ~all of it** (symmetric bytes; FreeRDP client decode = our

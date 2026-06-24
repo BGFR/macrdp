@@ -17,12 +17,16 @@ were web-verified on the date above; verify again before acting, code moves.*
   cellular): no head-of-line blocking, drop-stale instead of retransmit, FEC
   recovery without a round-trip. **On a clean LAN — macrdp's design target — the
   benefit is marginal.**
-- **Two genuinely hard, new pieces:** (1) a DTLS implementation (rustls has
+- **Two genuinely hard, new pieces:** (1) DTLS for the lossy transport (rustls has
   **no** DTLS — [issue #40, open since 2016](https://github.com/rustls/rustls/issues/40);
-  Rust DTLS crates are immature), and (2) the server-side transport glue
-  (UDP listener, cookie→session mapping, channel migration via `drdynvc`, a
-  second writer in the dispatch loop). **Server-side UDP is pioneering** — even
-  FreeRDP only finished the *client*; its server path is a bootstrap stub.
+  pure-Rust DTLS crates are immature) — but this is **solvable today via mature
+  FFI bindings (`boring`/`openssl`)**, and macrdp's build **already links C crypto**
+  (rustls 0.23's default provider is `aws-lc-rs` = AWS-LC, a BoringSSL fork, + `ring`),
+  so a C DTLS lib is a smaller leap than "pure-Rust → C" implies; and (2) the
+  server-side transport glue (UDP listener, cookie→session mapping, channel
+  migration via `drdynvc`, a second writer in the dispatch loop). **Server-side UDP
+  is pioneering** — even FreeRDP only finished the *client*; its server path is a
+  bootstrap stub.
 - **Recommendation:** treat as a multi-month research project, gated on whether
   macrdp's target shifts from LAN to remote-over-internet. On the LAN it's built
   for, don't.
@@ -89,12 +93,35 @@ I/O. Two layers map cleanly onto that:
 ## What is genuinely hard / new
 
 3. **DTLS.** The lossy transport is secured with **DTLS** (datagram TLS); the
-   reliable transport uses normal TLS. macrdp/IronRDP use `rustls`, which has
-   **no DTLS** (open since 2016). Options today are all weak: `webrtc-dtls`
-   (community pure-Rust, WebRTC-oriented), **DusTLS** (reuses rustls primitives
-   but is a DTLS 1.2 PoC / WIP), or OpenSSL DTLS bindings (a heavy new dep + a new
-   security surface). **This is a real dependency problem with no clean answer.**
-   (Reliable-UDP-only via RDPEUDP2 + normal TLS would sidestep DTLS — see below.)
+   reliable transport uses normal TLS. macrdp/IronRDP use **`rustls` for TLS, and
+   `rustls` has no DTLS** ([issue #40, open since 2016](https://github.com/rustls/rustls/issues/40)).
+   The pure-Rust DTLS options are immature — `webrtc-dtls` (community, WebRTC-
+   oriented) and **DusTLS** (reuses rustls primitives, but a DTLS 1.2 PoC / WIP).
+   **The clean answer is mature FFI DTLS:** the **`boring`** crate (Cloudflare
+   bindings to Google's BoringSSL — DTLS 1.0/1.2, the same DTLS Chrome's WebRTC
+   uses; statically links a pinned BoringSSL, so the build is reproducible) or the
+   **`openssl`** crate (DTLS 1.0/1.2, and 1.3 on OpenSSL 3.2+). Both expose DTLS via
+   `SslMethod::dtls()`. Integration fits the sans-I/O style: drive `SslStream` over
+   a **memory BIO** pumped with UDP datagrams (feed received packets in, read
+   packets to send out), rather than the stream-oriented `tokio-openssl`/
+   `tokio-boring` wrappers — [`tokio-dtls-stream-sink`](https://crates.io/crates/tokio-dtls-stream-sink)
+   is a working DTLS-over-UDP reference.
+
+   **Important context (corrected 2026-06-25):** adding `boring`/`openssl` is **not**
+   "introducing C crypto for the first time." macrdp's build **already compiles C/asm
+   crypto** — rustls 0.23's default crypto provider is **`aws-lc-rs`** (links
+   **AWS-LC**, a C library that is itself a **BoringSSL fork**, via `aws-lc-sys`),
+   plus **`ring`** (C + assembly). So a C DTLS dependency is a *second* C crypto lib
+   (closely related to AWS-LC), not a departure from a "pure-Rust" build macrdp does
+   not actually have. You can't reuse AWS-LC for it, though: `aws-lc-rs` exposes
+   crypto *primitives* for rustls, not a libssl/DTLS *protocol* stack — hence still
+   needing `boring`/`openssl`. The real costs are a **second TLS stack in the binary**
+   (rustls for TCP + boring/openssl for DTLS), larger binary, and a wider crypto
+   attack surface. **Lean: `boring`** (reproducible static vendored build — no
+   system-lib variance, which matters for the signed/notarized macOS app — and the
+   most battle-tested DTLS path); `openssl` is more conventional and the only one
+   with DTLS 1.3, but its cross-platform build is fussier.
+   (Reliable-UDP-only via RDPEUDP2 + normal TLS would sidestep DTLS entirely — see below.)
 
 4. **Server I/O integration — architecturally invasive (`ironrdp-server`).** The
    server model assumes one `Framed` byte-stream writer. UDP needs:
@@ -131,13 +158,15 @@ I/O. Two layers map cleanly onto that:
 ## A cheaper middle path (if ever pursued)
 
 **Reliable-UDP-only (RDPEUDP2 + normal TLS), no lossy/DTLS.** EUDP2 is
-reliable-only, so it rides ordinary TLS — **eliminating the DTLS dependency
-problem entirely**. You'd lose the "drop-stale lossy video" benefit (the biggest
-WAN win for video) but still gain RDPEUDP's own congestion control and avoid
-TCP's loss=congestion throttling. Lower risk, smaller blast radius, and a
-sensible Phase-1 if the feature is ever scoped. (macrdp already drops stale
-*audio* at the app layer, so a reliable transport isn't as costly for audio as it
-sounds.)
+reliable-only, so it rides ordinary TLS over the reliable RDPEUDP stream —
+**reusing macrdp's existing `rustls` and adding no new crypto dependency at all**.
+You'd lose the "drop-stale lossy video" benefit (the biggest WAN win for video)
+but still gain RDPEUDP's own congestion control and avoid TCP's loss=congestion
+throttling. Lower risk, smaller blast radius, and a sensible Phase-1 if the
+feature is ever scoped. (macrdp already drops stale *audio* at the app layer, so a
+reliable transport isn't as costly for audio as it sounds.) The lossy/DTLS path
+(Phase 2) is then a *known, reachable* follow-up via `boring`/`openssl`, not a
+blocker — see DTLS above.
 
 ## Upstream vs. vendor
 
@@ -156,16 +185,20 @@ mstsc as the gate.
   TCP port; the server would need a reachable UDP port and graceful **fall back
   to TCP** when the UDP path can't be established (which the protocol already
   models — multitransport is best-effort over the always-present TCP connection).
-- **New dependency** (DTLS) unless the reliable-only path is chosen.
+- **New crypto dependency** only for the lossy/DTLS path (`boring` or `openssl`) —
+  the reliable-only path adds none. Note the build **already** compiles C crypto
+  (`aws-lc-sys`/AWS-LC + `ring`), so a C DTLS lib doesn't change the toolchain
+  requirements, only adds a second TLS stack + binary size.
 
 ## Recommendation
 
 - **Gate on the use case, not on feasibility.** It's *possible* and IronRDP is a
   decent host; it's just multi-month and only pays off off-LAN.
 - If pursued: **Phase 1 = the PDU crate + a reliable-UDP-only (RDPEUDP2/TLS) path**
-  (no DTLS, smaller refactor) to prove the transport-migration plumbing in
-  `ironrdp-server`. **Phase 2 = lossy UDP + DTLS + FEC** for the real video win,
-  once a viable Rust DTLS story exists.
+  (no DTLS, no new crypto dep, smaller refactor) to prove the transport-migration
+  plumbing in `ironrdp-server`. **Phase 2 = lossy UDP + DTLS + FEC** for the real
+  video win, securing the lossy transport with **`boring`** (or `openssl`) — DTLS
+  is a known, reachable dependency, not a blocker.
 - **Do it upstream**, not as a vendor fork.
 - Validate against FreeRDP *and* mstsc; treat the specs as authoritative.
 
@@ -175,6 +208,12 @@ mstsc as the gate.
   <https://github.com/Devolutions/IronRDP/blob/master/ARCHITECTURE.md>
 - rustls has no DTLS (open since 2016): <https://github.com/rustls/rustls/issues/40>
 - DusTLS (WIP pure-Rust DTLS reusing rustls): <https://github.com/ShadowJonathan/dustls>
+- `boring` (Cloudflare BoringSSL bindings, DTLS support): <https://github.com/cloudflare/boring>,
+  <https://deepwiki.com/cloudflare/boring/3-ssltls-support>
+- `openssl` / `tokio-openssl` DTLS + DTLS-over-UDP reference:
+  <https://docs.rs/crate/tokio-openssl/0.1.1>, <https://crates.io/crates/tokio-dtls-stream-sink>
+- macrdp already links C crypto: `aws-lc-rs` (rustls 0.23 default provider, AWS-LC = a
+  BoringSSL fork) + `ring` — confirmed in `Cargo.lock`.
 - FreeRDP UDP implementation write-up (client-focused):
   <https://www.hardening-consulting.com/en/posts/20210131-udp-support-1.html>,
   <https://www.hardening-consulting.com/en/posts/20230109-udp-support-2.html>

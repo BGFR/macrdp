@@ -1,10 +1,18 @@
 # UDP Multitransport on macrdp (extending IronRDP) — Feasibility Notes
 
-*Research notes, 2026-06-25. Exploratory — macrdp does **not** implement UDP
-multitransport today (it serves everything over one TCP+TLS connection), and
-nothing here is committed work. This is a scoping document for if/when
-remote-over-WAN ever becomes a goal. All "what IronRDP/FreeRDP do today" claims
-were web-verified on the date above; verify again before acting, code moves.*
+*Research notes, 2026-06-25. This is the scoping document for the staged build.
+All "what IronRDP/FreeRDP do today" claims were web-verified on the date above;
+verify again before acting, code moves.*
+
+> **Status: M1 LANDED (2026-06-25, commit `bf26824`, PR #15).** Negotiation +
+> safe TCP fallback behind the `multitransport` cargo feature on the vendored
+> server + `--enable-udp-multitransport` (default OFF). Verified live on mstsc
+> and sdl-freerdp (plumbing + graceful fallback render over TCP); the Initiate
+> Request framing has a round-trip CI test. **Loopback can't exercise the actual
+> send** — neither client advertises UDP for 127.0.0.1 (mstsc suppresses it,
+> this sdl-freerdp build gates it even with `/network:auto`), so real-Windows
+> on-wire send acceptance is deferred to **M3** (UDP listener + remote client).
+> Next: **M2** — the offline `ironrdp-rdpeudp` crate + reliability state machine.
 
 ## TL;DR
 

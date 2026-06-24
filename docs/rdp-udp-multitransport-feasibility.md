@@ -4,15 +4,25 @@
 All "what IronRDP/FreeRDP do today" claims were web-verified on the date above;
 verify again before acting, code moves.*
 
-> **Status: M1 LANDED (2026-06-25, commit `bf26824`, PR #15).** Negotiation +
-> safe TCP fallback behind the `multitransport` cargo feature on the vendored
-> server + `--enable-udp-multitransport` (default OFF). Verified live on mstsc
-> and sdl-freerdp (plumbing + graceful fallback render over TCP); the Initiate
-> Request framing has a round-trip CI test. **Loopback can't exercise the actual
-> send** — neither client advertises UDP for 127.0.0.1 (mstsc suppresses it,
-> this sdl-freerdp build gates it even with `/network:auto`), so real-Windows
-> on-wire send acceptance is deferred to **M3** (UDP listener + remote client).
-> Next: **M2** — the offline `ironrdp-rdpeudp` crate + reliability state machine.
+> **Status: M1 + M2 LANDED (2026-06-25).**
+> - **M1** (PR #15, `bf26824`): MS-RDPEMT negotiation + safe TCP fallback behind
+>   the `multitransport` cargo feature + `--enable-udp-multitransport` (default
+>   OFF). Verified live on mstsc + sdl-freerdp; Initiate Request framing has a
+>   round-trip CI test. Loopback can't exercise the actual *send* (no client
+>   advertises UDP for 127.0.0.1) → real-Windows send acceptance deferred to M3.
+> - **M2** (PRs #16/#17/#18): the offline `ironrdp-rdpeudp` crate — RDPEUDP v1 PDU
+>   codecs (`pdu.rs`, big-endian, spec-capture-anchored; flag values corrected
+>   against the spec), ACK-vector codec, whole-datagram assemble/parse
+>   (`datagram.rs`), and the **sans-I/O reliable transport state machine**
+>   (`state.rs`): handshake + in-order de-duplicated delivery + cumulative-ACK +
+>   RTO retransmit, proven by a two-instance in-memory loss/reorder/dup test.
+>
+> **Next: M3 — UDP listener + RDPEUDP SYN handshake on the wire. BLOCKED on a
+> spike that needs the USER:** a real mstsc UDP capture (Wireshark) to author the
+> underdocumented **RDPEUDP2 (`0x0101`) bit-packed data framing** — mstsc's data
+> path — against real bytes. The crate's algorithm is framing-agnostic and ready
+> to reuse; cumulative-ACK only so far (selective retransmit + congestion control
+> deferred).
 
 ## TL;DR
 

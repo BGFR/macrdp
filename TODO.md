@@ -27,6 +27,23 @@ _(nothing in flight — see Deferred/Parked below)_
   - RTT / queuing-delay trend from ACK timing (+ RDPEUDP2 ack timestamps / AckOfAcks);
   - flow ceiling = peer's advertised `uReceiveWindowSize`.
   Needs *a* controller on those (delay+loss+CN), **not** a full URCP reimplementation.
+  Design shape:
+  - **`--bitrate`/`--fps` become the clean-link *ceiling*, not fixed targets** (today
+    both are set once at session start). Controller operates in `[floor, ceiling]`; clean
+    link = full configured rate (unchanged from today), congestion pulls down, recovery
+    climbs back. Needs a **floor** (~0.5–1 Mbps / a few fps) so it degrades to "choppy
+    but alive," not dead.
+  - **Lever order:** (1) lower bitrate first — `kVTCompressionPropertyKey_AverageBitRate`
+    is **live-settable**, no encoder rebuild (softer image, smooth motion); (2) drop
+    frames (don't submit captured frames) for lower effective fps when bitrate cuts aren't
+    enough — fewer frames + fewer packets, the visible "skipping"; (3) **back off / stretch
+    the periodic IDR while congested** (a ~240 KB keyframe is the worst thing to inject —
+    it's what wedges macrdp today), force one only on real recovery.
+  - **Two feedback adapters, same output.** UDP path reads the RDPEUDP signals above
+    (CN / ACK-vector loss / ack-timing RTT). **TCP path can't see per-packet loss** (kernel
+    hides it) → read **write backpressure** (SharedWriter blocking / send-buffer full) +
+    `TCP_CONNECTION_INFO` (RTT, retransmits via `getsockopt`, macOS). Same controller +
+    same VT-bitrate/frame-drop/IDR-backoff levers; only the input source differs per transport.
   Bigger than FEC (dead) or auto-fallback (band-aid). Worth a real-server↔mstsc capture
   first to read the URCP signaling. See finding #5 in `docs/rdp-udp-multitransport-feasibility.md`.
 - [ ] **EGFX-over-UDP auto-fallback to TCP on tunnel abandonment** (secondary safety net,

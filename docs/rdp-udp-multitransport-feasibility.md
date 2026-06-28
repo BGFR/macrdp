@@ -277,6 +277,33 @@ reliable-only multitransport.
    `ship_frames` `ctx`↔`server_handle` ordering. That one was a real deadlock; this
    item is the expected lossy-link behavior.)
 
+5. **Real Windows server ↔ mstsc under the SAME ~8% loss degrades GRACEFULLY
+   (frame-skip, not freeze) — observed 2026-06-28; the missing reference data
+   point.** Every capture above is mstsc ↔ *macrdp*; this doc had flagged that we
+   have **zero** capture of mstsc against a *real Windows server* under loss. An
+   informal A/B over a bridged network (clumsy ~8% drop, mstsc → a real Windows RDP
+   server) closed that gap: the video **skips frames / drops to a low framerate but
+   keeps moving**, audio runs (occasionally rough) — it **never permanently freezes**
+   the way macrdp does. Crucially this is on **RDPUDP2-reliable (no FEC)** — so FEC is
+   **not** what makes Windows graceful (final nail; see the P2.3 NO-GO). The
+   difference is entirely **server-side adaptation macrdp lacks**: (a) **URCP
+   congestion control** — the server measures loss+RTT and throttles H.264
+   bitrate/framerate to fit the degraded path, so the reliable stream's retransmit
+   backlog stays small + recoverable instead of pegging the window at 1024; and (b)
+   **encoder-side frame dropping** — it drops frames at the encoder (→ the visible
+   "skipping") rather than flooding a fixed ~60 fps + 2 s IDR into the tunnel the way
+   macrdp does. Same reliable transport, opposite outcome, purely from rate
+   adaptation. mstsc itself does nothing special — no client-side TCP fallback, no
+   re-engage (finding #4); the graceful degradation is **all server-side**.
+   **Roadmap consequence:** the real Phase-2 loss-resilience lever is
+   **congestion-responsive rate control + encoder frame-dropping**, NOT FEC (dead,
+   P2.3) and NOT auto-fallback (a band-aid). And because the freeze is ordered-stream
+   HOL-block on *either* transport (finding #3), rate-adapting the encoder would make
+   EGFX-under-loss degrade to "choppy" on the **default TCP path too**, not just UDP —
+   making it the highest-value video-under-loss work, above anything UDP-specific.
+   (A proper *capture* of real-server↔mstsc — to read the exact URCP rate-control
+   signaling on the wire — is still worth doing before implementing.)
+
 ### P2.2 lossy-delivery soak (runbook)
 
 The first soak (above) shaped the **reliable** EGFX-over-UDP path. This one targets the

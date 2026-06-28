@@ -11,6 +11,23 @@ _(nothing in flight — see Deferred/Parked below)_
 
 ## Deferred — scoped, not started
 
+- [ ] **Congestion-responsive encoder rate control + frame dropping** (highest-value
+  video-under-loss work — helps BOTH the default TCP path and UDP). Today macrdp ships
+  a fixed ~60 fps + a 2 s periodic IDR regardless of the client's congestion signal, so
+  under loss the ordered stream HOL-blocks and EGFX **freezes** (finding #3/#4). A real
+  Windows server under the same ~8% loss **degrades gracefully** — skips frames / drops
+  framerate, never freezes — via **URCP congestion control + encoder-side frame dropping**,
+  and *without* FEC (observed 2026-06-28, finding #5). The lever: read the client's
+  loss/RTT/window-state feedback → dynamically lower VideoToolbox bitrate, skip frames to
+  a lower effective fps, and back off the periodic IDR under congestion. Bigger than FEC
+  (dead) or auto-fallback (band-aid). Worth a real-server↔mstsc capture first to read the
+  URCP signaling. See finding #5 in `docs/rdp-udp-multitransport-feasibility.md`.
+- [ ] **EGFX-over-UDP auto-fallback to TCP on tunnel abandonment** (secondary safety net,
+  below rate control). When the reliable tunnel is abandoned (window pegged / client
+  stopped acking), re-route EGFX to TCP + force an IDR instead of staying frozen. Open
+  risk: in-session fallback would be *frozen→recover* (NOT the reconnect-blank quirk —
+  that needs a new connection), but only if mstsc accepts the channel's data back on TCP
+  after Soft-Sync (no standard reverse Soft-Sync; untested). Spike against real mstsc first.
 - [ ] **UDP multitransport Phase 2 — lossy `UdpFecL` + DTLS + 1+1 redundancy** (FEC dropped).
   Phase 1 (reliable EGFX-over-UDP) shipped (v0.8.15, clean-link only). Phase 2 wants
   loss resilience. Status: lossy delivery mode + 1+1 duplicate-send (repetition code)

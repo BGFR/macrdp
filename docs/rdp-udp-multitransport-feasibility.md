@@ -304,6 +304,27 @@ reliable-only multitransport.
    (A proper *capture* of real-server↔mstsc — to read the exact URCP rate-control
    signaling on the wire — is still worth doing before implementing.)
 
+   **What "URCP" actually is, and the concrete signals macrdp already ignores.**
+   URCP = **Universal Rate Control Protocol** (Microsoft Research, ~2013) — the
+   congestion-/rate-control *algorithm* under RDP Shortpath + MS-RDPEUDP2. It's not a
+   single wire field; it's a controller that estimates path bandwidth + delay and
+   **paces the sender to a target rate** (delay-based, real-time-tuned — it backs off
+   *before* loss rather than TCP's loss=halve). The point for macrdp: we do **not**
+   need to reimplement URCP — we need *a* controller reading the same feedback that
+   **already arrives in the RDPEUDP ACK stream and that macrdp currently throws away**:
+   - **Explicit congestion bit** — `RDPUDP_FLAG_CN` (congestion notification; the
+     sender replies `RDPUDP_FLAG_CWR`). **This is the exact "CN" mstsc sent in finding
+     #4 right before it abandoned the tunnel — macrdp received it and did nothing.**
+   - **Loss** — gaps in the `RDPUDP_ACK_VECTOR_HEADER` (+ retransmit events).
+   - **RTT / queuing-delay trend** — from ACK round-trip timing (and RDPEUDP2 ack
+     timestamps / AckOfAcks); rising RTT = growing queue = back off early.
+   - **Flow-control ceiling** — the peer's advertised `uReceiveWindowSize`.
+   A simple delay+loss+CN controller driving the VideoToolbox bitrate/fps down (and
+   backing off the periodic IDR) already turns the freeze into graceful degradation;
+   matching URCP's exact algorithm is a refinement, not a prerequisite. (Refs: MS
+   Research "URCP: Universal Rate Control Protocol for Real-Time Communication";
+   RDP Shortpath docs.)
+
 ### P2.2 lossy-delivery soak (runbook)
 
 The first soak (above) shaped the **reliable** EGFX-over-UDP path. This one targets the

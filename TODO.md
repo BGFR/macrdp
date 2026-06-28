@@ -17,11 +17,18 @@ _(nothing in flight — see Deferred/Parked below)_
   under loss the ordered stream HOL-blocks and EGFX **freezes** (finding #3/#4). A real
   Windows server under the same ~8% loss **degrades gracefully** — skips frames / drops
   framerate, never freezes — via **URCP congestion control + encoder-side frame dropping**,
-  and *without* FEC (observed 2026-06-28, finding #5). The lever: read the client's
-  loss/RTT/window-state feedback → dynamically lower VideoToolbox bitrate, skip frames to
-  a lower effective fps, and back off the periodic IDR under congestion. Bigger than FEC
-  (dead) or auto-fallback (band-aid). Worth a real-server↔mstsc capture first to read the
-  URCP signaling. See finding #5 in `docs/rdp-udp-multitransport-feasibility.md`.
+  and *without* FEC (observed 2026-06-28, finding #5). The lever: feed a controller the
+  RDPEUDP feedback macrdp **already receives and ignores** → dynamically lower
+  VideoToolbox bitrate, skip frames to a lower effective fps, and back off the periodic
+  IDR under congestion. Concrete signals already on the wire:
+  - `RDPUDP_FLAG_CN` (congestion notification; reply `RDPUDP_FLAG_CWR`) — **the exact
+    "CN" mstsc sent in finding #4 before abandoning the tunnel, which we ignored**;
+  - loss = gaps in `RDPUDP_ACK_VECTOR_HEADER` (+ retransmit events);
+  - RTT / queuing-delay trend from ACK timing (+ RDPEUDP2 ack timestamps / AckOfAcks);
+  - flow ceiling = peer's advertised `uReceiveWindowSize`.
+  Needs *a* controller on those (delay+loss+CN), **not** a full URCP reimplementation.
+  Bigger than FEC (dead) or auto-fallback (band-aid). Worth a real-server↔mstsc capture
+  first to read the URCP signaling. See finding #5 in `docs/rdp-udp-multitransport-feasibility.md`.
 - [ ] **EGFX-over-UDP auto-fallback to TCP on tunnel abandonment** (secondary safety net,
   below rate control). When the reliable tunnel is abandoned (window pegged / client
   stopped acking), re-route EGFX to TCP + force an IDR instead of staying frozen. Open

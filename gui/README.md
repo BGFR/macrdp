@@ -72,7 +72,9 @@ macrdpController.app/Contents/MacOS/macrdptray --print-paths      # diagnose res
   `bootout` the agent (with EIO retry).
 - **Options** — H.264 / AAC / HiDPI / **Un-minimize on Cmd+Tab** / **App-switcher HUD** /
   **Per-connection workers (reconnect fix)** checkmarks, **Drive / Smart-card
-  redirection** toggles, plus **Allow network connections** (flips `BIND` between
+  redirection** toggles, **UDP multitransport** + **↳ Move video to UDP (clean
+  link only)** (experimental; mutually exclusive with per-connection workers,
+  enforced with an alert), plus **Allow network connections** (flips `BIND` between
   `127.0.0.1` and `0.0.0.0`, preserving the port, with a confirmation before
   exposing to the LAN); shows the current listening address. All write
   `config.env` and live-`kickstart` if running.

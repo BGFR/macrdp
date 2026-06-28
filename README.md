@@ -10,7 +10,7 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 ## Status
 
-v0 — daily-driver usable on a trusted LAN. **Latest release: [v0.8.13](https://github.com/clintcan/macrdp/releases/latest)** — adds the experimental opt-in **`--fork-workers`** (per-connection worker processes, xrdp's model): reconnecting `mstsc` to a still-running server now **renders instead of going blank** — a fresh worker process per connection dodges mstsc's EGFX surface-retention bug (a rare residual blank clears by reconnecting once more). Off by default; enable with `FORK_WORKERS=1` or the GUI controller's "Per-connection workers" toggle / "Set Up Remote Desktop" preset. A thin supervisor owns the virtual display, headless blanking, caffeinate, and app-switcher HUD across reconnects; verified end-to-end including `--virtual-display`/`--capture-primary` and smart-card redirection. v0.8.12 fixed the `--map-ctrl-to-cmd` remap applying immediately after a Cmd+Tab/Option+Tab app switch (previously it stayed suppressed until you clicked the new app, when cycling in from a terminal/editor), plus small readability cleanups and a startup warning when `--password` is used. v0.8.11 added the app-switcher HUD to the GUI controller's "Set Up Remote Desktop" preset. v0.8.10 added the `--map-ctrl-to-cmd` opt-in that remaps Windows editing shortcuts (Ctrl+C/V/X/…) to their Cmd equivalents so Windows muscle memory drives macOS copy/paste, auto-suppressed in terminals (`--no-remap-apps` extends that for editors with an embedded terminal, also editable from the GUI controller); plus a startup log naming the legacy bitmap codec and recommending `--enable-h264`. The generic-USB-redirection [feasibility writeup](docs/usb-redirection-feasibility.md) landed in v0.8.8, the GUI smart-card-installer self-kill fix in v0.8.6, and the visual [app-switcher HUD](#cli) (`--app-switcher-hud`) in v0.8.3. See [CLAUDE.md](CLAUDE.md) for what's wired up, what isn't, and known quirks.
+v0 — daily-driver usable on a trusted LAN. **Latest release: [v0.8.15](https://github.com/clintcan/macrdp/releases/latest)** — fixes an H.264 ship-path **deadlock** (a lock-order inversion that could freeze the EGFX pipeline — "renders fine, then freezes after a few seconds"; rare on TCP, frequent on the UDP path) and lands experimental **RDP UDP multitransport** (`--enable-udp-multitransport`, opt-in, default OFF): the H.264/EGFX video channel can ride a reliable UDP tunnel (MS-RDPEMT over RDPEUDP) instead of TCP via `--udp-migrate-egfx`. As far as is known this is the first open-source RDP *server* with a working UDP data path (verified rendering on mstsc). It's a **clean-link feature** — under packet loss the reliable ordered tunnel head-of-line-blocks like TCP, so video loss-resilience (lossy transport + FEC) is in-progress Phase 2; input/audio/clipboard always ride TCP. Both switches are also in the GUI controller. Default (TCP) behavior is unchanged. The earlier **`--fork-workers`** (per-connection worker processes, xrdp's model — reconnecting `mstsc` renders instead of going blank) shipped in v0.8.13; `--map-ctrl-to-cmd` (Windows Ctrl→Cmd editing shortcuts, auto-suppressed in terminals) in v0.8.10; the generic-USB-redirection [feasibility writeup](docs/usb-redirection-feasibility.md) in v0.8.8; and the visual [app-switcher HUD](#cli) (`--app-switcher-hud`) in v0.8.3. See [CLAUDE.md](CLAUDE.md) for what's wired up, what isn't, and known quirks.
 
 ## Quick start
 
@@ -280,6 +280,21 @@ build locally with [`packaging/make-app.sh`](#building-the-full-app).
                           still-running server renders instead of going blank.
                           See Known limitations (Video) below. macOS-only; off
                           by default.
+--enable-udp-multitransport  EXPERIMENTAL, opt-in. Offer RDP UDP multitransport
+                          (MS-RDPEMT over reliable RDPEUDP) and bind a UDP
+                          listener on the same address/port as TCP. On its own,
+                          EGFX still rides TCP (a proven safe spike) — add
+                          --udp-migrate-egfx to move the video. Input/audio/
+                          clipboard always ride TCP. As far as is known, the
+                          first OSS RDP *server* with a working UDP data path.
+                          Not supported under --fork-workers. Off by default.
+--udp-migrate-egfx        EXPERIMENTAL, opt-in (needs --enable-udp-multitransport).
+                          Migrate the H.264/EGFX video channel onto the reliable
+                          UDP tunnel via MS-RDPEDYC Soft-Sync (verified on mstsc).
+                          CLEAN-LINK ONLY: the reliable tunnel is an ordered
+                          stream, so under packet loss it head-of-line-blocks
+                          like TCP and can freeze with no recovery until you
+                          reconnect (audio keeps playing on TCP). Off by default.
 ```
 
 `RUST_LOG=debug` for verbose logging.

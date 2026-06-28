@@ -736,6 +736,21 @@ link would **not** downgrade to a FEC-capable version; it'd still be RDPUDP2, st
 would never decode FEC we emit — building the encoder is pointless. P2.3 is closed NO-GO**, confirming the
 spec research (blocker #3) on real Windows wire *and* in the RDPUDP2 spec text itself.
 
+**Industry status (2026-06-28 web survey) — FEC is a dead/legacy feature across the whole RDP ecosystem,
+not just a macrdp gap.** The only RDP stack that *ever* shipped FEC is **Microsoft's own server in the
+RDP 8.x / RemoteFX-over-UDP era** (RDPEUDP **v1** lossy, `UDP-FEC-L`, Reed–Solomon). Microsoft then
+**removed FEC entirely in RDPEUDP2** ([MS-RDPEUDP2] quoted above) and modern Windows (RDP 10+, incl. AVD
+RDP Shortpath) negotiates RDPUDP2 → **retransmit-only, never FEC** (matches our zero-FEC capture).
+**FreeRDP** deliberately implemented **only RDPUDP2**, explicitly to avoid FEC (its UDP author: *"annoyed
+by the FEC in RDPEUDP"*) — so it has no FEC either, on top of having no working server UDP path at all.
+xrdp/ogon/gnome-remote-desktop/Weston are TCP-only. **Net:** both Microsoft (by removing it) and FreeRDP
+(by skipping it) voted for reliable retransmit over FEC, so there is **no current client that would accept
+macrdp-emitted FEC** — reinforcing the NO-GO and validating the **1+1 lossy-audio redundancy** stand-in
+(P2.3 below) as the only loss-resilience lever reachable for a modern client. Sources: [MS-RDPEUDP2
+Transition](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeudp2/c1ff35b9-fdb4-474b-ba32-a91ebf047561),
+[UDP support in FreeRDP pt.2](https://www.hardening-consulting.com/en/posts/20230109-udp-support-2.html),
+[RemoteFX deprecation (Wikipedia)](https://en.wikipedia.org/wiki/RemoteFX).
+
 (Aside: RDPUDP2 being reliable-only does **not** affect macrdp's lossy-audio / 1+1 work — that rides
 RDPEUDP **v2 with RDP-UDP-L**, which mstsc opens because macrdp offers `UdpFecL` and negotiates v1/v2, not
 RDPUDP2. RDPUDP2's reliable-only constraint just means modern *Windows-to-Windows* never opens that lossy

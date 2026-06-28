@@ -13,13 +13,22 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Deferred — scoped, not started
 
-- [ ] **UDP multitransport Phase 2 — lossy `UdpFecL` + DTLS + FEC.**
+- [ ] **UDP multitransport Phase 2 — lossy `UdpFecL` + DTLS + 1+1 redundancy** (FEC dropped).
   Phase 1 (reliable EGFX-over-UDP) shipped (v0.8.15, clean-link only). Phase 2 wants
   loss resilience. Status: lossy delivery mode + 1+1 duplicate-send (repetition code)
   exist in `ironrdp-rdpeudp` behind `MACRDP_UDP_LOSSY_AUDIO_DUP`; DTLS via `boring`
-  not wired. **Real Reed-Solomon FEC is a NO-GO with modern mstsc** (it negotiates
-  RDPUDP2, which has no FEC) — revisit only with legacy-Windows test machines.
-  See `docs/rdp-udp-multitransport-feasibility.md` ("P2.2"/"P2.3") + `vendor/ironrdp-rdpeudp/CLAUDE.md`.
+  not wired. Remaining: wire DTLS, soak the 1+1 lossy-audio path under loss.
+- [x] ~~**Reed-Solomon FEC** (RDPEUDP v1 `UDPFECL`)~~ — **CLOSED, structural NO-GO.**
+  FEC is a dead/legacy feature across the *whole* RDP ecosystem, not just a macrdp gap
+  (2026-06-28 industry survey): the only stack that ever shipped FEC is Microsoft's
+  RDP-8.x/RemoteFX-over-UDP server (v1 lossy); **Microsoft removed FEC in RDPEUDP2** and
+  modern Windows (RDP 10+, AVD Shortpath) negotiates RDPUDP2 → retransmit-only, **never
+  FEC** (confirmed by our own zero-FEC capture). FreeRDP deliberately skipped it
+  (RDPUDP2-only). So **no current client would decode macrdp-emitted FEC** — building the
+  encoder is pointless. The 1+1 redundancy stand-in (above) is the only loss-resilience
+  lever reachable for a modern client. Would only reopen with legacy-Windows-8.x test
+  machines, which isn't a realistic target. See the "Industry status" + "P2.3 FEC capture
+  RESULT" notes in `docs/rdp-udp-multitransport-feasibility.md` + `vendor/ironrdp-rdpeudp/CLAUDE.md`.
 
 - [ ] **Generic USB redirection (MS-RDPEUSB).**
   Viable path scoped: user-space virtual USB host controller via `IOUSBHostControllerInterface`/

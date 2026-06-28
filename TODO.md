@@ -7,23 +7,30 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **UDP multitransport peer leak — idle-timeout GC** (branch `fix/udp-peer-idle-gc`;
-  built + clippy/fmt green; **awaiting real-mstsc verification before merge**). Listener
-  `peers` map was inserted-but-never-removed (M3c GC never built), so a dead client kept
-  RTO-retransmitting unacked EGFX for the process lifetime — the user's "UDP doesn't close
-  on disconnect" + blank-on-reconnect pcap. Fix: `Peer.last_seen_ms` bumped on inbound,
-  `gc_idle_peers` evicts peers idle >10s (+ their `bound_addrs`) on the existing tick.
-  **Verify:** temporarily `UDP_MIGRATE_EGFX=1`, run with
-  `RUST_LOG=info,ironrdp_server::multitransport=debug`, connect+close mstsc, confirm an
-  `evicted idle UDP peer` log ~10s later and UDP to the old client stops; then reconnect a
-  fresh mstsc to see if the blank improves (if not → mstsc surface quirk / clean-link
-  limit, answer stays `--udp-migrate-egfx` off). Listener-only backstop; the prompt
-  server→listener instant-retire signal is still deferred. See feasibility doc "M3c peer GC".
+- [ ] **EGFX-over-UDP reconnect blank/black — per-connection state reset** (branch
+  `fix/udp-egfx-reconnect-state`; built + clippy/fmt green; **awaiting real-mstsc
+  verification before merge**). With `--udp-migrate-egfx`, 1st connection rendered but
+  reconnect went blank→black; plain-TCP EGFX reconnect was always fine (UDP-specific).
+  Two only-set-never-reset bugs on the persistent server+listener: (a) server
+  `egfx_on_udp` (+ lossy-audio counters + `egfx_on_lossy_handle`) stayed true → conn 2
+  routed EGFX over an unbound UDP tunnel → frames dropped → blank (fix: reset in the
+  `run()` accept loop); (b) listener reused a stale established `Peer` on a same-port
+  reconnect → new tunnel never bound, acks dropped (fix: replace the peer when a SYN
+  arrives on an already-established addr). **Verified on real mstsc** — multi-cycle
+  reconnect now renders and stays responsive. Follows the merged idle-GC (#87). See
+  feasibility doc "M3c reconnect state-reset".
 
 ## Deferred — scoped, not started
 
 - [ ] **Congestion-responsive encoder rate control + frame dropping** (highest-value
-  video-under-loss work — helps BOTH the default TCP path and UDP). Today macrdp ships
+  video-under-loss work — helps BOTH the default TCP path and UDP). **Concrete
+  manifestation found 2026-06-28:** EGFX-over-UDP reconnect freezes *intermittently*
+  because the server never throttles on the client's EGFX `queueDepth` —
+  `GfxHandler::on_frame_ack` only records ack timing, so macrdp ships at full rate while
+  the client's queue runs away (observed peak ~352k) → frozen display + RDPEUDP ACK
+  storm. A focused **queue_depth-aware throttle / frame-drop** (a sub-piece of this item)
+  is the targeted fix; note raw `queueDepth` is oddly large even when healthy (~30k–82k),
+  so capture a real-Windows-server baseline before picking a threshold. Today macrdp ships
   a fixed ~60 fps + a 2 s periodic IDR regardless of the client's congestion signal, so
   under loss the ordered stream HOL-blocks and EGFX **freezes** (finding #3/#4). A real
   Windows server under the same ~8% loss **degrades gracefully** — skips frames / drops

@@ -7,10 +7,8 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **EGFX-over-UDP → TCP watchdog** (auto-recover a wedged reliable tunnel) — built
-  + verified on real mstsc (deterministic ack-drop injection AND genuine clumsy UDP-only
-  loss; recovered, no permanent freeze), branch `feat/udp-egfx-watchdog-tcp-fallback`.
-  **Awaiting CI green + squash-merge.** Was the "auto-fallback" deferred item below.
+- (nothing in flight — EGFX-over-UDP → TCP watchdog shipped as #93, verified on real
+  mstsc under clumsy UDP-only loss)
 
 ## Deferred — scoped, not started
 

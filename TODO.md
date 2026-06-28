@@ -7,9 +7,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **PR #84 — `input.rs` de-nest of `commit_cycle_session` (lock-order hardening).**
-  CI green; **awaiting a real-client Cmd+Tab verification before merge** (verify-before-merge
-  rule). Once confirmed on a live mstsc/FreeRDP session, squash-merge + delete branch.
+_(nothing in flight — see Deferred/Parked below)_
 
 ## Deferred — scoped, not started
 

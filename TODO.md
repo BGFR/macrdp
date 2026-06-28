@@ -7,18 +7,8 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **EGFX-over-UDP reconnect blank/black — per-connection state reset** (branch
-  `fix/udp-egfx-reconnect-state`; built + clippy/fmt green; **awaiting real-mstsc
-  verification before merge**). With `--udp-migrate-egfx`, 1st connection rendered but
-  reconnect went blank→black; plain-TCP EGFX reconnect was always fine (UDP-specific).
-  Two only-set-never-reset bugs on the persistent server+listener: (a) server
-  `egfx_on_udp` (+ lossy-audio counters + `egfx_on_lossy_handle`) stayed true → conn 2
-  routed EGFX over an unbound UDP tunnel → frames dropped → blank (fix: reset in the
-  `run()` accept loop); (b) listener reused a stale established `Peer` on a same-port
-  reconnect → new tunnel never bound, acks dropped (fix: replace the peer when a SYN
-  arrives on an already-established addr). **Verified on real mstsc** — multi-cycle
-  reconnect now renders and stays responsive. Follows the merged idle-GC (#87). See
-  feasibility doc "M3c reconnect state-reset".
+- (nothing in flight — EGFX-over-UDP reconnect state reset shipped as #88, and the
+  freeze-under-load fix as #89/v0.8.17)
 
 ## Deferred — scoped, not started
 
@@ -30,7 +20,11 @@ then delete; promote a parked item to *In flight* when work actually starts.
   the client's queue runs away (observed peak ~352k) → frozen display + RDPEUDP ACK
   storm. A focused **queue_depth-aware throttle / frame-drop** (a sub-piece of this item)
   is the targeted fix; note raw `queueDepth` is oddly large even when healthy (~30k–82k),
-  so capture a real-Windows-server baseline before picking a threshold. Today macrdp ships
+  so capture a real-Windows-server baseline before picking a threshold. **First sub-piece
+  SHIPPED (#89/v0.8.17):** a frame-ack-lag backpressure gate in `submit_bgra` with a
+  trickle floor (drop most captures when the client's ack lag is high, but never to zero —
+  mstsc needs trailing frames to present/ack) — removes the *load*-induced freeze on a
+  clean link; the fuller congestion-responsive controller below remains. Today macrdp ships
   a fixed ~60 fps + a 2 s periodic IDR regardless of the client's congestion signal, so
   under loss the ordered stream HOL-blocks and EGFX **freezes** (finding #3/#4). A real
   Windows server under the same ~8% loss **degrades gracefully** — skips frames / drops

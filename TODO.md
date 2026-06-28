@@ -7,12 +7,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [ ] **Congestion-responsive rate control — P1: adaptive bitrate** (`--adaptive-bitrate`).
-  Built + verified on real mstsc under clumsy UDP-only loss: at 8% the bitrate dropped
-  (AIMD on the reliable-tunnel retransmit signal) and video **stayed alive with no wedge**;
-  at sustained 12% it still wedged → watchdog → TCP (the backstop). Branch
-  `feat/udp-adaptive-bitrate`. **Awaiting CI + merge.** P2/P3 (IDR-backoff, frame-drop
-  integration, TCP adapter, real-server capture tuning) remain in the item below.
+- (nothing in flight — rate-control P1 adaptive bitrate shipped as #94, verified on real
+  mstsc under clumsy UDP-only loss: 8% stayed alive no-wedge, 12% → watchdog → TCP)
+
+## Deferred — scoped, not started
 
 - [ ] **Watchdog follow-up: keep the de-migrated UDP tunnel from timing out.** Found
   2026-06-29 during P1 testing: under *sustained* heavy loss the watchdog de-migrates EGFX
@@ -23,13 +21,11 @@ then delete; promote a parked item to *In flight* when work actually starts.
   cleanly **close** the multitransport tunnel so mstsc stops expecting it. Must distinguish
   "de-migrated, client still here" from "client gone" (interacts with the 60s idle-GC).
   Still strictly better than the pre-watchdog permanent freeze; only bites under sustained
-  loss. See the `feat/udp-adaptive-bitrate` test log (wedge 23:44:49 → reset 23:45:50).
-
-## Deferred — scoped, not started
+  loss. See the v0.8.x test log (wedge 23:44:49 → reset 23:45:50, 2026-06-29).
 
 - [ ] **Congestion-responsive encoder rate control + frame dropping** (highest-value
   video-under-loss work — helps BOTH the default TCP path and UDP). **P1 (adaptive bitrate)
-  SHIPPING — see In-flight above;** the remaining P2/P3 sub-pieces (IDR-backoff under the
+  SHIPPED as #94;** the remaining P2/P3 sub-pieces (IDR-backoff under the
   controller, frame-drop integration, the TCP-path adapter, and tuning the control law
   against a real-Windows-server capture) are below. **Concrete
   manifestation found 2026-06-28:** EGFX-over-UDP reconnect freezes *intermittently*

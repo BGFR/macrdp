@@ -177,8 +177,13 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   CEILING, not a fixed target. Lets you set a high ceiling
                           #   (e.g. 8) and have it back off only when the link strains.
                           #   Tunables: MACRDP_UDP_ADAPTIVE_{FLOOR_BPS,INCREASE_BPS,
-                          #   DECREASE,INTERVAL_MS}, MACRDP_{UDP,TCP}_ADAPTIVE_LAG_
-                          #   THRESHOLD, MACRDP_ADAPTIVE_EWMA_ALPHA. macOS-only.
+                          #   DECREASE,INTERVAL_MS,RETX_TOLERANCE}, MACRDP_{UDP,TCP}_
+                          #   ADAPTIVE_LAG_THRESHOLD, MACRDP_ADAPTIVE_EWMA_ALPHA. The
+                          #   RETX_TOLERANCE (default 2) is the per-interval reliable-
+                          #   retransmit count tolerated before treating loss as
+                          #   congestion — keeps sporadic wireless (WiFi) retransmits
+                          #   from ratcheting the bitrate down (0 = any retransmit
+                          #   counts, the old behaviour). macOS-only.
 --fork-workers            # EXPERIMENTAL, opt-in (default OFF; FORK_WORKERS=1 in
                           #   config.env). xrdp's model on macOS: a thin supervisor
                           #   binds the port and fork+execs a FRESH worker process

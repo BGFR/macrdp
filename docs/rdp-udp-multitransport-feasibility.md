@@ -454,6 +454,26 @@ reliable-only multitransport.
    UDP tunnel — proactively de-migrating to TCP`. Confirms the freeze was the *transport*,
    not the unfixable reconnect-blank surface bug. See the quirk note in `docs/known-quirks.md`.
 
+   **SHIPPED 2026-06-29 — UDP retransmit tolerance (PR #100) + a disproven hypothesis.**
+   User reported EGFX-over-UDP bitrate getting "worse and worse over time" on WiFi6 with
+   no recovery. Hypothesis: the controller treated *any* reliable retransmit in a 300ms
+   interval as congestion (multiplicative Decrease), while an Increase needed a *zero*-
+   retransmit interval — and a wireless link's near-continuous low-level loss rarely gives
+   one → one-way ratchet to the floor. Fix: a per-interval retransmit **tolerance**
+   (`MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE`, default 2) — only `retransmit_delta > tolerance`
+   counts as loss (new pure helper `retransmit_is_lossy`; `congested_hysteresis`/
+   `rate_action` now take `retransmit_lossy: bool`). UDP-only; `tolerance=0` restores the
+   old behaviour. **But the live mstsc/WiFi6 test DISPROVED the hypothesis for that link:**
+   the actual decreases were **ack-lag-driven** (ack_lag climbed 19→34, `retransmit_delta=0`
+   on *every* decrease 6.0M→750k) → the tunnel was *wedging* (HOL-block, cause #2), not
+   ratcheting on retransmits → watchdog correctly de-migrated to TCP → video recovered. So
+   the retransmit signal was ~always 0 on that link and the tolerance never engaged. The fix
+   is kept as a correct, low-risk robustness improvement for links that *do* register
+   retransmits, NOT as the WiFi6 cure — for a link lossy enough to wedge the ordered tunnel,
+   `UDP_MIGRATE_EGFX=0` (TCP) remains the answer; the real loss-resilience fix is Phase 2
+   (lossy + FEC). Lesson: the reliable-tunnel retransmit counter barely fires in practice —
+   **ack-lag is the dominant (effectively sole) congestion signal** on both transports.
+
    **What "URCP" actually is, and the concrete signals macrdp already ignores.**
    URCP = **Universal Rate Control Protocol** (Microsoft Research, ~2013) — the
    congestion-/rate-control *algorithm* under RDP Shortpath + MS-RDPEUDP2. It's not a

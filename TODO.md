@@ -15,19 +15,15 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Deferred — scoped, not started
 
-- [ ] **Softer UDP adaptive-bitrate signal over WiFi (stop the ratchet-down).** User
-  reported 2026-06-29: EGFX-over-UDP on WiFi6 gets "worse and worse over time" and doesn't
-  recover. Cause: the UDP congestion signal is binary — **any** reliable retransmit in a
-  300ms interval forces a multiplicative decrease, while an increase needs a **zero**-
-  retransmit interval, which a wireless link with constant low-level loss rarely gives →
-  one-way ratchet to floor. (Proof: the controller recovers fully on the TCP path — climbs
-  back to ceiling after every dip — but logged ZERO udp adjustments.) Fix: decrease on a
-  retransmit-**rate** tolerance (not a single retransmit) + allow climbing under low-but-
-  nonzero loss — likely an EWMA/threshold on `retransmit_delta` mirroring the ack-lag
-  smoothing, behind a `MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE` tunable. NOTE this only fixes the
-  *ratchet*; the reliable tunnel's HOL-block latency under loss is structural (needs Phase 2
-  FEC). Meanwhile `UDP_MIGRATE_EGFX=0` is the robust WiFi config. See the
-  `project_softer_udp_signal_wifi` memory.
+- [x] **Softer UDP adaptive-bitrate signal over WiFi (retransmit tolerance).** SHIPPED
+  2026-06-29 (#100): `MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE` (default 2) so sporadic wireless
+  retransmits don't ratchet the bitrate down. BUT the live mstsc/WiFi6 test disproved the
+  hypothesis for that link — the degradation was **ack-lag-driven** (tunnel wedging /
+  HOL-block, `retransmit_delta=0` on every decrease), not retransmit-driven, so the
+  tolerance never engaged and the watchdog de-migrated to TCP. Kept as a correct low-risk
+  improvement for links that *do* retransmit; the WiFi6 answer stays `UDP_MIGRATE_EGFX=0`.
+  The reliable-tunnel retransmit counter barely fires in practice — ack-lag is the dominant
+  signal. (Remove this line next prune.)
 
 - [ ] **Watchdog follow-up: keep the de-migrated UDP tunnel from timing out.** Found
   2026-06-29 during P1 testing: under *sustained* heavy loss the watchdog de-migrates EGFX

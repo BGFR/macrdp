@@ -9,10 +9,25 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 - (nothing in flight — the congestion-responsive rate-control arc is complete and verified
   on real mstsc: watchdog #93, adaptive-bitrate P1 #94, IDR-backoff + ack-lag P2a #95,
-  de-migrate bitrate restore #96, TCP-path P3 #97, EWMA + 3-zone hold #98. Remaining
-  pieces — P2b frame-drop, stronger TCP signal, audio-resync lever B — are in Deferred.)
+  de-migrate bitrate restore #96, TCP-path P3 #97, EWMA + 3-zone hold #98, minimize/restore
+  proactive de-migrate #99. Remaining pieces — softer UDP signal, P2b frame-drop, stronger
+  TCP signal, audio-resync lever B — are in Deferred.)
 
 ## Deferred — scoped, not started
+
+- [ ] **Softer UDP adaptive-bitrate signal over WiFi (stop the ratchet-down).** User
+  reported 2026-06-29: EGFX-over-UDP on WiFi6 gets "worse and worse over time" and doesn't
+  recover. Cause: the UDP congestion signal is binary — **any** reliable retransmit in a
+  300ms interval forces a multiplicative decrease, while an increase needs a **zero**-
+  retransmit interval, which a wireless link with constant low-level loss rarely gives →
+  one-way ratchet to floor. (Proof: the controller recovers fully on the TCP path — climbs
+  back to ceiling after every dip — but logged ZERO udp adjustments.) Fix: decrease on a
+  retransmit-**rate** tolerance (not a single retransmit) + allow climbing under low-but-
+  nonzero loss — likely an EWMA/threshold on `retransmit_delta` mirroring the ack-lag
+  smoothing, behind a `MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE` tunable. NOTE this only fixes the
+  *ratchet*; the reliable tunnel's HOL-block latency under loss is structural (needs Phase 2
+  FEC). Meanwhile `UDP_MIGRATE_EGFX=0` is the robust WiFi config. See the
+  `project_softer_udp_signal_wifi` memory.
 
 - [ ] **Watchdog follow-up: keep the de-migrated UDP tunnel from timing out.** Found
   2026-06-29 during P1 testing: under *sustained* heavy loss the watchdog de-migrates EGFX

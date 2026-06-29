@@ -7,8 +7,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- (nothing in flight — rate-control P1 adaptive bitrate shipped as #94, verified on real
-  mstsc under clumsy UDP-only loss: 8% stayed alive no-wedge, 12% → watchdog → TCP)
+- (nothing in flight — the congestion-responsive rate-control arc is complete and verified
+  on real mstsc: watchdog #93, adaptive-bitrate P1 #94, IDR-backoff + ack-lag P2a #95,
+  de-migrate bitrate restore #96, TCP-path P3 #97, EWMA + 3-zone hold #98. Remaining
+  pieces — P2b frame-drop, stronger TCP signal, audio-resync lever B — are in Deferred.)
 
 ## Deferred — scoped, not started
 

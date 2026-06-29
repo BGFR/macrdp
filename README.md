@@ -291,10 +291,20 @@ build locally with [`packaging/make-app.sh`](#building-the-full-app).
 --udp-migrate-egfx        EXPERIMENTAL, opt-in (needs --enable-udp-multitransport).
                           Migrate the H.264/EGFX video channel onto the reliable
                           UDP tunnel via MS-RDPEDYC Soft-Sync (verified on mstsc).
-                          CLEAN-LINK ONLY: the reliable tunnel is an ordered
+                          Clean-link optimal: the reliable tunnel is an ordered
                           stream, so under packet loss it head-of-line-blocks
-                          like TCP and can freeze with no recovery until you
-                          reconnect (audio keeps playing on TCP). Off by default.
+                          like TCP — but an auto-recovery watchdog de-migrates
+                          EGFX back to TCP on a wedge (no more freeze-until-
+                          reconnect; audio always rode TCP). Off by default.
+--adaptive-bitrate        Opt-in. Congestion-responsive H.264 rate control on
+                          both the UDP tunnel and the TCP path (only with
+                          --enable-h264): an AIMD controller reads the client's
+                          frame-ack lag (EWMA-smoothed) + retransmits and live-
+                          adjusts the encoder bitrate within [floor, --bitrate
+                          ceiling] — backs off under congestion, climbs back when
+                          clear. So --bitrate becomes a ceiling, not a fixed
+                          target: set it high (e.g. 8) and let it adapt. Off by
+                          default.
 ```
 
 `RUST_LOG=debug` for verbose logging.

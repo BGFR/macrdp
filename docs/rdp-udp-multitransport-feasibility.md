@@ -436,6 +436,24 @@ reliable-only multitransport.
    waves to keep sync — the skip is the cost of the better sync; lever B / audio-resync
    tuning, deferred — see the `project_av_sync_under_drops` note).
 
+   **SHIPPED 2026-06-29 — proactive de-migrate on minimize/restore (PR #99).** User
+   reported: with `--udp-migrate-egfx`, minimizing the mstsc window then restoring it
+   froze the video until a disconnect + reconnect to a *fresh* mstsc (audio, on TCP,
+   resumed fine); `UDP_MIGRATE_EGFX=0` handled minimize/restore cleanly. Root cause:
+   once EGFX is Soft-Sync-migrated onto the reliable tunnel, mstsc's surface doesn't
+   survive the SuppressOutput→restore cycle, and the wedge watchdog only de-migrates
+   *reactively* — 3–6 s after restore (log: `since_ack_ms=6641`), after we've already
+   shipped the restore frames into the now-stale tunnel, too late to heal the surface.
+   Fix: on the un-suppress (restore) edge, if EGFX is on the reliable UDP tunnel,
+   **proactively de-migrate to TCP before shipping a single frame back into the tunnel**
+   (`Gfx::demigrate_on_resume`, called from `capture.rs`'s `was_suppressed` edge), so the
+   restore IDR lands over TCP. Mirrors the watchdog's de-migrate steps; one-way per
+   connection; no-op on TCP/default/lossy (`egfx_on_udp && !egfx_on_lossy`). **Verified
+   on real mstsc** (`--udp-migrate-egfx --bitrate 6 --adaptive-bitrate`): minimize→restore
+   → video returns; log shows `client resumed from minimize while EGFX was on the reliable
+   UDP tunnel — proactively de-migrating to TCP`. Confirms the freeze was the *transport*,
+   not the unfixable reconnect-blank surface bug. See the quirk note in `docs/known-quirks.md`.
+
    **What "URCP" actually is, and the concrete signals macrdp already ignores.**
    URCP = **Universal Rate Control Protocol** (Microsoft Research, ~2013) — the
    congestion-/rate-control *algorithm* under RDP Shortpath + MS-RDPEUDP2. It's not a

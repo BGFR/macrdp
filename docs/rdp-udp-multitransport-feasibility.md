@@ -840,6 +840,24 @@ was enough — the documented time-staggered-duplicate hardening (Contingency A,
 defeating both copies) was NOT needed** and stays deferred unless a future burst-loss case
 defeats 1+1.
 
+**REAL-LINK PERCEPTUAL VALIDATION (2026-06-29, live mstsc/WiFi6, clumsy on the port):**
+beyond the loss-rate soak above, a live drive across the loss range confirmed the A/V-sync
+thesis perceptually with **audio on lossy UDP + video on TCP** (the robust config —
+`ENABLE_LOSSY_AUDIO=1` + `UDP_MIGRATE_EGFX=0`):
+- **15% UDP-only drop:** audio stayed smooth (1+1 covered it); video untouched (loss wasn't
+  on its transport).
+- **15% TCP (video) drop:** video went **jittery→smooth** — the TCP-path adaptive controller
+  backed the bitrate off the 6 Mbps ceiling (P3/EWMA); video got blocky-but-moving, no freeze.
+- **5% on both:** graceful — occasional skips, video sometimes blocky, **but A/V stayed in
+  sync**, with video gradually skipping to re-align to audio. Crucially the user observed
+  **"audio jumps, but it's really in sync"** — i.e. audio skips *forward* to the current
+  position (drop-stale, never-replay-late) rather than drifting behind as it does on pure TCP.
+  This is the whole point: audio is the real-time anchor, video adapts to it.
+The residual skips at 5% are the known unbuilt pieces (encoder frame-drop/fps at the floor =
+"P2b"; tighter audio-lag resync = "lever B"); sync itself holds. Note: a UDP-only clumsy
+filter stresses ONLY audio (video on TCP sees no loss) — use a TCP-inclusive filter to also
+exercise the video adaptive path.
+
 **SHIPPED as the single `--enable-lossy-audio` flag (PR #101, 2026-06-29).** It implies the
 UDP listener and bridges the four expert env gates
 (`MACRDP_UDP_{OFFER_FECL,LOSSY_DELIVERY,LOSSY_AUDIO,LOSSY_AUDIO_DUP}`, which still work

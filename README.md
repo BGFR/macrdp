@@ -557,7 +557,7 @@ Then verify the reader registered with `system_profiler SPSmartCardsDataType`.
 
 ## Reason why this was made
 
-This was done to scratch an itch.  There are practically no active open source RDP servers for MacOS.  The closest project that does this functionality is xrdp; however this program only runs on Linux/Unix machines, and has no homebrew equivalent on Macs. Done in a few hours with the help of Claude and runs pretty well. Multi-monitor support is on the list when I'm bored or need a distraction from real life.
+This was done to scratch an itch.  There are practically no active open source RDP servers for MacOS.  The closest project that does this functionality is xrdp; however this program only runs on Linux/Unix machines, and has no homebrew equivalent on Macs. Initial POC done in a few hours with the help of Claude and runs pretty well at start. Additional combing through pcap files and documentation, and debugging each mstsc/FreeRDP connect is what makes this work tedious yet rewarding when it finally works.  Multi-monitor support is on the list when I'm bored or need a distraction from real life.
 
 ## Support this project
 

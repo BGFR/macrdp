@@ -32,7 +32,7 @@ Short version: **a polished v0 daily-driver for trusted LANs — not an enterpri
 - **The UDP multitransport / lossy-audio paths are EXPERIMENTAL** (opt-in, default OFF) — robust in testing but newer and less soaked than the TCP core, which remains the default everything rides on.
 - **It's a solo v0** built on vendored [IronRDP](https://github.com/Devolutions/IronRDP) forks — no commercial support or SLA.
 
-If your use case is "remote into my own Mac over my LAN/VPN," it's in good shape. If it's unattended production, untrusted networks, or multi-user, it isn't there yet.
+If your use case is "remote into my own Mac over my LAN/VPN," it's in good shape. If it's unattended production, untrusted networks, or multi-user, it isn't there yet — see [`docs/production-readiness-roadmap.md`](docs/production-readiness-roadmap.md) for what would close that gap (real TLS certs, auth hardening, a multi-day soak) and what can't be (multi-user GUI sessions, on macOS).
 
 ## Quick start
 

@@ -176,14 +176,20 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   a big keyframe into a congested tunnel. So --bitrate is a
                           #   CEILING, not a fixed target. Lets you set a high ceiling
                           #   (e.g. 8) and have it back off only when the link strains.
+                          #   P2b frame-rate floor: once bitrate is pinned at the floor
+                          #   AND still congested (quality cuts exhausted), it caps the
+                          #   effective fps (default 10) to shed packet load — on BOTH
+                          #   transports, never to zero (the client needs trailing frames
+                          #   to present/ack). Video degrades to choppy-but-steady-and-in-
+                          #   sync instead of freezing; fps + bitrate recover when clear.
                           #   Tunables: MACRDP_UDP_ADAPTIVE_{FLOOR_BPS,INCREASE_BPS,
                           #   DECREASE,INTERVAL_MS,RETX_TOLERANCE}, MACRDP_{UDP,TCP}_
-                          #   ADAPTIVE_LAG_THRESHOLD, MACRDP_ADAPTIVE_EWMA_ALPHA. The
-                          #   RETX_TOLERANCE (default 2) is the per-interval reliable-
-                          #   retransmit count tolerated before treating loss as
-                          #   congestion — keeps sporadic wireless (WiFi) retransmits
-                          #   from ratcheting the bitrate down (0 = any retransmit
-                          #   counts, the old behaviour). macOS-only.
+                          #   ADAPTIVE_LAG_THRESHOLD, MACRDP_ADAPTIVE_EWMA_ALPHA,
+                          #   MACRDP_ADAPTIVE_FLOOR_FPS. The RETX_TOLERANCE (default 2) is
+                          #   the per-interval reliable-retransmit count tolerated before
+                          #   treating loss as congestion — keeps sporadic wireless (WiFi)
+                          #   retransmits from ratcheting the bitrate down (0 = any
+                          #   retransmit counts, the old behaviour). macOS-only.
 --enable-lossy-audio      # EXPERIMENTAL, opt-in (default OFF; ENABLE_LOSSY_AUDIO=1
                           #   in config.env). Implies --enable-udp-multitransport;
                           #   needs --enable-aac + --enable-h264. Stream RDPSND audio

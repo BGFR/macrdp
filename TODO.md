@@ -10,8 +10,8 @@ then delete; promote a parked item to *In flight* when work actually starts.
 - (nothing in flight — the congestion-responsive rate-control arc is complete and verified
   on real mstsc: watchdog #93, adaptive-bitrate P1 #94, IDR-backoff + ack-lag P2a #95,
   de-migrate bitrate restore #96, TCP-path P3 #97, EWMA + 3-zone hold #98, minimize/restore
-  proactive de-migrate #99. Remaining pieces — softer UDP signal, P2b frame-drop, stronger
-  TCP signal, audio-resync lever B — are in Deferred.)
+  proactive de-migrate #99, lossy-audio flag #101, **P2b frame-rate floor #102**. Remaining
+  pieces — softer UDP signal, stronger TCP signal, audio-resync lever B — are in Deferred.)
 
 ## Deferred — scoped, not started
 
@@ -45,11 +45,16 @@ then delete; promote a parked item to *In flight* when work actually starts.
   ack-lag on TCP is a real but spiky/lower-amplitude signal, tuned via a ¾·max_frame_lag
   threshold). **EWMA smoothing + hysteresis + 3-zone hold SHIPPED 2026-06-29** (verified
   mstsc: per-spike sawtooth → one gentle step-and-recover per episode; A/V more in sync,
-  catch-up speed-up cut, "video sometimes stops" gone — see feasibility doc). Remaining
-  sub-pieces: **P2b** frame-drop / fps reduction when bitrate is at the floor; a **stronger
-  TCP signal** (`TCP_CONNECTION_INFO` RTT+retransmits / write-backpressure — less spiky
-  than ack-lag); the CN/RTT/window signals; and tuning the control law against a
-  real-Windows-server capture. **Concrete
+  catch-up speed-up cut, "video sometimes stops" gone — see feasibility doc). **P2b
+  frame-rate floor SHIPPED 2026-06-29 (#102, verified mstsc):** once bitrate is pinned at
+  the floor AND still congested, cap the effective fps (drop captures within `1/floor-fps`,
+  default 10 fps, never zero) to shed packet load — on BOTH transports (the only fps lever
+  on TCP). Pure `frame_drop_at_floor`; `MACRDP_ADAPTIVE_FLOOR_FPS` tunable. Live log
+  confirmed: bitrate AIMD → 750k floor under rising ack-lag → P2b caps to ~10 fps
+  (choppy-but-steady, in sync) → recovers to the 6M ceiling + full fps when loss clears.
+  Remaining sub-pieces: a **stronger TCP signal** (`TCP_CONNECTION_INFO` RTT+retransmits /
+  write-backpressure — less spiky than ack-lag); the CN/RTT/window signals; and tuning the
+  control law against a real-Windows-server capture. **Concrete
   manifestation found 2026-06-28:** EGFX-over-UDP reconnect freezes *intermittently*
   because the server never throttles on the client's EGFX `queueDepth` —
   `GfxHandler::on_frame_ack` only records ack timing, so macrdp ships at full rate while

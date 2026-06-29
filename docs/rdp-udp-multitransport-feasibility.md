@@ -474,6 +474,30 @@ reliable-only multitransport.
    (lossy + FEC). Lesson: the reliable-tunnel retransmit counter barely fires in practice —
    **ack-lag is the dominant (effectively sole) congestion signal** on both transports.
 
+   **SHIPPED 2026-06-29 — rate control P2b: frame-rate floor (PR #102, verified mstsc).**
+   Design lever (2) ("drop frames for lower effective fps when bitrate cuts aren't enough").
+   Once the controller has cut the bitrate to its floor AND the link is still congested —
+   lowering quality can no longer help — the next lever is shedding *frames*. New pure
+   `frame_drop_at_floor(at_floor, congested, since_last_pass, min_interval)` (2 unit tests),
+   gated in `submit_bgra` on `--adaptive-bitrate` + actually at-floor-under-congestion (so
+   the default path is byte-unchanged): it caps the effective fps by dropping captures
+   arriving within `1/floor-fps` of the last let-through (default 10 fps,
+   `MACRDP_ADAPTIVE_FLOOR_FPS`). **Never zero** — one capture per interval gets through so
+   the client keeps trailing frames to present/ack (the same lesson as the EGFX-on-UDP
+   trickle floor; dropping to zero pins the ack-lag and freezes). Works on **both
+   transports** — it's the only fps lever on TCP (no UDP frame-ack backpressure gate there).
+   Dropping before encode keeps the H.264 reference chain valid; `need_keyframe` persists
+   across a drop. **Verified on real mstsc** (pure-TCP, `--bitrate 6`, ~8–10% clumsy TCP
+   drop), confirmed end-to-end from the log: bitrate AIMD walked down to the 750k floor
+   under rising ack-lag (34→53) → P2b engaged (324× `frame-rate floor active — capping fps`)
+   → video settled to a controlled ~10 fps (choppy-but-steady, **in sync** with audio, no
+   freeze) → when loss cleared, bitrate climbed back to the 6M ceiling and full fps resumed;
+   0 de-migrate/wedge (video on TCP). The residual recovery catch-up (rate-adaptive video
+   draining its buffer to re-sync to audio) is the separate, deferred audio-resync "lever B".
+   Remaining rate-control refinements: a stronger/less-spiky TCP signal
+   (`TCP_CONNECTION_INFO` RTT+retransmits / write-backpressure), the CN/RTT/window signals,
+   and tuning against a real-Windows-server capture.
+
    **What "URCP" actually is, and the concrete signals macrdp already ignores.**
    URCP = **Universal Rate Control Protocol** (Microsoft Research, ~2013) — the
    congestion-/rate-control *algorithm* under RDP Shortpath + MS-RDPEUDP2. It's not a

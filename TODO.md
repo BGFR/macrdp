@@ -80,6 +80,17 @@ then delete; promote a parked item to *In flight* when work actually starts.
     same VT-bitrate/frame-drop/IDR-backoff levers; only the input source differs per transport.
   Bigger than FEC (dead) or auto-fallback (band-aid). Worth a real-server↔mstsc capture
   first to read the URCP signaling. See finding #5 in `docs/rdp-udp-multitransport-feasibility.md`.
+- [ ] **A/V desync under packet loss** (user-reported 2026-06-29, after P3). Audio drifts
+  from video under drops, most apparent on the TCP path. Root constraint: **RDP has no A/V
+  sync primitive** (RDPSND + EGFX are independent channels, no shared clock/PTS) → true
+  lip-sync is impossible, only *reduce* drift. The P3 adaptive video catches up (speeds/
+  slows) while fixed-rate audio can't, which makes the drift visible. Two partial levers,
+  both deferred: **A** — EWMA/hysteresis smoothing of the video controller (recommended
+  first; fixes the cause — video timing swings — with no audio-quality cost; also smooths
+  the residual P3 dip/catch-up); **B** — tighten the audio-lag resync (vendored
+  `dispatch_audio`, ~300 ms threshold tuned for resize-freezes, not slow drift) to keep
+  audio live, at the cost of choppier audio. Try A first. Detail: `project_av_sync_under_drops`
+  memory + the rate-control "Design shape" above.
 - [ ] **EGFX-over-UDP watchdog — ack-lag-pegged secondary trigger** (refinement of the
   shipped watchdog above). The watchdog fires on ~3s of *fully silent* acks; a real wedge
   dribbles a few stray acks before going silent, so it latched at `since_ack_ms≈7.7s` in

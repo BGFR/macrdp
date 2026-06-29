@@ -12,6 +12,28 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 v0 — daily-driver usable on a trusted LAN. **Latest release: [v0.8.19](https://github.com/clintcan/macrdp/releases/latest)** — the **congestion-responsive rate-control arc**: under packet loss an H.264 session now degrades gracefully instead of freezing. **`--adaptive-bitrate`** runs an AIMD controller (EWMA-smoothed frame-ack lag + hysteresis + a 3-zone hold) on **both** the UDP tunnel and the TCP path, so `--bitrate` is a ceiling that backs off under congestion; once it bottoms out, a **frame-rate floor** sheds fps (never to zero) so video stays choppy-but-steady-and-in-sync rather than freezing. An **EGFX-over-UDP watchdog** auto-de-migrates a wedged reliable UDP tunnel back to TCP (incl. proactively on minimize/restore). And **`--enable-lossy-audio`** streams RDPSND over a lossy UDP/DTLS tunnel with 1+1 redundancy (each datagram sent twice → p→p² loss) — soak-verified smooth on real mstsc at 5/10/15% loss where single-send glitches. All verified on real mstsc; every switch is opt-in, default (TCP) behavior unchanged. Earlier milestones: **`--enable-udp-multitransport`** (first known OSS RDP *server* with a working UDP data path) in v0.8.15; **`--fork-workers`** (per-connection worker processes, xrdp's model — reconnecting `mstsc` renders instead of going blank) in v0.8.13; `--map-ctrl-to-cmd` in v0.8.10; the generic-USB-redirection [feasibility writeup](docs/usb-redirection-feasibility.md) in v0.8.8; the visual [app-switcher HUD](#cli) (`--app-switcher-hud`) in v0.8.3. See [CLAUDE.md](CLAUDE.md) for what's wired up, what isn't, and known quirks.
 
+## Production readiness
+
+Short version: **a polished v0 daily-driver for trusted LANs — not an enterprise RDP server.** Use it to reach your own Mac over a network you control; don't put it on a public IP or treat it as multi-user/critical infrastructure.
+
+**What's solid (verified on real mstsc / Microsoft Remote Desktop / FreeRDP):**
+- Real auth — TLS + NLA/CredSSP against the macOS account via PAM, password from the Keychain.
+- The full daily workflow — display, keyboard/mouse (incl. non-US layouts, Cmd+Tab, optional Ctrl→Cmd), clipboard text/images/files both ways, system audio, drive + smart-card redirection, headless virtual displays.
+- H.264/EGFX with **congestion-responsive rate control** — under packet loss it degrades gracefully (bitrate backs off → fps sheds at the floor → stays choppy-but-in-sync) instead of freezing, and audio can ride a loss-resilient lossy-UDP path.
+- Deployable — signed + notarized `.app`, a LaunchAgent, and a menu-bar GUI controller; TCC grants survive rebuilds.
+- Tested — 108 unit tests + a regression harness, run in CI on every push.
+
+**Known limitations — read before relying on it:**
+- **Trusted-LAN scope is load-bearing.** The cert is self-signed (trust-on-first-use); nothing here is hardened for internet exposure or hostile networks. Put it behind a VPN if you need remote access.
+- **Single session, single user.** No multi-monitor (client-side multi-display) and no printer redirection.
+- **Some content can't be captured, by OS design** — DRM video (Netflix etc.) and password-manager vault windows render blank; macOS excludes protected content from screen capture and that can't (and shouldn't) be overridden.
+- **Synthetic input can't reach secure contexts** — the login window, lock screen, and secure-input password fields are OS-blocked.
+- **Client quirks, documented not fixed** — reconnecting *mstsc* to a still-running server can show a blank screen (`--fork-workers` largely fixes it; residual ~1/7 recovers by reconnecting once more); FreeRDP/Thincast are unaffected.
+- **The UDP multitransport / lossy-audio paths are EXPERIMENTAL** (opt-in, default OFF) — robust in testing but newer and less soaked than the TCP core, which remains the default everything rides on.
+- **It's a solo v0** built on vendored [IronRDP](https://github.com/Devolutions/IronRDP) forks — no commercial support or SLA.
+
+If your use case is "remote into my own Mac over my LAN/VPN," it's in good shape. If it's unattended production, untrusted networks, or multi-user, it isn't there yet.
+
 ## Quick start
 
 ```bash

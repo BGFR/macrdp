@@ -818,6 +818,36 @@ cut in effective AU loss, for ~2× of a ~130 kbps stream (negligible). (c) Separ
 **lag-model blindness to the tunnel backlog** is a real latent issue for any future
 reliable-tunnel payload, though moot for send-once (which never backlogs).
 
+### Lossy-audio soak RESULT (2026-06-29, mstsc) — 1+1 redundancy WORKS; SHIPPED as `--enable-lossy-audio`
+
+Follow-up (b) above — duplicate-AU redundancy — was built (`MACRDP_UDP_LOSSY_AUDIO_DUP`:
+each lossy datagram sent twice; the client's DTLS anti-replay window dedups, so audio never
+double-plays) and **soaked under real loss on mstsc. It holds where send-once fails:**
+
+| Link | Delivery | Result |
+|---|---|---|
+| 5% loss | send-once (dup=0) | glitchy (baseline — confirms loss hits the lossy path) |
+| 5% loss | **1+1 (dup=1)** | **smooth** |
+| 10% loss | **1+1 (dup=1)** | **smooth** |
+| 15% loss | **1+1 (dup=1)** | **smooth** (trace jitter only) |
+
+No teardown, no RTO retransmits (1+1 *is* the recovery — there's nothing to retransmit), and
+audio was genuinely on the lossy UDP tunnel (TCP fallback ruled out: `streaming Wave2 … LOSSY
+UDP/DTLS tunnel`, one continuous session, `dup=0` glitched on the same path). So the earlier
+"needs FEC" conclusion is **superseded** — the p→p² math (5%→0.25%) bears out in practice, and
+FEC proper is a structural NO-GO anyway (see the P2.3 FEC RESULT). **The back-to-back duplicate
+was enough — the documented time-staggered-duplicate hardening (Contingency A, for bursts
+defeating both copies) was NOT needed** and stays deferred unless a future burst-loss case
+defeats 1+1.
+
+**SHIPPED as the single `--enable-lossy-audio` flag (PR #101, 2026-06-29).** It implies the
+UDP listener and bridges the four expert env gates
+(`MACRDP_UDP_{OFFER_FECL,LOSSY_DELIVERY,LOSSY_AUDIO,LOSSY_AUDIO_DUP}`, which still work
+standalone); requires `--enable-aac` (MS-RDPEA) + `--enable-h264` (the lossy-audio Soft-Sync
+rides the EGFX dispatch path) and warns if either is missing. This is the first user-noticeable
+Phase-2 *win* — loss-resilient audio. Lossy *video* over the tunnel remains the open ceiling
+(reliable-tunnel HOL-block; separate, lower value).
+
 ## Audio belongs on the lossy transport, not the reliable one
 
 A natural-looking "next step" is to also route **audio (RDPSND)** over the UDP

@@ -124,11 +124,20 @@ then delete; promote a parked item to *In flight* when work actually starts.
   per-cookie tunnel-bound flag. See vendor `listener.rs` `PEER_IDLE_TIMEOUT_MS` + the
   feasibility doc "M3c peer GC".
 
-- [ ] **UDP multitransport Phase 2 — lossy `UdpFecL` + DTLS + 1+1 redundancy** (FEC dropped).
-  Phase 1 (reliable EGFX-over-UDP) shipped (v0.8.15, clean-link only). Phase 2 wants
-  loss resilience. Status: lossy delivery mode + 1+1 duplicate-send (repetition code)
-  exist in `ironrdp-rdpeudp` behind `MACRDP_UDP_LOSSY_AUDIO_DUP`; DTLS via `boring`
-  not wired. Remaining: wire DTLS, soak the 1+1 lossy-audio path under loss.
+- [x] **UDP multitransport Phase 2 — lossy `UdpFecL` + DTLS + 1+1 redundancy** (FEC dropped).
+  **Lossy AUDIO is DONE + verified.** Phase 1 (reliable EGFX-over-UDP) shipped (v0.8.15,
+  clean-link only). Phase 2 loss resilience for *audio* is now shipped and soaked: lossy
+  RDPEUDP delivery (deliver-on-arrival, no retransmit) + DTLS-over-lossy + the dual-channel
+  topology (MS-RDPEA format handshake on the reliable `AUDIO_PLAYBACK_DVC` over TCP; AAC
+  Wave2 data Soft-Synced onto the lossy `AUDIO_PLAYBACK_LOSSY_DVC`) + **1+1 duplicate-send**
+  (each datagram sent twice; client DTLS anti-replay dedups → p→p² loss). **Soak-verified on
+  real mstsc 2026-06-29:** dup=0 glitches at 5% loss; dup=1 stays smooth at 5/10/15% (trace
+  jitter only at 15%). Promoted from the four expert env gates to the single
+  **`--enable-lossy-audio`** flag (#101). Back-to-back duplicates were enough — the
+  documented staggered-duplicate hardening was NOT needed (deferred unless a future burst
+  case defeats 1+1). Remaining Phase-2 piece is *video* over the lossy tunnel (the known
+  HOL-block ceiling — separate, lower value); see the lossy-video deferral and the
+  watchdog-timeout follow-up above.
 - [x] ~~**Reed-Solomon FEC** (RDPEUDP v1 `UDPFECL`)~~ — **CLOSED, structural NO-GO.**
   FEC is a dead/legacy feature across the *whole* RDP ecosystem, not just a macrdp gap
   (2026-06-28 industry survey): the only stack that ever shipped FEC is Microsoft's

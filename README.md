@@ -305,6 +305,15 @@ build locally with [`packaging/make-app.sh`](#building-the-full-app).
                           clear. So --bitrate becomes a ceiling, not a fixed
                           target: set it high (e.g. 8) and let it adapt. Off by
                           default.
+--enable-lossy-audio      EXPERIMENTAL, opt-in (implies --enable-udp-multitransport;
+                          needs --enable-aac + --enable-h264). Stream RDPSND audio
+                          over a LOSSY UDP/DTLS tunnel instead of TCP — the loss-
+                          resilient audio path. AAC Wave2 data rides a lossy
+                          RDPEUDP flow (deliver-on-arrival, no retransmit) and each
+                          datagram is sent TWICE (the client's DTLS anti-replay
+                          dedups), so an independent-loss link of rate p drops a
+                          payload only at p^2. Verified smooth on mstsc at
+                          5/10/15% loss where single-send glitches. Off by default.
 ```
 
 `RUST_LOG=debug` for verbose logging.

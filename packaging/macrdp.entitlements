@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the USB-redirection build of macrdp.
+
+  Only used when packaging/make-app.sh is run with PROVISION_PROFILE=<...> set;
+  the normal build signs with NO entitlements (unchanged). The key below is the
+  managed entitlement Apple granted to team QGLA89KHM7 (FB23363880, 2026-07-01),
+  required to drive a user-space virtual USB host controller via
+  IOUSBHostControllerInterface / AppleUSBUserHCI.
+
+  This entitlement set MUST be a subset of the provisioning profile's entitlements
+  or codesign fails ("not in profile"). If the granted profile lists this key with
+  a different value type than the boolean below, match the profile.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.usb.host-controller-interface</key>
+	<true/>
+</dict>
+</plist>

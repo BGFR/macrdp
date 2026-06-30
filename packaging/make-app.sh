@@ -68,6 +68,24 @@ fi
 # Developer ID must (notarization requires it). Shared by the IFD bundle + app.
 if [ "$IDENTITY" = "-" ]; then TS="--timestamp=none"; else TS="--timestamp"; fi
 
+# Optional: provisioning profile + entitlements (USB-redirection builds only).
+# PROVISION_PROFILE=<path.provisionprofile> embeds the profile and signs the main
+# binary + app with packaging/macrdp.entitlements (override via ENTITLEMENTS=).
+# Unset (the normal build) → no profile, no entitlements, byte-identical signing.
+# The entitlement set MUST be a subset of the profile's, or codesign fails.
+PROVISION_PROFILE="${PROVISION_PROFILE:-}"
+ENTITLEMENTS="${ENTITLEMENTS:-}"
+ENT_ARG=""
+if [ -n "$PROVISION_PROFILE" ]; then
+    [ -f "$PROVISION_PROFILE" ] || { echo "PROVISION_PROFILE not found: $PROVISION_PROFILE" >&2; exit 1; }
+    [ "$IDENTITY" != "-" ] || { echo "PROVISION_PROFILE needs a real CODESIGN_IDENTITY (not ad-hoc)" >&2; exit 1; }
+    [ -n "$ENTITLEMENTS" ] || ENTITLEMENTS="$PKG_DIR/macrdp.entitlements"
+fi
+if [ -n "$ENTITLEMENTS" ]; then
+    [ -f "$ENTITLEMENTS" ] || { echo "ENTITLEMENTS not found: $ENTITLEMENTS" >&2; exit 1; }
+    ENT_ARG="--entitlements $ENTITLEMENTS"
+fi
+
 # 2c. Embed the PC/SC IFD handler bundle (smart-card redirection,
 #     --enable-smartcard-redirection). It ships inside the app so it travels in
 #     the DMG; packaging/install-ifd-handler.sh later copies it (privileged) to
@@ -121,9 +139,17 @@ fi
 
 # 3. Sign the Mach-O executable, then the bundle (which seals Info.plist + the
 #    Resources, including the app icon + the embedded IFD bundle).
-echo "==> codesign (hardened runtime, ts: $TS)"
-codesign --force --options runtime $TS -s "$IDENTITY" "$STAGE/Contents/MacOS/macrdp"
-codesign --force --options runtime $TS -s "$IDENTITY" "$STAGE"
+# Embed the provisioning profile (if any) BEFORE the bundle sign so it's sealed in.
+if [ -n "$PROVISION_PROFILE" ]; then
+    cp "$PROVISION_PROFILE" "$STAGE/Contents/embedded.provisionprofile"
+    echo "==> embedded provisioning profile"
+fi
+echo "==> codesign (hardened runtime, ts: $TS${ENT_ARG:+, entitlements})"
+# Entitlements go on the main executable (which actually runs) and the bundle.
+# The other signed items (IFD dylib/bundle, macrdphud) deliberately get NO
+# entitlements — only macrdp needs the USB host-controller capability.
+codesign --force --options runtime $TS $ENT_ARG -s "$IDENTITY" "$STAGE/Contents/MacOS/macrdp"
+codesign --force --options runtime $TS $ENT_ARG -s "$IDENTITY" "$STAGE"
 codesign --verify --deep --strict "$STAGE"
 
 # 3b. Optional notarization (NOTARIZE=1, real Developer ID + NOTARY_PROFILE).

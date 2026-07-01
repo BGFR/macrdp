@@ -244,12 +244,19 @@ then delete; promote a parked item to *In flight* when work actually starts.
   machines, which isn't a realistic target. See the "Industry status" + "P2.3 FEC capture
   RESULT" notes in `docs/rdp-udp-multitransport-feasibility.md` + `vendor/ironrdp-rdpeudp/CLAUDE.md`.
 
-- [ ] **Generic USB redirection (MS-RDPEUSB).**
-  Viable path scoped: user-space virtual USB host controller via `IOUSBHostControllerInterface`/
-  `AppleUSBUserHCI` (no kext/dext). **Blocked on Apple:** entitlement
-  `com.apple.developer.usb.host-controller-interface` submitted 2026-06-24 (FB23363880),
-  awaiting grant. Then: MS-RDPEUSB server-direction + UserHCI; gates to a signed build.
-  See `docs/usb-redirection-feasibility.md`.
+- [ ] **Generic USB redirection (MS-RDPEUSB) — Phase 1 GO ✅ (2026-07-01), Phases 2–3 open.**
+  Path: user-space virtual USB host controller via `IOUSBHostControllerInterface` (a **public,
+  headered** IOUSBHost.framework API — NOT private SPI as first assumed; its doc says it
+  "create[s] synthetic USB devices"). Entitlement `com.apple.developer.usb.host-controller-
+  interface` **GRANTED** to QGLA89KHM7 (FB23363880). **Phase 1 spike proven live** (branch
+  `feat/usb-redirect-spike`, `--usb-spike`): an entitled signed+provisioned build creates the
+  controller and the kernel begins the command exchange → the route works. Remaining:
+  **P2** — drive the controller/port/device/endpoint state machines to present a synthetic
+  device (extend `src/usb_redirect/usb_spike.m`); **P3** — MS-RDPEUSB server-direction over
+  DVC, reusing upstream `ironrdp-rdpeusb`'s bidirectional PDU layer (client processor only
+  today — add the server processor, ideally upstreamed). Gates to the official signed+
+  provisioned build (entitlement baked into the signature). See
+  `docs/usb-redirection-feasibility.md` + [[project_usb_redirection_feasibility]].
 
 - [ ] **Multi-monitor (client-side multi-display).**
   Extend `--virtual-display` to N monitors. **Blocker:** the git-pinned `ironrdp-acceptor`

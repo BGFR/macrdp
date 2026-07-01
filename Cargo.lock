@@ -1976,6 +1976,7 @@ dependencies = [
  "async-trait",
  "block2",
  "bytes",
+ "cc",
  "clap",
  "core-foundation 0.10.1",
  "core-graphics",

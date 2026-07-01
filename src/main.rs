@@ -34,6 +34,7 @@ mod reaper;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
 mod switcher_hud;
+mod usb_redirect;
 mod videotoolbox;
 mod virtual_display;
 
@@ -632,6 +633,14 @@ struct Args {
     /// handed to each worker via the internal MACRDP_WORKER_FD env var. macOS-only.
     #[arg(long = "fork-workers")]
     fork_workers: bool,
+
+    /// EXPERIMENTAL research spike (not a real feature): instantiate a user-space
+    /// USB host controller via IOUSBHostControllerInterface to prove the
+    /// generic-USB-redirection route works, print GO/NO-GO, then exit. Requires a
+    /// signed+provisioned build carrying the com.apple.developer.usb.host-controller-
+    /// interface entitlement (packaging/make-app.sh PROVISION_PROFILE=...). macOS-only.
+    #[arg(long = "usb-spike")]
+    usb_spike: bool,
 }
 
 /// Env var the `--fork-workers` supervisor sets on each spawned worker, carrying
@@ -1681,6 +1690,13 @@ async fn async_main() -> Result<()> {
     // sole source of truth — rebuild Args from it.
     if let Some(cfg_path) = args.config.clone() {
         args = args_from_config(&cfg_path)?;
+    }
+
+    // Research spike (Phase-1b USB-redirection go/no-go): run the UserHCI probe
+    // and exit before any server/auth/capture setup. Requires the signed+
+    // provisioned entitled build; see src/usb_redirect/.
+    if args.usb_spike {
+        std::process::exit(usb_redirect::run_spike());
     }
 
     // RUST_LOG (if set) always wins. Otherwise: --verbose turns on debug

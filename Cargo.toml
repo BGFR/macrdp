@@ -68,6 +68,10 @@ ironrdp-tokio = "0.8"
 # For the UDP multitransport loopback test: decode the listener's SYN+ACK reply.
 ironrdp-rdpeudp = { path = "vendor/ironrdp-rdpeudp" }
 
+[build-dependencies]
+# Compile the USB-redirection Obj-C shim (src/usb_redirect/usb_spike.m) on macOS.
+cc = "1"
+
 # macOS-only: screen capture + input synthesis
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { version = "0.24", features = ["highsierra"] }

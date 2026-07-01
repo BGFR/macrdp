@@ -4,6 +4,22 @@
 USB redirection today, and nothing here is committed work. This is a scoping
 document for if/when it's ever pursued.*
 
+> **UPDATE 2026-07-01 — Phase 1 is GO ✅, and two early assumptions below were wrong.**
+> The entitlement `com.apple.developer.usb.host-controller-interface` was **granted** to
+> team QGLA89KHM7 (FB23363880). A signed+provisioned spike (`--usb-spike`, `src/usb_redirect/`)
+> successfully instantiated `IOUSBHostControllerInterface` and the kernel driver began the
+> command exchange — so the entitlement functions and the UserHCI route is real.
+> **Correction 1:** `IOUSBHostControllerInterface` is **NOT undocumented private SPI** — it's a
+> **public, SDK-headered API** in the public `IOUSBHost.framework` (headers incl.
+> `IOUSBHostControllerInterface.h` + the `IOUSBHostCI*StateMachine.h` set) with a complete
+> example `main()`; its doc literally says it "create[s] synthetic USB devices." So the "private
+> SPI, hard, moving target" and "VirtualHere binary forensics" framing below is superseded —
+> it's documented-API FFI. **Correction 2:** upstream IronRDP now has an `ironrdp-rdpeusb` crate
+> with the **complete bidirectional MS-RDPEUSB PDU layer** (client processor only), so the
+> protocol side is no longer "unprecedented / from scratch" — we add a server processor on that.
+> Remaining: P2 (present a device via the state machines) + P3 (MS-RDPEUSB server-direction).
+> See the `project_usb_redirection_feasibility` memory for specifics.
+
 ## TL;DR
 
 - **macrdp could, in principle, do generic USB redirection**, and the right macOS

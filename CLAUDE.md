@@ -18,12 +18,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Functional v0 — daily-driver usable on a trusted LAN. **Latest release: v0.8.21**
-(the production-readiness arc: operator-supplied TLS certs `--cert`/`--key`,
-connection rate-limiting + lockout + an auth audit log, and bounded log rotation +
-a startup reaper — Tier 1.1/1.2/2.5 of `@docs/production-readiness-roadmap.md`.
-v0.8.21 fixes an auth-guard false-lockout that could block a legitimately
-reconnecting client — surfaced by the Tier 2.4 soak).
+Functional v0 — daily-driver usable on a trusted LAN. **Latest release: v0.8.23**
+(the production-readiness arc — Tier 1 + Tier 2.5 of
+`@docs/production-readiness-roadmap.md`: operator-supplied TLS certs `--cert`/`--key`,
+connection rate-limiting + lockout + an auth audit log, bounded log rotation + a
+startup reaper, and — v0.8.23 — a **health-check watchdog** (`src/health.rs`) that
+bounces a hung-but-alive process so launchd / the `--fork-workers` supervisor
+restarts a fresh one, closing the gap `KeepAlive` couldn't. v0.8.22 auto-recovers
+the mstsc EGFX reconnect-blank via QoE-EDR detection + a Server Auto-Reconnect
+Cookie; v0.8.21 fixed an auth-guard false-lockout of a legitimately reconnecting
+client — surfaced by the Tier 2.4 soak).
 RDP clients (mstsc, Microsoft Remote Desktop, FreeRDP) connect over TLS and get
 the macOS desktop with keyboard/mouse/clipboard/audio, optional H.264-over-EGFX,
 headless virtual displays, drive + smart-card redirection, and (opt-in) UDP

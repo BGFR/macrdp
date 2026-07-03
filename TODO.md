@@ -20,10 +20,11 @@ then delete; promote a parked item to *In flight* when work actually starts.
   a few tries while I was out" incident); the **post-fix soak window had ZERO lockouts** + 14
   balanced accept/disconnect pairs. **Still open because:** (a) 31 h < the 48–72 h target; (b)
   predates v0.8.22 → **blank-recovery detector** (per-QoE-callback, can drop the connection) +
-  **ARC cookie** not exercised. **Next action:** 48–72 h re-soak on **v0.8.22+**, biased toward
-  reconnect cycles. Logging fixes for that run: `fsync`/`F_FULLFSYNC` the soak logger (or tee to
-  the macOS unified log) so a transfer can't zero-fill it; demote the `multitransport`/`audio_dvc`
-  "GREEN" status lines from WARN to INFO/DEBUG. See `docs/production-readiness-roadmap.md` Tier 2.4.
+  **ARC cookie** not exercised (and now also the **v0.8.23 health-check watchdog**). **Next
+  action:** 48–72 h re-soak on **v0.8.23** (now the deployed build), biased toward reconnect
+  cycles. Logging fixes for that run **DONE 2026-07-03 (#124):** the soak logger now `sync`s
+  after every CSV append (can't zero-fill on transfer), and the `multitransport`/`audio_dvc`
+  "GREEN" status lines are demoted WARN→DEBUG. See `docs/production-readiness-roadmap.md` Tier 2.4.
 
 ## Deferred — scoped, not started
 

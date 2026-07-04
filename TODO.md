@@ -55,28 +55,38 @@ then delete; promote a parked item to *In flight* when work actually starts.
   The reliable-tunnel retransmit counter barely fires in practice — ack-lag is the dominant
   signal. (Remove this line next prune.)
 
-- [x] **UDP-tunnel death detection + offer cooldown — SHIPPED 2026-07-04** (the fix for
-  mstsc's ~60s dead-tunnel session reset; keepalives were REJECTED — in the overlay case
-  the UDP path itself is dead, so keepalives can't arrive either). The listener declares a
-  BOUND tunnel dead after `MACRDP_UDP_TUNNEL_DEAD_SECS` (30s) of inbound silence → audio
-  falls back to TCP immediately (per-wave `lossy_audio_target` re-check) + multitransport
-  offers are suppressed for `MACRDP_UDP_MT_COOLDOWN_SECS` (600s) so the client's reset
-  reconnects as a stable plain-TCP session — the cycle is broken after at most ONE reset.
-  Registry semantics unit-tested; **live verification of the listener path pending** (needs
-  real mstsc with a bound tunnel + UDP-only blockage — e.g. LAN mstsc with lossy audio on,
-  then a UDP-only pf block on 3390). ORIGINAL ITEM (kept for context):** Original find (2026-06-29, P1 testing): after the watchdog de-migrates EGFX
-  to TCP, the abandoned reliable tunnel goes silent and ~60s later **mstsc resets the whole
-  session** (its multitransport dead-tunnel timeout). New repro (2026-07-04): with
-  `ENABLE_LOSSY_AUDIO=1` over **ZeroTier**, the lossy UDP/DTLS audio tunnel wedges on the
-  overlay network and the same ~60s reset fires **cyclically** — session up ~61s → reset →
-  auto-reconnect → reconnect-blank → blank-recovery drop → renders → repeat (audit log
-  2026-07-04T00:32–00:34; every stage behaved "correctly", the tunnel wedge was the driver).
-  Users on VPN/ZeroTier-class links must keep `ENABLE_UDP_MULTITRANSPORT=0` +
-  `ENABLE_LOSSY_AUDIO=0` until this is fixed (documented in cli.md/features.md). Fix:
-  RDPEUDP **keepalives** on an idle/wedged tunnel so mstsc doesn't time out, or cleanly
-  **close** the multitransport tunnel (and fall audio back to TCP) when it wedges. Must
-  distinguish "tunnel idle, client still here" from "client gone" (interacts with the 60s
-  idle-GC).
+- [x] **UDP-tunnel death detection + offer cooldown — SHIPPED (#133) + LIVE-VERIFIED
+  2026-07-04** (the fix for mstsc's ~60s dead-tunnel session reset; keepalives were
+  REJECTED — in the overlay case the UDP path itself is dead, so keepalives can't arrive
+  either). The listener declares a BOUND tunnel dead after `MACRDP_UDP_TUNNEL_DEAD_SECS`
+  (30s) of inbound silence → audio falls back to TCP immediately + multitransport offers
+  are suppressed for `MACRDP_UDP_MT_COOLDOWN_SECS` (600s). **Live verification (real
+  mstsc over ZeroTier, natural wedge):** 3× `UDP tunnel DEAD` at `idle_ms≈30s`, audio
+  kept playing through the fallback (user-confirmed), every reconnect logged
+  `multitransport offer SUPPRESSED` and ran plain TCP — cycle broken. Known limit: the
+  cooldown is in-process state, so a server crash/restart wipes it (observed once via the
+  NSPasteboard SIGSEGV below — one fresh offer followed). The verify run also surfaced the
+  oversized-cursor session-killer (PR #134) and that crash. Docs updated
+  (features.md/cli.md). Blockage tool for future re-tests: `scripts/udp-block.sh`
+  (pf-anchor UDP-only block on :3390). (Remove this item next prune.)
+
+- [ ] **Oversized-cursor sprite kills the session — FIX IN FLIGHT (PR #134).**
+  `TS_COLORPOINTERATTRIBUTE`'s XOR mask length is u16, so `w*h*4 > 65535` (e.g. macOS
+  shake-to-locate at Retina backing pixels, 128×128 = 65536) makes the encode error tear
+  down the whole client loop — killed 6 straight ZeroTier sessions at ~45 s during the
+  #133 verify (and fired at 00:43 that morning on the previous build). Fix:
+  `cursor/mod.rs::clamp_pointer_size` downscales aspect-preserving (hotspot-exact) via the
+  existing resampler; unit-tested. Remaining: merge #134, redeploy, live shake-to-locate
+  check on a real client.
+
+- [ ] **NSPasteboard SIGSEGV crash (main thread) — investigate.** 2026-07-04 19:47:58,
+  crash report `macrdp-2026-07-04-194758.ips`: `objc_msgSend` under
+  `-[NSPasteboard _updateTypeCacheIfNeeded]` ← `_typesAtIndex:combinesItems:` during
+  connection churn (~13 s after a client-loop failure + a fresh accept). Suspect the
+  clipboard change-count poller reading a pasteboard item freed under it. Restarted the
+  server via launchd (and wiped the in-process #133 cooldown). Different signature from
+  the 2026-06-28 crash (`UNKNOWN_0x32` on a pthread). One-off so far — gather more
+  occurrences before chasing; keep the .ips files.
 
 - [ ] **Congestion-responsive encoder rate control + frame dropping** (highest-value
   video-under-loss work — helps BOTH the default TCP path and UDP). **P1 (adaptive bitrate)

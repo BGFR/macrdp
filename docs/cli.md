@@ -161,8 +161,11 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   audio falls back to TCP and multitransport offers are
                           #   suppressed for MACRDP_UDP_MT_COOLDOWN_SECS (600) — so
                           #   the reset reconnects as a stable plain-TCP session
-                          #   (at most ONE reset instead of an endless cycle; live
-                          #   verification pending). Plain TCP (both flags off) is
+                          #   (at most ONE reset instead of an endless cycle;
+                          #   LIVE-VERIFIED 2026-07-04 on real mstsc/ZeroTier:
+                          #   3x tunnel-DEAD at ~30s, audio kept playing, all
+                          #   reconnects offer-SUPPRESSED plain TCP). Plain TCP
+                          #   (both flags off) is
                           #   still the recommended config for such links.
                           #   macOS-only.
 --fork-workers            # Opt-in (default OFF; FORK_WORKERS=1 in config.env) —

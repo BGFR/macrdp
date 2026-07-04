@@ -19,7 +19,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.24** (the remote-link release: RTT-aware
+(VPN/ZeroTier). **Latest release: v0.8.25** (the resilient-link release —
+three session-killers fixed, all live-verified over ZeroTier incl. mobile:
+**oversized-cursor clamp** — a shake-to-locate/enlarged cursor at Retina backing
+pixels overflowed the pointer PDU's u16 mask and the encode error tore down the
+whole session, now downscaled to fit (#134); **link-aware blank recovery** —
+kernel TCP RTT sampled per connection at accept gates the detector: evidence
+window scales with RTT and the drop lever is withheld ≥80 ms, where the EDR==0
+signal is untrustworthy and the false drops themselves poisoned mstsc into a
+real permanent black (#135); **RTT-seeded adaptive bitrate** — slow links start
+at ceiling/3 and climb instead of overshooting the pipe (#135); **UDP
+tunnel-death detection + offer cooldown** — a wedged tunnel falls audio back to
+TCP in ~30 s and suppresses multitransport offers so mstsc's dead-tunnel reset
+reconnects as a stable plain-TCP session, breaking the reset cycle (#133).)
+Earlier: **v0.8.24** (the remote-link release: RTT-aware
 adaptive rate control — standing-queue-delay signal, no-ack distress fallback,
 IDR backoff on both transports, ZeroTier-verified; Windows App for Android
 support via channel-level EGFX decline; 2× faster blank recovery; parked idle

@@ -7,6 +7,20 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
+- [ ] **Make blank-recovery RTT-aware — it FALSE-POSITIVES on high-latency links.** Found
+  live 2026-07-05 (real mstsc over ZeroTier). The detector (`src/h264.rs`
+  `should_blank_recover`) reads mstsc's QoE decode+render-time==0 as "not presenting" and
+  drops the connection, expecting nonzero EDR within ~200 ms (a LAN assumption). Over
+  ZeroTier a session that IS visibly rendering reports EDR=0 → it force-drops a WORKING
+  session every ~5 s, and the repeated drops poison mstsc's surface into a REAL permanent
+  black — i.e. the recovery *causes* the blank it's meant to fix. **Worked around** for the
+  ZeroTier user by `MACRDP_BLANK_RECOVERY=0` in the deployed LaunchAgent plist, but that
+  globally loses the LAN reconnect-blank protection. Proper fix (analogous to the #130
+  RTT-aware adaptive-bitrate signal): gate/scale the detector by link RTT, or require a
+  stronger signal (e.g. also-no-frame-acks, not just EDR==0) before dropping. Also worth
+  bridging `BLANK_RECOVERY` as a friendly `config.env` key (today it's env-only, not in the
+  `args_from_config` bridge list). Detail: [[project_zerotier_mstsc_tuning]].
+
 - [ ] **Tier 2.4 — multi-day soak (foundation core PASSED 31 h 2026-07-03; full 48–72 h on
   v0.8.24 still needed).** The last leg of the production-readiness trio (TLS ✓ #104, auth ✓
   #105). Tooling: `scripts/soak-monitor.sh monitor` samples a resource CSV; `… analyze`

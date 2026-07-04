@@ -18,7 +18,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Functional v0 — daily-driver usable on a trusted LAN. **Latest release: v0.8.23**
+Functional v0 — daily-driver usable on a trusted LAN and over the internet
+(VPN/ZeroTier). **Latest release: v0.8.24** (the remote-link release: RTT-aware
+adaptive rate control — standing-queue-delay signal, no-ack distress fallback,
+IDR backoff on both transports, ZeroTier-verified; Windows App for Android
+support via channel-level EGFX decline; 2× faster blank recovery; parked idle
+pollers. Lossy audio is LAN/WiFi-only until the UDP-tunnel keepalive lands.)
+Earlier: **v0.8.23**
 (the production-readiness arc — Tier 1 + Tier 2.5 of
 `@docs/production-readiness-roadmap.md`: operator-supplied TLS certs `--cert`/`--key`,
 connection rate-limiting + lockout + an auth audit log, bounded log rotation + a

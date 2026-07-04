@@ -8,7 +8,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
 ## In flight (needs an action)
 
 - [ ] **Tier 2.4 — multi-day soak (foundation core PASSED 31 h 2026-07-03; full 48–72 h on
-  v0.8.22+ still needed).** The last leg of the production-readiness trio (TLS ✓ #104, auth ✓
+  v0.8.24 still needed).** The last leg of the production-readiness trio (TLS ✓ #104, auth ✓
   #105). Tooling: `scripts/soak-monitor.sh monitor` samples a resource CSV; `… analyze`
   summarizes. **2026-07-01 run (31 h / 1861 samples, pre-v0.8.22 / pre-ARC build; data recovered
   on a clean re-copy after a first transfer zero-filled):** CLEAN — **no memory leak** (RSS
@@ -21,7 +21,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   balanced accept/disconnect pairs. **Still open because:** (a) 31 h < the 48–72 h target; (b)
   predates v0.8.22 → **blank-recovery detector** (per-QoE-callback, can drop the connection) +
   **ARC cookie** not exercised (and now also the **v0.8.23 health-check watchdog**). **Next
-  action:** 48–72 h re-soak on **v0.8.23** (now the deployed build), biased toward reconnect
+  action:** 48–72 h re-soak on **v0.8.24** (the deployed build — now also carrying the RTT-aware controller, Android support, drop-first blank recovery, tunnel-death handling), biased toward reconnect
   cycles. Logging fixes for that run **DONE 2026-07-03 (#124):** the soak logger now `sync`s
   after every CSV append (can't zero-fill on transfer), and the `multitransport`/`audio_dvc`
   "GREEN" status lines are demoted WARN→DEBUG. See `docs/production-readiness-roadmap.md` Tier 2.4.

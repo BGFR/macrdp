@@ -7,7 +7,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [x] **Make blank-recovery RTT-aware — DONE (PR pending merge; RTT gate + ceiling/3 bitrate seed; see known-quirks blank-recovery UPDATE 2026-07-05). Remove this item once deployed + live-verified over ZeroTier.** Original item: Found
+- [x] **Make blank-recovery RTT-aware — DONE, #135 merged + deployed + LIVE-VERIFIED 2026-07-05 (real mstsc over ZeroTier-on-MOBILE, link_rtt 142–161 ms: `seeding adaptive bitrate at ceiling/3` seed_bps=2000000 + `blank recovery DISARMED` both fired; session stable, user-confirmed working; config now clean — no plist override, --bitrate 6 restored). (Remove this item next prune.)** Original item: Found
   live 2026-07-05 (real mstsc over ZeroTier). The detector (`src/h264.rs`
   `should_blank_recover`) reads mstsc's QoE decode+render-time==0 as "not presenting" and
   drops the connection, expecting nonzero EDR within ~200 ms (a LAN assumption). Over

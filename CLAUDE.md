@@ -19,7 +19,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.25** (the resilient-link release —
+(VPN/ZeroTier). **Latest release: v0.8.26** (the roaming-client release —
+UDP multitransport now configures and cleans up after itself, making
+`ENABLE_LOSSY_AUDIO`/`ENABLE_UDP_MULTITRANSPORT` safe to leave permanently on
+for a client that moves between networks: **RTT-gated offer** — links measured
+at/above `MACRDP_UDP_OFFER_MAX_RTT_MS` (80 ms) at accept are never offered UDP
+and run plain TCP from the first byte, so overlay links have no tunnel to wedge
+(#136); **tunnel-lifecycle hardening** — an ended session's abandoned tunnel
+retires quietly instead of triggering the 10-min offer cooldown (the false
+cooldown that silently downgraded healthy-LAN reconnects, observed live), while
+a tunnel that wedged BEFORE its session ended is still adjudicated as dead so
+the reset-cycle protection can't be laundered away; offer cookies are evicted
+on every connection end (was: leaked per failed handshake, with a
+late-tunnel-bind zombie-peer window); all three peer-removal sites now lower
+the shared bound flag (#137/#138/#139); **fork-workers sample the link RTT**
+so the blank-recovery gate + bitrate seed apply there too (#138). Triple
+adversarially reviewed; docs de-drifted.)
+Earlier: **v0.8.25** (the resilient-link release —
 three session-killers fixed, all live-verified over ZeroTier incl. mobile:
 **oversized-cursor clamp** — a shake-to-locate/enlarged cursor at Retina backing
 pixels overflowed the pointer PDU's u16 mask and the encode error tore down the

@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(13)/(14) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15) below are upstreamed
 AND released — #1276 landing is NOT sufficient.
 
 (1) The original "keep newest queued waves on per-batch overflow"

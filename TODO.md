@@ -35,7 +35,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   balanced accept/disconnect pairs. **Still open because:** (a) 31 h < the 48–72 h target; (b)
   predates v0.8.22 → **blank-recovery detector** (per-QoE-callback, can drop the connection) +
   **ARC cookie** not exercised (and now also the **v0.8.23 health-check watchdog**). **Next
-  action:** 48–72 h re-soak on **v0.8.24** (the deployed build — now also carrying the RTT-aware controller, Android support, drop-first blank recovery, tunnel-death handling), biased toward reconnect
+  action:** 48–72 h re-soak on a **build from main ≥ d8ecec9** (v0.8.25 + the post-tag #136/#137/#138 link-aware + tunnel-death hardening; running on a separate Mac since 2026-07-06), biased toward reconnect
   cycles. Logging fixes for that run **DONE 2026-07-03 (#124):** the soak logger now `sync`s
   after every CSV append (can't zero-fill on transfer), and the `multitransport`/`audio_dvc`
   "GREEN" status lines are demoted WARN→DEBUG. See `docs/production-readiness-roadmap.md` Tier 2.4.
@@ -84,14 +84,13 @@ then delete; promote a parked item to *In flight* when work actually starts.
   (features.md/cli.md). Blockage tool for future re-tests: `scripts/udp-block.sh`
   (pf-anchor UDP-only block on :3390). (Remove this item next prune.)
 
-- [ ] **Oversized-cursor sprite kills the session — FIX IN FLIGHT (PR #134).**
+- [x] **Oversized-cursor sprite kills the session — FIXED (#134, in v0.8.25, deployed; field-verified through hours of live use that previously crashed every ~45 s). (Remove next prune.)**
   `TS_COLORPOINTERATTRIBUTE`'s XOR mask length is u16, so `w*h*4 > 65535` (e.g. macOS
   shake-to-locate at Retina backing pixels, 128×128 = 65536) makes the encode error tear
   down the whole client loop — killed 6 straight ZeroTier sessions at ~45 s during the
   #133 verify (and fired at 00:43 that morning on the previous build). Fix:
   `cursor/mod.rs::clamp_pointer_size` downscales aspect-preserving (hotspot-exact) via the
-  existing resampler; unit-tested. Remaining: merge #134, redeploy, live shake-to-locate
-  check on a real client.
+  existing resampler; unit-tested.
 
 - [ ] **NSPasteboard SIGSEGV crash (main thread) — investigate.** 2026-07-04 19:47:58,
   crash report `macrdp-2026-07-04-194758.ips`: `objc_msgSend` under

@@ -165,7 +165,9 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   class overlays the UDP tunnel can wedge and mstsc's ~60s
                           #   dead-tunnel timeout resets the session. Tunnel-death
                           #   detection now bounds that: after MACRDP_UDP_TUNNEL_
-                          #   DEAD_SECS (30) of inbound silence on a bound tunnel,
+                          #   DEAD_SECS (30) of inbound silence on a bound tunnel
+                          #   whose session is still live (an ended session's
+                          #   abandoned tunnel retires quietly, no cooldown),
                           #   audio falls back to TCP and multitransport offers are
                           #   suppressed for MACRDP_UDP_MT_COOLDOWN_SECS (600) — so
                           #   the reset reconnects as a stable plain-TCP session
@@ -180,7 +182,10 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   client. Plain TCP (both flags off) remains the
                           #   zero-risk config for overlay-only setups.
                           #   macOS-only.
---fork-workers            # Opt-in (default OFF; FORK_WORKERS=1 in config.env) —
+--fork-workers            # Opt-in (default OFF; FORK_WORKERS=1 in config.env).
+                          #   Workers sample the link RTT themselves, so the
+                          #   link-aware features (blank-recovery gate, bitrate
+                          #   seed) apply under fork-workers too —
                           #   and staying opt-in by DECISION (2026-07-04, roadmap
                           #   Tier 2.6): the production default is single-process +
                           #   blank-recovery + the auto-reconnect cookie (field-
@@ -304,6 +309,22 @@ when the runtime it watches is wedged) submits a trivial probe onto the runtime
 each interval and waits `TIMEOUT_SECS` for it to run; a deadlocked runtime never
 runs it. A bounce logs `health-check watchdog: tokio runtime wedged …` before
 exiting.
+
+Blank recovery + auto-reconnect (env-only; on by default with `--enable-h264`).
+The mstsc reconnect-blank auto-heal is link-aware: the server measures each
+connection's TCP RTT at accept, scales the evidence window with it, and
+withholds the drop entirely on slow links where the signal is unreliable (see
+the blank-recovery notes in `docs/known-quirks.md`):
+```
+MACRDP_BLANK_RECOVERY=1                # 0 disables the detector entirely
+MACRDP_BLANK_RECOVERY_MAX_RTT_MS=80    # withhold the drop at/above this link RTT (0 = no gate)
+MACRDP_BLANK_RECOVERY_MIN_QOE=24       # all-zero QoE reports required (~3 s on LAN)
+MACRDP_BLANK_RECOVERY_ARM_MS=3000      # skip the connect-time churn window
+MACRDP_BLANK_RECOVERY_RETRY_MS=5000    # spacing between attempts
+MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS=1   # 1 = drop-first; >=2 re-enables remap-first
+MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS=3  # reconnect-storm guard (0 = uncapped)
+MACRDP_AUTO_RECONNECT=1                # 0 = don't provision the auto-reconnect cookie
+```
 
 Testing against the server:
 ```bash

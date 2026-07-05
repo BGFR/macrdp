@@ -244,19 +244,34 @@ then delete; promote a parked item to *In flight* when work actually starts.
   machines, which isn't a realistic target. See the "Industry status" + "P2.3 FEC capture
   RESULT" notes in `docs/rdp-udp-multitransport-feasibility.md` + `vendor/ironrdp-rdpeudp/CLAUDE.md`.
 
-- [ ] **Generic USB redirection (MS-RDPEUSB) — Phase 1 GO ✅ (2026-07-01), Phases 2–3 open.**
+- [ ] **Generic USB redirection (MS-RDPEUSB) — Phases 1 + 2 + 3.0 GO ✅, Phase 3.1 open.**
   Path: user-space virtual USB host controller via `IOUSBHostControllerInterface` (a **public,
   headered** IOUSBHost.framework API — NOT private SPI as first assumed; its doc says it
   "create[s] synthetic USB devices"). Entitlement `com.apple.developer.usb.host-controller-
-  interface` **GRANTED** to QGLA89KHM7 (FB23363880). **Phase 1 spike proven live** (branch
-  `feat/usb-redirect-spike`, `--usb-spike`): an entitled signed+provisioned build creates the
-  controller and the kernel begins the command exchange → the route works. Remaining:
-  **P2** — drive the controller/port/device/endpoint state machines to present a synthetic
-  device (extend `src/usb_redirect/usb_spike.m`); **P3** — MS-RDPEUSB server-direction over
-  DVC, reusing upstream `ironrdp-rdpeusb`'s bidirectional PDU layer (client processor only
-  today — add the server processor, ideally upstreamed). Gates to the official signed+
-  provisioned build (entitlement baked into the signature). See
-  `docs/usb-redirection-feasibility.md` + [[project_usb_redirection_feasibility]].
+  interface` **GRANTED** to QGLA89KHM7 (FB23363880). All on branch `feat/usb-redirect-spike`.
+  - **Phase 1 GO** (2026-07-01, `--usb-spike`): entitled signed+provisioned build creates the
+    controller and the kernel begins the command exchange → the route works.
+  - **Phase 2 GO** (2026-07-06, commit `ab91a63`): `usb_spike.m` drives the full UserHCI
+    command/doorbell loop and a **hardcoded synthetic device enumerates LIVE in `ioreg`**
+    (VID 0x1209/PID 0x0001, full EP0 GET_DESCRIPTOR flow, clean teardown) — the whole macOS
+    presenting path proven.
+  - **Phase 3.0 GO** (2026-07-06, commit `3a435c9`): URBDRC server-direction DVC observe-only
+    spike GREEN — `--enable-usb-redirection` advertises URBDRC + runs the MS-RDPEUSB capability
+    exchange; **verified locally with a plain `cargo build`** (observe-only never touches the
+    UserHCI controller, so no entitled build needed) via `sdl-freerdp /usb:auto` → channel
+    opens (Create status 0) + caps exchange completes (S_OK). No `AddDevice` only because this
+    Mac has no attachable USB device to redirect. Vendored ironrdp-server **divergence 16**
+    (`src/rdpeusb.rs`, `UrbdrcServer` + `UrbdrcServerFactory`); `ironrdp-rdpeusb` added as a
+    git dep (PDU-only, pinned rev).
+  - **Phase 3.1 (next)** — control-only forward so a **real** client device enumerates in
+    `ioreg`: grow `UrbdrcServer` into the handshake state machine + a `UsbHandle`/`UsbRouter`
+    async transfer path, and evolve `usb_spike.m` from hardcoded+synchronous to
+    client-sourced+async (the IOUSBHost-serial-queue ↔ tokio boundary — the core engineering
+    risk). Live 3.1 verification needs a physical redirectable USB device (or mstsc + the
+    RemoteFX-USB Group Policy). Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.1.
+  Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
+  into the signature). See `docs/usb-redirection-feasibility.md` +
+  [[project_usb_redirection_feasibility]].
 
 - [ ] **Multi-monitor (client-side multi-display).**
   Extend `--virtual-display` to N monitors. **Blocker:** the git-pinned `ironrdp-acceptor`

@@ -10,7 +10,7 @@ use super::display::{DesktopSize, RdpServerDisplay};
 use super::gfx::GfxServerFactory;
 use super::handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use super::server::{ConnectionHandler, RdpServer, RdpServerOptions, RdpServerSecurity};
-use crate::{DisplayUpdate, RdpServerDisplayUpdates, RdpdrServerFactory, SoundServerFactory};
+use crate::{DisplayUpdate, RdpServerDisplayUpdates, RdpdrServerFactory, SoundServerFactory, UrbdrcServerFactory};
 
 pub struct WantsAddr {}
 pub struct WantsSecurity {
@@ -35,6 +35,7 @@ pub struct BuilderDone {
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
     rdpdr_factory: Option<Box<dyn RdpdrServerFactory>>,
+    usb_factory: Option<Box<dyn UrbdrcServerFactory>>,
     connection_handler: Option<Box<dyn ConnectionHandler>>,
     #[cfg(feature = "egfx")]
     gfx_factory: Option<Box<dyn GfxServerFactory>>,
@@ -131,6 +132,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 sound_factory: None,
                 cliprdr_factory: None,
                 rdpdr_factory: None,
+                usb_factory: None,
                 connection_handler: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
                 max_request_size: RdpServerOptions::DEFAULT_MAX_REQUEST_SIZE,
@@ -150,6 +152,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 sound_factory: None,
                 cliprdr_factory: None,
                 rdpdr_factory: None,
+                usb_factory: None,
                 connection_handler: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
                 max_request_size: RdpServerOptions::DEFAULT_MAX_REQUEST_SIZE,
@@ -182,6 +185,14 @@ impl RdpServerBuilder<BuilderDone> {
     #[cfg(feature = "egfx")]
     pub fn with_gfx_factory(mut self, gfx_factory: Option<Box<dyn GfxServerFactory>>) -> Self {
         self.state.gfx_factory = gfx_factory;
+        self
+    }
+
+    /// Configure server-direction MS-RDPEUSB (USB device redirection). The
+    /// client's redirected USB device is driven through the
+    /// [`UrbdrcServerFactory`](crate::UrbdrcServerFactory)-built DVC processor.
+    pub fn with_usb_factory(mut self, usb_factory: Option<Box<dyn UrbdrcServerFactory>>) -> Self {
+        self.state.usb_factory = usb_factory;
         self
     }
 
@@ -221,6 +232,7 @@ impl RdpServerBuilder<BuilderDone> {
             self.state.sound_factory,
             self.state.cliprdr_factory,
             self.state.rdpdr_factory,
+            self.state.usb_factory,
             self.state.connection_handler,
             #[cfg(feature = "egfx")]
             self.state.gfx_factory,

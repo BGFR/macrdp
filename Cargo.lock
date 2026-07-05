@@ -1771,6 +1771,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-rdpeusb"
+version = "0.1.0"
+source = "git+https://github.com/Devolutions/IronRDP.git?rev=879ffed866c32748d30d26b54f9d667ad001c51c#879ffed866c32748d30d26b54f9d667ad001c51c"
+dependencies = [
+ "ironrdp-core",
+ "ironrdp-pdu",
+ "ironrdp-str",
+]
+
+[[package]]
 name = "ironrdp-rdpsnd"
 version = "0.7.0"
 source = "git+https://github.com/Devolutions/IronRDP.git?rev=879ffed866c32748d30d26b54f9d667ad001c51c#879ffed866c32748d30d26b54f9d667ad001c51c"
@@ -1804,6 +1814,7 @@ dependencies = [
  "ironrdp-pdu",
  "ironrdp-rdpdr",
  "ironrdp-rdpeudp",
+ "ironrdp-rdpeusb",
  "ironrdp-rdpsnd",
  "ironrdp-svc",
  "ironrdp-tokio",
@@ -1814,6 +1825,15 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "zstd-safe",
+]
+
+[[package]]
+name = "ironrdp-str"
+version = "0.1.0"
+source = "git+https://github.com/Devolutions/IronRDP.git?rev=879ffed866c32748d30d26b54f9d667ad001c51c#879ffed866c32748d30d26b54f9d667ad001c51c"
+dependencies = [
+ "bytemuck",
+ "ironrdp-core",
 ]
 
 [[package]]

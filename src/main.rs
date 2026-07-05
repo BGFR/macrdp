@@ -475,6 +475,16 @@ struct Args {
     #[arg(long)]
     enable_smartcard_redirection: bool,
 
+    /// EXPERIMENTAL, opt-in (default OFF). Enable server-direction USB redirection
+    /// (MS-RDPEUSB / the URBDRC dynamic channel): the connecting client redirects a
+    /// physical USB device and macrdp drives it locally via a user-space USB host
+    /// controller. Phase 3.0 is an observe-only go/no-go — it advertises URBDRC and
+    /// logs whether a client opens it + announces a device. Needs the entitled
+    /// (signed+provisioned) build. The client must opt in too (FreeRDP: /usb; mstsc:
+    /// the RemoteFX USB redirection Group Policy). macOS-only.
+    #[arg(long)]
+    enable_usb_redirection: bool,
+
     /// EXPERIMENTAL, opt-in (default OFF). Offer RDP UDP multitransport
     /// (MS-RDPEMT over reliable RDPEUDP) to clients that advertise it, and bind a
     /// UDP listener on the same address/port as TCP. On its own, EGFX stays on TCP
@@ -1579,6 +1589,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ENABLE_SMARTCARD_REDIRECTION", false) {
         argv.push("--enable-smartcard-redirection".into());
     }
+    if on("ENABLE_USB_REDIRECTION", false) {
+        argv.push("--enable-usb-redirection".into());
+    }
     if on("ENABLE_UDP_MULTITRANSPORT", false) {
         argv.push("--enable-udp-multitransport".into());
     }
@@ -2440,6 +2453,15 @@ async fn async_main() -> Result<()> {
             None
         };
 
+    // Server-direction USB redirection (--enable-usb-redirection, opt-in). Phase
+    // 3.0 installs the observe-only URBDRC DVC processor (capability exchange +
+    // device-announce logging). Ships inert when the flag is off.
+    let usb_factory: Option<Box<dyn ironrdp_server::UrbdrcServerFactory>> = if args.enable_usb_redirection {
+        Some(Box::new(usb_redirect::MacUsb::new()))
+    } else {
+        None
+    };
+
     // Auth hardening (Tier 1.2): per-IP rate-limit + lockout + audit log via the
     // server's pre-handshake/post-disconnect ConnectionHandler seam. On by default
     // (MACRDP_CONN_GUARD=0 disables). A fork *worker* bypasses the accept loop
@@ -2459,6 +2481,7 @@ async fn async_main() -> Result<()> {
         .with_cliprdr_factory(Some(cliprdr))
         .with_sound_factory(Some(sound))
         .with_rdpdr_factory(rdpdr_factory)
+        .with_usb_factory(usb_factory)
         .with_bitmap_codecs(bitmap_codecs())
         .with_gfx_factory(gfx_factory)
         .with_connection_handler(conn_handler)

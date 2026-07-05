@@ -17,6 +17,47 @@
 //! quarantined in `usb_spike.m` (the maintenance boundary), built + linked by
 //! `build.rs` on macOS.
 
+use ironrdp_server::{ServerEvent, ServerEventSender, UrbdrcServer, UrbdrcServerFactory};
+use tokio::sync::mpsc;
+
+/// macrdp's server-direction USB-redirection factory (`--enable-usb-redirection`).
+///
+/// **Phase 3.0 (observe-only):** installs the vendored `UrbdrcServer` DVC
+/// processor, which advertises the `URBDRC` channel, runs the MS-RDPEUSB
+/// capability exchange, and logs what a client announces — answering the
+/// go/no-go question (does a reachable client open `URBDRC` + announce a device?)
+/// before the transfer-forwarding machinery is built. Phase 3.1 grows this to
+/// build a `UsbHandle` and own the macOS UserHCI controller.
+///
+/// Cross-platform (pure protocol policy — no macOS APIs yet); the presenting
+/// side lives behind `--usb-spike` / the future controller module.
+pub struct MacUsb;
+
+impl MacUsb {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for MacUsb {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServerEventSender for MacUsb {
+    fn set_sender(&mut self, _sender: mpsc::UnboundedSender<ServerEvent>) {
+        // No-op for the observe-only spike — there's no outbound `UsbHandle` yet
+        // (Phase 3.1 will retain the sender to drive transfers).
+    }
+}
+
+impl UrbdrcServerFactory for MacUsb {
+    fn build_processor(&self) -> UrbdrcServer {
+        UrbdrcServer::new()
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     unsafe extern "C" {

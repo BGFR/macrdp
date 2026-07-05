@@ -21,6 +21,7 @@ mod helper;
 #[cfg(feature = "multitransport")]
 mod multitransport;
 mod rdpdr;
+mod rdpeusb;
 mod server;
 mod sound;
 
@@ -46,6 +47,7 @@ pub use rdpdr::{
     RdpdrServerMessage, RdpdrStatus, SCARD_EJECT_CARD, SCARD_LEAVE_CARD, SCARD_RESET_CARD, SCARD_SHARE_DIRECT,
     SCARD_SHARE_EXCLUSIVE, SCARD_SHARE_SHARED, SCARD_UNPOWER_CARD,
 };
+pub use rdpeusb::{URBDRC_CHANNEL_NAME, UrbdrcServer, UrbdrcServerFactory};
 #[cfg(feature = "helper")]
 pub use helper::TlsIdentityCtx;
 pub use server::{

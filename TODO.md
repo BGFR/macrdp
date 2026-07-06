@@ -244,7 +244,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   machines, which isn't a realistic target. See the "Industry status" + "P2.3 FEC capture
   RESULT" notes in `docs/rdp-udp-multitransport-feasibility.md` + `vendor/ironrdp-rdpeudp/CLAUDE.md`.
 
-- [ ] **Generic USB redirection (MS-RDPEUSB) — Phases 1 + 2 + 3.0 + 3.1a + 3.1b(1) GO ✅, 3.1b(2) open.**
+- [ ] **Generic USB redirection (MS-RDPEUSB) — Phases 1 + 2 + 3.0 + 3.1a + 3.1b(1) + 3.1b(2a) GO ✅, 3.1b(2b) open.**
   Path: user-space virtual USB host controller via `IOUSBHostControllerInterface` (a **public,
   headered** IOUSBHost.framework API — NOT private SPI as first assumed; its doc says it
   "create[s] synthetic USB devices"). Entitlement `com.apple.developer.usb.host-controller-
@@ -278,12 +278,20 @@ then delete; promote a parked item to *In flight* when work actually starts.
     `UsbBusIfaceVer`/`DeviceSpeed` are data-carrying enums with the named values + an `Other(u32)`
     fallback (named `Usb30/31/32` added), so a modern USB-3 device's `0x320` caps parse instead of
     erroring. Verified live with a USB-3.2 flash drive. New vendored crate divergence.
-  - **Phase 3.1b(2) (next)** — the async transfer path: a `UsbHandle`/`UsbRouter` (the RdpdrHandle
-    pattern + one extra queue hop) so the server issues control/data transfers and awaits
-    completions; then evolve `usb_spike.m` from hardcoded+synchronous to client-sourced+async (the
-    IOUSBHost-serial-queue ↔ tokio boundary — the core engineering risk). Needs the **entitled/
-    provisioned build** (touches UserHCI). Then a **real** client device enumerates in `ioreg`.
-    Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.1.
+  - **Phase 3.1b(2a) GO** (2026-07-06, commit `5ef8e4b`): a server-initiated **`GET_DESCRIPTOR`
+    control transfer round-trips REAL device data** — proven observe-only (plain `cargo build`).
+    On `ADD_DEVICE` the device processor reactively sends `RegisterRequestCallback` +
+    `TransferInRequest(GetDescriptorFromDevice)` and decodes the `URB_COMPLETION`. Verified live:
+    `hresult=0x0 descriptor_len=18 vid=0x2174 pid=0x2100` — the flash drive's real VID/PID read
+    from the physical device. macOS libusb kernel-detach was not a blocker after unmount. This
+    de-risks the whole transfer path.
+  - **Phase 3.1b(2b) (next)** — refactor the reactive spike into a reusable **`UsbHandle`/
+    `UsbRouter`** (the RdpdrHandle pattern: `AtomicU32` req id + `Mutex<HashMap<id, oneshot>>` +
+    a `ServerEvent::Urbdrc(SendMessages)` dispatch on the device channel + completion routing) so
+    the macOS side can drive **arbitrary** transfers on demand; then evolve `usb_spike.m` from
+    hardcoded+synchronous to client-sourced+async (the IOUSBHost-serial-queue ↔ tokio boundary —
+    the core engineering risk). Needs the **entitled/provisioned build** (touches UserHCI). Then a
+    **real** client device enumerates in `ioreg`. Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.1.
   Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].

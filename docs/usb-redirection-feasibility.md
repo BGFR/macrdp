@@ -247,9 +247,15 @@ The entitlement `com.apple.developer.usb.host-controller-interface` is **granted
   a lenient `UsbDeviceCaps` decode (USB 3.x versions + `Other(u32)` fallbacks). Verified
   live with a USB-3.2 flash drive (`usb_version=Usb32`). See
   `vendor/ironrdp-rdpeusb/CLAUDE.md`.
-- **Phase 3.1b(2) (next)** — the `UsbHandle`/`UsbRouter` async transfer path + evolve
-  `usb_spike.m` to client-sourced descriptors so a real device enumerates in `ioreg`
-  (needs the entitled/provisioned build — it drives UserHCI).
+- **Phase 3.1b(2a) GO** — a server-initiated **`GET_DESCRIPTOR` control transfer**
+  round-trips real device data (proven observe-only, plain `cargo build`): on
+  `ADD_DEVICE` the device processor sends `RegisterRequestCallback` +
+  `TransferInRequest` and decodes the `URB_COMPLETION`. Verified live with a USB-3.2
+  flash drive (`vid=0x2174 pid=0x2100`, read from the physical device). This de-risks
+  the transfer path — libusb kernel-detach was not a blocker after unmount.
+- **Phase 3.1b(2b) (next)** — refactor into a reusable `UsbHandle`/`UsbRouter` (async
+  transfer path) + evolve `usb_spike.m` to client-sourced descriptors so a real device
+  enumerates in `ioreg` (needs the entitled/provisioned build — it drives UserHCI).
 
 Cross-reference the `docs/known-quirks.md` smart-card note (kext vs dext vs UserHCI
 rationale) and `project_usb_redirection_feasibility` memory for the running log.

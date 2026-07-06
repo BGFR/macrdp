@@ -381,6 +381,18 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
             NSLog(@"[usb2] completion token=%llu: endpoint gone", token);
             return;
         }
+        // Per IOUSBHost: only an Active endpoint may inspect transfer structures,
+        // read/modify IO buffers, or generate completions. If the device reset or
+        // was suspended between the client round-trip and now, the endpoint is
+        // Paused/Halted/Destroyed and `p.msg` points into a recycled ring slot —
+        // touching msg->data1 there is a use-after-free (observed: SIGSEGV in the
+        // memcpy below when a drive reset during interface-claim re-enumeration).
+        // Drop the stale completion; the reset re-drives fresh transfers.
+        if (ep.endpointState != IOUSBHostCIEndpointStateActive) {
+            NSLog(@"[usb2] completion token=%llu: endpoint not Active (state=%ld) — dropping stale transfer",
+                  token, (long)ep.endpointState);
+            return;
+        }
         const IOUSBHostCIMessage *msg = p.msg;
         NSUInteger moved = 0;
         if (status == IOUSBHostCIMessageStatusSuccess && data != nil) {

@@ -321,11 +321,18 @@ then delete; promote a parked item to *In flight* when work actually starts.
     every bulk transfer needs. EP0 descriptor reads work; bulk needs a **claimable-interface client**
     (a real Windows client, or a **Linux FreeRDP** client where kernel-detach works — i.e. a second
     machine). Degrades to enumerate-only (5s timeout).
+  - **Phase 3.2 dedup — done** (2026-07-06, commit `e11eed3`): one presenting controller per
+    physical device. A client can announce one device on multiple `URBDRC` channels (SuperSpeed
+    dual-announce, composite, re-announce); `UsbHandle` now carries the client's `device_instance_id`
+    and macrdp's `drive_device` keys a live-device set on it (presenting-side policy, not vendored).
+    Unit-tested + verified no regression.
   - **Phase 3.2 remaining** — bulk IN/OUT forwarding (`TsUrb::BulkInterruptTransfer` with the pipe
     handles + Obj-C generalize the ring walk to EP1 endpoints), general control-OUT forwarding
-    (SET_*), **a claimable-interface test client to verify the actual mount**, dedup multiple
-    device-channel announces → one controller, mid-session retract, multi-device, dispatch-priority
-    tier. Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
+    (SET_*), **a claimable-interface test client to verify the actual mount** (a Linux FreeRDP VM
+    with USB passthrough — UTM/QEMU, Parallels, or VMware Fusion on Apple Silicon; NOT VirtualBox,
+    whose arm64 build has no USB passthrough — or a vendor-class USB device macOS doesn't claim),
+    mid-session retract, multi-device, dispatch-priority tier. Plan:
+    `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
   Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].

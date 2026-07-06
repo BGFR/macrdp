@@ -1133,6 +1133,32 @@ AND released — #1276 landing is NOT sufficient.
       device disappears from `ioreg` on disconnect while the server stays up). `close()` on
       the DVC processor is never called by the server (same gap as EGFX `on_close`), so this
       leans on `Drop` via that `static_channels` reset, which is prompt.
+    - **Phase 3.2 SelectConfiguration + typed URB results (2026-07-06).** The router
+      now delivers a `UrbReply { output_buffer, urb_result, hresult }` instead of a
+      bare `Vec<u8>` — a `URB_COMPLETION` carries both the transferred bytes AND the
+      TS_URB result payload (decoded as `TsUrbResultPayload::Raw` by default; a typed
+      request re-decodes it). `UsbHandle::select_configuration(config_bytes)` parses
+      the full config descriptor (`parse_configuration` → `UsbConfigDesc` +
+      per-interface `TsUsbdInterfaceInfo`/`TsUsbdPipeInfo`), sends `TsUrb::SelectConfig`
+      via `TransferInRequest`, and decodes `TsUrbSelectConfigResult` into `UsbPipe
+      { endpoint_address, pipe_handle, is_bulk }` — the client `pipe_handle`s are the
+      prerequisite for any bulk transfer. **VERIFIED the URB is correct** (FreeRDP
+      receives + parses it as `TS_URB_SELECT_CONFIGURATION` and attempts it) but it
+      can't COMPLETE on a macOS-client loopback for a mass-storage device: macOS
+      libusb can't detach the mass-storage kernel driver to claim the interface
+      (`LIBUSB_ERROR_ACCESS`), which every bulk transfer needs — so the loopback
+      proves enumeration + encoding, and the mount needs a claimable-interface client
+      (real Windows / Linux FreeRDP). macrdp bounds it with a 5 s timeout (degrade to
+      enumerate-only, no hang).
+    - **One controller per physical device (dedup).** `UsbHandle` carries the client's
+      `device_instance_id` (from `ADD_DEVICE`, `Cch32String::to_native_lossy`); a client
+      can announce one physical device on more than one `URBDRC` channel (SuperSpeed
+      dual-announce, composite, re-announce), and each announce would otherwise spin up
+      its own presenting controller. The dedup is a **presenting-side policy** (macrdp's
+      `drive_device` keys a live-device set on the instance id — one controller per id,
+      released on teardown), NOT in the vendored crate: the server correctly opens the
+      channel the client asked for; only the presenting side decides not to present a
+      device twice. Empty instance ids are never deduped.
     - A per-connection `MAX_DEVICE_CHANNELS` (32) cap on `OpenDeviceChannel`
       requests bounds a client that spams `ADD_VIRTUAL_CHANNEL` (each opens a DVC
       that's never pruned within a connection) from growing the DRDYNVC slab.

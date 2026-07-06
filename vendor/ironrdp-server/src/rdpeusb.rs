@@ -251,6 +251,11 @@ pub struct UsbHandle {
     channel_id: u32,
     /// The device's interface id (addresses the device in each request header).
     device_iface: InterfaceId,
+    /// The client's device-instance id (the Windows device-instance path). Stable
+    /// per physical device, so the presenting side dedups on it — a client that
+    /// announces one device on two channels yields two handles with the same id,
+    /// and only the first should get a controller. Empty if the client omitted it.
+    device_instance_id: Arc<str>,
     /// Resolves when the owning device processor is dropped (the DVC channel /
     /// connection went away), so the presenting side can tear its controller down.
     closed: watch::Receiver<bool>,
@@ -262,6 +267,7 @@ impl UsbHandle {
         router: UsbRouter,
         channel_id: u32,
         device_iface: InterfaceId,
+        device_instance_id: Arc<str>,
         closed: watch::Receiver<bool>,
     ) -> Self {
         Self {
@@ -269,8 +275,15 @@ impl UsbHandle {
             router,
             channel_id,
             device_iface,
+            device_instance_id,
             closed,
         }
+    }
+
+    /// The client's device-instance id — a per-physical-device identity the
+    /// presenting side dedups on (empty if the client didn't send one).
+    pub fn device_instance_id(&self) -> &str {
+        &self.device_instance_id
     }
 
     /// Await the device going away — the owning [`UrbdrcDeviceProcessor`] being
@@ -672,12 +685,13 @@ impl UrbdrcDeviceProcessor {
     }
 
     /// Hand the presenting side a [`UsbHandle`] onto the newly-announced device.
-    fn notify_device(&self, channel_id: u32, device_iface: InterfaceId) {
+    fn notify_device(&self, channel_id: u32, device_iface: InterfaceId, device_instance_id: Arc<str>) {
         let handle = UsbHandle::new(
             self.sender.clone(),
             self.router.clone(),
             channel_id,
             device_iface,
+            device_instance_id,
             self.alive.subscribe(),
         );
         match &self.device_cb {
@@ -717,7 +731,8 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
                 );
                 if !self.announced {
                     self.announced = true;
-                    self.notify_device(channel_id, dev.usb_device);
+                    let instance_id: Arc<str> = Arc::from(dev.device_instance_id.to_native_lossy().as_ref());
+                    self.notify_device(channel_id, dev.usb_device, instance_id);
                 }
             }
             Ok(UrbdrcClientPdu::UrbComp(comp)) => {

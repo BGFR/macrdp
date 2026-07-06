@@ -30,7 +30,8 @@
 //! linked by `build.rs` on macOS; the standalone `--usb-spike` path still presents
 //! the hardcoded synthetic device through the same async completion machinery.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use ironrdp_server::{
     ServerEvent, ServerEventSender, UrbdrcServer, UrbdrcServerFactory, UsbDeviceCallback, UsbHandle,
@@ -44,12 +45,14 @@ use tracing::{info, warn};
 /// the MS-RDPEUSB init handshake, opens a per-device DVC per `ADD_DEVICE`), and —
 /// via [`device_callback`](UrbdrcServerFactory::device_callback) — receives a
 /// [`UsbHandle`] onto each announced device. [`drive_device`] is the presenting-
-/// side driver: today it fetches + logs the real descriptor over the handle;
-/// next it creates the macOS UserHCI controller (`usb_spike.m`) for the device
-/// and answers the kernel's EP0 transfers by driving that same handle.
+/// side driver: it dedups the device (one controller per physical device), fetches
+/// and logs the real descriptor over the handle, then creates the macOS UserHCI
+/// controller (`usb_spike.m`) for it and answers the kernel's EP0 transfers by
+/// driving that same handle.
 ///
-/// Cross-platform (pure protocol policy — no macOS APIs yet); the UserHCI
-/// controller lives behind `--usb-spike` / the future `drive_device` body.
+/// This factory + `drive_device` are cross-platform (pure protocol/dedup policy);
+/// every macOS-only touch (the UserHCI controller) is confined to the `imp`
+/// submodule below.
 pub struct MacUsb {
     sender: Option<mpsc::UnboundedSender<ServerEvent>>,
 }
@@ -82,14 +85,52 @@ impl UrbdrcServerFactory for MacUsb {
     }
 }
 
+/// Physical devices with a live presenting controller, keyed by device-instance
+/// id, so we present each device exactly once. A client can announce one physical
+/// device on more than one `URBDRC` channel (a SuperSpeed device announced as both
+/// USB-2 and USB-3, a composite device, or a mid-session re-announce); without
+/// this each announce would spin up its own UserHCI controller for the *same*
+/// device — a harmless-but-confusing duplicate in `ioreg`. An entry is removed
+/// when its controller tears down, so a later genuine re-add still presents.
+static PRESENTED_DEVICES: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Claim the presenting slot for `instance_id`. Returns `true` if this call won it
+/// (present the device), `false` if another channel already holds it (skip). A
+/// device that reports no instance id (`""`) is never deduped — better a possible
+/// duplicate than hiding a genuine second device behind an empty key.
+fn claim_device(instance_id: &str) -> bool {
+    instance_id.is_empty()
+        || PRESENTED_DEVICES
+            .lock()
+            .unwrap()
+            .insert(instance_id.to_owned())
+}
+
+/// Release the presenting slot for `instance_id` (its controller went away).
+fn release_device(instance_id: &str) {
+    if !instance_id.is_empty() {
+        PRESENTED_DEVICES.lock().unwrap().remove(instance_id);
+    }
+}
+
 /// Presenting-side driver for one redirected USB device, called (with a
-/// [`UsbHandle`] onto it) when the client announces it. Fetches + logs the real
+/// [`UsbHandle`] onto it) when the client announces it. Dedups so one physical
+/// device gets one controller (see [`PRESENTED_DEVICES`]), fetches + logs the real
 /// device descriptor (proving the transfer path cross-platform), then hands the
 /// handle to [`imp::present_device`] — which on the entitled macOS build creates
 /// a UserHCI controller and answers the kernel's EP0 transfers by driving this
 /// same handle, so the client's device enumerates locally in `ioreg`.
 fn drive_device(handle: UsbHandle) {
     tokio::spawn(async move {
+        let instance_id = handle.device_instance_id().to_owned();
+        if !claim_device(&instance_id) {
+            info!(
+                instance_id = %instance_id,
+                "USB redirection: device already presented on another channel — skipping duplicate"
+            );
+            return;
+        }
         match handle.device_descriptor().await {
             Ok(d) => info!(
                 vid = format_args!("{:#06x}", d.vendor_id),
@@ -100,10 +141,12 @@ fn drive_device(handle: UsbHandle) {
             ),
             Err(e) => {
                 warn!(error = %e, "USB redirection: device-descriptor fetch failed");
+                release_device(&instance_id);
                 return;
             }
         }
         imp::present_device(handle).await;
+        release_device(&instance_id);
     });
 }
 
@@ -356,3 +399,44 @@ mod imp {
 }
 
 pub use imp::run_spike;
+
+#[cfg(test)]
+mod tests {
+    use super::{claim_device, release_device};
+
+    // The dedup registry is a process-wide static shared across tests, so each
+    // test uses its own unique instance ids to stay independent of ordering.
+
+    #[test]
+    fn claims_once_then_releases() {
+        let id = "test-instance-claims-once";
+        assert!(claim_device(id), "first claim wins");
+        assert!(
+            !claim_device(id),
+            "second claim on a live device is skipped"
+        );
+        release_device(id);
+        assert!(
+            claim_device(id),
+            "claimable again after its controller released"
+        );
+        release_device(id);
+    }
+
+    #[test]
+    fn distinct_devices_are_independent() {
+        let a = "test-instance-distinct-a";
+        let b = "test-instance-distinct-b";
+        assert!(claim_device(a));
+        assert!(claim_device(b), "a different device presents independently");
+        release_device(a);
+        release_device(b);
+    }
+
+    #[test]
+    fn empty_instance_id_is_never_deduped() {
+        // An absent instance id must never merge two genuinely different devices.
+        assert!(claim_device(""));
+        assert!(claim_device(""), "empty id always presents");
+    }
+}

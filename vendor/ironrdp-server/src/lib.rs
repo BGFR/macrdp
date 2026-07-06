@@ -49,7 +49,7 @@ pub use rdpdr::{
 };
 pub use rdpeusb::{
     DeviceDescriptor, URBDRC_CHANNEL_NAME, UrbdrcServer, UrbdrcServerFactory, UrbdrcServerMessage, UsbDeviceCallback,
-    UsbHandle,
+    UsbHandle, UsbPipe,
 };
 #[cfg(feature = "helper")]
 pub use helper::TlsIdentityCtx;

@@ -31,14 +31,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use ironrdp_core::{Encode, EncodeResult, WriteCursor, decode, impl_as_any};
+use ironrdp_core::{Encode, EncodeResult, ReadCursor, WriteCursor, decode, impl_as_any};
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
 use ironrdp_pdu::PduResult;
 use ironrdp_rdpeusb::pdu::caps::{Capability, RimExchangeCapabilityRequest};
+use ironrdp_rdpeusb::pdu::completion::ts_urb_result::{TsUrbResultPayload, TsUrbSelectConfigResult, UsbdPipeType};
 use ironrdp_rdpeusb::pdu::header::{FunctionId, InterfaceId, Mask, SharedMsgHeader};
 use ironrdp_rdpeusb::pdu::notify::{ChannelCreated, Direction};
-use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::utils::{TsUrbHeader, UrbFunction};
-use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::{TsUrb, TsUrbControlDescRequest};
+use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::utils::{TsUrbHeader, TsUsbdInterfaceInfo, TsUsbdPipeInfo, UrbFunction, UsbConfigDesc};
+use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::{TsUrb, TsUrbControlDescRequest, TsUrbSelectConfig};
 use ironrdp_rdpeusb::pdu::usb_dev::{RegisterRequestCallback, TransferInRequest};
 use ironrdp_rdpeusb::pdu::utils::RequestIdTransferInOut;
 use ironrdp_rdpeusb::pdu::{UrbdrcClientPdu, UrbdrcServerPdu};
@@ -47,8 +48,11 @@ use tracing::{debug, info, warn};
 
 use crate::{ServerEvent, ServerEventSender};
 
-/// USB standard `bDescriptorType` value for a device descriptor.
+/// USB standard `bDescriptorType` values.
 const USB_DESCRIPTOR_TYPE_DEVICE: u8 = 1;
+const USB_DESCRIPTOR_TYPE_CONFIGURATION: u8 = 2;
+const USB_DESCRIPTOR_TYPE_INTERFACE: u8 = 4;
+const USB_DESCRIPTOR_TYPE_ENDPOINT: u8 = 5;
 /// A USB device descriptor is 18 bytes.
 const USB_DEVICE_DESCRIPTOR_LEN: u32 = 18;
 
@@ -185,6 +189,17 @@ impl DeviceDescriptor {
     }
 }
 
+/// The parts of a `URB_COMPLETION` a waiter needs: `output_buffer` (the
+/// transferred bytes — a descriptor, or bulk-IN data) and `urb_result` (the raw
+/// TS_URB result payload, which a typed request like SelectConfiguration
+/// re-decodes for its pipe handles). `hresult` is the client's NTSTATUS-ish code.
+#[derive(Default)]
+pub struct UrbReply {
+    pub output_buffer: Vec<u8>,
+    pub urb_result: Vec<u8>,
+    pub hresult: u32,
+}
+
 /// Correlates outstanding transfer requests with their `URB_COMPLETION`s by the
 /// request id echoed in the completion. Mirrors `rdpdr::IoRouter`. Cheaply
 /// clonable (shared inner); the request id doubles as the TS_URB `RequestId`
@@ -197,7 +212,7 @@ pub struct UsbRouter {
 #[derive(Default)]
 struct UsbRouterInner {
     next_id: AtomicU32,
-    pending: Mutex<HashMap<u32, oneshot::Sender<Vec<u8>>>>,
+    pending: Mutex<HashMap<u32, oneshot::Sender<UrbReply>>>,
 }
 
 impl UsbRouter {
@@ -205,18 +220,18 @@ impl UsbRouter {
         Self::default()
     }
 
-    /// Allocate a 31-bit request id + a receiver for its completion body.
-    fn register(&self) -> (u32, oneshot::Receiver<Vec<u8>>) {
+    /// Allocate a 31-bit request id + a receiver for its completion.
+    fn register(&self) -> (u32, oneshot::Receiver<UrbReply>) {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) & 0x7FFF_FFFF;
         let (tx, rx) = oneshot::channel();
         self.inner.pending.lock().unwrap().insert(id, tx);
         (id, rx)
     }
 
-    /// Deliver a completion body to the matching waiter (dropped if none).
-    fn deliver(&self, req_id: u32, body: Vec<u8>) {
+    /// Deliver a completion to the matching waiter (dropped if none).
+    fn deliver(&self, req_id: u32, reply: UrbReply) {
         if let Some(tx) = self.inner.pending.lock().unwrap().remove(&req_id) {
-            let _ = tx.send(body);
+            let _ = tx.send(reply);
         } else {
             debug!(req_id, "URBDRC: URB completion with no waiter (dropped)");
         }
@@ -280,7 +295,7 @@ impl UsbHandle {
             }))
             .ok()
             .context("URBDRC: server event loop gone")?;
-        rx.await.context("URBDRC: connection closed before completion")
+        Ok(rx.await.context("URBDRC: connection closed before completion")?.output_buffer)
     }
 
     /// Convenience: fetch the 18-byte device descriptor and parse it.
@@ -290,6 +305,135 @@ impl UsbHandle {
             .await?;
         DeviceDescriptor::parse(&bytes).context("URBDRC: malformed device descriptor")
     }
+
+    /// Select the device's configuration on the client, opening its endpoints'
+    /// pipes, and return them ([`UsbPipe`] per non-default endpoint). This is the
+    /// prerequisite for any bulk/interrupt transfer — those address the endpoint by
+    /// the client `pipe_handle` returned here, which only `SelectConfiguration`
+    /// yields. `config_bytes` is the full configuration descriptor (the config
+    /// header plus its interface + endpoint descriptors).
+    pub async fn select_configuration(&self, config_bytes: &[u8]) -> Result<Vec<UsbPipe>> {
+        let (config_desc, ifaces) = parse_configuration(config_bytes)?;
+        let (req_id, rx) = self.router.register();
+        let messages = select_config_request(self.device_iface, req_id, config_desc, ifaces);
+        self.sender
+            .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
+                channel_id: self.channel_id,
+                messages,
+            }))
+            .ok()
+            .context("URBDRC: server event loop gone")?;
+        let reply = rx.await.context("URBDRC: connection closed before SelectConfiguration completion")?;
+        if reply.hresult != 0 {
+            anyhow::bail!("URBDRC: SelectConfiguration failed (hresult {:#010x})", reply.hresult);
+        }
+        let result = TsUrbSelectConfigResult::decode(&mut ReadCursor::new(&reply.urb_result))
+            .map_err(|e| anyhow::anyhow!("URBDRC: malformed SelectConfiguration result: {e}"))?;
+        Ok(result
+            .interface
+            .iter()
+            .flat_map(|iface| iface.pipes.iter())
+            .map(|pipe| UsbPipe {
+                endpoint_address: pipe.endpoint_address,
+                pipe_handle: pipe.pipe_handle,
+                is_bulk: matches!(pipe.pipe_type, UsbdPipeType::Bulk),
+            })
+            .collect())
+    }
+}
+
+/// One endpoint pipe opened by [`UsbHandle::select_configuration`]: its USB
+/// address (bit 7 = IN) and the client `pipe_handle` that addresses transfers on
+/// it.
+#[derive(Debug, Clone, Copy)]
+pub struct UsbPipe {
+    pub endpoint_address: u8,
+    pub pipe_handle: u32,
+    pub is_bulk: bool,
+}
+
+/// Parse a full configuration descriptor into the [`UsbConfigDesc`] header + one
+/// [`TsUsbdInterfaceInfo`] per interface (each carrying a [`TsUsbdPipeInfo`] per
+/// endpoint, in descriptor order — the client returns each pipe's handle in the
+/// same order). Walks the standard TLV descriptor chain (config 9.6.3).
+fn parse_configuration(buf: &[u8]) -> Result<(UsbConfigDesc, Vec<TsUsbdInterfaceInfo>)> {
+    if buf.len() < 9 || buf[1] != USB_DESCRIPTOR_TYPE_CONFIGURATION {
+        anyhow::bail!("URBDRC: not a configuration descriptor ({} bytes)", buf.len());
+    }
+    let u16le = |i: usize| u16::from_le_bytes([buf[i], buf[i + 1]]);
+    let config = UsbConfigDesc {
+        length: buf[0],
+        descriptor_type: buf[1],
+        total_length: u16le(2),
+        num_interfaces: buf[4],
+        configuration_value: buf[5],
+        configuration: buf[6],
+        attributes: buf[7],
+        max_power: buf[8],
+    };
+    let mut ifaces: Vec<TsUsbdInterfaceInfo> = Vec::new();
+    let mut i = 9usize;
+    while i + 2 <= buf.len() {
+        let len = buf[i] as usize;
+        let dtype = buf[i + 1];
+        if len == 0 || i + len > buf.len() {
+            break;
+        }
+        match dtype {
+            USB_DESCRIPTOR_TYPE_INTERFACE if len >= 9 => ifaces.push(TsUsbdInterfaceInfo {
+                interface_number: buf[i + 2],
+                alternate_setting: buf[i + 3],
+                ts_usbd_pipe_info: Vec::new(),
+            }),
+            USB_DESCRIPTOR_TYPE_ENDPOINT if len >= 7 => {
+                if let Some(iface) = ifaces.last_mut() {
+                    iface.ts_usbd_pipe_info.push(TsUsbdPipeInfo {
+                        max_packet_size: u16le(i + 4),
+                        max_transfer_size: 64 * 1024,
+                        pipe_flags: 0,
+                    });
+                }
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    Ok((config, ifaces))
+}
+
+/// Build a `SELECT_CONFIGURATION` request (a `RegisterRequestCallback` naming the
+/// completion interface + a `TransferInRequest` carrying the SelectConfig URB with
+/// `output_buffer_size = 0`). Mirrors [`get_descriptor_request`].
+fn select_config_request(
+    device_iface: InterfaceId,
+    req_id: u32,
+    desc: UsbConfigDesc,
+    ifaces: Vec<TsUsbdInterfaceInfo>,
+) -> Vec<DvcMessage> {
+    let reg = RegisterRequestCallback {
+        msg_id: 0,
+        udev_iface: device_iface,
+        request_completion: Some(device_iface),
+    };
+    let ts_req_id = RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
+    let select = TransferInRequest {
+        msg_id: 0,
+        udev_iface: device_iface,
+        ts_urb: TsUrb::SelectConfig(TsUrbSelectConfig {
+            header: TsUrbHeader {
+                func: UrbFunction::SelectConfiguration,
+                req_id: ts_req_id,
+                no_ack: false,
+            },
+            usbd_ifaces: ifaces,
+            desc: Some(desc),
+        }),
+        output_buffer_size: 0,
+    };
+    vec![
+        dvc_msg(UrbdrcServerPdu::RegReqCb(reg)),
+        dvc_msg(UrbdrcServerPdu::TransferIn(select)),
+    ]
 }
 
 /// Build a `GET_DESCRIPTOR` control-transfer request (IN): a
@@ -577,16 +721,39 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
                 }
             }
             Ok(UrbdrcClientPdu::UrbComp(comp)) => {
-                self.router.deliver(comp.req_id.into(), comp.output_buffer);
+                let urb_result = match comp.ts_urb_result.payload {
+                    TsUrbResultPayload::Raw(bytes) => bytes,
+                    _ => Vec::new(),
+                };
+                self.router.deliver(
+                    comp.req_id.into(),
+                    UrbReply {
+                        output_buffer: comp.output_buffer,
+                        urb_result,
+                        hresult: comp.hresult,
+                    },
+                );
             }
             Ok(UrbdrcClientPdu::UrbCompNoData(comp)) => {
-                // No payload; wake the waiter with an empty body so it doesn't hang.
+                // No data buffer; wake the waiter so it doesn't hang. The URB result
+                // (e.g. SelectConfiguration's pipe handles) still rides here.
                 debug!(
                     channel_id,
                     hresult = format_args!("{:#010x}", comp.hresult),
                     "URBDRC URB_COMPLETION_NO_DATA"
                 );
-                self.router.deliver(comp.req_id.into(), Vec::new());
+                let urb_result = match comp.ts_urb_result.payload {
+                    TsUrbResultPayload::Raw(bytes) => bytes,
+                    _ => Vec::new(),
+                };
+                self.router.deliver(
+                    comp.req_id.into(),
+                    UrbReply {
+                        output_buffer: Vec::new(),
+                        urb_result,
+                        hresult: comp.hresult,
+                    },
+                );
             }
             Ok(_) => {
                 debug!(channel_id, "URBDRC device-channel PDU (unhandled)");

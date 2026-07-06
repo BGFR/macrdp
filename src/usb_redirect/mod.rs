@@ -17,12 +17,18 @@
 //! the client over the wire and the client's device enumerates in `ioreg -p
 //! IOUSB` with its real VID/PID/strings. **Verified** on the entitled build: a
 //! client-redirected flash drive (ESD310C, VID 0x2174) enumerates on macrdp's
-//! controller. Deferred to Phase 3.2: bulk/interrupt/isoch endpoints (so the
-//! device is only enumerable, not yet usable-as-storage), retract/hot-unplug +
-//! per-device teardown, and multi-device. All Obj-C / IOUSBHost SPI touches are
-//! quarantined in `usb_spike.m` (the maintenance boundary), built + linked by
-//! `build.rs` on macOS; the standalone `--usb-spike` path still presents the
-//! hardcoded synthetic device through the same async completion machinery.
+//! controller. Phase 3.2 (usable, not just enumerable) is in progress:
+//! `select_client_config` fetches the full config descriptor and sends a
+//! `SelectConfiguration` URB to open the device's pipes (the prerequisite for
+//! bulk) — verified correct (FreeRDP parses + attempts it), but it CANNOT be
+//! completed on the loopback test because a macOS *client*'s libusb can't detach
+//! the mass-storage kernel driver to claim the interface (`LIBUSB_ERROR_ACCESS`);
+//! it times out and degrades to enumerate-only. Bulk forwarding + a
+//! claimable-interface client (real Windows/Linux) are the remaining 3.2 work,
+//! along with retract/hot-unplug and multi-device. All Obj-C / IOUSBHost SPI
+//! touches are quarantined in `usb_spike.m` (the maintenance boundary), built +
+//! linked by `build.rs` on macOS; the standalone `--usb-spike` path still presents
+//! the hardcoded synthetic device through the same async completion machinery.
 
 use std::sync::Arc;
 
@@ -105,11 +111,12 @@ fn drive_device(handle: UsbHandle) {
 mod imp {
     use std::os::raw::{c_int, c_void};
 
-    use ironrdp_server::UsbHandle;
+    use ironrdp_server::{UsbHandle, UsbPipe};
     use tracing::{info, warn};
 
     // ---- USB standard-request constants ----
     const USB_REQ_GET_DESCRIPTOR: u8 = 0x06;
+    const USB_DESCRIPTOR_TYPE_CONFIGURATION: u8 = 2;
     const STATUS_OK: i32 = 0;
     const STATUS_STALL: i32 = 1;
 
@@ -222,6 +229,30 @@ mod imp {
         let controller = ControllerHandle(raw);
         info!("USB redirection: UserHCI controller created — presenting the client's device (watch `ioreg -p IOUSB`)");
 
+        // Configure the client's device + learn its endpoint pipe handles — the
+        // prerequisite for bulk transfers (which address the endpoint by the pipe
+        // handle SelectConfiguration returns). Best-effort: control-only enumeration
+        // still works without it. Bulk forwarding (the actual mount) is the next step.
+        match select_client_config(&handle).await {
+            Ok(pipes) => {
+                for p in &pipes {
+                    info!(
+                        endpoint = format_args!("{:#04x}", p.endpoint_address),
+                        pipe_handle = p.pipe_handle,
+                        bulk = p.is_bulk,
+                        "USB redirection: endpoint pipe opened"
+                    );
+                }
+                info!(
+                    count = pipes.len(),
+                    "USB redirection: SelectConfiguration succeeded — pipes ready for bulk"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "USB redirection: SelectConfiguration failed (bulk transfers unavailable)")
+            }
+        }
+
         // EP0 control transfers are serialized by the kernel, so service each
         // inline. Stop when the device goes away: a fetch failure (link dead) or
         // the device channel closing (disconnect) via handle.closed().
@@ -260,6 +291,53 @@ mod imp {
             }
         }
         drop(controller);
+    }
+
+    /// Fetch the full configuration descriptor (header first for `wTotalLength`,
+    /// then the whole thing) and SelectConfiguration on the client, returning the
+    /// opened endpoint pipes.
+    async fn select_client_config(handle: &UsbHandle) -> anyhow::Result<Vec<UsbPipe>> {
+        info!("USB redirection: fetching configuration-descriptor header");
+        let hdr = handle
+            .get_descriptor(USB_DESCRIPTOR_TYPE_CONFIGURATION, 0, 0, 9)
+            .await?;
+        if hdr.len() < 4 {
+            anyhow::bail!(
+                "short configuration-descriptor header ({} bytes)",
+                hdr.len()
+            );
+        }
+        let total_len = u16::from_le_bytes([hdr[2], hdr[3]]);
+        info!(
+            total_len,
+            "USB redirection: fetching full configuration descriptor"
+        );
+        let full = handle
+            .get_descriptor(
+                USB_DESCRIPTOR_TYPE_CONFIGURATION,
+                0,
+                0,
+                u32::from(total_len),
+            )
+            .await?;
+        info!(
+            bytes = full.len(),
+            "USB redirection: sending SelectConfiguration"
+        );
+        // A client that can't configure the device (e.g. a macOS client whose
+        // kernel driver holds a mass-storage interface, so libusb can't claim it)
+        // may fail the URB without a completion — bound the wait so we don't hang.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle.select_configuration(&full),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => anyhow::bail!(
+                "SelectConfiguration timed out — client did not complete it (interface claimable?)"
+            ),
+        }
     }
 }
 

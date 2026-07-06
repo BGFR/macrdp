@@ -224,9 +224,41 @@ That contrast is the whole reason macrdp's redirection strategy is device-class-
 - `usbipd-mac` (USB/IP for macOS, blocked on the DriverKit USB entitlement):
   <https://github.com/beriberikix/usbipd-mac>
 
+## First open-source RDP *server* to present a redirected USB device
+
+As far as is known, macrdp is the **first (and currently only) open-source RDP server
+that receives a client-redirected USB device and presents it as a real local device** —
+i.e. it implements the **server direction** of MS-RDPEUSB (`URBDRC`) plus local device
+synthesis. This mirrors the project's earlier UDP-multitransport finding (first OSS RDP
+server with a working UDP data path).
+
+The claim is specifically about the *server/presenting* side. USB redirection in RDP is
+inherently **client → server**: the client owns the physical device and redirects it; the
+server must synthesize/present it. On real Windows RDS that presentation is done by
+**closed-source kernel drivers** (`usbdr.sys` / the RemoteFX USB bus), not by any OSS
+server.
+
+**Verified 2026-07-06 against current sources:**
+- **FreeRDP** — the most complete OSS RDP stack — implements `URBDRC` **client-direction
+  only**. Its `channels/urbdrc/` tree has `client/` and `common/` subdirectories and **no
+  `server/`** (`common/` is just the shared `msusb.c` PDU marshaling). FreeRDP issue
+  [#7558 "server side channel not implemented"](https://github.com/FreeRDP/FreeRDP/issues/7558)
+  documents this, and the project's own guidance states "the urbdrc channel has only the
+  client side implemented." So FreeRDP-based servers (ogon, freerdp-shadow) cannot present a
+  redirected device.
+- **xrdp**, **ogon**, **gnome-remote-desktop** — no USB-redirection code at all (source-tree
+  greps for `urbdrc`/`usbredir`/`usb_redir` returned nothing).
+- **VirtualHere / usbip** present remote USB devices, but they are **USB-over-IP** (their own
+  protocols), not RDP — and VirtualHere is proprietary.
+
+Scope/hedge: "as far as is known" — this is a negative-existence claim over the OSS
+landscape; it's backed by the source checks above, not a proof no niche project exists.
+macrdp's presenting side is macOS-only (the UserHCI virtual host controller) and needs the
+entitled/provisioned build.
+
 ## Status
 
-**In progress — Phases 1, 2, 3.0, and 3.1a done** (branch `feat/usb-redirect-spike`).
+**In progress — Phases 1, 2, 3.0, 3.1, and 3.2 (bulk/mount) done** (branch `feat/usb-redirect-spike`).
 The entitlement `com.apple.developer.usb.host-controller-interface` is **granted**
 (team QGLA89KHM7, FB23363880).
 - **Phase 1 GO** — entitled build instantiates the `IOUSBHostControllerInterface`
@@ -253,9 +285,26 @@ The entitlement `com.apple.developer.usb.host-controller-interface` is **granted
   `TransferInRequest` and decodes the `URB_COMPLETION`. Verified live with a USB-3.2
   flash drive (`vid=0x2174 pid=0x2100`, read from the physical device). This de-risks
   the transfer path — libusb kernel-detach was not a blocker after unmount.
-- **Phase 3.1b(2b) (next)** — refactor into a reusable `UsbHandle`/`UsbRouter` (async
-  transfer path) + evolve `usb_spike.m` to client-sourced descriptors so a real device
-  enumerates in `ioreg` (needs the entitled/provisioned build — it drives UserHCI).
+- **Phase 3.1b(2b) GO ✅✅ — a real client device enumerates locally** — the transfer
+  path became a reusable async `UsbHandle`/`UsbRouter`, the driver moved into macrdp
+  (`src/usb_redirect/mod.rs::drive_device`) via a `device_callback` seam, and
+  `usb_spike.m` was restructured to async out-of-band EP0 completion. Verified entitled +
+  FreeRDP: the client-redirected ESD310C flash drive enumerates on macrdp's UserHCI
+  controller with descriptors/strings sourced live from the client. Controller is
+  destroyed on disconnect (a `watch` channel → `closed()`), not leaked.
+- **Phase 3.2 GO ✅✅ — the redirected USB DRIVE MOUNTS on the Mac** — `select_configuration`
+  opens the device's pipe handles and `UsbHandle::bulk_transfer_in/out`
+  (`TsUrb::BulkInterruptTransfer`) forward bulk on the mass-storage endpoints, so the
+  macOS driver's SCSI (CBW/data/CSW) rides the client's real drive. **Verified end-to-end
+  on a real Linux FreeRDP client** (UTM-QEMU Ubuntu + a USB-2.0 hub for a claimable
+  interface): the ESD310C **mounts and stays mounted** (1300+ steady bulk transfers, no
+  resets/timeouts). Two load-bearing fixes: dedup on the device's hardware identity
+  (`VID:PID:bcdDevice`, not the client's per-announce instance id — FreeRDP double-announces
+  one drive, and presenting both duels two virtual drives over the one device); and an
+  Obj-C endpoint-object identity guard on completion (a device reset destroys+recreates the
+  endpoint at the same key, leaving a pending transfer pointing into a freed ring). Remaining
+  3.2: control-OUT forwarding (mass-storage reset / Clear-Feature), retract/hot-unplug,
+  true multi-device.
 
 Cross-reference the `docs/known-quirks.md` smart-card note (kext vs dext vs UserHCI
 rationale) and `project_usb_redirection_feasibility` memory for the running log.

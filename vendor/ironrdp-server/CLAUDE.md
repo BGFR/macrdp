@@ -1097,9 +1097,22 @@ AND released — #1276 landing is NOT sufficient.
       `get_svc_processor::<DrdynvcServer>()` → `create_channel(UrbdrcDeviceProcessor)`
       → `server_encode_svc_messages` the resulting CreateRequest. This is the only
       place a per-device DVC can be opened (only the loop holds `&mut DrdynvcServer`).
-    - `UrbdrcDeviceProcessor` (per-device channel): on open (`start`) sends its own
-      `RIMCALL_RELEASE` (FreeRDP's `INIT_CHANNEL_OUT` barrier) so the client sends
-      `ADD_DEVICE` with the real descriptors, which `process` decodes/logs.
+    - `UrbdrcDeviceProcessor` (per-device channel): on open (`start`) runs the SAME
+      per-channel handshake as the main channel — **capability exchange →
+      `CHANNEL_CREATED` → `RIMCALL_RELEASE`** (the `INIT_CHANNEL_OUT` barrier) — so
+      the client sends `ADD_DEVICE` with the real descriptors, which `process`
+      decodes/logs. **The full handshake is REQUIRED by mstsc** (2026-07-07): FreeRDP
+      is fine with the per-device channel jumping straight to `RIMCALL_RELEASE` (its
+      readiness state is global to the main channel), but mstsc CLOSES a per-device
+      channel that receives `RIMCALL_RELEASE`/`CHANNEL_CREATED` with no preceding
+      capability exchange — it keeps a silent channel open and waits for the caps
+      request. Diagnosed with a silence-vs-message A/B; with the full handshake mstsc
+      completes it and sends `ADD_DEVICE`. (This was the blocker that made mstsc USB
+      redirection never announce a device; FreeRDP masked it — same lesson as the
+      RDPDR handshake-ordering divergence.) `start`/`process` carry a `next_msg_id`
+      for the caps/CHANNEL_CREATED/RIMCALL_RELEASE MessageIds. Pairs with the
+      `ironrdp-rdpeusb` divergences (1) `UsbDevice=0` + (2) interface-0 completion
+      routing — all three needed for an mstsc device to enumerate.
     - **Phase 3.1b(2) transfer path (async `UsbHandle`/`UsbRouter`):** transfers ride
       an async seam modeled on `rdpdr::RdpdrHandle`/`IoRouter`. `UsbRouter` (shared
       `Arc` inner: `AtomicU32` req id masked to 31 bits + `Mutex<HashMap<id,
@@ -1213,6 +1226,19 @@ AND released — #1276 landing is NOT sufficient.
     - Remaining: retract/hot-unplug via an explicit RETRACT_DEVICE PDU (the client
       channel-close path above covers detach/reset — the common case — live-verified),
       true multi-device (iSerialNumber), non-mass-storage device classes (untested).
+    - **mstsc client — ENUMERATES end-to-end (2026-07-07), does not STREAM yet.**
+      With the three interop fixes (per-device full handshake here + `ironrdp-rdpeusb`
+      (1)/(2)), a real mstsc RemoteFX-USB device now completes the handshake, announces
+      `ADD_DEVICE`, and macrdp fetches its descriptors + presents the UserHCI controller
+      (verified live with an A4Tech camera + a USB Audio/HID device). The remaining
+      ceiling is device-class work, NOT protocol: `SelectConfiguration` fails on mstsc
+      with `hresult 0x80070057` (E_INVALIDARG) → no pipe handles → all endpoint transfers
+      stall, and the UVC/UAC class-control requests (`bmreq 0xa1/0x22`) also 0x80070057;
+      plus isoch (camera/audio) / interrupt (HID) endpoints aren't implemented. So mstsc
+      devices ENUMERATE but don't function. `SelectConfiguration`-on-mstsc is the next
+      protocol blocker (mstsc-strictness, like the handshake — FreeRDP's `SelectConfiguration`
+      succeeds and mass storage mounts). NB mstsc's RemoteFX USB list excludes mass storage
+      (that rides Drives/RDPDR), so the verified-working bulk path can't be exercised from mstsc.
     - **One controller per physical device (dedup, presenting-side).** A client can
       announce ONE physical device on more than one `URBDRC` channel — FreeRDP announces
       the same drive twice with instance ids differing by a byte (`…d31`/`…d32`), plus a

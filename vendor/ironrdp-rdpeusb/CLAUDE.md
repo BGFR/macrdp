@@ -42,3 +42,33 @@ dropped because we live outside the IronRDP cargo workspace (mirrors
     Upstreamable (the strict enums are a genuine interop bug against real Windows
     USB-3 devices) — offer it alongside the server-direction `UrbdrcServer` work.
     Keep this vendor dir until that lands AND releases.
+
+    **Extension (2026-07-07, real mstsc): `AddDevice.usb_device == 0` accepted**
+    (`src/pdu/sink.rs`). `AddDevice::decode` rejected the `UsbDevice` interface id
+    in the reserved range `0x0..=0x3` (it assumed a device id is always `>= 0x4`,
+    which holds for FreeRDP). But **real mstsc assigns `UsbDevice = 0`** to a
+    redirected device — the device is addressed by its own per-device DVC, so a
+    per-channel interface id of 0 is unambiguous and valid. The reject arm made
+    every mstsc `ADD_DEVICE` fail to parse (`unsupported UsbDevice (0)`), so the
+    device never reached the presenting side. Fix: accept the full `0x0..=0x3F_FF_FF_FF`
+    plain-interface-id range (only the StreamId-masked high range stays invalid).
+    FreeRDP (id `>= 0x4`) is unaffected. Verified live: an mstsc-redirected camera +
+    audio/HID device parse and enumerate.
+
+(2) **Interface-0 device-completion routing** (`src/pdu/mod.rs`,
+    `UrbdrcClientPdu::decode`). Consequence of the mstsc `UsbDevice = 0` above: a
+    URB completion for that device arrives on `interface_id == 0` (== `CAPABILITIES`),
+    so the interface-id-first dispatch routed it to the capability-response decoder
+    and failed with "invalid RIM_EXCHANGE_CAPABILITY_RESPONSE header" — i.e. macrdp's
+    `GET_DESCRIPTOR` reply was silently dropped and the fetch hung until disconnect.
+    Fix: the `CAPABILITIES` arm now, when the header is NOT a genuine caps response
+    (`function_id.is_none() && mask == StreamIdNone`), falls through to a shared
+    `decode_device_message(src, header)` that dispatches by `(function_id, mask)` —
+    the same routine the `interface_id >= 0x4` arm uses. So `URB_COMPLETION` (0x101),
+    `URB_COMPLETION_NO_DATA` (0x102), `IOCONTROL_COMPLETION` (0x100) and
+    `QUERY_DEVICE_TEXT` responses all decode whether the device interface id is 0
+    (mstsc) or `>= 0x4` (FreeRDP). NB `URB_COMPLETION` and `ADD_DEVICE` share
+    function id `0x101` — they are disambiguated only by interface + mask, which is
+    why this can't be a plain global function-id match and must stay keyed off the
+    interface arm. Verified live: the mstsc device descriptor round-trips (real
+    vid/pid read back). Upstreamable alongside (1) as a real-mstsc interop fix.

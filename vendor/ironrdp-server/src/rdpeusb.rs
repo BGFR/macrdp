@@ -911,6 +911,9 @@ pub struct UrbdrcDeviceProcessor {
     /// sender, resolving every handle's `closed()`. That's how the presenting
     /// side learns the device went away and tears its controller down.
     alive: watch::Sender<bool>,
+    /// Monotonic MS-RDPEUSB `MessageId` for the notification messages this
+    /// processor emits on its channel (caps request, CHANNEL_CREATED, RIMCALL_RELEASE).
+    next_msg_id: u32,
 }
 
 impl UrbdrcDeviceProcessor {
@@ -921,7 +924,14 @@ impl UrbdrcDeviceProcessor {
             device_cb,
             announced: false,
             alive: watch::channel(false).0,
+            next_msg_id: 1,
         }
+    }
+
+    fn take_msg_id(&mut self) -> u32 {
+        let id = self.next_msg_id;
+        self.next_msg_id += 1;
+        id
     }
 
     /// Hand the presenting side a [`UsbHandle`] onto the newly-announced device.
@@ -949,10 +959,23 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
     }
 
     fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
-        // The per-device channel is up. Send RIMCALL_RELEASE so the client's
-        // INIT_CHANNEL_OUT path fires and it sends us ADD_DEVICE (the descriptors).
-        info!(channel_id, "URBDRC device channel opened — sending RIMCALL_RELEASE for ADD_DEVICE");
-        Ok(vec![rimcall_release(1)])
+        // The per-device channel needs the SAME per-channel handshake as the main
+        // URBDRC channel: capability exchange → CHANNEL_CREATED → RIMCALL_RELEASE.
+        // mstsc REQUIRES it — it keeps the channel open+silent when the server sends
+        // nothing, but CLOSES it the instant it receives a RIMCALL_RELEASE (or
+        // CHANNEL_CREATED) with no preceding capability exchange (verified live
+        // 2026-07-06: with the caps exchange, mstsc completes the handshake and sends
+        // ADD_DEVICE; without it, mstsc sends a DVC Close and no device ever arrives).
+        // FreeRDP tolerates skipping it (its readiness state is global to the main
+        // channel's RIMCALL_RELEASE). So kick off the caps exchange here; process()
+        // drives CHANNEL_CREATED then RIMCALL_RELEASE, after which the client sends
+        // ADD_DEVICE (the real descriptors).
+        info!(channel_id, "URBDRC device channel opened — sending capability request (per-channel handshake)");
+        let req = RimExchangeCapabilityRequest {
+            msg_id: self.take_msg_id(),
+            capability: Capability::RimCapabilityVersion01,
+        };
+        Ok(vec![dvc_msg(UrbdrcServerPdu::Caps(req))])
     }
 
     fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
@@ -960,6 +983,27 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
         // the RDP session (same lesson as the ironrdp-dvc Soft-Sync divergence).
         // Tolerate it, and still recognize ADD_DEVICE from its header.
         match decode::<UrbdrcClientPdu>(payload) {
+            Ok(UrbdrcClientPdu::Caps(resp)) => {
+                // Per-channel capability exchange done — advance to CHANNEL_CREATED,
+                // exactly as the main channel does (see `start`).
+                info!(
+                    channel_id,
+                    result = format_args!("{:#010x}", resp.result),
+                    "URBDRC per-device capability response — sending CHANNEL_CREATED"
+                );
+                let created = ChannelCreated {
+                    msg_id: self.take_msg_id(),
+                    direction: Direction::ToClient,
+                };
+                return Ok(vec![dvc_msg(UrbdrcServerPdu::ChanCreated(created))]);
+            }
+            Ok(UrbdrcClientPdu::ChanCreated(cc)) => {
+                // Channel-created handshake done — send RIMCALL_RELEASE, the barrier
+                // that makes the client send ADD_DEVICE (the descriptors) on THIS channel.
+                debug!(channel_id, direction = ?cc.direction, "URBDRC per-device CHANNEL_CREATED reply");
+                info!(channel_id, "URBDRC per-device handshake complete — sending RIMCALL_RELEASE for ADD_DEVICE");
+                return Ok(vec![rimcall_release(self.take_msg_id())]);
+            }
             Ok(UrbdrcClientPdu::AddDev(dev)) => {
                 info!(
                     channel_id,

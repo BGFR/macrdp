@@ -201,11 +201,16 @@ mod imp {
     /// service its EP0 control-IN transfers from the client over `handle`. A no-op
     /// (logs once) when the controller can't be created — e.g. a plain `cargo`
     /// build without the `com.apple.developer.usb.host-controller-interface`
-    /// entitlement. Runs until the client link fails (which tears the controller
-    /// down); fuller lifecycle (retract / multi-device) is Phase 3.2.
+    /// entitlement. Runs until the device goes away — either the client link
+    /// fails on a fetch, or `handle.closed()` fires (the owning device processor
+    /// dropped on disconnect) — then destroys the controller. Fuller lifecycle
+    /// (mid-session retract / multi-device) is Phase 3.2.
     pub async fn present_device(handle: UsbHandle) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ControlInReq>();
-        // Leak the ctx so any late C callback after teardown stays memory-safe.
+        // Leak the ctx (a small, bounded per-presentation allocation) so a C
+        // callback that races teardown stays memory-safe — the send just fails
+        // once `rx` is dropped. Freeing it needs a guaranteed-drained queue,
+        // which the controller destroy doesn't promise; not worth the risk.
         let ctx = Box::into_raw(Box::new(CallbackCtx { tx }));
         let mut err: c_int = 0;
         let raw =
@@ -218,8 +223,19 @@ mod imp {
         info!("USB redirection: UserHCI controller created — presenting the client's device (watch `ioreg -p IOUSB`)");
 
         // EP0 control transfers are serialized by the kernel, so service each
-        // inline. A fetch failure means the client link is gone → tear down.
-        while let Some(req) = rx.recv().await {
+        // inline. Stop when the device goes away: a fetch failure (link dead) or
+        // the device channel closing (disconnect) via handle.closed().
+        loop {
+            let req = tokio::select! {
+                maybe = rx.recv() => match maybe {
+                    Some(req) => req,
+                    None => break,
+                },
+                () = handle.closed() => {
+                    info!("USB redirection: device channel closed (disconnect) — destroying UserHCI controller");
+                    break;
+                }
+            };
             let b_request = req.setup[1];
             if b_request != USB_REQ_GET_DESCRIPTOR {
                 // Only descriptor reads are forwarded today (enough to enumerate);
@@ -243,7 +259,6 @@ mod imp {
                 }
             }
         }
-        info!("USB redirection: device driver loop ended — destroying UserHCI controller");
         drop(controller);
     }
 }

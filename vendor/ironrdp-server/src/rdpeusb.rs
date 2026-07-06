@@ -42,7 +42,7 @@ use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::{TsUrb, TsUrbControlDescRequest};
 use ironrdp_rdpeusb::pdu::usb_dev::{RegisterRequestCallback, TransferInRequest};
 use ironrdp_rdpeusb::pdu::utils::RequestIdTransferInOut;
 use ironrdp_rdpeusb::pdu::{UrbdrcClientPdu, UrbdrcServerPdu};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
 use crate::{ServerEvent, ServerEventSender};
@@ -236,16 +236,35 @@ pub struct UsbHandle {
     channel_id: u32,
     /// The device's interface id (addresses the device in each request header).
     device_iface: InterfaceId,
+    /// Resolves when the owning device processor is dropped (the DVC channel /
+    /// connection went away), so the presenting side can tear its controller down.
+    closed: watch::Receiver<bool>,
 }
 
 impl UsbHandle {
-    fn new(sender: mpsc::UnboundedSender<ServerEvent>, router: UsbRouter, channel_id: u32, device_iface: InterfaceId) -> Self {
+    fn new(
+        sender: mpsc::UnboundedSender<ServerEvent>,
+        router: UsbRouter,
+        channel_id: u32,
+        device_iface: InterfaceId,
+        closed: watch::Receiver<bool>,
+    ) -> Self {
         Self {
             sender,
             router,
             channel_id,
             device_iface,
+            closed,
         }
+    }
+
+    /// Await the device going away — the owning [`UrbdrcDeviceProcessor`] being
+    /// dropped closes the `watch` sender, which resolves this. Used by the
+    /// presenting side to stop driving + destroy its controller on disconnect.
+    pub async fn closed(&self) {
+        let mut rx = self.closed.clone();
+        // `changed()` returns Err once the sender is dropped — either way, done.
+        let _ = rx.changed().await;
     }
 
     /// Fetch a descriptor via a `GET_DESCRIPTOR` control transfer (IN) and return
@@ -489,6 +508,12 @@ pub struct UrbdrcDeviceProcessor {
     device_cb: Option<UsbDeviceCallback>,
     /// One-shot guard so the presenting side is notified at most once per device.
     announced: bool,
+    /// Liveness signal handed (as a subscriber) to each [`UsbHandle`]. Dropping
+    /// this processor — which the server does on disconnect, when it resets
+    /// `static_channels` right after the connection loop returns — drops the
+    /// sender, resolving every handle's `closed()`. That's how the presenting
+    /// side learns the device went away and tears its controller down.
+    alive: watch::Sender<bool>,
 }
 
 impl UrbdrcDeviceProcessor {
@@ -498,12 +523,19 @@ impl UrbdrcDeviceProcessor {
             router: UsbRouter::new(),
             device_cb,
             announced: false,
+            alive: watch::channel(false).0,
         }
     }
 
     /// Hand the presenting side a [`UsbHandle`] onto the newly-announced device.
     fn notify_device(&self, channel_id: u32, device_iface: InterfaceId) {
-        let handle = UsbHandle::new(self.sender.clone(), self.router.clone(), channel_id, device_iface);
+        let handle = UsbHandle::new(
+            self.sender.clone(),
+            self.router.clone(),
+            channel_id,
+            device_iface,
+            self.alive.subscribe(),
+        );
         match &self.device_cb {
             Some(cb) => cb(handle),
             None => debug!(channel_id, "URBDRC device announced but no presenting side is wired"),

@@ -475,13 +475,15 @@ struct Args {
     #[arg(long)]
     enable_smartcard_redirection: bool,
 
-    /// EXPERIMENTAL, opt-in (default OFF). Enable server-direction USB redirection
-    /// (MS-RDPEUSB / the URBDRC dynamic channel): the connecting client redirects a
-    /// physical USB device and macrdp drives it locally via a user-space USB host
-    /// controller. Phase 3.0 is an observe-only go/no-go — it advertises URBDRC and
-    /// logs whether a client opens it + announces a device. Needs the entitled
-    /// (signed+provisioned) build. The client must opt in too (FreeRDP: /usb; mstsc:
-    /// the RemoteFX USB redirection Group Policy). macOS-only.
+    /// EXPERIMENTAL, opt-in (default OFF). Generic USB redirection (MS-RDPEUSB /
+    /// the URBDRC dynamic channel): the connecting client redirects a physical USB
+    /// device and macrdp presents it as a REAL local device via a user-space virtual
+    /// USB host controller (IOUSBHost UserHCI) — e.g. a redirected flash drive mounts
+    /// in Finder. Needs the entitled (signed+provisioned) build (the
+    /// com.apple.developer.usb.host-controller-interface entitlement); a plain build
+    /// logs "controller unavailable" and no-ops. Mass storage is verified end-to-end;
+    /// other device classes are untested. The client must opt in too (FreeRDP: /usb;
+    /// mstsc: Local Resources -> More -> USB). macOS-only.
     #[arg(long)]
     enable_usb_redirection: bool,
 

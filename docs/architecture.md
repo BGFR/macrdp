@@ -214,6 +214,27 @@ src/health.rs     Health-check watchdog (Tier 2.5) — turns a hung-but-alive
                   ~90s to bounce). Env: MACRDP_HEALTHCHECK=0/1 +
                   MACRDP_HEALTHCHECK_{INTERVAL_SECS,TIMEOUT_SECS,FAILURES}
                   (config.env HEALTH_CHECK / HEALTHCHECK_*). Cross-platform.
+src/usb_redirect/ Generic USB redirection (MS-RDPEUSB / URBDRC), the SERVER /
+  mod.rs          presenting side (--enable-usb-redirection, EXPERIMENTAL, opt-in,
+  usb_spike.m     macOS-only, needs the entitled build). The client redirects a
+                  physical USB device and macrdp presents it as a REAL local device
+                  via a user-space virtual USB host controller (public IOUSBHost
+                  UserHCI / IOUSBHostControllerInterface — the entitlement
+                  com.apple.developer.usb.host-controller-interface). mod.rs is the
+                  cross-platform policy: the MacUsb UrbdrcServerFactory + drive_device
+                  (dedups one controller per physical device on VID:PID:bcdDevice —
+                  the client can double-announce one drive) + the async driver loop
+                  that answers the macOS kernel's EP0 GET_DESCRIPTOR / control-OUT and
+                  the bulk-endpoint transfers by driving the device's UsbHandle over
+                  URBDRC. usb_spike.m is the quarantined Obj-C / IOUSBHost SPI boundary
+                  (the UserHCI command/doorbell state machine + async out-of-band
+                  transfer completion hopping onto the interface's serial queue; also
+                  the standalone --usb-spike synthetic-device path). The URBDRC server
+                  processor + UsbHandle transfer path (get_descriptor / bulk_transfer
+                  / control_transfer_out / select_configuration) live in the vendored
+                  ironrdp-server (src/rdpeusb.rs, divergence 16). VERIFIED end-to-end
+                  on a real Linux FreeRDP client: a redirected flash drive mounts on
+                  the Mac. See docs/usb-redirection-feasibility.md.
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
 vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in via
@@ -252,6 +273,20 @@ vendor/ironrdp-rdpdr/     Local fork of ironrdp-rdpdr 0.5.0 (added 2026-06-16,
                           server-side RdpdrServer processor itself lives in
                           vendor/ironrdp-server/src/rdpdr.rs. See
                           vendor/ironrdp-rdpdr/CLAUDE.md.
+
+vendor/ironrdp-rdpeusb/   Local fork of ironrdp-rdpeusb (added 2026-07-06) for
+                          generic USB redirection (--enable-usb-redirection, opt-in,
+                          EXPERIMENTAL). The MS-RDPEUSB / URBDRC PDU layer (server
+                          UrbdrcServerPdu encode + client UrbdrcClientPdu decode incl.
+                          AddDevice + UrbCompletion, and the TS_URB set — descriptor /
+                          SelectConfiguration / bulk-or-interrupt / control-transfer).
+                          The fork's divergence is a LENIENT UsbDeviceCaps decode (USB
+                          3.x SupportedUsbVer + Other(u32) fallbacks) so a modern USB-3
+                          device's caps parse instead of erroring. The server-direction
+                          UrbdrcServer processor + the async UsbHandle transfer path
+                          that USE these PDUs live in the vendored ironrdp-server
+                          (src/rdpeusb.rs, divergence 16), NOT here. Candidate for
+                          upstream. See vendor/ironrdp-rdpeusb/CLAUDE.md.
 
 vendor/ironrdp-rdpeudp/   NEW sans-I/O crate (added 2026-06-25) for RDP UDP
                           multitransport (--enable-udp-multitransport, feature

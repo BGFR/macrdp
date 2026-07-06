@@ -309,5 +309,16 @@ The entitlement `com.apple.developer.usb.host-controller-interface` is **granted
   3.2: generic control-IN forwarding (GET_DESCRIPTOR-only today), retract/hot-unplug, true
   multi-device.
 
+**Merge-readiness (branch `feat/usb-redirect-spike`).** The feature is fully wired and
+opt-in: `--enable-usb-redirection` (default OFF; when off the URBDRC factory is `None`, so
+the build is inert), `ENABLE_USB_REDIRECTION` in `config.env`, `docs/cli.md` + `--help`
+documented, and the `--fork-workers` supervisor forwards it (verbatim argv). CI green;
+`cargo clippy`/`test`/`fmt` clean. It's **safe to merge as EXPERIMENTAL** (the UDP-multitransport
+precedent) — the risky robustness gap (control-OUT / mass-storage reset not forwarded) is now
+closed and the clean path is field-verified. What's genuinely deferred before it's a *supported*
+feature: generic control-IN forwarding (single-LUN only today), retract/hot-unplug, multi-device,
+and verification of device classes beyond mass storage. Presenting side is macOS-only and needs
+the entitled/provisioned build.
+
 Cross-reference the `docs/known-quirks.md` smart-card note (kext vs dext vs UserHCI
 rationale) and `project_usb_redirection_feasibility` memory for the running log.

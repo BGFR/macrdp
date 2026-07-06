@@ -34,6 +34,7 @@ mod reaper;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
 mod switcher_hud;
+mod usb_redirect;
 mod videotoolbox;
 mod virtual_display;
 
@@ -474,6 +475,18 @@ struct Args {
     #[arg(long)]
     enable_smartcard_redirection: bool,
 
+    /// EXPERIMENTAL, opt-in (default OFF). Generic USB redirection (MS-RDPEUSB /
+    /// the URBDRC dynamic channel): the connecting client redirects a physical USB
+    /// device and macrdp presents it as a REAL local device via a user-space virtual
+    /// USB host controller (IOUSBHost UserHCI) — e.g. a redirected flash drive mounts
+    /// in Finder. Needs the entitled (signed+provisioned) build (the
+    /// com.apple.developer.usb.host-controller-interface entitlement); a plain build
+    /// logs "controller unavailable" and no-ops. Mass storage is verified end-to-end;
+    /// other device classes are untested. The client must opt in too (FreeRDP: /usb;
+    /// mstsc: Local Resources -> More -> USB). macOS-only.
+    #[arg(long)]
+    enable_usb_redirection: bool,
+
     /// EXPERIMENTAL, opt-in (default OFF). Offer RDP UDP multitransport
     /// (MS-RDPEMT over reliable RDPEUDP) to clients that advertise it, and bind a
     /// UDP listener on the same address/port as TCP. On its own, EGFX stays on TCP
@@ -632,6 +645,14 @@ struct Args {
     /// handed to each worker via the internal MACRDP_WORKER_FD env var. macOS-only.
     #[arg(long = "fork-workers")]
     fork_workers: bool,
+
+    /// EXPERIMENTAL research spike (not a real feature): instantiate a user-space
+    /// USB host controller via IOUSBHostControllerInterface to prove the
+    /// generic-USB-redirection route works, print GO/NO-GO, then exit. Requires a
+    /// signed+provisioned build carrying the com.apple.developer.usb.host-controller-
+    /// interface entitlement (packaging/make-app.sh PROVISION_PROFILE=...). macOS-only.
+    #[arg(long = "usb-spike")]
+    usb_spike: bool,
 }
 
 /// Env var the `--fork-workers` supervisor sets on each spawned worker, carrying
@@ -1570,6 +1591,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ENABLE_SMARTCARD_REDIRECTION", false) {
         argv.push("--enable-smartcard-redirection".into());
     }
+    if on("ENABLE_USB_REDIRECTION", false) {
+        argv.push("--enable-usb-redirection".into());
+    }
     if on("ENABLE_UDP_MULTITRANSPORT", false) {
         argv.push("--enable-udp-multitransport".into());
     }
@@ -1681,6 +1705,13 @@ async fn async_main() -> Result<()> {
     // sole source of truth — rebuild Args from it.
     if let Some(cfg_path) = args.config.clone() {
         args = args_from_config(&cfg_path)?;
+    }
+
+    // Research spike (Phase-1b USB-redirection go/no-go): run the UserHCI probe
+    // and exit before any server/auth/capture setup. Requires the signed+
+    // provisioned entitled build; see src/usb_redirect/.
+    if args.usb_spike {
+        std::process::exit(usb_redirect::run_spike());
     }
 
     // RUST_LOG (if set) always wins. Otherwise: --verbose turns on debug
@@ -2424,6 +2455,16 @@ async fn async_main() -> Result<()> {
             None
         };
 
+    // Server-direction USB redirection (--enable-usb-redirection, opt-in). Phase
+    // 3.0 installs the observe-only URBDRC DVC processor (capability exchange +
+    // device-announce logging). Ships inert when the flag is off.
+    let usb_factory: Option<Box<dyn ironrdp_server::UrbdrcServerFactory>> =
+        if args.enable_usb_redirection {
+            Some(Box::new(usb_redirect::MacUsb::new()))
+        } else {
+            None
+        };
+
     // Auth hardening (Tier 1.2): per-IP rate-limit + lockout + audit log via the
     // server's pre-handshake/post-disconnect ConnectionHandler seam. On by default
     // (MACRDP_CONN_GUARD=0 disables). A fork *worker* bypasses the accept loop
@@ -2443,6 +2484,7 @@ async fn async_main() -> Result<()> {
         .with_cliprdr_factory(Some(cliprdr))
         .with_sound_factory(Some(sound))
         .with_rdpdr_factory(rdpdr_factory)
+        .with_usb_factory(usb_factory)
         .with_bitmap_codecs(bitmap_codecs())
         .with_gfx_factory(gfx_factory)
         .with_connection_handler(conn_handler)

@@ -74,6 +74,22 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   (packaging/install-ifd-handler.sh) + a USB trigger
                           #   device. Client opts in too (mstsc Local Resources →
                           #   More → Smart cards; FreeRDP /smartcard). macOS-only.
+--enable-usb-redirection  # EXPERIMENTAL, opt-in (default OFF). Generic USB
+                          #   redirection (MS-RDPEUSB / URBDRC): the client redirects
+                          #   a USB device and the Mac presents it as a REAL local
+                          #   device — e.g. a redirected flash drive mounts in Finder.
+                          #   Presented via a user-space virtual USB host controller
+                          #   (IOUSBHost UserHCI), so it needs the entitled
+                          #   signed+provisioned build (the
+                          #   com.apple.developer.usb.host-controller-interface
+                          #   entitlement); a plain build logs "controller
+                          #   unavailable" and no-ops. Mass storage verified
+                          #   end-to-end (mounts + read/write); other device classes
+                          #   untested; retract/hot-unplug + multi-device not yet
+                          #   done. Client opts in too (mstsc Local Resources → More →
+                          #   USB; FreeRDP /usb:...). As far as is known, the first
+                          #   OSS RDP *server* to present a redirected USB device.
+                          #   macOS-only. See docs/usb-redirection-feasibility.md.
 --no-lazy-paste           # Opt out of lazy Windows→Mac file paste (default ON).
                           #   Lazy streams bytes on Cmd-V (NSFilePresenter) with native
                           #   "Preparing to paste" progress and lower chunk parallelism;

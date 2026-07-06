@@ -14,6 +14,17 @@ fn main() {
         return;
     }
 
+    // Compile the USB-redirection Obj-C shim (Phase-1b UserHCI spike) and link
+    // the public IOUSBHost framework. macOS-only; the module's non-macOS stub
+    // never references the extern, so Linux CI builds without any of this.
+    println!("cargo:rerun-if-changed=src/usb_redirect/usb_spike.m");
+    cc::Build::new()
+        .file("src/usb_redirect/usb_spike.m")
+        .flag("-fobjc-arc")
+        .compile("macrdp_usb_spike");
+    println!("cargo:rustc-link-lib=framework=IOUSBHost");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+
     // /usr/lib/swift holds most of Swift's stdlib on modern macOS — cheap to
     // include even though libswift_Concurrency.dylib lives only in the Xcode
     // toolchain on this version of macOS.

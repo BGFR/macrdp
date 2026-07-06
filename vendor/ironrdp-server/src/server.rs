@@ -381,6 +381,9 @@ pub struct RdpServer {
     sound_factory: Option<Box<dyn SoundServerFactory>>,
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
     rdpdr_factory: Option<Box<dyn crate::RdpdrServerFactory>>,
+    // (divergence 16) server-direction MS-RDPEUSB (URBDRC) USB redirection.
+    // Ships inert: the URBDRC DVC is advertised only when this is `Some`.
+    usb_factory: Option<Box<dyn crate::UrbdrcServerFactory>>,
     echo_handle: EchoServerHandle,
     #[cfg(feature = "egfx")]
     gfx_factory: Option<Box<dyn GfxServerFactory>>,
@@ -569,6 +572,9 @@ pub enum ServerEvent {
     /// Server-initiated RDPDR device-I/O requests, framed by [`RdpdrHandle`]
     /// (drive redirection). Written on the rdpdr static channel.
     Rdpdr(crate::RdpdrServerMessage),
+    /// Server-loop actions for server-direction USB redirection (MS-RDPEUSB) that
+    /// the `URBDRC` processor can't do itself — currently opening a per-device DVC.
+    Urbdrc(crate::UrbdrcServerMessage),
     Echo(EchoServerMessage),
     SetCredentials(Credentials),
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
@@ -603,6 +609,7 @@ impl RdpServer {
         mut sound_factory: Option<Box<dyn SoundServerFactory>>,
         mut cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
         mut rdpdr_factory: Option<Box<dyn crate::RdpdrServerFactory>>,
+        mut usb_factory: Option<Box<dyn crate::UrbdrcServerFactory>>,
         connection_handler: Option<Box<dyn ConnectionHandler>>,
         #[cfg(feature = "egfx")] mut gfx_factory: Option<Box<dyn GfxServerFactory>>,
     ) -> Self {
@@ -623,6 +630,9 @@ impl RdpServer {
         if let Some(rdpdr) = rdpdr_factory.as_mut() {
             rdpdr.set_sender(ev_sender.clone());
         }
+        if let Some(usb) = usb_factory.as_mut() {
+            usb.set_sender(ev_sender.clone());
+        }
         #[cfg(feature = "egfx")]
         if let Some(gfx) = gfx_factory.as_mut() {
             gfx.set_sender(ev_sender.clone());
@@ -635,6 +645,7 @@ impl RdpServer {
             sound_factory,
             cliprdr_factory,
             rdpdr_factory,
+            usb_factory,
             echo_handle: EchoServerHandle::new(ev_sender.clone()),
             #[cfg(feature = "egfx")]
             gfx_factory,
@@ -947,6 +958,16 @@ impl RdpServer {
             if let Some(formats) = self.multitransport_lossy_audio_formats.clone() {
                 dvc = dvc.with_dynamic_channel(AudioLossyDvc::reliable(formats, self.lossy_audio_format.clone()));
                 dvc = dvc.with_dynamic_channel(AudioLossyDvc::lossy());
+            }
+            dvc
+        };
+
+        // (divergence 16) server-direction MS-RDPEUSB (URBDRC) USB redirection.
+        // Advertised only when a factory is installed; byte-identical when None.
+        let dvc = {
+            let mut dvc = dvc;
+            if let Some(usb_factory) = self.usb_factory.as_deref() {
+                dvc = dvc.with_dynamic_channel(usb_factory.build_processor());
             }
             dvc
         };
@@ -1597,6 +1618,48 @@ impl RdpServer {
                             continue;
                         };
                         let data = server_encode_svc_messages(messages, channel_id, user_channel_id)?;
+                        writer.write_all(&data).await?;
+                    }
+                },
+                ServerEvent::Urbdrc(msg) => match msg {
+                    // (divergence 16) The URBDRC processor announced a device and needs
+                    // a per-device DVC. Only the event loop can reach DrdynvcServer, so
+                    // open the channel here and ship the resulting CreateRequest.
+                    crate::UrbdrcServerMessage::OpenDeviceChannel => {
+                        // Clone the sender + presenting-side callback BEFORE the
+                        // &mut self borrow below; the new device processor keeps them
+                        // to ship transfers and to hand the device to the macOS side.
+                        let sender = self.ev_sender.clone();
+                        let device_cb = self.usb_factory.as_deref().and_then(|f| f.device_callback());
+                        let create_msg = {
+                            let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
+                                warn!("No DRDYNVC channel, cannot open URBDRC device channel");
+                                continue;
+                            };
+                            match drdynvc.create_channel(crate::rdpeusb::UrbdrcDeviceProcessor::new(sender, device_cb)) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    warn!(error = %e, "failed to create URBDRC device channel");
+                                    continue;
+                                }
+                            }
+                        };
+                        let Some(drdynvc_channel_id) = self.get_channel_id_by_type::<dvc::DrdynvcServer>() else {
+                            warn!("No DRDYNVC channel id, dropping URBDRC device channel");
+                            continue;
+                        };
+                        let data = server_encode_svc_messages(vec![create_msg], drdynvc_channel_id, user_channel_id)?;
+                        writer.write_all(&data).await?;
+                    }
+                    // A UsbHandle wants to ship a transfer request on an open device
+                    // channel. DVC-frame the messages and write them (mirrors Echo).
+                    crate::UrbdrcServerMessage::SendMessages { channel_id, messages } => {
+                        let dvc_messages = dvc::encode_dvc_messages(channel_id, messages, ChannelFlags::empty())?;
+                        let Some(drdynvc_channel_id) = self.get_channel_id_by_type::<dvc::DrdynvcServer>() else {
+                            warn!("No DRDYNVC channel, dropping URBDRC transfer");
+                            continue;
+                        };
+                        let data = server_encode_svc_messages(dvc_messages, drdynvc_channel_id, user_channel_id)?;
                         writer.write_all(&data).await?;
                     }
                 },

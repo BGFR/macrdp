@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16) below are upstreamed
 AND released — #1276 landing is NOT sufficient.
 
 (1) The original "keep newest queued waves on per-batch overflow"
@@ -1072,3 +1072,183 @@ AND released — #1276 landing is NOT sufficient.
     confirmed clean: per-offer flag Arc identity (no cross-connection
     retirement), CookieRegistry lock ordering/poisoning, inbound-sink
     lifetime, Relaxed ordering adequacy.
+
+(16) Server-direction MS-RDPEUSB (USB redirection, the `URBDRC` DVC) — NOT
+    upstreamed; added 2026-07-06; behind macrdp's `--enable-usb-redirection`
+    (opt-in). New `src/rdpeusb.rs` drives the server side of MS-RDPEUSB against
+    the pinned PDU-only `ironrdp-rdpeusb` crate (added as a **git dep**, not a
+    `[patch.crates-io]` since it's `publish = false`) — we write the processor
+    ourselves rather than adopt the upstream `Urbdrc*Server` (which is ~3 PRs
+    ahead and needs a breaking IronRDP pin bump), the same pattern as the
+    server-direction RDPDR (divergence 11).
+    - `UrbdrcServer` (main channel `DvcProcessor`+`DvcServerProcessor`): drives the
+      MS-RDPEUSB init handshake — RIM capability exchange → `CHANNEL_CREATED`
+      (Direction::ToClient) → `RIMCALL_RELEASE`. Each of those server→client
+      steps is required; the caps exchange alone leaves the client's device
+      registered but un-announced (found live with FreeRDP-with-urbdrc).
+      `RIMCALL_RELEASE` has no dedicated server PDU in the pinned crate, so it's a
+      bare `SharedMsgHeader` (NOTIFY_CLIENT / StreamIdProxy / FunctionId
+      RIMCALL_RELEASE) via a local `UsbHeaderMsg` `DvcEncode` wrapper (the
+      server→client `UrbdrcServerPdu` rides a `UsbDvcPdu` wrapper, à la
+      `OwnedAudioPdu`). On the client's `ADD_VIRTUAL_CHANNEL` (device announce),
+      the processor can't open a DVC itself, so it signals the event loop via the
+      new **`ServerEvent::Urbdrc(UrbdrcServerMessage::OpenDeviceChannel)`**.
+    - Dispatch arm in `client_loop` (mirrors the `ServerEvent::Rdpdr`/`Egfx` arms):
+      `get_svc_processor::<DrdynvcServer>()` → `create_channel(UrbdrcDeviceProcessor)`
+      → `server_encode_svc_messages` the resulting CreateRequest. This is the only
+      place a per-device DVC can be opened (only the loop holds `&mut DrdynvcServer`).
+    - `UrbdrcDeviceProcessor` (per-device channel): on open (`start`) sends its own
+      `RIMCALL_RELEASE` (FreeRDP's `INIT_CHANNEL_OUT` barrier) so the client sends
+      `ADD_DEVICE` with the real descriptors, which `process` decodes/logs.
+    - **Phase 3.1b(2) transfer path (async `UsbHandle`/`UsbRouter`):** transfers ride
+      an async seam modeled on `rdpdr::RdpdrHandle`/`IoRouter`. `UsbRouter` (shared
+      `Arc` inner: `AtomicU32` req id masked to 31 bits + `Mutex<HashMap<id,
+      oneshot>>`) correlates a request with its `URB_COMPLETION` by the TS_URB
+      `RequestId` the completion echoes. `UsbHandle { sender, router, channel_id,
+      device_iface }` (clone it to drive transfers from anywhere) exposes
+      `get_descriptor()`/`device_descriptor()`: register a waiter → ship the request
+      via `ServerEvent::Urbdrc(SendMessages { channel_id, messages })` → the loop
+      DVC-frames it onto the device channel (`encode_dvc_messages` → mirrors the Echo
+      arm) → `await` the completion. `UrbdrcDeviceProcessor::process()` is thin —
+      decode + route: log `ADD_DEVICE`, hand `URB_COMPLETION`s to `router.deliver`,
+      tolerate the rest. `DeviceDescriptor::parse` keeps the USB byte-layout in one
+      typed place (no inline offsets). The DRIVER (what to do with a device) is NOT
+      in the vendored crate — `UrbdrcServerFactory::device_callback() ->
+      Option<UsbDeviceCallback>` (an `Arc<dyn Fn(UsbHandle) + Send + Sync>`) is the
+      seam: the device processor calls it once per `ADD_DEVICE` with the device's
+      handle, and macrdp's `MacUsb` (the presenting side) does the work
+      (`src/usb_redirect/mod.rs::drive_device` — fetch the descriptor now, drive the
+      UserHCI controller next). **VERIFIED live** with a USB-3.2 flash drive over
+      FreeRDP-with-urbdrc: macrdp's driver fetched `vid=0x2174 pid=0x2100
+      usb_version=0x0320` (the drive's real data, read from the device) through the
+      handle. macOS libusb kernel-detach for a mass-storage device was not a blocker
+      after `diskutil unmountDisk`.
+    - **Device lifetime → presenting-side teardown.** `UrbdrcDeviceProcessor` holds a
+      `watch::Sender<bool>` and hands each `UsbHandle` a subscriber; `UsbHandle::closed()`
+      awaits it. The server resets `static_channels` right after the connection loop
+      returns (`server.rs:1244`), so the per-device processor drops on disconnect → the
+      sender drops → every handle's `closed()` resolves. macrdp's `present_device` selects
+      `closed()` against its request channel and destroys the UserHCI controller when it
+      fires — so a controller no longer outlives its connection (VERIFIED: the presented
+      device disappears from `ioreg` on disconnect while the server stays up). `close()` on
+      the DVC processor is never called by the server (same gap as EGFX `on_close`), so this
+      leans on `Drop` via that `static_channels` reset, which is prompt.
+    - **Phase 3.2 SelectConfiguration + typed URB results (2026-07-06).** The router
+      now delivers a `UrbReply { output_buffer, urb_result, hresult }` instead of a
+      bare `Vec<u8>` — a `URB_COMPLETION` carries both the transferred bytes AND the
+      TS_URB result payload (decoded as `TsUrbResultPayload::Raw` by default; a typed
+      request re-decodes it). `UsbHandle::select_configuration(config_bytes)` parses
+      the full config descriptor (`parse_configuration` → `UsbConfigDesc` +
+      per-interface `TsUsbdInterfaceInfo`/`TsUsbdPipeInfo`), sends `TsUrb::SelectConfig`
+      via `TransferInRequest`, and decodes `TsUrbSelectConfigResult` into `UsbPipe
+      { endpoint_address, pipe_handle, is_bulk }` — the client `pipe_handle`s are the
+      prerequisite for any bulk transfer. **VERIFIED the URB is correct** (FreeRDP
+      receives + parses it as `TS_URB_SELECT_CONFIGURATION` and attempts it) but it
+      can't COMPLETE on a macOS-client loopback for a mass-storage device: macOS
+      libusb can't detach the mass-storage kernel driver to claim the interface
+      (`LIBUSB_ERROR_ACCESS`), which every bulk transfer needs — so the loopback
+      proves enumeration + encoding, and the mount needs a claimable-interface client
+      (real Windows / Linux FreeRDP). macrdp bounds it with a 5 s timeout (degrade to
+      enumerate-only, no hang).
+    - **Phase 3.2 bulk transfer forwarding — the redirected drive MOUNTS (2026-07-06).**
+      `UsbHandle::bulk_transfer_in(pipe_handle, length)` / `bulk_transfer_out(pipe_handle,
+      data)` build a `TS_URB_BULK_OR_INTERRUPT_TRANSFER` (via the shared
+      `bulk_transfer_request` helper: `RegisterRequestCallback` + `TransferInRequest`
+      with `output_buffer_size` for IN / `TransferOutRequest` with `output_buffer` for
+      OUT; the `USBD_TRANSFER_DIRECTION_IN` flag MUST match the request PDU or the codec
+      rejects it) on a client `pipe_handle` from SelectConfiguration. macrdp's driver loop
+      forwards each kernel-raised bulk transfer on the mass-storage endpoints (0x01 OUT /
+      0x82 IN) so the macOS driver's SCSI (CBW → data → CSW) rides the client's real drive.
+      **VERIFIED end-to-end on a real Linux FreeRDP client** (UTM-QEMU Ubuntu + USB-2.0 hub
+      for a claimable interface): the ESD310C flash drive mounts on the Mac and stays
+      mounted, 1300+ steady bulk transfers, no resets/timeouts.
+    - **Phase 3.2 control-OUT forwarding (2026-07-06).** `UsbHandle::control_transfer_out(setup,
+      data)` forwards an EP0 host→device request to the real device via a generic
+      `URB_FUNCTION_CONTROL_TRANSFER_EX` (`TsUrb::CtlTransferEx`) on pipe handle 0 (the default
+      control endpoint — MS-RDPEUSB maps `EndpointAddress = PipeHandle & 0xff`), so a
+      mass-storage Bulk-Only Reset / Clear-Feature(HALT) reaches the device for SCSI error
+      recovery instead of being ACKed only on the macOS side. macrdp's Obj-C side forwards on the
+      control STATUS stage and excludes the standard requests the host controller /
+      SelectConfiguration own (SET_ADDRESS/CONFIGURATION/INTERFACE). Regression-verified live (clean
+      path unaffected — SET_CONFIGURATION correctly stays a local ACK); the forward only fires under
+      a device error/stall.
+    - **Hardening pass (2026-07-07, all live-verified with the connect-while-mounted repro).**
+      Five fixes closed real gaps found reviewing the bulk/control path:
+      1. **Disconnect-race deadlock (serious).** Every `UsbHandle` transfer awaited a
+         oneshot whose sender lives in the router map, kept alive by the handle's own
+         `Arc` — so on disconnect the completion never arrives AND the sender never
+         drops, and a bare `rx.await` pends forever, wedging the presenting driver
+         mid-transfer (controller + dedup slot leaked until process exit). New
+         `UsbHandle::await_reply` races every completion against `closed()` (`biased`,
+         reply-first). ALL transfer methods route through it.
+      2. **Generic control-IN forwarding.** New `UsbHandle::control_transfer_in(setup,
+         max_len)` (generic `CONTROL_TRANSFER_EX`, IN direction, raw SETUP preserved);
+         the Obj-C side now forwards ANY device→host EP0 data stage, and the Rust
+         driver routes standard device-recipient `GET_DESCRIPTOR` (`0x80/0x06`) through
+         the dedicated descriptor URB and everything else generically. Fixes mass-storage
+         **Get Max LUN** (`0xa1/0xfe`, multi-LUN devices) — VERIFIED forwarded+answered
+         live — and unblocks HID report-descriptor reads. `control_out_request` was
+         generalized to `control_transfer_request(dir, …)` serving both directions;
+         `get_descriptor` now honors `hresult` (stalls instead of returning 0 bytes,
+         which made the kernel retry).
+      3. **Per-endpoint transfer supersession (fixes a SIGBUS).** When a slow device
+         (Get Max LUN on a flaky drive) missed the kernel's ~5 s EP0 timeout, the kernel
+         re-issued the transfer slot; the late completion of the ORIGINAL then wrote
+         through the retired ring `msg` → SIGBUS in the completion memcpy (the two prior
+         guards — endpoint liveness + object identity — couldn't catch it: same endpoint,
+         still Active, only the ring slot stale). `usb_spike.m` now tracks one outstanding
+         transfer per endpoint (`pendingByEndpoint`) and invalidates the prior on a new
+         raise / EndpointDestroy. VERIFIED: connect-while-mounted (the crash repro) now
+         mounts and stays.
+      4. **Client channel-close → presenting teardown (hot-unplug).** `UrbdrcDeviceProcessor`
+         now implements `DvcProcessor::close` (newly *invoked* by the vendored
+         `ironrdp-dvc` server — divergence 2 there): it flips the liveness `watch` so a
+         client-initiated per-device-channel close (device unplugged/reset on the client)
+         tears the controller down and releases the dedup slot, so a reset re-presents
+         fresh instead of being skipped as a duplicate of a corpse. `closed()` switched
+         from `changed()` to `wait_for(|v| *v)` so a transfer raised after the flip still
+         sees it. **VERIFIED live 2026-07-07**: detaching the drive in UTM logged
+         `per-device channel closed by the client (device unplugged/reset) → destroying
+         UserHCI controller → dedup slot released`, and re-attaching re-presented + mounted.
+    - Remaining: retract/hot-unplug via an explicit RETRACT_DEVICE PDU (the client
+      channel-close path above covers detach/reset — the common case — live-verified),
+      true multi-device (iSerialNumber), non-mass-storage device classes (untested).
+    - **One controller per physical device (dedup, presenting-side).** A client can
+      announce ONE physical device on more than one `URBDRC` channel — FreeRDP announces
+      the same drive twice with instance ids differing by a byte (`…d31`/`…d32`), plus a
+      reset re-announces it — and presenting each spins up its own controller: two virtual
+      drives then **duel over the single client device** (conflicting SCSI, 10 s timeouts,
+      failed mount — observed live). So macrdp's `drive_device` dedups on the device's
+      **stable hardware identity** (`VID:PID:bcdDevice` from the descriptor, fetched before
+      claiming), NOT the client's per-announce `device_instance_id` (which varies). This is
+      a **presenting-side policy**, not in the vendored crate: the server correctly opens
+      the channel the client asked for; the presenting side decides not to present one
+      device twice. (`UsbHandle` still exposes `device_instance_id` for logging.) Limitation:
+      two different drives of the identical model+revision share a key — true multi-device
+      needs the iSerialNumber string, deferred.
+    - A per-connection `MAX_DEVICE_CHANNELS` (32) cap on `OpenDeviceChannel`
+      requests bounds a client that spams `ADD_VIRTUAL_CHANNEL` (each opens a DVC
+      that's never pruned within a connection) from growing the DRDYNVC slab.
+    - **Robustness (load-bearing):** BOTH `process()` impls TOLERATE decode errors
+      (log + `Ok(Vec::new())`, never propagate) — a decode error would otherwise
+      propagate out of `svc.process()?` and tear down the whole RDP session for an
+      opt-in feature (same lesson as the ironrdp-dvc Soft-Sync divergence). The
+      device processor also recognizes `ADD_DEVICE` from its header
+      (`peek_function_id`) so a body it can't parse still logs a GO. **Phase 3.1b
+      (2026-07-06): `ironrdp-rdpeusb` is now VENDORED** (`vendor/ironrdp-rdpeusb`,
+      leaf crate → one-sided path-dep + `ironrdp-str` pinned) with a lenient
+      `UsbDeviceCaps` decode (USB 3.x `SupportedUsbVer` + `Other(u32)` fallbacks on
+      the device-reported version/speed fields — see its CLAUDE.md divergence 1), so
+      the tolerant `process()` is now the belt to that suspenders: a real USB-3.2
+      flash drive's `ADD_DEVICE` **fully parses** (`usb_version=Usb32`), not just
+      header-recognized. Still remaining for 3.1b: the `UsbHandle`/router async
+      transfer path + client-sourced descriptors in `usb_spike.m`.
+    - Wiring: `usb_factory: Option<Box<dyn UrbdrcServerFactory>>` field + `new`
+      param + `set_sender` + `builder.with_usb_factory` + `.with_dynamic_channel`
+      in `attach_channels` (advertised only when `Some` — byte-identical when off).
+      macrdp's `MacUsb` factory captures the connection event sender (`set_sender`)
+      and hands it to each `build_processor()` → `UrbdrcServer::with_sender`.
+    **VERIFIED end-to-end** with a purpose-built FreeRDP-with-urbdrc client
+    (`WITH_URBDRC=ON` + libusb) redirecting a real USB-3 flash drive: full handshake
+    → per-device channel opened → `ADD_DEVICE` received (GO), session stays up
+    (decode error tolerated). Off-path (`--enable-usb-redirection` absent) unchanged.

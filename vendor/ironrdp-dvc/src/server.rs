@@ -221,6 +221,13 @@ impl SvcProcessor for DrdynvcServer {
                     return Err(pdu_other_err!("invalid channel state"));
                 }
                 c.state = ChannelState::Closed;
+                // (macrdp divergence) Notify the processor its channel is gone. The
+                // trait hook (`DvcProcessor::close`, default no-op) existed but was
+                // never invoked here, so a client-initiated close — e.g. URBDRC
+                // closing a per-device channel when the redirected USB device
+                // unplugs/resets — was silently swallowed and the server side kept
+                // driving a dead channel.
+                c.processor.close(close_resp.channel_id());
             }
             DrdynvcClientPdu::Data(data) => {
                 let channel_id = data.channel_id();

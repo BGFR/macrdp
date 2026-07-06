@@ -58,6 +58,12 @@ ironrdp-acceptor = "0.8" # public
 ironrdp-graphics = "0.7" # public
 ironrdp-rdpsnd = "0.7" # public
 ironrdp-rdpdr = "0.5" # public (vendored — server-direction RDPDR)
+# (USB redirection, divergence 16) MS-RDPEUSB PDU codecs — VENDORED at
+# vendor/ironrdp-rdpeusb (extends SupportedUsbVer with USB 3.x so a modern
+# device's ADD_DEVICE caps parse). Resolved via the root [patch.crates-io]
+# path redirect, same as the other vendored ironrdp-* crates. The
+# server-direction `UrbdrcServer` DVC processor lives in src/rdpeusb.rs.
+ironrdp-rdpeusb = "0.1"
 # (vendored, multitransport-only) sans-I/O RDPEUDP/RDPEUDP2 wire codecs +
 # reliability state machine. Local path crate (not on crates.io); its own
 # [patch.crates-io] is ignored in the macrdp build, where ironrdp-core resolves

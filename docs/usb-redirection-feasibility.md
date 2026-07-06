@@ -4,6 +4,42 @@
 USB redirection today, and nothing here is committed work. This is a scoping
 document for if/when it's ever pursued.*
 
+> **UPDATE 2026-07-01 — Phase 1 is GO ✅, and two early assumptions below were wrong.**
+> The entitlement `com.apple.developer.usb.host-controller-interface` was **granted** to
+> team QGLA89KHM7 (FB23363880). A signed+provisioned spike (`--usb-spike`, `src/usb_redirect/`)
+> successfully instantiated `IOUSBHostControllerInterface` and the kernel driver began the
+> command exchange — so the entitlement functions and the UserHCI route is real.
+> **Correction 1:** `IOUSBHostControllerInterface` is **NOT undocumented private SPI** — it's a
+> **public, SDK-headered API** in the public `IOUSBHost.framework` (headers incl.
+> `IOUSBHostControllerInterface.h` + the `IOUSBHostCI*StateMachine.h` set) with a complete
+> example `main()`; its doc literally says it "create[s] synthetic USB devices." So the "private
+> SPI, hard, moving target" and "VirtualHere binary forensics" framing below is superseded —
+> it's documented-API FFI. **Correction 2:** upstream IronRDP now has an `ironrdp-rdpeusb` crate
+> with the **complete bidirectional MS-RDPEUSB PDU layer** (client processor only), so the
+> protocol side is no longer "unprecedented / from scratch" — we add a server processor on that.
+> See the `project_usb_redirection_feasibility` memory for specifics.
+>
+> **UPDATE 2026-07-06 — Phases 2 and 3.0 are GO ✅ (branch `feat/usb-redirect-spike`).**
+> - **Phase 2 (P2 below) DONE** (commit `ab91a63`): `src/usb_redirect/usb_spike.m` drives the
+>   full UserHCI command/doorbell loop and a **hardcoded synthetic device enumerates LIVE in
+>   `ioreg`** (VID 0x1209/PID 0x0001, complete EP0 GET_DESCRIPTOR flow, clean teardown) — the
+>   whole macOS *presenting* path is proven end-to-end.
+> - **Phase 3.0 (a go/no-go slice of P3) DONE** (commit `3a435c9`): a server-direction
+>   `URBDRC` DVC **observe-only** processor (`--enable-usb-redirection`) advertises the channel
+>   and runs the MS-RDPEUSB capability exchange. **Verified GREEN locally with a plain
+>   `cargo build`** — the observe-only slice never touches the UserHCI controller, so **no
+>   entitled build is needed for it** — via `sdl-freerdp /usb:auto`: the client opens URBDRC
+>   (Create status 0) and completes the caps exchange (S_OK). (No `AddDevice` only because the
+>   test Mac had no attachable USB device to redirect; channel-open + caps-exchange is the gate.)
+>   Built as vendored `ironrdp-server` **divergence 16** (`src/rdpeusb.rs`), with
+>   `ironrdp-rdpeusb` pulled in as a pinned-rev git dep (PDU-only — we drive the wire ourselves,
+>   the same pattern as the server-direction RDPDR, rather than bump the whole IronRDP pin).
+> - **Remaining: Phase 3.1** — the real forward: grow the processor into the handshake state
+>   machine + an async `UsbHandle`/`UsbRouter` transfer path, and evolve `usb_spike.m` from
+>   hardcoded+synchronous to client-sourced+async (the IOUSBHost-serial-queue ↔ tokio boundary).
+>   Live 3.1 verification needs a physical redirectable device (or mstsc + the RemoteFX-USB
+>   Group Policy). The *presenting* side still gates to the signed+provisioned entitled build.
+
 ## TL;DR
 
 - **macrdp could, in principle, do generic USB redirection**, and the right macOS
@@ -118,19 +154,30 @@ redirected device is in use.)
 
 ## What it would take for macrdp (concretely)
 
-1. **Request + obtain** `com.apple.developer.usb.host-controller-interface` for the
-   macrdp signing team. (Phase-0 spike — cheap, decisive.) A ready-to-paste
-   Feedback Assistant draft is in [`docs/entitlement-request.md`](entitlement-request.md).
-2. **Provisioning profile.** macrdp currently signs with plain **Developer ID** (no
-   profile). A managed entitlement must be embedded in a **provisioning profile**, so
-   the build/sign pipeline (`packaging/make-app.sh`) gains a profile step.
-3. **Implement `MS-RDPEUSB` server-direction** in vendored IronRDP (URB DVC,
-   device announce/remove, transfer types). Large.
-4. **Implement the UserHCI virtual controller** (`src/usb/…`): create the controller
-   interface, drive the device/endpoint state machines, translate EUSB URBs ↔ the
-   controller-interface transfer model. Private SPI; expect a `private_api.rs`-style
-   maintenance boundary like `virtual_display/`.
-5. **Lifecycle**: device hotplug on client redirect, teardown on disconnect/exit.
+*(Status tags added 2026-07-06; the two UPDATE blocks at the top of this file carry
+the current picture — this list is the original scoping.)*
+
+1. **[DONE ✅]** **Request + obtain** `com.apple.developer.usb.host-controller-interface`
+   for the macrdp signing team. Granted to QGLA89KHM7 (FB23363880). The
+   Feedback Assistant draft used is in [`docs/entitlement-request.md`](entitlement-request.md).
+2. **[DONE ✅]** **Provisioning profile.** `packaging/make-app.sh` gained the profile step
+   (`PROVISION_PROFILE=…`); the profile embedding the USB capability lives OUTSIDE the repo
+   at `../provcerts/macrdp/macrdpprov2.provisionprofile` (a secret — never committed).
+3. **[IN PROGRESS]** **Implement `MS-RDPEUSB` server-direction** in vendored IronRDP (URB DVC,
+   device announce/remove, transfer types). **Phases 3.0 + 3.1a done** (divergence 16): the
+   init handshake, the per-device DVC (opened via `ServerEvent::Urbdrc` →
+   `DrdynvcServer::create_channel`), and the client's real `ADD_DEVICE` are all verified live.
+   Remaining: **3.1b** — extend the caps decoder to parse USB-3 descriptors (vendor
+   `ironrdp-rdpeusb`) + the async transfer path. Note: we write our own `UrbdrcServer` on the
+   pinned `ironrdp-rdpeusb` **PDU layer** rather than adopt upstream's newer processor (which
+   needs a breaking IronRDP pin bump).
+4. **[IN PROGRESS — Phase 2 done]** **Implement the UserHCI virtual controller**
+   (`src/usb_redirect/usb_spike.m`): **Phase 2 done** — a hardcoded synthetic device
+   enumerates in `ioreg`. *(Correction: this is public IOUSBHost.framework API, NOT private
+   SPI — see the top-of-file corrections; no `private_api.rs`-style boundary needed.)* Phase 3.1
+   swaps the hardcoded descriptors + synchronous transfers for the client's real device over
+   URBDRC (the async IOUSBHost-queue ↔ tokio boundary).
+5. **[Phase 3.1+]** **Lifecycle**: device hotplug on client redirect, teardown on disconnect/exit.
 
 ## Distribution / packaging implications
 
@@ -177,7 +224,123 @@ That contrast is the whole reason macrdp's redirection strategy is device-class-
 - `usbipd-mac` (USB/IP for macOS, blocked on the DriverKit USB entitlement):
   <https://github.com/beriberikix/usbipd-mac>
 
+## First open-source RDP *server* to present a redirected USB device
+
+As far as is known, macrdp is the **first (and currently only) open-source RDP server
+that receives a client-redirected USB device and presents it as a real local device** —
+i.e. it implements the **server direction** of MS-RDPEUSB (`URBDRC`) plus local device
+synthesis. This mirrors the project's earlier UDP-multitransport finding (first OSS RDP
+server with a working UDP data path).
+
+The claim is specifically about the *server/presenting* side. USB redirection in RDP is
+inherently **client → server**: the client owns the physical device and redirects it; the
+server must synthesize/present it. On real Windows RDS that presentation is done by
+**closed-source kernel drivers** (`usbdr.sys` / the RemoteFX USB bus), not by any OSS
+server.
+
+**Verified 2026-07-06 against current sources:**
+- **FreeRDP** — the most complete OSS RDP stack — implements `URBDRC` **client-direction
+  only**. Its `channels/urbdrc/` tree has `client/` and `common/` subdirectories and **no
+  `server/`** (`common/` is just the shared `msusb.c` PDU marshaling). FreeRDP issue
+  [#7558 "server side channel not implemented"](https://github.com/FreeRDP/FreeRDP/issues/7558)
+  documents this, and the project's own guidance states "the urbdrc channel has only the
+  client side implemented." So FreeRDP-based servers (ogon, freerdp-shadow) cannot present a
+  redirected device.
+- **xrdp**, **ogon**, **gnome-remote-desktop** — no USB-redirection code at all (source-tree
+  greps for `urbdrc`/`usbredir`/`usb_redir` returned nothing).
+- **VirtualHere / usbip** present remote USB devices, but they are **USB-over-IP** (their own
+  protocols), not RDP — and VirtualHere is proprietary.
+
+Scope/hedge: "as far as is known" — this is a negative-existence claim over the OSS
+landscape; it's backed by the source checks above, not a proof no niche project exists.
+macrdp's presenting side is macOS-only (the UserHCI virtual host controller) and needs the
+entitled/provisioned build.
+
 ## Status
 
-**Exploratory / not started.** No code, no entitlement requested. Cross-reference:
-the `docs/known-quirks.md` smart-card note (kext vs dext vs UserHCI rationale).
+**In progress — Phases 1, 2, 3.0, 3.1, and 3.2 (bulk/mount) done** (branch `feat/usb-redirect-spike`).
+The entitlement `com.apple.developer.usb.host-controller-interface` is **granted**
+(team QGLA89KHM7, FB23363880).
+- **Phase 1 GO** — entitled build instantiates the `IOUSBHostControllerInterface`
+  controller; kernel command exchange begins.
+- **Phase 2 GO** — a hardcoded synthetic device enumerates live in `ioreg` (the whole
+  macOS UserHCI presenting path proven).
+- **Phase 3.0 GO** — the server-direction `URBDRC` DVC + MS-RDPEUSB init handshake
+  (caps → CHANNEL_CREATED → RIMCALL_RELEASE) drives a real client to announce a device
+  (`ADD_VIRTUAL_CHANNEL`), verified with a purpose-built FreeRDP-with-urbdrc client.
+- **Phase 3.1a GO** — the server opens a **per-device DVC** on demand
+  (`ServerEvent::Urbdrc` → `DrdynvcServer::create_channel`) and the client's real
+  `ADD_DEVICE` (device descriptors) arrives on it (verified live, USB-3 flash drive).
+  Both DVC `process()` impls tolerate decode errors so an unparseable PDU never tears
+  down the session. Vendored `ironrdp-server` divergence 16.
+- **Phase 3.1b(1) GO** — `ADD_DEVICE` now **fully parses** (real descriptors). The
+  pinned `ironrdp-rdpeusb` `SupportedUsbVer` enum stopped at USB 2.0 and rejected a
+  modern device's `0x320` (USB 3.2) caps, so `ironrdp-rdpeusb` is now **vendored** with
+  a lenient `UsbDeviceCaps` decode (USB 3.x versions + `Other(u32)` fallbacks). Verified
+  live with a USB-3.2 flash drive (`usb_version=Usb32`). See
+  `vendor/ironrdp-rdpeusb/CLAUDE.md`.
+- **Phase 3.1b(2a) GO** — a server-initiated **`GET_DESCRIPTOR` control transfer**
+  round-trips real device data (proven observe-only, plain `cargo build`): on
+  `ADD_DEVICE` the device processor sends `RegisterRequestCallback` +
+  `TransferInRequest` and decodes the `URB_COMPLETION`. Verified live with a USB-3.2
+  flash drive (`vid=0x2174 pid=0x2100`, read from the physical device). This de-risks
+  the transfer path — libusb kernel-detach was not a blocker after unmount.
+- **Phase 3.1b(2b) GO ✅✅ — a real client device enumerates locally** — the transfer
+  path became a reusable async `UsbHandle`/`UsbRouter`, the driver moved into macrdp
+  (`src/usb_redirect/mod.rs::drive_device`) via a `device_callback` seam, and
+  `usb_spike.m` was restructured to async out-of-band EP0 completion. Verified entitled +
+  FreeRDP: the client-redirected ESD310C flash drive enumerates on macrdp's UserHCI
+  controller with descriptors/strings sourced live from the client. Controller is
+  destroyed on disconnect (a `watch` channel → `closed()`), not leaked.
+- **Phase 3.2 GO ✅✅ — the redirected USB DRIVE MOUNTS on the Mac** — `select_configuration`
+  opens the device's pipe handles and `UsbHandle::bulk_transfer_in/out`
+  (`TsUrb::BulkInterruptTransfer`) forward bulk on the mass-storage endpoints, so the
+  macOS driver's SCSI (CBW/data/CSW) rides the client's real drive. **Verified end-to-end
+  on a real Linux FreeRDP client** (UTM-QEMU Ubuntu + a USB-2.0 hub for a claimable
+  interface): the ESD310C **mounts and stays mounted** (1300+ steady bulk transfers, no
+  resets/timeouts). Two load-bearing fixes: dedup on the device's hardware identity
+  (`VID:PID:bcdDevice`, not the client's per-announce instance id — FreeRDP double-announces
+  one drive, and presenting both duels two virtual drives over the one device); and an
+  Obj-C endpoint-object identity guard on completion (a device reset destroys+recreates the
+  endpoint at the same key, leaving a pending transfer pointing into a freed ring). EP0
+  **control-OUT** forwarding also lands (mass-storage Bulk-Only Reset / Clear-Feature ride
+  `UsbHandle::control_transfer_out`, a generic `CONTROL_TRANSFER_EX`; SET_ADDRESS/CONFIGURATION/
+  INTERFACE stay local ACKs), regression-verified but only fires under a SCSI error.
+
+- **Hardening pass (2026-07-07)** — five review fixes, all live-verified with the
+  connect-while-mounted repro (the drive now mounts and stays, no crash): (1) a
+  **disconnect-race deadlock** — every transfer awaited a oneshot the handle's own
+  `Arc` kept alive, so a disconnect mid-transfer pended forever and leaked the
+  controller + dedup slot; `UsbHandle::await_reply` now races every completion against
+  `closed()`. (2) **Generic control-IN forwarding** — `UsbHandle::control_transfer_in`
+  forwards any non-standard-descriptor EP0 IN with the raw SETUP preserved, so
+  mass-storage **Get Max LUN** (multi-LUN) and HID report-descriptor reads work
+  (verified forwarded+answered live). (3) **Per-endpoint transfer supersession** — a
+  slow device missing the kernel's ~5 s EP0 timeout let the kernel re-issue the ring
+  slot while the original completion was still in flight → SIGBUS through the retired
+  slot; the Obj-C side now invalidates a superseded transfer at raise time (this was
+  the connect-while-mounted crash). (4) **Client channel-close → teardown** — a
+  one-line `ironrdp-dvc` divergence now invokes the (previously-dead) `DvcProcessor::close`
+  hook, so the client closing a per-device channel (device unplug/reset) tears the
+  controller down and releases the dedup slot → hot-unplug + reset re-present
+  (**verified live 2026-07-07**: detach in UTM → controller torn down → re-attach
+  re-mounts). (5) the Obj-C OUT data-stage reports the full accepted length.
+  **"Disk not ejected properly" on client-stop is expected/correct** — the client
+  vanished, macrdp destroys the virtual controller (verified to cleanly remove the
+  device from `ioreg`), and macOS reports the ungraceful removal exactly like yanking a
+  USB stick. Remaining 3.2: an explicit RETRACT_DEVICE PDU (channel-close covers the
+  common case), true multi-device (iSerialNumber), non-mass-storage device classes.
+
+**Merge-readiness (branch `feat/usb-redirect-spike`).** The feature is fully wired and
+opt-in: `--enable-usb-redirection` (default OFF; when off the URBDRC factory is `None`, so
+the build is inert), `ENABLE_USB_REDIRECTION` in `config.env`, `docs/cli.md` + `--help`
+documented, and the `--fork-workers` supervisor forwards it (verbatim argv). CI green;
+`cargo clippy`/`test`/`fmt` clean. It's **safe to merge as EXPERIMENTAL** (the UDP-multitransport
+precedent) — the robustness gaps found in review (disconnect-race deadlock, the connect-while-
+mounted SIGBUS, control forwarding, hot-unplug) are now closed and the clean path is
+field-verified. What's genuinely deferred before it's a *supported* feature: an explicit
+RETRACT_DEVICE PDU, true multi-device, and verification of device classes beyond mass storage.
+Presenting side is macOS-only and needs the entitled/provisioned build.
+
+Cross-reference the `docs/known-quirks.md` smart-card note (kext vs dext vs UserHCI
+rationale) and `project_usb_redirection_feasibility` memory for the running log.

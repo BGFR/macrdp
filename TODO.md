@@ -244,12 +244,119 @@ then delete; promote a parked item to *In flight* when work actually starts.
   machines, which isn't a realistic target. See the "Industry status" + "P2.3 FEC capture
   RESULT" notes in `docs/rdp-udp-multitransport-feasibility.md` + `vendor/ironrdp-rdpeudp/CLAUDE.md`.
 
-- [ ] **Generic USB redirection (MS-RDPEUSB).**
-  Viable path scoped: user-space virtual USB host controller via `IOUSBHostControllerInterface`/
-  `AppleUSBUserHCI` (no kext/dext). **Blocked on Apple:** entitlement
-  `com.apple.developer.usb.host-controller-interface` submitted 2026-06-24 (FB23363880),
-  awaiting grant. Then: MS-RDPEUSB server-direction + UserHCI; gates to a signed build.
-  See `docs/usb-redirection-feasibility.md`.
+- [ ] **Generic USB redirection (MS-RDPEUSB) — through Phase 3.2 bulk GO ✅✅ (a redirected USB DRIVE MOUNTS on the Mac); control-OUT + retract/multi-device remain.**
+  Path: user-space virtual USB host controller via `IOUSBHostControllerInterface` (a **public,
+  headered** IOUSBHost.framework API — NOT private SPI as first assumed; its doc says it
+  "create[s] synthetic USB devices"). Entitlement `com.apple.developer.usb.host-controller-
+  interface` **GRANTED** to QGLA89KHM7 (FB23363880). All on branch `feat/usb-redirect-spike`.
+  - **Phase 1 GO** (2026-07-01, `--usb-spike`): entitled signed+provisioned build creates the
+    controller and the kernel begins the command exchange → the route works.
+  - **Phase 2 GO** (2026-07-06, commit `ab91a63`): `usb_spike.m` drives the full UserHCI
+    command/doorbell loop and a **hardcoded synthetic device enumerates LIVE in `ioreg`**
+    (VID 0x1209/PID 0x0001, full EP0 GET_DESCRIPTOR flow, clean teardown) — the whole macOS
+    presenting path proven.
+  - **Phase 3.0 GO** (2026-07-06, commit `3a435c9`): URBDRC server-direction DVC observe-only
+    spike GREEN — `--enable-usb-redirection` advertises URBDRC + runs the MS-RDPEUSB capability
+    exchange; **verified locally with a plain `cargo build`** (observe-only never touches the
+    UserHCI controller, so no entitled build needed) via `sdl-freerdp /usb:auto` → channel
+    opens (Create status 0) + caps exchange completes (S_OK). No `AddDevice` only because this
+    Mac has no attachable USB device to redirect. Vendored ironrdp-server **divergence 16**
+    (`src/rdpeusb.rs`, `UrbdrcServer` + `UrbdrcServerFactory`); `ironrdp-rdpeusb` added as a
+    git dep (PDU-only, pinned rev).
+  - **Phase 3.1a GO** (2026-07-06, commit `38a360f`): the server opens a **per-device DVC** on
+    the client's `ADD_VIRTUAL_CHANNEL` (via `ServerEvent::Urbdrc(OpenDeviceChannel)` → the
+    `client_loop` dispatch arm → `DrdynvcServer::create_channel(UrbdrcDeviceProcessor)`), which
+    sends `RIMCALL_RELEASE` on the new channel so the client sends `ADD_DEVICE` with the real
+    descriptors. **Verified live** with a USB-3 flash drive (full handshake → per-device channel
+    → `ADD_DEVICE` = GO, session stays up). Both `process()` impls now **tolerate decode errors**
+    (never tear down the session) — the pinned `ironrdp-rdpeusb` `SupportedUsbVer` enum stops at
+    USB 2.0 and rejects the SSD's USB-3.2 `0x320` caps; adversarially code-reviewed clean.
+  - **Phase 3.1b(1) GO** (2026-07-06, commit `357624f`): the client's `ADD_DEVICE` now **fully
+    parses** (real descriptors, `usb_version=Usb32`), not just header-recognized. **Vendored
+    `ironrdp-rdpeusb`** (leaf crate → clean one-sided path-dep; `ironrdp-str` pinned via
+    `[patch.crates-io]`) with a **lenient `UsbDeviceCaps` decode**: `SupportedUsbVer`/`UsbdiVer`/
+    `UsbBusIfaceVer`/`DeviceSpeed` are data-carrying enums with the named values + an `Other(u32)`
+    fallback (named `Usb30/31/32` added), so a modern USB-3 device's `0x320` caps parse instead of
+    erroring. Verified live with a USB-3.2 flash drive. New vendored crate divergence.
+  - **Phase 3.1b(2a) GO** (2026-07-06, commit `5ef8e4b`): a server-initiated **`GET_DESCRIPTOR`
+    control transfer round-trips REAL device data** — proven observe-only (plain `cargo build`).
+    On `ADD_DEVICE` the device processor reactively sends `RegisterRequestCallback` +
+    `TransferInRequest(GetDescriptorFromDevice)` and decodes the `URB_COMPLETION`. Verified live:
+    `hresult=0x0 descriptor_len=18 vid=0x2174 pid=0x2100` — the flash drive's real VID/PID read
+    from the physical device. macOS libusb kernel-detach was not a blocker after unmount. This
+    de-risks the whole transfer path.
+  - **Phase 3.1b(2b) part 1 GO** (2026-07-06, commit `e79fa85`): the transfer path is now a
+    reusable **async `UsbHandle`/`UsbRouter`** seam (the RdpdrHandle pattern: 31-bit req-id router +
+    `ServerEvent::Urbdrc(SendMessages)` DVC-framed dispatch + `DeviceDescriptor::parse`), and
+    `UrbdrcDeviceProcessor::process()` shrank to decode-and-route. The descriptor fetch is driven
+    through the handle. Verified live: `vid=0x2174 pid=0x2100 usb_version=0x0320`. (Elegance
+    refactor of the 2a spike.)
+  - **Phase 3.1b(2b) part 2-i GO** (2026-07-06, commit `c464df0`): **device-callback seam** — the
+    vendored server exposes the `UsbHandle` via `UrbdrcServerFactory::device_callback()`; the
+    per-device processor invokes it on `ADD_DEVICE`, and the transfer **driver moved into macrdp**
+    (`src/usb_redirect/mod.rs::drive_device`). `UrbdrcDeviceProcessor::process()` is now purely
+    decode-and-route. Verified live: macrdp's driver fetched `vid=0x2174 pid=0x2100`. (Elegance +
+    the exact hook the UserHCI integration needs.)
+  - **Phase 3.1b(2b) part 2-ii GO ✅✅ — the Phase-3.1 milestone: a REAL client device enumerates
+    locally** (2026-07-06, commits `c1f27e9` async boundary + `0ffc6ce` presenting side). 2-ii-a
+    restructured `usb_spike.m` to async out-of-band EP0 completion (raise via C callback → leave
+    outstanding → `macrdp_usb_complete_control_in` `dispatch_async`es onto `self.interface.queue`),
+    with a bidirectional C ABI; `--usb-spike` still enumerates the synthetic device through it.
+    2-ii-b wired `imp::present_device`: create the controller with a Rust control-IN callback that
+    services each EP0 `GET_DESCRIPTOR` by awaiting `handle.get_descriptor()` (client-sourced over
+    URBDRC). **Verified entitled + FreeRDP `/usb` (flash drive): ESD310C, idVendor=0x2174 enumerates
+    on macrdp's UserHCI controller** (ioreg `@80100000`), device + string descriptors (product
+    "ESD310C") sourced live from the client. Non-entitled path degrades gracefully.
+  - **Phase 3.2 STARTED — teardown/lifecycle first** (2026-07-06, commit `3c85845`): the UserHCI
+    controller is now destroyed on disconnect instead of leaking until process exit.
+    `UrbdrcDeviceProcessor` holds a `watch::Sender`; each `UsbHandle` carries a subscriber +
+    `closed()`; the server's `static_channels` reset (`server.rs:1244`) drops the processor on
+    disconnect → `closed()` resolves → `present_device` breaks + destroys the controller. Verified
+    entitled + FreeRDP: the presented ESD310C disappears from `ioreg` on disconnect (server stays up).
+  - **Phase 3.2 bulk — SelectConfiguration done + a test-environment blocker found** (2026-07-06,
+    commit `ed735d5`): implemented the config-descriptor parse + `SelectConfiguration` URB (opens the
+    device's pipe handles — the prerequisite for bulk). **The URB is verified correct** (FreeRDP
+    parses + attempts it), **but the macOS-client loopback CANNOT complete bulk**: FreeRDP's libusb
+    can't detach the mass-storage kernel driver to claim the interface (`LIBUSB_ERROR_ACCESS`), which
+    every bulk transfer needs. EP0 descriptor reads work; bulk needs a **claimable-interface client**
+    (a real Windows client, or a **Linux FreeRDP** client where kernel-detach works — i.e. a second
+    machine). Degrades to enumerate-only (5s timeout).
+  - **Phase 3.2 dedup — done, then hardened** (2026-07-06, commits `e11eed3` then the bulk commit):
+    one presenting controller per physical device. Initially keyed on the client's
+    `device_instance_id`, but that FAILED live — FreeRDP announces one drive twice with instance ids
+    differing by a byte (`…d31`/`…d32`), so both presented and the two virtual drives **dueled over
+    the single client device** (10 s SCSI timeouts, failed mount). Re-keyed on the device's **stable
+    hardware identity** (`VID:PID:bcdDevice`, fetched before claiming). Unit-tested; verified live
+    (one controller, clean mount). (`UsbHandle` still exposes `device_instance_id` for logging.)
+  - **Phase 3.2 bulk IN/OUT forwarding GO ✅✅ — the redirected DRIVE MOUNTS** (2026-07-06): 
+    `UsbHandle::bulk_transfer_in/out` (`TsUrb::BulkInterruptTransfer` on the SelectConfiguration pipe
+    handles, direction-flag matched) + the Obj-C ring walk generalized to the bulk endpoints (async
+    out-of-band completion, same pattern as EP0 control-IN). **Verified end-to-end on a real Linux
+    FreeRDP client** (UTM-QEMU Ubuntu 24.04 ARM64 + a **USB-2.0 hub** to force high-speed so the
+    USB-3.2 SSD enumerates in QEMU; guest `udev MODE=0666` + `xfreerdp /usb:dbg,id:2174:2100`): the
+    ESD310C **mounts on the Mac and stays mounted**, 1300+ steady bulk transfers, no resets/timeouts.
+    Two load-bearing fixes: (1) the hardware-identity dedup above; (2) an Obj-C **endpoint-object
+    identity guard** on completion — a device reset destroys+recreates the endpoint at the same key
+    (new Active object, but `p.msg` points into the old freed ring), so the completion is dropped
+    unless `endpoints[key]` is still the same object it was raised on (fixes a reset-during-bulk
+    SIGSEGV the liveness check alone missed).
+  - **Phase 3.2 control-OUT forwarding — done** (2026-07-06): EP0 host→device requests the local
+    kernel issues (mass-storage Bulk-Only Reset `bReq=0xff` / Clear-Feature(HALT)) now forward to the
+    real device via `UsbHandle::control_transfer_out` (generic `URB_FUNCTION_CONTROL_TRANSFER_EX`,
+    pipe 0 = default control EP); the standard requests the host controller / SelectConfiguration own
+    (SET_ADDRESS/CONFIGURATION/INTERFACE) stay a local ACK. Obj-C forwards on the control STATUS stage
+    (no-data requests are SETUP→STATUS) and stashes any DATA-OUT payload. **Regression-verified live**
+    (clean mount + file copy + remove/reattach unaffected; the one SET_CONFIGURATION seen was correctly
+    NOT forwarded). The forward path itself only fires under a SCSI error/stall, which didn't occur, so
+    it's implemented + regression-safe but not yet observed firing.
+  - **Phase 3.2 remaining** — generic control-IN forwarding (currently GET_DESCRIPTOR-only; a class/
+    vendor control-IN like Get Max LUN is stalled → assumed 1 LUN, wrong for a multi-LUN device),
+    mid-session retract/hot-unplug, true multi-device (needs iSerialNumber to distinguish identical
+    models), dispatch-priority tier. Test rig proven: UTM-QEMU Linux FreeRDP + USB-2.0 hub. Plan:
+    `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
+  Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
+  into the signature). See `docs/usb-redirection-feasibility.md` +
+  [[project_usb_redirection_feasibility]].
 
 - [ ] **Multi-monitor (client-side multi-display).**
   Extend `--virtual-display` to N monitors. **Blocker:** the git-pinned `ironrdp-acceptor`

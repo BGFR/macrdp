@@ -1,28 +1,27 @@
-// Phase-2 spike for generic USB redirection (MS-RDPEUSB): present a *synthetic*
-// USB device to macOS via the PUBLIC IOUSBHost.framework user-space host
-// controller (`IOUSBHostControllerInterface`, entitlement
-// com.apple.developer.usb.host-controller-interface).
+// USB redirection (MS-RDPEUSB) macOS presenting side: drive a user-space virtual
+// USB host controller (PUBLIC IOUSBHost.framework `IOUSBHostControllerInterface`,
+// entitlement com.apple.developer.usb.host-controller-interface) so a device
+// enumerates in `ioreg -p IOUSB`.
 //
 // Phase 1b proved the controller instantiates in a signed+provisioned build.
-// Phase 2 drives the full UserHCI command protocol so the kernel enumerates a
-// device:
-//   2a  controller + port state machines — bring the controller Active, power
-//       the root port, assert connect → kernel issues PortReset.
-//   2b  DeviceCreate → device state machine + EP0 endpoint; answer the kernel's
-//       GET_DESCRIPTOR control transfers with a hardcoded vendor-specific
-//       device so it shows up in `ioreg -p IOUSB` / `system_profiler
-//       SPUSBDataType`.
+// Phase 2 drives the full UserHCI command protocol — controller / port / device /
+// endpoint state machines + EP0 GET_DESCRIPTOR handling.
 //
-// The device here is HARDCODED (VID 0x1209 / PID 0x0001, pid.codes test id) —
-// Phase 3 replaces the descriptor bytes + transfer handling with the real
-// device redirected over MS-RDPEUSB from the RDP client. This stays the
-// maintenance boundary for the Apple USB SPI: every IOUSBHost touch lives here
-// (mirrors src/virtual_display/private_api.rs). Built only on macOS (build.rs
-// compiles it + links IOUSBHost); driven from src/usb_redirect/mod.rs behind the
-// default-OFF `--usb-spike` flag.
+// Phase 3.1b(2b) makes the EP0 data path ASYNCHRONOUS + client-sourced. A
+// control-IN data stage no longer completes inline: it is raised to Rust via a
+// C callback (the kernel wants these descriptor bytes), left OUTSTANDING in the
+// transfer ring, and completed later — out-of-band — when the answer arrives
+// (from the RDP client over URBDRC, or, for the standalone `--usb-spike` path,
+// from a built-in hardcoded callback). The completion hops back onto the
+// interface's serial queue via `dispatch_async` (`self.interface.queue`), so the
+// `memcpy` + `enqueueTransferCompletionForMessage:` + ring re-walk all run on the
+// one thread that owns the ring — the queue<->tokio boundary. SETUP / STATUS /
+// host-to-device stages still complete synchronously on the queue.
 //
-// The command + doorbell handlers run on the interface's own serial dispatch
-// queue, so the mutable device/endpoint maps need no locking.
+// This stays the maintenance boundary for the Apple USB SPI: every IOUSBHost
+// touch lives here (mirrors src/virtual_display/private_api.rs). Built only on
+// macOS (build.rs compiles it + links IOUSBHost). The C ABI at the bottom is the
+// bidirectional FFI src/usb_redirect/mod.rs drives.
 
 #import <Foundation/Foundation.h>
 #import <IOUSBHost/IOUSBHostControllerInterface.h>
@@ -31,6 +30,13 @@
 #import <IOUSBHost/IOUSBHostCIDeviceStateMachine.h>
 #import <IOUSBHost/IOUSBHostCIEndpointStateMachine.h>
 #import <mach/mach_time.h>
+
+// ---- bidirectional C ABI (see the bottom of the file for the functions) ------
+// ObjC -> Rust: the kernel wants a control-IN data stage serviced. The Rust side
+// must eventually call macrdp_usb_complete_control_in(handle, token, ...). The
+// callback MUST NOT retain `setup8` (it points at stack memory) — copy it and
+// return immediately (non-blocking). `max_len` is the data-stage buffer capacity.
+typedef void (*MacrdpUsbControlInFn)(void *ctx, uint64_t token, const uint8_t *setup8, uint32_t max_len);
 
 // ---- helpers to pull a bit-field out of an IOUSBHostCIMessage word ----------
 // The SDK phase macros expand to the low bit index; mask is (range) already
@@ -44,57 +50,6 @@ static inline BOOL msg_valid(const IOUSBHostCIMessage *m) {
 static inline BOOL msg_no_response(const IOUSBHostCIMessage *m) {
     return (m->control & IOUSBHostCIMessageControlNoResponse) != 0;
 }
-
-// ---- hardcoded synthetic device descriptors ---------------------------------
-// Full-speed vendor-specific device with only the default control endpoint.
-// Full-speed so the host never asks for a device_qualifier (which we'd stall).
-static const uint8_t kDeviceDescriptor[] = {
-    0x12,       // bLength
-    0x01,       // bDescriptorType = DEVICE
-    0x00, 0x02, // bcdUSB 2.00
-    0xFF,       // bDeviceClass = vendor-specific
-    0x00,       // bDeviceSubClass
-    0x00,       // bDeviceProtocol
-    0x40,       // bMaxPacketSize0 = 64
-    0x09, 0x12, // idVendor  = 0x1209 (pid.codes)
-    0x01, 0x00, // idProduct = 0x0001 (test)
-    0x00, 0x01, // bcdDevice 1.00
-    0x01,       // iManufacturer -> string 1
-    0x02,       // iProduct      -> string 2
-    0x00,       // iSerialNumber -> none
-    0x01,       // bNumConfigurations
-};
-
-static const uint8_t kConfigDescriptor[] = {
-    // Configuration descriptor
-    0x09,       // bLength
-    0x02,       // bDescriptorType = CONFIGURATION
-    0x12, 0x00, // wTotalLength = 18
-    0x01,       // bNumInterfaces
-    0x01,       // bConfigurationValue
-    0x00,       // iConfiguration
-    0x80,       // bmAttributes = bus-powered
-    0x32,       // bMaxPower = 100 mA
-    // Interface descriptor (control-only, no data endpoints)
-    0x09,       // bLength
-    0x04,       // bDescriptorType = INTERFACE
-    0x00,       // bInterfaceNumber
-    0x00,       // bAlternateSetting
-    0x00,       // bNumEndpoints (EP0 only)
-    0xFF,       // bInterfaceClass = vendor-specific
-    0x00,       // bInterfaceSubClass
-    0x00,       // bInterfaceProtocol
-    0x00,       // iInterface
-};
-
-static const uint8_t kStringLangIDs[] = { 0x04, 0x03, 0x09, 0x04 }; // 0x0409 en-US
-static const uint8_t kStringManufacturer[] = {
-    0x0E, 0x03, 'm', 0, 'a', 0, 'c', 0, 'r', 0, 'd', 0, 'p', 0,
-};
-static const uint8_t kStringProduct[] = {
-    0x16, 0x03, 'm', 0, 'a', 0, 'c', 0, 'r', 0, 'd', 0, 'p', 0,
-    ' ', 0, 'U', 0, 'S', 0, 'B', 0,
-};
 
 // USB standard request / descriptor-type constants.
 enum {
@@ -110,6 +65,18 @@ enum {
 static const NSUInteger kSyntheticDeviceAddress = 1;
 
 // -----------------------------------------------------------------------------
+// One outstanding (raised-but-not-yet-completed) control-IN transfer, keyed by a
+// monotonic token. The raw `msg` pointer stays valid because the ring slot is
+// pinned until we enqueue its completion (and the queue is serial, so no
+// concurrent ring mutation).
+@interface MacrdpPendingTransfer : NSObject
+@property(nonatomic, assign) const IOUSBHostCIMessage *msg;
+@property(nonatomic, strong) NSNumber *endpointKey;
+@end
+@implementation MacrdpPendingTransfer
+@end
+
+// -----------------------------------------------------------------------------
 
 @interface MacrdpUsbController : NSObject
 @property(nonatomic, strong) IOUSBHostControllerInterface *interface;
@@ -119,6 +86,12 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, IOUSBHostCIEndpointStateMachine *> *endpoints;
 // endpoint key -> pending 8-byte SETUP packet for the in-flight control transfer
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSData *> *pendingSetup;
+// token -> outstanding control-IN transfer awaiting an out-of-band completion
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, MacrdpPendingTransfer *> *tokenMap;
+@property(nonatomic, assign) uint64_t nextToken;
+// ObjC -> Rust control-IN callback + its opaque context (set at create).
+@property(nonatomic, assign) MacrdpUsbControlInFn controlInCb;
+@property(nonatomic, assign) void *cbCtx;
 @property(nonatomic, assign) BOOL portConnected;
 @end
 
@@ -129,6 +102,7 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         _devices = [NSMutableDictionary dictionary];
         _endpoints = [NSMutableDictionary dictionary];
         _pendingSetup = [NSMutableDictionary dictionary];
+        _tokenMap = [NSMutableDictionary dictionary];
     }
     return self;
 }
@@ -336,40 +310,107 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 
 // ---- control-transfer (EP0) handling ----------------------------------------
 
-// Build the response bytes for a GET_DESCRIPTOR request. Returns the descriptor
-// and its length via out-params; returns NO to STALL an unsupported request.
-- (BOOL)descriptorForValue:(uint16_t)wValue index:(uint16_t)wIndex
-                     bytes:(const uint8_t **)outBytes length:(size_t *)outLen {
-    uint8_t descType = (wValue >> 8) & 0xff;
-    uint8_t descIndex = wValue & 0xff;
-    switch (descType) {
-        case kUsbDescDevice:
-            *outBytes = kDeviceDescriptor;
-            *outLen = sizeof(kDeviceDescriptor);
-            return YES;
-        case kUsbDescConfiguration:
-            *outBytes = kConfigDescriptor;
-            *outLen = sizeof(kConfigDescriptor);
-            return YES;
-        case kUsbDescString:
-            switch (descIndex) {
-                case 0: *outBytes = kStringLangIDs;      *outLen = sizeof(kStringLangIDs);      return YES;
-                case 1: *outBytes = kStringManufacturer; *outLen = sizeof(kStringManufacturer); return YES;
-                case 2: *outBytes = kStringProduct;      *outLen = sizeof(kStringProduct);      return YES;
-                default: return NO;
-            }
-        default:
-            return NO; // device_qualifier, BOS, etc. — stall.
+// Is the current transfer a control-IN data stage we forward to the client (i.e.
+// a device-to-host GET_DESCRIPTOR whose bytes must come from the real device)?
+// Those go async; everything else (SETUP, STATUS, host-to-device, non-descriptor)
+// completes synchronously on the queue in `processTransfer:`.
+- (BOOL)transferIsForwardedControlIn:(const IOUSBHostCIMessage *)msg endpointKey:(NSNumber *)key {
+    if (msg_type(msg) != IOUSBHostCIMessageTypeNormalTransfer) {
+        return NO;
+    }
+    NSData *setupData = self.pendingSetup[key];
+    if (setupData == nil || setupData.length < 8) {
+        return NO;
+    }
+    const uint8_t *s = setupData.bytes;
+    return (s[0] & kUsbDirDeviceToHost) && s[1] == kUsbReqGetDescriptor;
+}
+
+// Raise a control-IN data stage to the Rust side and leave it outstanding. The
+// completion arrives later via macrdp_usb_complete_control_in(token, ...).
+- (void)raiseControlIn:(const IOUSBHostCIMessage *)msg endpointKey:(NSNumber *)key {
+    NSData *setupData = self.pendingSetup[key];
+    uint8_t setup[8] = {0};
+    if (setupData && setupData.length >= 8) {
+        memcpy(setup, setupData.bytes, 8);
+    }
+    NSUInteger bufLen = (msg->data0 & IOUSBHostCINormalTransferData0Length)
+                      >> IOUSBHostCINormalTransferData0LengthPhase;
+
+    uint64_t token = ++self.nextToken;
+    MacrdpPendingTransfer *p = [MacrdpPendingTransfer new];
+    p.msg = msg;
+    p.endpointKey = key;
+    self.tokenMap[@(token)] = p;
+
+    uint16_t wValue = (uint16_t)setup[2] | ((uint16_t)setup[3] << 8);
+    NSLog(@"[usb2] EP0 control-IN forwarded token=%llu wValue=0x%04x bufLen=%lu",
+          token, wValue, (unsigned long)bufLen);
+
+    if (self.controlInCb) {
+        self.controlInCb(self.cbCtx, token, setup, (uint32_t)bufLen);
+    } else {
+        // No presenting side wired — we can't source the bytes, so stall.
+        [self completeControlInToken:token bytes:NULL len:0 status:IOUSBHostCIMessageStatusStallError];
     }
 }
 
-// Process one transfer message on EP0; return the status to complete it with and
-// the number of bytes moved. Interprets SETUP/DATA/STATUS stages of a control
-// transfer, currently only servicing GET_DESCRIPTOR (everything else is ACKed
-// with zero-length so enumeration's SET_ADDRESS / SET_CONFIGURATION succeed).
+// Complete a previously-raised control-IN transfer, hopping onto the interface's
+// serial queue so the memcpy + ring enqueue + re-walk run where the ring lives.
+// Safe to call from any thread (tokio, or the built-in spike callback).
+- (void)completeControlInToken:(uint64_t)token
+                         bytes:(const uint8_t *)bytes
+                           len:(uint32_t)len
+                        status:(IOUSBHostCIMessageStatus)status {
+    // Copy the answer now — the caller's buffer may be transient.
+    NSData *data = (bytes != NULL && len > 0) ? [NSData dataWithBytes:bytes length:len] : nil;
+    dispatch_queue_t queue = self.interface.queue;
+    if (queue == nil) {
+        NSLog(@"[usb2] completion token=%llu: no interface queue (torn down?)", token);
+        return;
+    }
+    dispatch_async(queue, ^{
+        MacrdpPendingTransfer *p = self.tokenMap[@(token)];
+        if (p == nil) {
+            NSLog(@"[usb2] completion for unknown/expired token=%llu", token);
+            return;
+        }
+        [self.tokenMap removeObjectForKey:@(token)];
+        IOUSBHostCIEndpointStateMachine *ep = self.endpoints[p.endpointKey];
+        if (ep == nil) {
+            NSLog(@"[usb2] completion token=%llu: endpoint gone", token);
+            return;
+        }
+        const IOUSBHostCIMessage *msg = p.msg;
+        NSUInteger moved = 0;
+        if (status == IOUSBHostCIMessageStatusSuccess && data != nil) {
+            NSUInteger bufLen = (msg->data0 & IOUSBHostCINormalTransferData0Length)
+                              >> IOUSBHostCINormalTransferData0LengthPhase;
+            void *buf = (void *)(uintptr_t)msg->data1;
+            if (buf != NULL) {
+                NSUInteger n = data.length < bufLen ? data.length : bufLen;
+                memcpy(buf, data.bytes, n);
+                moved = n;
+            }
+        }
+        NSError *e = nil;
+        if (![ep enqueueTransferCompletionForMessage:msg status:status transferLength:moved error:&e]) {
+            NSLog(@"[usb2] async enqueueTransferCompletion token=%llu failed: %@", token, e);
+            return;
+        }
+        NSLog(@"[usb2] EP0 control-IN completed token=%llu moved=%lu status=%ld",
+              token, (unsigned long)moved, (long)status);
+        // Drain the STATUS stage + any further transfers now that the ring advanced.
+        [self walkEndpoint:p.endpointKey];
+    });
+}
+
+// Synchronously service SETUP / STATUS / host-to-device / non-forwarded stages,
+// returning the completion status + bytes moved. Control-IN data stages that need
+// client bytes are handled out-of-band by raiseControlIn: and never reach here.
 - (IOUSBHostCIMessageStatus)processTransfer:(const IOUSBHostCIMessage *)msg
-                                  endpointKey:(NSNumber *)key
-                                transferLength:(NSUInteger *)outLen {
+                                endpointKey:(NSNumber *)key
+                             transferLength:(NSUInteger *)outLen {
     *outLen = 0;
     uint32_t type = msg_type(msg);
     switch (type) {
@@ -390,41 +431,51 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
                   setup[0], setup[1], wValue, wIndex, wLength);
             return IOUSBHostCIMessageStatusSuccess;
         }
-        case IOUSBHostCIMessageTypeNormalTransfer: {
-            // Control-transfer data stage. Buffer VA is in our address space.
-            NSUInteger bufLen = (msg->data0 & IOUSBHostCINormalTransferData0Length)
-                              >> IOUSBHostCINormalTransferData0LengthPhase;
-            void *buf = (void *)(uintptr_t)msg->data1;
-            NSData *setupData = self.pendingSetup[key];
-            if (setupData == nil || buf == NULL) {
-                return IOUSBHostCIMessageStatusSuccess; // nothing to move
-            }
-            const uint8_t *s = setupData.bytes;
-            uint8_t bmRequestType = s[0];
-            uint8_t bRequest = s[1];
-            uint16_t wValue = (uint16_t)s[2] | ((uint16_t)s[3] << 8);
-            uint16_t wIndex = (uint16_t)s[4] | ((uint16_t)s[5] << 8);
-            if ((bmRequestType & kUsbDirDeviceToHost) && bRequest == kUsbReqGetDescriptor) {
-                const uint8_t *desc = NULL; size_t descLen = 0;
-                if (![self descriptorForValue:wValue index:wIndex bytes:&desc length:&descLen]) {
-                    NSLog(@"[usb2] EP0 GET_DESCRIPTOR unsupported wValue=0x%04x -> STALL", wValue);
-                    return IOUSBHostCIMessageStatusStallError;
-                }
-                size_t n = descLen < bufLen ? descLen : bufLen;
-                memcpy(buf, desc, n);
-                *outLen = n;
-                NSLog(@"[usb2] EP0 IN data stage moved %zu bytes (wValue=0x%04x)", n, wValue);
-                return IOUSBHostCIMessageStatusSuccess;
-            }
-            // Host-to-device or unhandled IN: accept without moving data.
+        case IOUSBHostCIMessageTypeNormalTransfer:
+            // A data stage that reached the sync path is host-to-device or a
+            // non-descriptor IN — accept without moving data (SET_* have no data,
+            // and enumeration only needs GET_DESCRIPTOR, which goes async).
             return IOUSBHostCIMessageStatusSuccess;
-        }
         case IOUSBHostCIMessageTypeStatusTransfer:
             [self.pendingSetup removeObjectForKey:key];
             return IOUSBHostCIMessageStatusSuccess;
         default:
             NSLog(@"[usb2] unexpected transfer type=0x%02x on EP0", type);
             return IOUSBHostCIMessageStatusSuccess;
+    }
+}
+
+// Walk an endpoint's transfer ring, completing sync stages inline and stopping at
+// the first stage that must be forwarded to the client (which is raised async and
+// re-enters this walk from its completion). Runs on the serial queue.
+- (void)walkEndpoint:(NSNumber *)key {
+    IOUSBHostCIEndpointStateMachine *ep = self.endpoints[key];
+    if (ep == nil) {
+        return;
+    }
+    NSError *e = nil;
+    for (int guard = 0; guard < 64; guard++) {
+        if (ep.endpointState != IOUSBHostCIEndpointStateActive) {
+            break;
+        }
+        const IOUSBHostCIMessage *msg = ep.currentTransferMessage;
+        if (msg == NULL || !msg_valid(msg)) {
+            break;
+        }
+        if ([self transferIsForwardedControlIn:msg endpointKey:key]) {
+            [self raiseControlIn:msg endpointKey:key];
+            return; // async; completion re-walks
+        }
+        NSUInteger moved = 0;
+        IOUSBHostCIMessageStatus status = [self processTransfer:msg endpointKey:key transferLength:&moved];
+        if (msg_no_response(msg)) {
+            NSLog(@"[usb2] EP0 transfer with NoResponse set — stopping ring walk");
+            break;
+        }
+        if (![ep enqueueTransferCompletionForMessage:msg status:status transferLength:moved error:&e]) {
+            NSLog(@"[usb2] enqueueTransferCompletion failed: %@", e);
+            break;
+        }
     }
 }
 
@@ -442,29 +493,7 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         NSLog(@"[usb2] processDoorbell dev=%lu ep=0x%02lx failed: %@", (unsigned long)addr, (unsigned long)epAddr, e);
         return;
     }
-    // Walk the transfer ring: the SM follows Link messages and advances
-    // currentTransferMessage as each is completed. Guard against a stuck ring.
-    for (int guard = 0; guard < 64; guard++) {
-        if (ep.endpointState != IOUSBHostCIEndpointStateActive) {
-            break;
-        }
-        const IOUSBHostCIMessage *msg = ep.currentTransferMessage;
-        if (msg == NULL || !msg_valid(msg)) {
-            break;
-        }
-        NSUInteger moved = 0;
-        IOUSBHostCIMessageStatus status = [self processTransfer:msg endpointKey:key transferLength:&moved];
-        if (msg_no_response(msg)) {
-            // No completion expected; without an advance API this would loop —
-            // control transfers always want a response, so treat as done.
-            NSLog(@"[usb2] EP0 transfer with NoResponse set — stopping ring walk");
-            break;
-        }
-        if (![ep enqueueTransferCompletionForMessage:msg status:status transferLength:moved error:&e]) {
-            NSLog(@"[usb2] enqueueTransferCompletion failed: %@", e);
-            break;
-        }
-    }
+    [self walkEndpoint:key];
 }
 
 - (BOOL)startWithError:(NSError **)error {
@@ -523,22 +552,145 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 
 @end
 
-// Returns 0 if the controller was created and the enumeration loop ran (see the
-// logs for how far the kernel drove us / whether the device appeared), non-zero
-// on init failure.
+// ---- hardcoded synthetic descriptors (standalone --usb-spike path only) ------
+// Full-speed vendor-specific device with only the default control endpoint.
+// Full-speed so the host never asks for a device_qualifier (which we'd stall).
+static const uint8_t kDeviceDescriptor[] = {
+    0x12,       // bLength
+    0x01,       // bDescriptorType = DEVICE
+    0x00, 0x02, // bcdUSB 2.00
+    0xFF,       // bDeviceClass = vendor-specific
+    0x00,       // bDeviceSubClass
+    0x00,       // bDeviceProtocol
+    0x40,       // bMaxPacketSize0 = 64
+    0x09, 0x12, // idVendor  = 0x1209 (pid.codes)
+    0x01, 0x00, // idProduct = 0x0001 (test)
+    0x00, 0x01, // bcdDevice 1.00
+    0x01,       // iManufacturer -> string 1
+    0x02,       // iProduct      -> string 2
+    0x00,       // iSerialNumber -> none
+    0x01,       // bNumConfigurations
+};
+static const uint8_t kConfigDescriptor[] = {
+    0x09, 0x02, 0x12, 0x00, 0x01, 0x01, 0x00, 0x80, 0x32,  // configuration
+    0x09, 0x04, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00,  // interface (EP0 only)
+};
+static const uint8_t kStringLangIDs[] = { 0x04, 0x03, 0x09, 0x04 }; // 0x0409 en-US
+static const uint8_t kStringManufacturer[] = {
+    0x0E, 0x03, 'm', 0, 'a', 0, 'c', 0, 'r', 0, 'd', 0, 'p', 0,
+};
+static const uint8_t kStringProduct[] = {
+    0x16, 0x03, 'm', 0, 'a', 0, 'c', 0, 'r', 0, 'd', 0, 'p', 0,
+    ' ', 0, 'U', 0, 'S', 0, 'B', 0,
+};
+
+static BOOL spike_descriptor_for_value(uint16_t wValue, const uint8_t **outBytes, size_t *outLen) {
+    uint8_t descType = (wValue >> 8) & 0xff;
+    uint8_t descIndex = wValue & 0xff;
+    switch (descType) {
+        case kUsbDescDevice:        *outBytes = kDeviceDescriptor; *outLen = sizeof(kDeviceDescriptor); return YES;
+        case kUsbDescConfiguration: *outBytes = kConfigDescriptor; *outLen = sizeof(kConfigDescriptor); return YES;
+        case kUsbDescString:
+            switch (descIndex) {
+                case 0: *outBytes = kStringLangIDs;      *outLen = sizeof(kStringLangIDs);      return YES;
+                case 1: *outBytes = kStringManufacturer; *outLen = sizeof(kStringManufacturer); return YES;
+                case 2: *outBytes = kStringProduct;      *outLen = sizeof(kStringProduct);      return YES;
+                default: return NO;
+            }
+        default:
+            return NO; // device_qualifier, BOS, etc. — stall.
+    }
+}
+
+// =============================================================================
+// C ABI — the bidirectional FFI src/usb_redirect/mod.rs drives.
+// =============================================================================
+
+// Create the controller. `cb`/`ctx` receive each EP0 control-IN forward; may be
+// NULL (then such transfers stall). Returns an opaque, retained handle (destroy
+// releases it), or NULL on init failure with *err set.
+void *macrdp_usb_controller_create(MacrdpUsbControlInFn cb, void *ctx, int *err) {
+    @autoreleasepool {
+        MacrdpUsbController *c = [[MacrdpUsbController alloc] init];
+        c.controlInCb = cb;
+        c.cbCtx = ctx;
+        NSError *e = nil;
+        if (![c startWithError:&e] || (e != nil && e.code != KERN_SUCCESS)) {
+            NSLog(@"[usb2] NO-GO: IOUSBHostControllerInterface init failed: %@", e);
+            if (err) {
+                *err = e ? (int)e.code : -1;
+            }
+            return NULL;
+        }
+        if (err) {
+            *err = 0;
+        }
+        return (void *)CFBridgingRetain(c);
+    }
+}
+
+// Complete a previously-raised control-IN transfer. status 0 = success (copy
+// `bytes`), nonzero = stall. Safe to call from any thread; hops to the queue.
+void macrdp_usb_complete_control_in(void *handle, uint64_t token,
+                                    const uint8_t *bytes, uint32_t len, int32_t status) {
+    if (handle == NULL) {
+        return;
+    }
+    MacrdpUsbController *c = (__bridge MacrdpUsbController *)handle;
+    IOUSBHostCIMessageStatus st = (status == 0) ? IOUSBHostCIMessageStatusSuccess : IOUSBHostCIMessageStatusStallError;
+    [c completeControlInToken:token bytes:bytes len:len status:st];
+}
+
+// Stop + release a controller created by macrdp_usb_controller_create.
+void macrdp_usb_controller_destroy(void *handle) {
+    if (handle == NULL) {
+        return;
+    }
+    @autoreleasepool {
+        MacrdpUsbController *c = (MacrdpUsbController *)CFBridgingRelease(handle);
+        [c stop];
+    }
+}
+
+// ---- standalone --usb-spike: synthetic device via the async path -------------
+// Proves the async completion boundary end-to-end with no RDP client: the kernel
+// raises each EP0 control-IN through the same callback the real driver uses, and
+// this built-in handler answers from the hardcoded descriptors above.
+static void *g_spike_handle = NULL;
+
+static void spike_control_in_cb(void *ctx, uint64_t token, const uint8_t *setup8, uint32_t max_len) {
+    (void)ctx;
+    (void)max_len;
+    uint8_t bRequest = setup8[1];
+    uint16_t wValue = (uint16_t)setup8[2] | ((uint16_t)setup8[3] << 8);
+    if (bRequest != kUsbReqGetDescriptor) {
+        macrdp_usb_complete_control_in(g_spike_handle, token, NULL, 0, 1); // stall
+        return;
+    }
+    const uint8_t *desc = NULL;
+    size_t descLen = 0;
+    if (!spike_descriptor_for_value(wValue, &desc, &descLen)) {
+        NSLog(@"[usb2] spike: unsupported GET_DESCRIPTOR wValue=0x%04x -> STALL", wValue);
+        macrdp_usb_complete_control_in(g_spike_handle, token, NULL, 0, 1);
+        return;
+    }
+    macrdp_usb_complete_control_in(g_spike_handle, token, desc, (uint32_t)descLen, 0);
+}
+
 int macrdp_usb_spike_run(void) {
     @autoreleasepool {
-        MacrdpUsbController *controller = [[MacrdpUsbController alloc] init];
-        NSError *error = nil;
-        if (![controller startWithError:&error] || (error != nil && error.code != KERN_SUCCESS)) {
-            NSLog(@"[usb2] NO-GO: IOUSBHostControllerInterface init failed: %@", error);
-            return error != nil ? (int)error.code : -1;
+        int err = 0;
+        void *handle = macrdp_usb_controller_create(spike_control_in_cb, NULL, &err);
+        if (handle == NULL) {
+            return err != 0 ? err : -1;
         }
-        NSLog(@"[usb2] controller created — driving enumeration. Watch for the "
+        g_spike_handle = handle;
+        NSLog(@"[usb2] controller created (async path) — driving enumeration. Watch for the "
               @"synthetic device (VID 0x1209/PID 0x0001) in `ioreg -p IOUSB` / "
               @"`system_profiler SPUSBDataType`. Holding 20s...");
         [NSThread sleepForTimeInterval:20.0];
-        [controller stop];
+        g_spike_handle = NULL;
+        macrdp_usb_controller_destroy(handle);
         NSLog(@"[usb2] controller destroyed; exiting");
         return 0;
     }

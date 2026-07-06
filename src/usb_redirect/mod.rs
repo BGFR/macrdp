@@ -22,20 +22,22 @@ use tokio::sync::mpsc;
 
 /// macrdp's server-direction USB-redirection factory (`--enable-usb-redirection`).
 ///
-/// **Phase 3.0 (observe-only):** installs the vendored `UrbdrcServer` DVC
-/// processor, which advertises the `URBDRC` channel, runs the MS-RDPEUSB
-/// capability exchange, and logs what a client announces — answering the
-/// go/no-go question (does a reachable client open `URBDRC` + announce a device?)
-/// before the transfer-forwarding machinery is built. Phase 3.1 grows this to
-/// build a `UsbHandle` and own the macOS UserHCI controller.
+/// Installs the vendored `UrbdrcServer` DVC processor, which advertises the
+/// `URBDRC` channel and drives the MS-RDPEUSB init handshake. **Phase 3.1a:** it
+/// retains the connection's server-event sender (captured in `set_sender`) and
+/// hands it to each built processor so the processor can request a per-device DVC
+/// (which surfaces the real device's `ADD_DEVICE` descriptors). Transfers +
+/// the macOS UserHCI controller are Phase 3.1b.
 ///
 /// Cross-platform (pure protocol policy — no macOS APIs yet); the presenting
 /// side lives behind `--usb-spike` / the future controller module.
-pub struct MacUsb;
+pub struct MacUsb {
+    sender: Option<mpsc::UnboundedSender<ServerEvent>>,
+}
 
 impl MacUsb {
     pub fn new() -> Self {
-        Self
+        Self { sender: None }
     }
 }
 
@@ -46,15 +48,14 @@ impl Default for MacUsb {
 }
 
 impl ServerEventSender for MacUsb {
-    fn set_sender(&mut self, _sender: mpsc::UnboundedSender<ServerEvent>) {
-        // No-op for the observe-only spike — there's no outbound `UsbHandle` yet
-        // (Phase 3.1 will retain the sender to drive transfers).
+    fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
+        self.sender = Some(sender);
     }
 }
 
 impl UrbdrcServerFactory for MacUsb {
     fn build_processor(&self) -> UrbdrcServer {
-        UrbdrcServer::new()
+        UrbdrcServer::with_sender(self.sender.clone())
     }
 }
 

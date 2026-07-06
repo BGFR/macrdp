@@ -1072,3 +1072,55 @@ AND released — #1276 landing is NOT sufficient.
     confirmed clean: per-offer flag Arc identity (no cross-connection
     retirement), CookieRegistry lock ordering/poisoning, inbound-sink
     lifetime, Relaxed ordering adequacy.
+
+(16) Server-direction MS-RDPEUSB (USB redirection, the `URBDRC` DVC) — NOT
+    upstreamed; added 2026-07-06; behind macrdp's `--enable-usb-redirection`
+    (opt-in). New `src/rdpeusb.rs` drives the server side of MS-RDPEUSB against
+    the pinned PDU-only `ironrdp-rdpeusb` crate (added as a **git dep**, not a
+    `[patch.crates-io]` since it's `publish = false`) — we write the processor
+    ourselves rather than adopt the upstream `Urbdrc*Server` (which is ~3 PRs
+    ahead and needs a breaking IronRDP pin bump), the same pattern as the
+    server-direction RDPDR (divergence 11).
+    - `UrbdrcServer` (main channel `DvcProcessor`+`DvcServerProcessor`): drives the
+      MS-RDPEUSB init handshake — RIM capability exchange → `CHANNEL_CREATED`
+      (Direction::ToClient) → `RIMCALL_RELEASE`. Each of those server→client
+      steps is required; the caps exchange alone leaves the client's device
+      registered but un-announced (found live with FreeRDP-with-urbdrc).
+      `RIMCALL_RELEASE` has no dedicated server PDU in the pinned crate, so it's a
+      bare `SharedMsgHeader` (NOTIFY_CLIENT / StreamIdProxy / FunctionId
+      RIMCALL_RELEASE) via a local `UsbHeaderMsg` `DvcEncode` wrapper (the
+      server→client `UrbdrcServerPdu` rides a `UsbDvcPdu` wrapper, à la
+      `OwnedAudioPdu`). On the client's `ADD_VIRTUAL_CHANNEL` (device announce),
+      the processor can't open a DVC itself, so it signals the event loop via the
+      new **`ServerEvent::Urbdrc(UrbdrcServerMessage::OpenDeviceChannel)`**.
+    - Dispatch arm in `client_loop` (mirrors the `ServerEvent::Rdpdr`/`Egfx` arms):
+      `get_svc_processor::<DrdynvcServer>()` → `create_channel(UrbdrcDeviceProcessor)`
+      → `server_encode_svc_messages` the resulting CreateRequest. This is the only
+      place a per-device DVC can be opened (only the loop holds `&mut DrdynvcServer`).
+    - `UrbdrcDeviceProcessor` (per-device channel): on open (`start`) sends its own
+      `RIMCALL_RELEASE` (FreeRDP's `INIT_CHANNEL_OUT` barrier) so the client sends
+      `ADD_DEVICE` with the real descriptors, which `process` decodes/logs.
+    - A per-connection `MAX_DEVICE_CHANNELS` (32) cap on `OpenDeviceChannel`
+      requests bounds a client that spams `ADD_VIRTUAL_CHANNEL` (each opens a DVC
+      that's never pruned within a connection) from growing the DRDYNVC slab.
+    - **Robustness (load-bearing):** BOTH `process()` impls TOLERATE decode errors
+      (log + `Ok(Vec::new())`, never propagate) — a decode error would otherwise
+      propagate out of `svc.process()?` and tear down the whole RDP session for an
+      opt-in feature (same lesson as the ironrdp-dvc Soft-Sync divergence). This is
+      NOT hypothetical: the pinned `ironrdp-rdpeusb` `SupportedUsbVer` enum stops at
+      USB 2.0 (0x200) and rejects USB 3.x (0x300/0x310/**0x320**) `AddDevice` caps,
+      which every modern USB-3 device sends — the device processor recognizes
+      `ADD_DEVICE` from its header (`peek_function_id`, pinned decoder only) and logs
+      it as a GO even when the caps body fails to parse. **Phase 3.1b** must extend
+      the caps decoder (vendor `ironrdp-rdpeusb` — a leaf crate, so a one-sided
+      path-dep vendor + pull `ironrdp-str`) to actually parse USB-3 descriptors, and
+      add the `UsbHandle`/router async transfer path.
+    - Wiring: `usb_factory: Option<Box<dyn UrbdrcServerFactory>>` field + `new`
+      param + `set_sender` + `builder.with_usb_factory` + `.with_dynamic_channel`
+      in `attach_channels` (advertised only when `Some` — byte-identical when off).
+      macrdp's `MacUsb` factory captures the connection event sender (`set_sender`)
+      and hands it to each `build_processor()` → `UrbdrcServer::with_sender`.
+    **VERIFIED end-to-end** with a purpose-built FreeRDP-with-urbdrc client
+    (`WITH_URBDRC=ON` + libusb) redirecting a real USB-3 flash drive: full handshake
+    → per-device channel opened → `ADD_DEVICE` received (GO), session stays up
+    (decode error tolerated). Off-path (`--enable-usb-redirection` absent) unchanged.

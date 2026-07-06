@@ -572,6 +572,9 @@ pub enum ServerEvent {
     /// Server-initiated RDPDR device-I/O requests, framed by [`RdpdrHandle`]
     /// (drive redirection). Written on the rdpdr static channel.
     Rdpdr(crate::RdpdrServerMessage),
+    /// Server-loop actions for server-direction USB redirection (MS-RDPEUSB) that
+    /// the `URBDRC` processor can't do itself — currently opening a per-device DVC.
+    Urbdrc(crate::UrbdrcServerMessage),
     Echo(EchoServerMessage),
     SetCredentials(Credentials),
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
@@ -1615,6 +1618,32 @@ impl RdpServer {
                             continue;
                         };
                         let data = server_encode_svc_messages(messages, channel_id, user_channel_id)?;
+                        writer.write_all(&data).await?;
+                    }
+                },
+                ServerEvent::Urbdrc(msg) => match msg {
+                    // (divergence 16) The URBDRC processor announced a device and needs
+                    // a per-device DVC. Only the event loop can reach DrdynvcServer, so
+                    // open the channel here and ship the resulting CreateRequest.
+                    crate::UrbdrcServerMessage::OpenDeviceChannel => {
+                        let create_msg = {
+                            let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
+                                warn!("No DRDYNVC channel, cannot open URBDRC device channel");
+                                continue;
+                            };
+                            match drdynvc.create_channel(crate::rdpeusb::UrbdrcDeviceProcessor::new()) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    warn!(error = %e, "failed to create URBDRC device channel");
+                                    continue;
+                                }
+                            }
+                        };
+                        let Some(drdynvc_channel_id) = self.get_channel_id_by_type::<dvc::DrdynvcServer>() else {
+                            warn!("No DRDYNVC channel id, dropping URBDRC device channel");
+                            continue;
+                        };
+                        let data = server_encode_svc_messages(vec![create_msg], drdynvc_channel_id, user_channel_id)?;
                         writer.write_all(&data).await?;
                     }
                 },

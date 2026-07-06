@@ -124,10 +124,16 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           trigger device — see [smart-card-redirection.md](smart-card-redirection.md).
                           macOS-only.
 --enable-usb-redirection  EXPERIMENTAL. Let the connecting client redirect a
-                          physical USB device (mstsc: Local Resources → More →
-                          USB; FreeRDP: /usb:...); macrdp presents it as a REAL
-                          local device — e.g. a redirected flash drive mounts in
-                          Finder. Off by default. Generic USB redirection
+                          physical USB device; macrdp presents it as a REAL local
+                          device — e.g. a redirected flash drive mounts in Finder.
+                          Off by default. The client must opt in too. mstsc gates
+                          this behind Group Policy: enable "Allow RDP redirection of
+                          other supported RemoteFX USB devices from this computer"
+                          (Computer Config → Admin Templates → Windows Components →
+                          Remote Desktop Services → Remote Desktop Connection Client →
+                          RemoteFX USB Device Redirection) and reboot — only then does
+                          the device show under Local Resources → More → USB. FreeRDP:
+                          /usb:... (no policy needed). Generic USB redirection
                           (MS-RDPEUSB) via a user-space virtual USB host controller,
                           so it needs the entitled signed+provisioned build (a plain
                           build no-ops). Mass storage is verified; other device

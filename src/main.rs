@@ -482,8 +482,12 @@ struct Args {
     /// in Finder. Needs the entitled (signed+provisioned) build (the
     /// com.apple.developer.usb.host-controller-interface entitlement); a plain build
     /// logs "controller unavailable" and no-ops. Mass storage is verified end-to-end;
-    /// other device classes are untested. The client must opt in too (FreeRDP: /usb;
-    /// mstsc: Local Resources -> More -> USB). macOS-only.
+    /// other device classes are untested. The client must opt in too (FreeRDP: /usb).
+    /// mstsc gates USB behind Group Policy: enable "Allow RDP redirection of other
+    /// supported RemoteFX USB devices from this computer" (Computer Config -> Admin
+    /// Templates -> Windows Components -> Remote Desktop Services -> Remote Desktop
+    /// Connection Client -> RemoteFX USB Device Redirection) + reboot, then select the
+    /// device under Local Resources -> More -> USB. macOS-only.
     #[arg(long)]
     enable_usb_redirection: bool,
 

@@ -112,6 +112,15 @@ ironrdp-rdpdr = { path = "vendor/ironrdp-rdpdr" }
 # tunnel. Upstream is client-oriented and errors on the server-inbound
 # SoftSyncResponse. See vendor/ironrdp-dvc/CLAUDE.md.
 ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
+# ironrdp-rdpeusb is vendored (same upstream rev) for server-direction USB
+# redirection: extend SupportedUsbVer with the USB 3.x versions so a modern
+# device's ADD_DEVICE caps parse. See vendor/ironrdp-rdpeusb/CLAUDE.md.
+ironrdp-rdpeusb = { path = "vendor/ironrdp-rdpeusb" }
+# ironrdp-str isn't depended on directly by macrdp, but the vendored
+# ironrdp-rdpeusb names it as a crates.io dep (it's a git-workspace crate, never
+# published); pin it to the same git rev so it resolves + unifies with the copy
+# the other ironrdp crates pull transitively. (Same shape as ironrdp-error above.)
+ironrdp-str              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 # ironrdp-error isn't depended on directly by macrdp, but the vendored
 # ironrdp-rdpdr names it as a crates.io dep; pin it to the same git rev as the
 # rest so it unifies with the copy the other ironrdp crates pull transitively.

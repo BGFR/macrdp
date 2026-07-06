@@ -258,6 +258,7 @@ impl DvcProcessor for UrbdrcServer {
                     channel_id,
                     usb_device = %dev.usb_device,
                     device_instance_id = %dev.device_instance_id,
+                    usb_version = ?dev.usb_device_caps.supported_usb_ver,
                     speed = ?dev.usb_device_caps.device_speed,
                     "URBDRC AddDevice on the main channel — client announced a redirected USB device (GO)"
                 );
@@ -322,6 +323,7 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
                     channel_id,
                     usb_device = %dev.usb_device,
                     device_instance_id = %dev.device_instance_id,
+                    usb_version = ?dev.usb_device_caps.supported_usb_ver,
                     speed = ?dev.usb_device_caps.device_speed,
                     "URBDRC ADD_DEVICE — real device descriptors received (GO)"
                 );

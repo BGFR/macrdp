@@ -1106,15 +1106,17 @@ AND released — #1276 landing is NOT sufficient.
     - **Robustness (load-bearing):** BOTH `process()` impls TOLERATE decode errors
       (log + `Ok(Vec::new())`, never propagate) — a decode error would otherwise
       propagate out of `svc.process()?` and tear down the whole RDP session for an
-      opt-in feature (same lesson as the ironrdp-dvc Soft-Sync divergence). This is
-      NOT hypothetical: the pinned `ironrdp-rdpeusb` `SupportedUsbVer` enum stops at
-      USB 2.0 (0x200) and rejects USB 3.x (0x300/0x310/**0x320**) `AddDevice` caps,
-      which every modern USB-3 device sends — the device processor recognizes
-      `ADD_DEVICE` from its header (`peek_function_id`, pinned decoder only) and logs
-      it as a GO even when the caps body fails to parse. **Phase 3.1b** must extend
-      the caps decoder (vendor `ironrdp-rdpeusb` — a leaf crate, so a one-sided
-      path-dep vendor + pull `ironrdp-str`) to actually parse USB-3 descriptors, and
-      add the `UsbHandle`/router async transfer path.
+      opt-in feature (same lesson as the ironrdp-dvc Soft-Sync divergence). The
+      device processor also recognizes `ADD_DEVICE` from its header
+      (`peek_function_id`) so a body it can't parse still logs a GO. **Phase 3.1b
+      (2026-07-06): `ironrdp-rdpeusb` is now VENDORED** (`vendor/ironrdp-rdpeusb`,
+      leaf crate → one-sided path-dep + `ironrdp-str` pinned) with a lenient
+      `UsbDeviceCaps` decode (USB 3.x `SupportedUsbVer` + `Other(u32)` fallbacks on
+      the device-reported version/speed fields — see its CLAUDE.md divergence 1), so
+      the tolerant `process()` is now the belt to that suspenders: a real USB-3.2
+      flash drive's `ADD_DEVICE` **fully parses** (`usb_version=Usb32`), not just
+      header-recognized. Still remaining for 3.1b: the `UsbHandle`/router async
+      transfer path + client-sourced descriptors in `usb_spike.m`.
     - Wiring: `usb_factory: Option<Box<dyn UrbdrcServerFactory>>` field + `new`
       param + `set_sender` + `builder.with_usb_factory` + `.with_dynamic_channel`
       in `attach_channels` (advertised only when `Some` — byte-identical when off).

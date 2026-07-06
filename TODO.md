@@ -313,10 +313,19 @@ then delete; promote a parked item to *In flight* when work actually starts.
     `closed()`; the server's `static_channels` reset (`server.rs:1244`) drops the processor on
     disconnect → `closed()` resolves → `present_device` breaks + destroys the controller. Verified
     entitled + FreeRDP: the presented ESD310C disappears from `ioreg` on disconnect (server stays up).
-  - **Phase 3.2 remaining** — bulk/interrupt/isoch endpoints (make the device *usable*, not just
-    enumerable — the big one), dedup multiple device-channel announces → one controller per physical
-    device, mid-session retract without disconnect, non-descriptor control requests, multi-device,
-    dispatch-priority tier. Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
+  - **Phase 3.2 bulk — SelectConfiguration done + a test-environment blocker found** (2026-07-06,
+    commit `ed735d5`): implemented the config-descriptor parse + `SelectConfiguration` URB (opens the
+    device's pipe handles — the prerequisite for bulk). **The URB is verified correct** (FreeRDP
+    parses + attempts it), **but the macOS-client loopback CANNOT complete bulk**: FreeRDP's libusb
+    can't detach the mass-storage kernel driver to claim the interface (`LIBUSB_ERROR_ACCESS`), which
+    every bulk transfer needs. EP0 descriptor reads work; bulk needs a **claimable-interface client**
+    (a real Windows client, or a **Linux FreeRDP** client where kernel-detach works — i.e. a second
+    machine). Degrades to enumerate-only (5s timeout).
+  - **Phase 3.2 remaining** — bulk IN/OUT forwarding (`TsUrb::BulkInterruptTransfer` with the pipe
+    handles + Obj-C generalize the ring walk to EP1 endpoints), general control-OUT forwarding
+    (SET_*), **a claimable-interface test client to verify the actual mount**, dedup multiple
+    device-channel announces → one controller, mid-session retract, multi-device, dispatch-priority
+    tier. Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
   Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].

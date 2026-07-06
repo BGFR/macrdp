@@ -297,13 +297,20 @@ then delete; promote a parked item to *In flight* when work actually starts.
     (`src/usb_redirect/mod.rs::drive_device`). `UrbdrcDeviceProcessor::process()` is now purely
     decode-and-route. Verified live: macrdp's driver fetched `vid=0x2174 pid=0x2100`. (Elegance +
     the exact hook the UserHCI integration needs.)
-  - **Phase 3.1b(2b) part 2-ii (next — the Obj-C, entitled build)** — in `drive_device`, create the
-    macOS UserHCI controller (evolve `usb_spike.m`) for the device and answer the kernel's EP0
-    `GET_DESCRIPTOR` by driving the `UsbHandle`: leave the kernel transfer outstanding on the serial
-    queue, fetch async via tokio, `dispatch_async` back to complete it with the client's bytes (the
-    IOUSBHost-serial-queue ↔ tokio boundary — the core engineering risk). Then a **real** device
-    enumerates in `ioreg` (VID 0x2174, not the synthetic 0x1209). Plan:
-    `~/.claude/plans/wobbly-honking-minsky.md` §3.1.
+  - **Phase 3.1b(2b) part 2-ii GO ✅✅ — the Phase-3.1 milestone: a REAL client device enumerates
+    locally** (2026-07-06, commits `c1f27e9` async boundary + `0ffc6ce` presenting side). 2-ii-a
+    restructured `usb_spike.m` to async out-of-band EP0 completion (raise via C callback → leave
+    outstanding → `macrdp_usb_complete_control_in` `dispatch_async`es onto `self.interface.queue`),
+    with a bidirectional C ABI; `--usb-spike` still enumerates the synthetic device through it.
+    2-ii-b wired `imp::present_device`: create the controller with a Rust control-IN callback that
+    services each EP0 `GET_DESCRIPTOR` by awaiting `handle.get_descriptor()` (client-sourced over
+    URBDRC). **Verified entitled + FreeRDP `/usb` (flash drive): ESD310C, idVendor=0x2174 enumerates
+    on macrdp's UserHCI controller** (ioreg `@80100000`), device + string descriptors (product
+    "ESD310C") sourced live from the client. Non-entitled path degrades gracefully.
+  - **Phase 3.2 (next, deferred milestone)** — bulk/interrupt/isoch endpoints (make the device
+    *usable*, not just enumerable), retract/hot-unplug + per-device controller teardown,
+    non-descriptor control requests, multi-device, dispatch-priority tier. Plan:
+    `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
   Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].

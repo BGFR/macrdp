@@ -340,11 +340,20 @@ then delete; promote a parked item to *In flight* when work actually starts.
     (new Active object, but `p.msg` points into the old freed ring), so the completion is dropped
     unless `endpoints[key]` is still the same object it was raised on (fixes a reset-during-bulk
     SIGSEGV the liveness check alone missed).
-  - **Phase 3.2 remaining** — general control-OUT forwarding (mass-storage Bulk-Only Reset `bReq=0xff`
-    + Clear-Feature(HALT), currently ACKed locally not forwarded — likely needed for robustness under
-    SCSI errors), mid-session retract/hot-unplug, true multi-device (needs iSerialNumber to
-    distinguish identical models), dispatch-priority tier. Test rig proven: UTM-QEMU Linux FreeRDP +
-    USB-2.0 hub. Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
+  - **Phase 3.2 control-OUT forwarding — done** (2026-07-06): EP0 host→device requests the local
+    kernel issues (mass-storage Bulk-Only Reset `bReq=0xff` / Clear-Feature(HALT)) now forward to the
+    real device via `UsbHandle::control_transfer_out` (generic `URB_FUNCTION_CONTROL_TRANSFER_EX`,
+    pipe 0 = default control EP); the standard requests the host controller / SelectConfiguration own
+    (SET_ADDRESS/CONFIGURATION/INTERFACE) stay a local ACK. Obj-C forwards on the control STATUS stage
+    (no-data requests are SETUP→STATUS) and stashes any DATA-OUT payload. **Regression-verified live**
+    (clean mount + file copy + remove/reattach unaffected; the one SET_CONFIGURATION seen was correctly
+    NOT forwarded). The forward path itself only fires under a SCSI error/stall, which didn't occur, so
+    it's implemented + regression-safe but not yet observed firing.
+  - **Phase 3.2 remaining** — generic control-IN forwarding (currently GET_DESCRIPTOR-only; a class/
+    vendor control-IN like Get Max LUN is stalled → assumed 1 LUN, wrong for a multi-LUN device),
+    mid-session retract/hot-unplug, true multi-device (needs iSerialNumber to distinguish identical
+    models), dispatch-priority tier. Test rig proven: UTM-QEMU Linux FreeRDP + USB-2.0 hub. Plan:
+    `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
   Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].

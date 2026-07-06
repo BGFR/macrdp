@@ -37,6 +37,11 @@
 // callback MUST NOT retain `setup8` (it points at stack memory) — copy it and
 // return immediately (non-blocking). `max_len` is the data-stage buffer capacity.
 typedef void (*MacrdpUsbControlInFn)(void *ctx, uint64_t token, const uint8_t *setup8, uint32_t max_len);
+// EP0 control-OUT (host->device) request raised to Rust for forwarding to the real
+// device: setup8 = the 8-byte SETUP, out_data/out_len = any payload (empty for the
+// no-data requests, e.g. mass-storage reset / Clear-Feature).
+typedef void (*MacrdpUsbControlOutFn)(void *ctx, uint64_t token, const uint8_t *setup8,
+                                      const uint8_t *out_data, uint32_t out_len);
 // Bulk/interrupt transfer raised to Rust: is_in != 0 = device->host read of out_len
 // bytes; else host->device write of the out_len bytes at out_data.
 typedef void (*MacrdpUsbBulkFn)(void *ctx, uint64_t token, uint32_t endpoint_address, int is_in,
@@ -58,9 +63,12 @@ static inline BOOL msg_no_response(const IOUSBHostCIMessage *m) {
 // USB standard request / descriptor-type constants.
 enum {
     kUsbDirDeviceToHost   = 0x80,
+    kUsbReqTypeMask       = 0x60, // bmRequestType bits 6:5 (0=standard,1=class,2=vendor)
+    kUsbReqTypeStandard   = 0x00,
     kUsbReqGetDescriptor  = 0x06,
     kUsbReqSetAddress     = 0x05,
     kUsbReqSetConfig      = 0x09,
+    kUsbReqSetInterface   = 0x0b,
     kUsbDescDevice        = 0x01,
     kUsbDescConfiguration = 0x02,
     kUsbDescString        = 0x03,
@@ -101,7 +109,11 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 @property(nonatomic, assign) uint64_t nextToken;
 // ObjC -> Rust control-IN callback + its opaque context (set at create).
 @property(nonatomic, assign) MacrdpUsbControlInFn controlInCb;
+@property(nonatomic, assign) MacrdpUsbControlOutFn controlOutCb;
 @property(nonatomic, assign) MacrdpUsbBulkFn bulkCb;
+// Host->device data stashed from a control-OUT DATA stage, keyed by endpoint, to
+// include when the STATUS stage forwards the request. Empty for no-data requests.
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSData *> *pendingOutData;
 @property(nonatomic, assign) void *cbCtx;
 @property(nonatomic, assign) BOOL portConnected;
 @end
@@ -113,6 +125,7 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         _devices = [NSMutableDictionary dictionary];
         _endpoints = [NSMutableDictionary dictionary];
         _pendingSetup = [NSMutableDictionary dictionary];
+        _pendingOutData = [NSMutableDictionary dictionary];
         _tokenMap = [NSMutableDictionary dictionary];
     }
     return self;
@@ -367,6 +380,59 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
     }
 }
 
+// Is this the STATUS stage of an EP0 control-OUT we should FORWARD to the real
+// device? A control transfer arrives as SETUP -> [DATA] -> STATUS; the no-data
+// host->device requests we care about (mass-storage Bulk-Only Reset, Clear-Feature)
+// have no DATA stage, so we forward on STATUS. We forward every host->device request
+// EXCEPT the standard ones the host controller / our SelectConfiguration path already
+// own (SET_ADDRESS / SET_CONFIGURATION / SET_INTERFACE) — those stay a local ACK.
+- (BOOL)transferIsForwardedControlOut:(const IOUSBHostCIMessage *)msg endpointKey:(NSNumber *)key {
+    if (msg_type(msg) != IOUSBHostCIMessageTypeStatusTransfer || !self.controlOutCb) {
+        return NO;
+    }
+    NSData *setupData = self.pendingSetup[key];
+    if (setupData == nil || setupData.length < 8) {
+        return NO;
+    }
+    const uint8_t *s = setupData.bytes;
+    if (s[0] & kUsbDirDeviceToHost) {
+        return NO; // device->host: its STATUS is host-side, nothing to forward
+    }
+    if ((s[0] & kUsbReqTypeMask) == kUsbReqTypeStandard &&
+        (s[1] == kUsbReqSetAddress || s[1] == kUsbReqSetConfig || s[1] == kUsbReqSetInterface)) {
+        return NO; // owned by the host controller / SelectConfiguration
+    }
+    return YES;
+}
+
+// Raise a control-OUT to the Rust side (forward to the real device) and leave the
+// STATUS stage outstanding; the completion arrives via macrdp_usb_complete_transfer.
+// Any host->device DATA bytes were stashed on the DATA stage (pendingOutData).
+- (void)raiseControlOut:(const IOUSBHostCIMessage *)msg endpointKey:(NSNumber *)key {
+    NSData *setupData = self.pendingSetup[key];
+    uint8_t setup[8] = {0};
+    if (setupData && setupData.length >= 8) {
+        memcpy(setup, setupData.bytes, 8);
+    }
+    NSData *outData = self.pendingOutData[key] ?: [NSData data];
+
+    uint64_t token = ++self.nextToken;
+    MacrdpPendingTransfer *p = [MacrdpPendingTransfer new];
+    p.msg = msg;
+    p.endpointKey = key;
+    p.ep = self.endpoints[key];
+    self.tokenMap[@(token)] = p;
+
+    // The setup + data are captured into the callback now; drop the per-key state so
+    // the next control transfer on EP0 starts clean.
+    [self.pendingSetup removeObjectForKey:key];
+    [self.pendingOutData removeObjectForKey:key];
+
+    NSLog(@"[usb2] EP0 control-OUT forwarded token=%llu bmReq=0x%02x bReq=0x%02x len=%lu",
+          token, setup[0], setup[1], (unsigned long)outData.length);
+    self.controlOutCb(self.cbCtx, token, setup, outData.bytes, (uint32_t)outData.length);
+}
+
 // Is this a bulk/interrupt transfer (a NormalTransfer on a non-control endpoint)?
 // Those forward to the client — a device->host read (IN) or host->device write
 // (OUT) — mirroring the async control-IN path.
@@ -517,13 +583,28 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
                   setup[0], setup[1], wValue, wIndex, wLength);
             return IOUSBHostCIMessageStatusSuccess;
         }
-        case IOUSBHostCIMessageTypeNormalTransfer:
-            // A data stage that reached the sync path is host-to-device or a
-            // non-descriptor IN — accept without moving data (SET_* have no data,
-            // and enumeration only needs GET_DESCRIPTOR, which goes async).
+        case IOUSBHostCIMessageTypeNormalTransfer: {
+            // A data stage that reached the sync path is host->device (control-OUT
+            // data) or a non-descriptor IN. For a host->device control-OUT with data,
+            // stash the bytes so the STATUS stage can forward them with the request;
+            // otherwise accept without moving data.
+            NSData *setupData = self.pendingSetup[key];
+            if (setupData && setupData.length >= 8) {
+                const uint8_t *s = setupData.bytes;
+                NSUInteger len = (msg->data0 & IOUSBHostCINormalTransferData0Length)
+                               >> IOUSBHostCINormalTransferData0LengthPhase;
+                const void *buf = (const void *)(uintptr_t)msg->data1;
+                if (!(s[0] & kUsbDirDeviceToHost) && buf != NULL && len > 0) {
+                    self.pendingOutData[key] = [NSData dataWithBytes:buf length:len];
+                }
+            }
             return IOUSBHostCIMessageStatusSuccess;
+        }
         case IOUSBHostCIMessageTypeStatusTransfer:
+            // STATUS of a locally-ACKed control transfer (a forwarded control-OUT is
+            // intercepted before this in walkEndpoint). Clear the per-key state.
             [self.pendingSetup removeObjectForKey:key];
+            [self.pendingOutData removeObjectForKey:key];
             return IOUSBHostCIMessageStatusSuccess;
         default:
             NSLog(@"[usb2] unexpected transfer type=0x%02x on EP0", type);
@@ -550,6 +631,10 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         }
         if ([self transferIsForwardedControlIn:msg endpointKey:key]) {
             [self raiseControlIn:msg endpointKey:key];
+            return; // async; completion re-walks
+        }
+        if ([self transferIsForwardedControlOut:msg endpointKey:key]) {
+            [self raiseControlOut:msg endpointKey:key];
             return; // async; completion re-walks
         }
         if ([self transferIsBulk:msg endpointKey:key]) {
@@ -699,10 +784,12 @@ static BOOL spike_descriptor_for_value(uint16_t wValue, const uint8_t **outBytes
 // Create the controller. `cb`/`ctx` receive each EP0 control-IN forward; may be
 // NULL (then such transfers stall). Returns an opaque, retained handle (destroy
 // releases it), or NULL on init failure with *err set.
-void *macrdp_usb_controller_create(MacrdpUsbControlInFn controlCb, MacrdpUsbBulkFn bulkCb, void *ctx, int *err) {
+void *macrdp_usb_controller_create(MacrdpUsbControlInFn controlCb, MacrdpUsbControlOutFn controlOutCb,
+                                   MacrdpUsbBulkFn bulkCb, void *ctx, int *err) {
     @autoreleasepool {
         MacrdpUsbController *c = [[MacrdpUsbController alloc] init];
         c.controlInCb = controlCb;
+        c.controlOutCb = controlOutCb;
         c.bulkCb = bulkCb;
         c.cbCtx = ctx;
         NSError *e = nil;
@@ -772,7 +859,7 @@ static void spike_control_in_cb(void *ctx, uint64_t token, const uint8_t *setup8
 int macrdp_usb_spike_run(void) {
     @autoreleasepool {
         int err = 0;
-        void *handle = macrdp_usb_controller_create(spike_control_in_cb, NULL, NULL, &err);
+        void *handle = macrdp_usb_controller_create(spike_control_in_cb, NULL, NULL, NULL, &err);
         if (handle == NULL) {
             return err != 0 ? err : -1;
         }

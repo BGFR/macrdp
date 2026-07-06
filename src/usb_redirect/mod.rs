@@ -29,9 +29,14 @@
 //! client announces it twice with differing instance ids — presenting both duels
 //! two virtual drives over one device (SCSI timeouts); (2) a completion that races a
 //! device reset (which destroys+recreates the endpoint) is dropped on the Obj-C side
-//! by endpoint-object identity, not just liveness — see `usb_spike.m`. Remaining 3.2
-//! work: control-OUT forwarding (mass-storage reset / Clear-Feature), retract/
-//! hot-unplug, true multi-device. All Obj-C / IOUSBHost SPI touches are quarantined
+//! by endpoint-object identity, not just liveness — see `usb_spike.m`. EP0
+//! **control-OUT** requests the local kernel issues (a mass-storage Bulk-Only Reset /
+//! Clear-Feature(HALT), needed for SCSI error recovery) are forwarded to the real
+//! device too, via [`UsbHandle::control_transfer_out`] (generic
+//! `URB_FUNCTION_CONTROL_TRANSFER_EX`); the standard requests the host controller /
+//! SelectConfiguration already own (SET_ADDRESS/CONFIGURATION/INTERFACE) stay a local
+//! ACK. Remaining 3.2 work: retract/hot-unplug, true multi-device. All Obj-C /
+//! IOUSBHost SPI touches are quarantined
 //! in `usb_spike.m` (the maintenance boundary), built + linked by `build.rs` on
 //! macOS; the standalone `--usb-spike` path still presents the hardcoded synthetic
 //! device through the same async completion machinery.
@@ -182,6 +187,18 @@ mod imp {
     /// Non-blocking — copies `setup8` and pushes it to the device driver loop.
     type ControlInFn = extern "C" fn(ctx: *mut c_void, token: u64, setup8: *const u8, max_len: u32);
 
+    /// ObjC -> Rust: the kernel wants an EP0 control-**OUT** (host->device) request
+    /// forwarded to the real device — e.g. a mass-storage reset / Clear-Feature.
+    /// `setup8` is the 8-byte SETUP; `out_data`/`out_len` is any payload (empty for
+    /// the no-data requests, the common case). Non-blocking.
+    type ControlOutFn = extern "C" fn(
+        ctx: *mut c_void,
+        token: u64,
+        setup8: *const u8,
+        out_data: *const u8,
+        out_len: u32,
+    );
+
     /// ObjC -> Rust: the kernel wants a bulk/interrupt transfer on `endpoint_address`
     /// serviced. `is_in` != 0 is a device->host read of `out_len` bytes; else it's a
     /// host->device write of the `out_len` bytes at `out_data`. Non-blocking.
@@ -198,6 +215,7 @@ mod imp {
         fn macrdp_usb_spike_run() -> c_int;
         fn macrdp_usb_controller_create(
             control_cb: ControlInFn,
+            control_out_cb: ControlOutFn,
             bulk_cb: BulkFn,
             ctx: *mut c_void,
             err: *mut c_int,
@@ -234,6 +252,11 @@ mod imp {
             setup: [u8; 8],
             max_len: u32,
         },
+        ControlOut {
+            token: u64,
+            setup: [u8; 8],
+            data: Vec<u8>,
+        },
         Bulk {
             token: u64,
             endpoint_address: u8,
@@ -263,6 +286,26 @@ mod imp {
             setup,
             max_len,
         });
+    }
+
+    extern "C" fn control_out_cb(
+        ctx: *mut c_void,
+        token: u64,
+        setup8: *const u8,
+        out_data: *const u8,
+        out_len: u32,
+    ) {
+        // SAFETY: `ctx` is the leaked CallbackCtx; `setup8` points at 8 readable
+        // bytes; for a payload request `out_data` points at `out_len` readable bytes.
+        let ctx = unsafe { &*(ctx as *const CallbackCtx) };
+        let mut setup = [0u8; 8];
+        unsafe { std::ptr::copy_nonoverlapping(setup8, setup.as_mut_ptr(), 8) };
+        let data = if !out_data.is_null() && out_len > 0 {
+            unsafe { std::slice::from_raw_parts(out_data, out_len as usize).to_vec() }
+        } else {
+            Vec::new()
+        };
+        let _ = ctx.tx.send(TransferReq::ControlOut { token, setup, data });
     }
 
     extern "C" fn bulk_cb(
@@ -340,7 +383,13 @@ mod imp {
         let ctx = Box::into_raw(Box::new(CallbackCtx { tx }));
         let mut err: c_int = 0;
         let raw = unsafe {
-            macrdp_usb_controller_create(control_in_cb, bulk_cb, ctx as *mut c_void, &mut err)
+            macrdp_usb_controller_create(
+                control_in_cb,
+                control_out_cb,
+                bulk_cb,
+                ctx as *mut c_void,
+                &mut err,
+            )
         };
         if raw.is_null() {
             warn!(err, "USB redirection: UserHCI controller unavailable (needs the entitled build) — not presenting");
@@ -416,6 +465,24 @@ mod imp {
                             warn!(error = %e, token, "USB redirection: descriptor fetch failed — tearing down");
                             controller.complete_in(token, &[], STATUS_STALL);
                             break;
+                        }
+                    }
+                }
+                TransferReq::ControlOut { token, setup, data } => {
+                    // Forward a host->device EP0 request to the real device (e.g. a
+                    // mass-storage Bulk-Only Reset / Clear-Feature(HALT)). A failure
+                    // stalls just this transfer — the driver retries — never tears down.
+                    match handle.control_transfer_out(setup, data).await {
+                        Ok(()) => controller.complete_out(token, 0, STATUS_OK),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                token,
+                                bmreq = format_args!("{:#04x}", setup[0]),
+                                breq = format_args!("{:#04x}", setup[1]),
+                                "USB redirection: control-OUT forward failed — stalling"
+                            );
+                            controller.complete_out(token, 0, STATUS_STALL);
                         }
                     }
                 }

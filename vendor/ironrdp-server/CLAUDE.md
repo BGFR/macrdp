@@ -1161,8 +1161,18 @@ AND released — #1276 landing is NOT sufficient.
       0x82 IN) so the macOS driver's SCSI (CBW → data → CSW) rides the client's real drive.
       **VERIFIED end-to-end on a real Linux FreeRDP client** (UTM-QEMU Ubuntu + USB-2.0 hub
       for a claimable interface): the ESD310C flash drive mounts on the Mac and stays
-      mounted, 1300+ steady bulk transfers, no resets/timeouts. Remaining: control-OUT
-      forwarding (mass-storage reset / Clear-Feature), retract/hot-unplug.
+      mounted, 1300+ steady bulk transfers, no resets/timeouts.
+    - **Phase 3.2 control-OUT forwarding (2026-07-06).** `UsbHandle::control_transfer_out(setup,
+      data)` forwards an EP0 host→device request to the real device via a generic
+      `URB_FUNCTION_CONTROL_TRANSFER_EX` (`TsUrb::CtlTransferEx`) on pipe handle 0 (the default
+      control endpoint — MS-RDPEUSB maps `EndpointAddress = PipeHandle & 0xff`), so a
+      mass-storage Bulk-Only Reset / Clear-Feature(HALT) reaches the device for SCSI error
+      recovery instead of being ACKed only on the macOS side. macrdp's Obj-C side forwards on the
+      control STATUS stage and excludes the standard requests the host controller /
+      SelectConfiguration own (SET_ADDRESS/CONFIGURATION/INTERFACE). Regression-verified live (clean
+      path unaffected — SET_CONFIGURATION correctly stays a local ACK); the forward only fires under
+      a device error/stall. Remaining: generic control-IN forwarding (GET_DESCRIPTOR-only today),
+      retract/hot-unplug.
     - **One controller per physical device (dedup, presenting-side).** A client can
       announce ONE physical device on more than one `URBDRC` channel — FreeRDP announces
       the same drive twice with instance ids differing by a byte (`…d31`/`…d32`), plus a

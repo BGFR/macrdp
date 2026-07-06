@@ -38,8 +38,12 @@ use ironrdp_rdpeusb::pdu::caps::{Capability, RimExchangeCapabilityRequest};
 use ironrdp_rdpeusb::pdu::completion::ts_urb_result::{TsUrbResultPayload, TsUrbSelectConfigResult, UsbdPipeType};
 use ironrdp_rdpeusb::pdu::header::{FunctionId, InterfaceId, Mask, SharedMsgHeader};
 use ironrdp_rdpeusb::pdu::notify::{ChannelCreated, Direction};
-use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::utils::{TsUrbHeader, TsUsbdInterfaceInfo, TsUsbdPipeInfo, UrbFunction, UsbConfigDesc};
-use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::{TsUrb, TsUrbBulkOrInterruptTransfer, TsUrbControlDescRequest, TsUrbSelectConfig};
+use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::utils::{
+    SetupPacket, TsUrbHeader, TsUsbdInterfaceInfo, TsUsbdPipeInfo, UrbFunction, UsbConfigDesc,
+};
+use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::{
+    TsUrb, TsUrbBulkOrInterruptTransfer, TsUrbControlDescRequest, TsUrbControlTransferEx, TsUrbSelectConfig,
+};
 use ironrdp_rdpeusb::pdu::usb_dev::{RegisterRequestCallback, TransferInRequest, TransferOutRequest};
 use ironrdp_rdpeusb::pdu::utils::RequestIdTransferInOut;
 use ironrdp_rdpeusb::pdu::{UrbdrcClientPdu, UrbdrcServerPdu};
@@ -396,6 +400,29 @@ impl UsbHandle {
         }
         Ok(n)
     }
+
+    /// Forward an EP0 **control-OUT** request (host→device) to the client's device
+    /// via a generic `URB_FUNCTION_CONTROL_TRANSFER_EX` on the default control pipe —
+    /// e.g. a mass-storage Bulk-Only Reset or `Clear-Feature(ENDPOINT_HALT)` the local
+    /// kernel issued, which must reach the real device to keep its state in sync.
+    /// `setup` is the raw 8-byte USB SETUP packet; `data` is any host→device payload
+    /// (empty for the no-data requests, which is the common case).
+    pub async fn control_transfer_out(&self, setup: [u8; 8], data: Vec<u8>) -> Result<()> {
+        let (req_id, rx) = self.router.register();
+        let messages = control_out_request(self.device_iface, req_id, setup, data);
+        self.sender
+            .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
+                channel_id: self.channel_id,
+                messages,
+            }))
+            .ok()
+            .context("URBDRC: server event loop gone")?;
+        let reply = rx.await.context("URBDRC: connection closed before control-OUT completion")?;
+        if reply.hresult != 0 {
+            anyhow::bail!("URBDRC: control OUT failed (hresult {:#010x})", reply.hresult);
+        }
+        Ok(())
+    }
 }
 
 /// Direction of a bulk/interrupt transfer (which request PDU + transfer-flag it uses).
@@ -451,6 +478,45 @@ fn bulk_transfer_request(
             output_buffer: out_data,
         })),
     };
+    vec![dvc_msg(UrbdrcServerPdu::RegReqCb(reg)), transfer]
+}
+
+/// Build a control-OUT transfer request: a `RegisterRequestCallback` + a
+/// `TransferOutRequest` carrying a `TS_URB_CONTROL_TRANSFER_EX` on the default
+/// control pipe (pipe handle 0 → the client maps it to endpoint 0, the default
+/// control endpoint — per MS-RDPEUSB `EndpointAddress = PipeHandle & 0xff`).
+/// `data` is the host→device payload (empty for no-data requests).
+fn control_out_request(device_iface: InterfaceId, req_id: u32, setup: [u8; 8], data: Vec<u8>) -> Vec<DvcMessage> {
+    let reg = RegisterRequestCallback {
+        msg_id: 0,
+        udev_iface: device_iface,
+        request_completion: Some(device_iface),
+    };
+    let ts_req_id = RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
+    let setup_packet = SetupPacket {
+        request_type: setup[0],
+        request: setup[1],
+        value: u16::from_le_bytes([setup[2], setup[3]]),
+        index: u16::from_le_bytes([setup[4], setup[5]]),
+        length: u16::from_le_bytes([setup[6], setup[7]]),
+    };
+    let urb = TsUrbControlTransferEx {
+        header: TsUrbHeader {
+            func: UrbFunction::ControlTransferEx,
+            req_id: ts_req_id,
+            no_ack: false,
+        },
+        pipe: 0,           // default control endpoint (EP0)
+        transfer_flags: 0, // host→device (OUT)
+        timeout: 0,
+        setup_packet,
+    };
+    let transfer = dvc_msg(UrbdrcServerPdu::TransferOut(TransferOutRequest {
+        msg_id: 0,
+        udev_iface: device_iface,
+        ts_urb: TsUrb::CtlTransferEx(urb),
+        output_buffer: data,
+    }));
     vec![dvc_msg(UrbdrcServerPdu::RegReqCb(reg)), transfer]
 }
 

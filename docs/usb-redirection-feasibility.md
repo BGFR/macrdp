@@ -302,9 +302,12 @@ The entitlement `com.apple.developer.usb.host-controller-interface` is **granted
   (`VID:PID:bcdDevice`, not the client's per-announce instance id — FreeRDP double-announces
   one drive, and presenting both duels two virtual drives over the one device); and an
   Obj-C endpoint-object identity guard on completion (a device reset destroys+recreates the
-  endpoint at the same key, leaving a pending transfer pointing into a freed ring). Remaining
-  3.2: control-OUT forwarding (mass-storage reset / Clear-Feature), retract/hot-unplug,
-  true multi-device.
+  endpoint at the same key, leaving a pending transfer pointing into a freed ring). EP0
+  **control-OUT** forwarding also lands (mass-storage Bulk-Only Reset / Clear-Feature ride
+  `UsbHandle::control_transfer_out`, a generic `CONTROL_TRANSFER_EX`; SET_ADDRESS/CONFIGURATION/
+  INTERFACE stay local ACKs), regression-verified but only fires under a SCSI error. Remaining
+  3.2: generic control-IN forwarding (GET_DESCRIPTOR-only today), retract/hot-unplug, true
+  multi-device.
 
 Cross-reference the `docs/known-quirks.md` smart-card note (kext vs dext vs UserHCI
 rationale) and `project_usb_redirection_feasibility` memory for the running log.

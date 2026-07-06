@@ -1100,6 +1100,19 @@ AND released — #1276 landing is NOT sufficient.
     - `UrbdrcDeviceProcessor` (per-device channel): on open (`start`) sends its own
       `RIMCALL_RELEASE` (FreeRDP's `INIT_CHANNEL_OUT` barrier) so the client sends
       `ADD_DEVICE` with the real descriptors, which `process` decodes/logs.
+    - **Phase 3.1b(2) transfer spike (reactive):** on `ADD_DEVICE` the device
+      processor also issues a server-initiated `GET_DESCRIPTOR` control transfer —
+      a `RegisterRequestCallback` (naming the completion interface) + a
+      `TransferInRequest` with `TsUrb::CtlDescReq(GetDescriptorFromDevice)`,
+      `output_buffer_size=18`, `desc_type=1` — and decodes the `URB_COMPLETION`,
+      logging the real device descriptor (idVendor @8..10, idProduct @10..12, LE).
+      This is reactive (returned from `process()`), no `UsbHandle`/router yet —
+      it proves the transfer round-trip (server → client → physical device →
+      completion) before the async machinery is built. **VERIFIED live** with a
+      USB-3.2 flash drive over FreeRDP-with-urbdrc: `hresult=S_OK descriptor_len=18
+      vid=0x2174 pid=0x2100` (the drive's real VID/PID, read from the device).
+      macOS libusb kernel-detach for a mass-storage device was not a blocker after
+      `diskutil unmountDisk`.
     - A per-connection `MAX_DEVICE_CHANNELS` (32) cap on `OpenDeviceChannel`
       requests bounds a client that spams `ADD_VIRTUAL_CHANNEL` (each opens a DVC
       that's never pruned within a connection) from growing the DRDYNVC slab.

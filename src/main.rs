@@ -487,7 +487,9 @@ struct Args {
     /// supported RemoteFX USB devices from this computer" (Computer Config -> Admin
     /// Templates -> Windows Components -> Remote Desktop Services -> Remote Desktop
     /// Connection Client -> RemoteFX USB Device Redirection) + reboot, then select the
-    /// device under Local Resources -> More -> USB. macOS-only.
+    /// device under Local Resources -> More -> USB. On mstsc a device now enumerates
+    /// but does not stream yet (SelectConfiguration ceiling; isoch/interrupt device
+    /// classes unimplemented). macOS-only.
     #[arg(long)]
     enable_usb_redirection: bool,
 

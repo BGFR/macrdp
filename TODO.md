@@ -244,7 +244,17 @@ then delete; promote a parked item to *In flight* when work actually starts.
   machines, which isn't a realistic target. See the "Industry status" + "P2.3 FEC capture
   RESULT" notes in `docs/rdp-udp-multitransport-feasibility.md` + `vendor/ironrdp-rdpeudp/CLAUDE.md`.
 
-- [ ] **Generic USB redirection (MS-RDPEUSB) — through Phase 3.2 bulk GO ✅✅ (a redirected USB DRIVE MOUNTS on the Mac); control-OUT + retract/multi-device remain.**
+- [ ] **Generic USB redirection (MS-RDPEUSB) — FreeRDP: DRIVE MOUNTS ✅✅ (Phase 3.2 bulk). mstsc: ENUMERATES end-to-end ✅ (2026-07-07, merged `a0d6c74`) but does NOT stream yet. Remaining: mstsc `SelectConfiguration`, device-class streaming (isoch/interrupt), retract/multi-device.**
+  **mstsc enumeration (merged `a0d6c74`):** three FreeRDP-safe interop fixes made a real mstsc
+  RemoteFX-USB device handshake + announce + enumerate (verified camera `09da:2692` + audio/HID
+  `0573:1573`; FreeRDP mount re-verified unchanged): (1) per-device channel needs the FULL
+  handshake caps→CHANNEL_CREATED→RIMCALL_RELEASE (not just RIMCALL_RELEASE — mstsc closes an
+  out-of-sequence channel; silence-vs-message A/B proved it); (2) accept `UsbDevice=0`
+  (`ironrdp-rdpeusb` div 1); (3) route interface-0 URB completions by function id (div 2).
+  **Next mstsc blocker (device-class, not protocol):** `SelectConfiguration` returns `0x80070057`
+  → no pipe handles → transfers stall; then isoch (camera/audio) + interrupt (HID) + class control
+  (UVC/UAC/HID) are unimplemented. mstsc's RemoteFX list EXCLUDES mass storage (rides Drives/RDPDR),
+  so the verified bulk path can't be exercised from mstsc. Detail: [[project_usb_redirection_feasibility]].
   Path: user-space virtual USB host controller via `IOUSBHostControllerInterface` (a **public,
   headered** IOUSBHost.framework API — NOT private SPI as first assumed; its doc says it
   "create[s] synthetic USB devices"). Entitlement `com.apple.developer.usb.host-controller-

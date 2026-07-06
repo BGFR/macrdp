@@ -331,6 +331,38 @@ The entitlement `com.apple.developer.usb.host-controller-interface` is **granted
   USB stick. Remaining 3.2: an explicit RETRACT_DEVICE PDU (channel-close covers the
   common case), true multi-device (iSerialNumber), non-mass-storage device classes.
 
+- **mstsc client — ENUMERATES end-to-end (2026-07-07), does not STREAM yet.** All
+  prior verification was on FreeRDP; mstsc (RemoteFX USB) is stricter and needed three
+  interop fixes before a device would even announce. Diagnosed with a silence-vs-message
+  A/B on the per-device channel: mstsc keeps a *silent* per-device channel open and
+  waits, but CLOSES it ~4 ms after any out-of-sequence first message. The fixes (all
+  FreeRDP-safe, merged to `main`):
+  1. **Per-device channel needs the full handshake** — capability exchange →
+     `CHANNEL_CREATED` → `RIMCALL_RELEASE`, exactly like the main channel, not just
+     `RIMCALL_RELEASE`. This was THE blocker (mstsc sent a DVC Close, never `ADD_DEVICE`);
+     FreeRDP tolerated the shortcut because its readiness state is global to the main
+     channel. Vendored `ironrdp-server` divergence 16.
+  2. **Accept `UsbDevice = 0`** — mstsc assigns interface-id 0 to a redirected device
+     (it's disambiguated by its own DVC); the decoder rejected the reserved `0x0..=0x3`
+     range, so every mstsc `ADD_DEVICE` failed to parse. Vendored `ironrdp-rdpeusb`
+     divergence 1.
+  3. **Route interface-0 URB completions by function id** — a consequence of (2): the
+     `GET_DESCRIPTOR` completion arrives on interface 0 (== CAPABILITIES) and was
+     mis-decoded as a capability response and silently dropped. Vendored `ironrdp-rdpeusb`
+     divergence 2.
+  With all three, a real mstsc device handshakes, announces `ADD_DEVICE`, and macrdp
+  fetches its descriptors + presents the UserHCI controller — **verified live with an
+  A4Tech camera (`09da:2692`) and a USB Audio/HID device (`0573:1573`)**; the FreeRDP
+  mass-storage mount was re-verified unchanged. **Ceiling reached (device-class work, not
+  protocol):** mstsc `SelectConfiguration` returns `hresult 0x80070057` (E_INVALIDARG),
+  so endpoint pipe handles aren't established → transfers stall, and the UVC/UAC
+  class-control requests (`bmreq 0xa1`/`0x22`) also fail; plus isochronous (camera/audio)
+  and interrupt (HID) endpoints aren't implemented. So **mstsc devices enumerate but
+  don't function.** `SelectConfiguration`-on-mstsc is the next protocol blocker (another
+  mstsc-strictness item; FreeRDP's succeeds and mass storage mounts). Note mstsc's
+  RemoteFX USB list **excludes mass storage** (it rides *Drives*/RDPDR), so the verified
+  bulk/mount path can't be exercised from mstsc.
+
 **Merge-readiness (branch `feat/usb-redirect-spike`).** The feature is fully wired and
 opt-in: `--enable-usb-redirection` (default OFF; when off the URBDRC factory is `None`, so
 the build is inert), `ENABLE_USB_REDIRECTION` in `config.env`, `docs/cli.md` + `--help`

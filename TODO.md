@@ -244,7 +244,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   machines, which isn't a realistic target. See the "Industry status" + "P2.3 FEC capture
   RESULT" notes in `docs/rdp-udp-multitransport-feasibility.md` + `vendor/ironrdp-rdpeudp/CLAUDE.md`.
 
-- [ ] **Generic USB redirection (MS-RDPEUSB) — Phases 1 + 2 + 3.0 + 3.1a GO ✅, Phase 3.1b open.**
+- [ ] **Generic USB redirection (MS-RDPEUSB) — Phases 1 + 2 + 3.0 + 3.1a + 3.1b(1) GO ✅, 3.1b(2) open.**
   Path: user-space virtual USB host controller via `IOUSBHostControllerInterface` (a **public,
   headered** IOUSBHost.framework API — NOT private SPI as first assumed; its doc says it
   "create[s] synthetic USB devices"). Entitlement `com.apple.developer.usb.host-controller-
@@ -271,12 +271,19 @@ then delete; promote a parked item to *In flight* when work actually starts.
     → `ADD_DEVICE` = GO, session stays up). Both `process()` impls now **tolerate decode errors**
     (never tear down the session) — the pinned `ironrdp-rdpeusb` `SupportedUsbVer` enum stops at
     USB 2.0 and rejects the SSD's USB-3.2 `0x320` caps; adversarially code-reviewed clean.
-  - **Phase 3.1b (next)** — full descriptor parse + transfers: **vendor `ironrdp-rdpeusb`** (leaf
-    crate → one-sided path-dep + pull `ironrdp-str`) to extend `SupportedUsbVer` (0x300/0x310/
-    0x320) so USB-3 `AddDevice` caps parse; add a `UsbHandle`/`UsbRouter` async transfer path;
-    evolve `usb_spike.m` from hardcoded+synchronous to client-sourced+async (the IOUSBHost-serial-
-    queue ↔ tokio boundary — the core engineering risk). Then a **real** client device enumerates
-    in `ioreg`. Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.1.
+  - **Phase 3.1b(1) GO** (2026-07-06, commit `357624f`): the client's `ADD_DEVICE` now **fully
+    parses** (real descriptors, `usb_version=Usb32`), not just header-recognized. **Vendored
+    `ironrdp-rdpeusb`** (leaf crate → clean one-sided path-dep; `ironrdp-str` pinned via
+    `[patch.crates-io]`) with a **lenient `UsbDeviceCaps` decode**: `SupportedUsbVer`/`UsbdiVer`/
+    `UsbBusIfaceVer`/`DeviceSpeed` are data-carrying enums with the named values + an `Other(u32)`
+    fallback (named `Usb30/31/32` added), so a modern USB-3 device's `0x320` caps parse instead of
+    erroring. Verified live with a USB-3.2 flash drive. New vendored crate divergence.
+  - **Phase 3.1b(2) (next)** — the async transfer path: a `UsbHandle`/`UsbRouter` (the RdpdrHandle
+    pattern + one extra queue hop) so the server issues control/data transfers and awaits
+    completions; then evolve `usb_spike.m` from hardcoded+synchronous to client-sourced+async (the
+    IOUSBHost-serial-queue ↔ tokio boundary — the core engineering risk). Needs the **entitled/
+    provisioned build** (touches UserHCI). Then a **real** client device enumerates in `ioreg`.
+    Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.1.
   Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].

@@ -240,12 +240,16 @@ The entitlement `com.apple.developer.usb.host-controller-interface` is **granted
   (`ServerEvent::Urbdrc` → `DrdynvcServer::create_channel`) and the client's real
   `ADD_DEVICE` (device descriptors) arrives on it (verified live, USB-3 flash drive).
   Both DVC `process()` impls tolerate decode errors so an unparseable PDU never tears
-  down the session (the pinned `ironrdp-rdpeusb` `SupportedUsbVer` enum still rejects
-  USB-3 `0x320` caps — full USB-3 descriptor parse is 3.1b). Vendored `ironrdp-server`
-  divergence 16.
-- **Phase 3.1b (next)** — vendor `ironrdp-rdpeusb` to parse USB-3 caps, add the
-  `UsbHandle` async transfer path, and evolve `usb_spike.m` to client-sourced
-  descriptors so a real device enumerates in `ioreg`.
+  down the session. Vendored `ironrdp-server` divergence 16.
+- **Phase 3.1b(1) GO** — `ADD_DEVICE` now **fully parses** (real descriptors). The
+  pinned `ironrdp-rdpeusb` `SupportedUsbVer` enum stopped at USB 2.0 and rejected a
+  modern device's `0x320` (USB 3.2) caps, so `ironrdp-rdpeusb` is now **vendored** with
+  a lenient `UsbDeviceCaps` decode (USB 3.x versions + `Other(u32)` fallbacks). Verified
+  live with a USB-3.2 flash drive (`usb_version=Usb32`). See
+  `vendor/ironrdp-rdpeusb/CLAUDE.md`.
+- **Phase 3.1b(2) (next)** — the `UsbHandle`/`UsbRouter` async transfer path + evolve
+  `usb_spike.m` to client-sourced descriptors so a real device enumerates in `ioreg`
+  (needs the entitled/provisioned build — it drives UserHCI).
 
 Cross-reference the `docs/known-quirks.md` smart-card note (kext vs dext vs UserHCI
 rationale) and `project_usb_redirection_feasibility` memory for the running log.

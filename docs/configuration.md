@@ -123,6 +123,16 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           Requires installing the PC/SC IFD handler once + a USB
                           trigger device — see [smart-card-redirection.md](smart-card-redirection.md).
                           macOS-only.
+--enable-usb-redirection  EXPERIMENTAL. Let the connecting client redirect a
+                          physical USB device (mstsc: Local Resources → More →
+                          USB; FreeRDP: /usb:...); macrdp presents it as a REAL
+                          local device — e.g. a redirected flash drive mounts in
+                          Finder. Off by default. Generic USB redirection
+                          (MS-RDPEUSB) via a user-space virtual USB host controller,
+                          so it needs the entitled signed+provisioned build (a plain
+                          build no-ops). Mass storage is verified; other device
+                          classes are untested. macOS-only. See
+                          [usb-redirection-feasibility.md](usb-redirection-feasibility.md).
 --no-mute-on-minimize     Opt out of muting audio while the client window is
                           minimized (default ON). When the client sends the
                           standard `SuppressOutput` PDU on minimize, the server

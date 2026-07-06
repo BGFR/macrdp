@@ -1207,10 +1207,12 @@ AND released — #1276 landing is NOT sufficient.
          tears the controller down and releases the dedup slot, so a reset re-presents
          fresh instead of being skipped as a duplicate of a corpse. `closed()` switched
          from `changed()` to `wait_for(|v| *v)` so a transfer raised after the flip still
-         sees it.
-    - Remaining: retract/hot-unplug via an explicit RETRACT_DEVICE PDU (channel-close
-      covers the common case now), true multi-device (iSerialNumber), non-mass-storage
-      device classes (untested).
+         sees it. **VERIFIED live 2026-07-07**: detaching the drive in UTM logged
+         `per-device channel closed by the client (device unplugged/reset) → destroying
+         UserHCI controller → dedup slot released`, and re-attaching re-presented + mounted.
+    - Remaining: retract/hot-unplug via an explicit RETRACT_DEVICE PDU (the client
+      channel-close path above covers detach/reset — the common case — live-verified),
+      true multi-device (iSerialNumber), non-mass-storage device classes (untested).
     - **One controller per physical device (dedup, presenting-side).** A client can
       announce ONE physical device on more than one `URBDRC` channel — FreeRDP announces
       the same drive twice with instance ids differing by a byte (`…d31`/`…d32`), plus a

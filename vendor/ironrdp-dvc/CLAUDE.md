@@ -104,7 +104,9 @@ since the lib is `test = false`.
     notification the presenting side kept driving a dead channel (a reset never
     re-presented — observed live with a drive resetting behind a flaky USB hub). The
     parallel path (whole-connection drop) already worked via `Drop`; this covers the
-    mid-session single-channel close.
+    mid-session single-channel close. **VERIFIED live 2026-07-07**: detaching a
+    redirected USB drive mid-session tore its controller down and re-attaching
+    re-presented it (the `close` arm fired the USB processor's teardown).
 
 ## Upstream candidacy
 

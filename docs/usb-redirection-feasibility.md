@@ -322,8 +322,9 @@ The entitlement `com.apple.developer.usb.host-controller-interface` is **granted
   the connect-while-mounted crash). (4) **Client channel-close → teardown** — a
   one-line `ironrdp-dvc` divergence now invokes the (previously-dead) `DvcProcessor::close`
   hook, so the client closing a per-device channel (device unplug/reset) tears the
-  controller down and releases the dedup slot → hot-unplug + reset re-present. (5) the
-  Obj-C OUT data-stage reports the full accepted length.
+  controller down and releases the dedup slot → hot-unplug + reset re-present
+  (**verified live 2026-07-07**: detach in UTM → controller torn down → re-attach
+  re-mounts). (5) the Obj-C OUT data-stage reports the full accepted length.
   **"Disk not ejected properly" on client-stop is expected/correct** — the client
   vanished, macrdp destroys the virtual controller (verified to cleanly remove the
   device from `ioreg`), and macOS reports the ungraceful removal exactly like yanking a

@@ -291,11 +291,18 @@ then delete; promote a parked item to *In flight* when work actually starts.
     `UrbdrcDeviceProcessor::process()` shrank to decode-and-route. The descriptor fetch is driven
     through the handle. Verified live: `vid=0x2174 pid=0x2100 usb_version=0x0320`. (Elegance
     refactor of the 2a spike.)
-  - **Phase 3.1b(2b) part 2 (next)** — evolve `usb_spike.m` from hardcoded+synchronous to
-    client-sourced+async: on the kernel's EP0 `GET_DESCRIPTOR`, drive the `UsbHandle` and complete
-    the kernel transfer out-of-band with the client's bytes (the IOUSBHost-serial-queue ↔ tokio
-    boundary — the core engineering risk). Needs the **entitled/provisioned build** (touches
-    UserHCI). Then a **real** client device enumerates in `ioreg`. Plan:
+  - **Phase 3.1b(2b) part 2-i GO** (2026-07-06, commit `c464df0`): **device-callback seam** — the
+    vendored server exposes the `UsbHandle` via `UrbdrcServerFactory::device_callback()`; the
+    per-device processor invokes it on `ADD_DEVICE`, and the transfer **driver moved into macrdp**
+    (`src/usb_redirect/mod.rs::drive_device`). `UrbdrcDeviceProcessor::process()` is now purely
+    decode-and-route. Verified live: macrdp's driver fetched `vid=0x2174 pid=0x2100`. (Elegance +
+    the exact hook the UserHCI integration needs.)
+  - **Phase 3.1b(2b) part 2-ii (next — the Obj-C, entitled build)** — in `drive_device`, create the
+    macOS UserHCI controller (evolve `usb_spike.m`) for the device and answer the kernel's EP0
+    `GET_DESCRIPTOR` by driving the `UsbHandle`: leave the kernel transfer outstanding on the serial
+    queue, fetch async via tokio, `dispatch_async` back to complete it with the client's bytes (the
+    IOUSBHost-serial-queue ↔ tokio boundary — the core engineering risk). Then a **real** device
+    enumerates in `ioreg` (VID 0x2174, not the synthetic 0x1209). Plan:
     `~/.claude/plans/wobbly-honking-minsky.md` §3.1.
   Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
   into the signature). See `docs/usb-redirection-feasibility.md` +

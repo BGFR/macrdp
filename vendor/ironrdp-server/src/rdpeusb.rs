@@ -25,6 +25,12 @@
 //! descriptors — on the per-device channel. Transfers (`UsbHandle`/router + the
 //! IOUSBHost bridge) are Phase 3.1b.
 
+use core::fmt;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
 use ironrdp_core::{Encode, EncodeResult, WriteCursor, decode, impl_as_any};
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
 use ironrdp_pdu::PduResult;
@@ -36,10 +42,15 @@ use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::{TsUrb, TsUrbControlDescRequest};
 use ironrdp_rdpeusb::pdu::usb_dev::{RegisterRequestCallback, TransferInRequest};
 use ironrdp_rdpeusb::pdu::utils::RequestIdTransferInOut;
 use ironrdp_rdpeusb::pdu::{UrbdrcClientPdu, UrbdrcServerPdu};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::{ServerEvent, ServerEventSender};
+
+/// USB standard `bDescriptorType` value for a device descriptor.
+const USB_DESCRIPTOR_TYPE_DEVICE: u8 = 1;
+/// A USB device descriptor is 18 bytes.
+const USB_DEVICE_DESCRIPTOR_LEN: u32 = 18;
 
 /// The MS-RDPEUSB dynamic virtual channel name (this rev's `ironrdp-rdpeusb`
 /// predates the upstream `CHANNEL_NAME` const, so it's spelled out here).
@@ -50,14 +61,30 @@ pub const URBDRC_CHANNEL_NAME: &str = "URBDRC";
 /// this bounds a hostile/buggy client that spams announcements from growing the
 /// DRDYNVC slab without limit. Far above any real device count.
 
-/// Server-loop actions requested by the `URBDRC` processor that it can't perform
-/// itself (they need `&mut DrdynvcServer`, which only the event loop holds).
-/// Delivered via [`ServerEvent::Urbdrc`].
-#[derive(Debug)]
+/// Server-loop actions requested by the `URBDRC` processor / [`UsbHandle`] that
+/// they can't perform themselves (they need `&mut DrdynvcServer`, which only the
+/// event loop holds). Delivered via [`ServerEvent::Urbdrc`].
 pub enum UrbdrcServerMessage {
     /// The client announced a device (`ADD_VIRTUAL_CHANNEL`) and wants a fresh
     /// per-device `URBDRC` DVC. The loop opens one with a [`UrbdrcDeviceProcessor`].
     OpenDeviceChannel,
+    /// Ship DVC messages (a transfer request originated by a [`UsbHandle`]) on an
+    /// already-open per-device channel. The loop DVC-frames them and writes them.
+    SendMessages { channel_id: u32, messages: Vec<DvcMessage> },
+}
+
+impl fmt::Debug for UrbdrcServerMessage {
+    // Manual: `DvcMessage` (a boxed encoder) isn't `Debug`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OpenDeviceChannel => write!(f, "OpenDeviceChannel"),
+            Self::SendMessages { channel_id, messages } => f
+                .debug_struct("SendMessages")
+                .field("channel_id", channel_id)
+                .field("messages", &messages.len())
+                .finish(),
+        }
+    }
 }
 
 /// Wrap a server→client `UrbdrcServerPdu` as a [`DvcMessage`]. The PDU implements
@@ -126,6 +153,165 @@ fn rimcall_release(msg_id: u32) -> DvcMessage {
 /// decoder only — no parallel wire parsing.
 fn peek_function_id(payload: &[u8]) -> Option<FunctionId> {
     decode::<SharedMsgHeader>(payload).ok().and_then(|h| h.function_id)
+}
+
+/// The fields of a standard 18-byte USB device descriptor we surface. Keeps the
+/// descriptor byte-layout knowledge in one typed place instead of inline offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceDescriptor {
+    pub usb_version: u16, // bcdUSB
+    pub device_class: u8,
+    pub vendor_id: u16,  // idVendor
+    pub product_id: u16, // idProduct
+    pub device_release: u16, // bcdDevice
+}
+
+impl DeviceDescriptor {
+    /// Parse a device descriptor (USB spec 9.6.1). Returns `None` if `buf` is too
+    /// short or isn't a device descriptor.
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        // bLength @0, bDescriptorType @1, then the fixed 18-byte layout.
+        if buf.len() < 18 || buf[1] != USB_DESCRIPTOR_TYPE_DEVICE {
+            return None;
+        }
+        let u16le = |i: usize| u16::from_le_bytes([buf[i], buf[i + 1]]);
+        Some(Self {
+            usb_version: u16le(2),
+            device_class: buf[4],
+            vendor_id: u16le(8),
+            product_id: u16le(10),
+            device_release: u16le(12),
+        })
+    }
+}
+
+/// Correlates outstanding transfer requests with their `URB_COMPLETION`s by the
+/// request id echoed in the completion. Mirrors `rdpdr::IoRouter`. Cheaply
+/// clonable (shared inner); the request id doubles as the TS_URB `RequestId`
+/// (31-bit — the counter is masked to fit).
+#[derive(Clone, Default)]
+pub struct UsbRouter {
+    inner: Arc<UsbRouterInner>,
+}
+
+#[derive(Default)]
+struct UsbRouterInner {
+    next_id: AtomicU32,
+    pending: Mutex<HashMap<u32, oneshot::Sender<Vec<u8>>>>,
+}
+
+impl UsbRouter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Allocate a 31-bit request id + a receiver for its completion body.
+    fn register(&self) -> (u32, oneshot::Receiver<Vec<u8>>) {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) & 0x7FFF_FFFF;
+        let (tx, rx) = oneshot::channel();
+        self.inner.pending.lock().unwrap().insert(id, tx);
+        (id, rx)
+    }
+
+    /// Deliver a completion body to the matching waiter (dropped if none).
+    fn deliver(&self, req_id: u32, body: Vec<u8>) {
+        if let Some(tx) = self.inner.pending.lock().unwrap().remove(&req_id) {
+            let _ = tx.send(body);
+        } else {
+            debug!(req_id, "URBDRC: URB completion with no waiter (dropped)");
+        }
+    }
+}
+
+/// Async handle onto a single redirected USB device's per-device DVC. Clone it to
+/// drive transfers from anywhere (the future macOS UserHCI side); each method
+/// registers a completion waiter, ships the request through the server event loop
+/// (`ServerEvent::Urbdrc(SendMessages)`) onto the device channel, and awaits the
+/// matching `URB_COMPLETION`. Mirrors `rdpdr::RdpdrHandle`.
+#[derive(Clone)]
+pub struct UsbHandle {
+    sender: mpsc::UnboundedSender<ServerEvent>,
+    router: UsbRouter,
+    /// The device's per-device DVC channel id (transfers ride this channel).
+    channel_id: u32,
+    /// The device's interface id (addresses the device in each request header).
+    device_iface: InterfaceId,
+}
+
+impl UsbHandle {
+    fn new(sender: mpsc::UnboundedSender<ServerEvent>, router: UsbRouter, channel_id: u32, device_iface: InterfaceId) -> Self {
+        Self {
+            sender,
+            router,
+            channel_id,
+            device_iface,
+        }
+    }
+
+    /// Fetch a descriptor via a `GET_DESCRIPTOR` control transfer (IN) and return
+    /// its raw bytes. `desc_type`/`index`/`lang_id` are the standard
+    /// `SETUP.wValue`/`wIndex`; `max_len` bounds the reply.
+    pub async fn get_descriptor(&self, desc_type: u8, index: u8, lang_id: u16, max_len: u32) -> Result<Vec<u8>> {
+        let (req_id, rx) = self.router.register();
+        let messages = get_descriptor_request(self.device_iface, req_id, desc_type, index, lang_id, max_len);
+        self.sender
+            .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
+                channel_id: self.channel_id,
+                messages,
+            }))
+            .ok()
+            .context("URBDRC: server event loop gone")?;
+        rx.await.context("URBDRC: connection closed before completion")
+    }
+
+    /// Convenience: fetch the 18-byte device descriptor and parse it.
+    pub async fn device_descriptor(&self) -> Result<DeviceDescriptor> {
+        let bytes = self
+            .get_descriptor(USB_DESCRIPTOR_TYPE_DEVICE, 0, 0, USB_DEVICE_DESCRIPTOR_LEN)
+            .await?;
+        DeviceDescriptor::parse(&bytes).context("URBDRC: malformed device descriptor")
+    }
+}
+
+/// Build a `GET_DESCRIPTOR` control-transfer request (IN): a
+/// `RegisterRequestCallback` (naming the completion interface) followed by a
+/// `TransferInRequest` whose TS_URB `RequestId` is `req_id` (echoed in the
+/// completion, so the [`UsbRouter`] can correlate it).
+fn get_descriptor_request(
+    device_iface: InterfaceId,
+    req_id: u32,
+    desc_type: u8,
+    index: u8,
+    lang_id: u16,
+    max_len: u32,
+) -> Vec<DvcMessage> {
+    // Any unique id works for the completion interface; the completion decode is
+    // interface-agnostic, so reuse the device's own interface id.
+    let reg = RegisterRequestCallback {
+        msg_id: 0,
+        udev_iface: device_iface,
+        request_completion: Some(device_iface),
+    };
+    let ts_req_id = RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
+    let get_desc = TransferInRequest {
+        msg_id: 0,
+        udev_iface: device_iface,
+        ts_urb: TsUrb::CtlDescReq(TsUrbControlDescRequest {
+            header: TsUrbHeader {
+                func: UrbFunction::GetDescriptorFromDevice,
+                req_id: ts_req_id,
+                no_ack: false,
+            },
+            index,
+            desc_type,
+            lang_id,
+        }),
+        output_buffer_size: max_len,
+    };
+    vec![
+        dvc_msg(UrbdrcServerPdu::RegReqCb(reg)),
+        dvc_msg(UrbdrcServerPdu::TransferIn(get_desc)),
+    ]
 }
 
 const MAX_DEVICE_CHANNELS: u32 = 32;
@@ -279,72 +465,50 @@ impl DvcServerProcessor for UrbdrcServer {}
 
 /// Per-device `URBDRC` DVC processor. Opened by the event loop in response to
 /// `ADD_VIRTUAL_CHANNEL`; on open it sends `RIMCALL_RELEASE` (the
-/// `INIT_CHANNEL_OUT` barrier) so the client sends `ADD_DEVICE`, which this
-/// decodes to surface the real device descriptors.
+/// `INIT_CHANNEL_OUT` barrier) so the client sends `ADD_DEVICE`.
 ///
-/// **Phase 3.1b(2) transfer spike:** on `ADD_DEVICE` it also issues a
-/// server-initiated `GET_DESCRIPTOR` control transfer (register a completion
-/// interface + `TransferInRequest`) and logs the real 18-byte device descriptor
-/// from the completion — proving the transfer round-trip end-to-end (client →
-/// physical device → completion) before the async `UsbHandle` machinery is built.
+/// Its `process()` is intentionally thin — decode and route: it logs
+/// `ADD_DEVICE`, hands `URB_COMPLETION`s to the [`UsbRouter`], and tolerates
+/// anything else. Transfers themselves are issued through a [`UsbHandle`] (the
+/// async seam the macOS UserHCI side drives). As a Phase 3.1b(2) spike — a
+/// stand-in for that driver — it fetches the real device descriptor once on
+/// `ADD_DEVICE` via that same handle, proving the transfer round-trip end-to-end.
 pub struct UrbdrcDeviceProcessor {
-    next_msg_id: u32,
+    /// Connection event sender, used to build [`UsbHandle`]s that ship transfers.
+    sender: mpsc::UnboundedSender<ServerEvent>,
+    /// Shared with every [`UsbHandle`] we build — completions route back through it.
+    router: UsbRouter,
     /// One-shot guard so the descriptor probe fires at most once per device.
     descriptor_probed: bool,
 }
 
 impl UrbdrcDeviceProcessor {
-    pub fn new() -> Self {
+    pub fn new(sender: mpsc::UnboundedSender<ServerEvent>) -> Self {
         Self {
-            next_msg_id: 1,
+            sender,
+            router: UsbRouter::new(),
             descriptor_probed: false,
         }
     }
 
-    fn take_msg_id(&mut self) -> u32 {
-        let id = self.next_msg_id;
-        self.next_msg_id = self.next_msg_id.wrapping_add(1);
-        id
-    }
-
-    /// Build the GET_DESCRIPTOR probe (Phase 3.1b(2) spike): a
-    /// `RegisterRequestCallback` (naming the completion interface) followed by a
-    /// `TransferInRequest` for the device descriptor (`bDescriptorType = 1`,
-    /// 18 bytes). The completion carries the device's real `idVendor`/`idProduct`.
-    fn build_descriptor_probe(&mut self, dev_iface: InterfaceId) -> Vec<DvcMessage> {
-        // Any unique id works for the completion interface; our completion decode
-        // is interface-agnostic, so reuse the device's own interface id.
-        let reg = RegisterRequestCallback {
-            msg_id: self.take_msg_id(),
-            udev_iface: dev_iface,
-            request_completion: Some(dev_iface),
-        };
-        let req_id = RequestIdTransferInOut::try_from(1).expect("1 fits in 31 bits");
-        let get_desc = TransferInRequest {
-            msg_id: self.take_msg_id(),
-            udev_iface: dev_iface,
-            ts_urb: TsUrb::CtlDescReq(TsUrbControlDescRequest {
-                header: TsUrbHeader {
-                    func: UrbFunction::GetDescriptorFromDevice,
-                    req_id,
-                    no_ack: false,
-                },
-                index: 0,
-                desc_type: 1, // USB device descriptor
-                lang_id: 0,
-            }),
-            output_buffer_size: 18, // device descriptor length
-        };
-        vec![
-            dvc_msg(UrbdrcServerPdu::RegReqCb(reg)),
-            dvc_msg(UrbdrcServerPdu::TransferIn(get_desc)),
-        ]
-    }
-}
-
-impl Default for UrbdrcDeviceProcessor {
-    fn default() -> Self {
-        Self::new()
+    /// Spike driver (stand-in for the future UserHCI side): fetch + log the real
+    /// device descriptor through the async [`UsbHandle`], off the event-loop thread.
+    fn spawn_descriptor_probe(&self, channel_id: u32, device_iface: InterfaceId) {
+        let handle = UsbHandle::new(self.sender.clone(), self.router.clone(), channel_id, device_iface);
+        info!(channel_id, "URBDRC issuing GET_DESCRIPTOR probe (device descriptor)");
+        tokio::spawn(async move {
+            match handle.device_descriptor().await {
+                Ok(d) => info!(
+                    channel_id,
+                    vid = format_args!("{:#06x}", d.vendor_id),
+                    pid = format_args!("{:#06x}", d.product_id),
+                    usb_version = format_args!("{:#06x}", d.usb_version),
+                    device_class = d.device_class,
+                    "URBDRC device descriptor — real device data received (transfer round-trip GO)"
+                ),
+                Err(e) => warn!(channel_id, error = %e, "URBDRC device-descriptor probe failed"),
+            }
+        });
     }
 }
 
@@ -359,7 +523,7 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
         // The per-device channel is up. Send RIMCALL_RELEASE so the client's
         // INIT_CHANNEL_OUT path fires and it sends us ADD_DEVICE (the descriptors).
         info!(channel_id, "URBDRC device channel opened — sending RIMCALL_RELEASE for ADD_DEVICE");
-        Ok(vec![rimcall_release(self.take_msg_id())])
+        Ok(vec![rimcall_release(1)])
     }
 
     fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
@@ -376,53 +540,34 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
                     speed = ?dev.usb_device_caps.device_speed,
                     "URBDRC ADD_DEVICE — real device descriptors received (GO)"
                 );
-                // Phase 3.1b(2) spike: fetch the real device descriptor once.
                 if !self.descriptor_probed {
                     self.descriptor_probed = true;
-                    info!(channel_id, "URBDRC issuing GET_DESCRIPTOR probe (device descriptor)");
-                    return Ok(self.build_descriptor_probe(dev.usb_device));
+                    self.spawn_descriptor_probe(channel_id, dev.usb_device);
                 }
             }
             Ok(UrbdrcClientPdu::UrbComp(comp)) => {
-                let buf = &comp.output_buffer;
-                // USB device descriptor: idVendor @ bytes 8..10, idProduct @ 10..12 (LE).
-                let (vid, pid) = if buf.len() >= 12 {
-                    (
-                        u16::from_le_bytes([buf[8], buf[9]]),
-                        u16::from_le_bytes([buf[10], buf[11]]),
-                    )
-                } else {
-                    (0, 0)
-                };
-                info!(
-                    channel_id,
-                    hresult = format_args!("{:#010x}", comp.hresult),
-                    descriptor_len = buf.len(),
-                    vid = format_args!("{vid:#06x}"),
-                    pid = format_args!("{pid:#06x}"),
-                    "URBDRC URB_COMPLETION — real device descriptor bytes received (transfer round-trip GO)"
-                );
+                self.router.deliver(comp.req_id.into(), comp.output_buffer);
             }
             Ok(UrbdrcClientPdu::UrbCompNoData(comp)) => {
-                warn!(
+                // No payload; wake the waiter with an empty body so it doesn't hang.
+                debug!(
                     channel_id,
                     hresult = format_args!("{:#010x}", comp.hresult),
-                    "URBDRC URB_COMPLETION_NO_DATA — transfer returned no data"
+                    "URBDRC URB_COMPLETION_NO_DATA"
                 );
+                self.router.deliver(comp.req_id.into(), Vec::new());
             }
             Ok(_) => {
-                debug!(channel_id, "URBDRC device-channel PDU (unhandled — transfer machinery is Phase 3.1b)");
+                debug!(channel_id, "URBDRC device-channel PDU (unhandled)");
             }
             Err(e) if peek_function_id(payload) == Some(FunctionId::ADD_DEVICE) => {
                 // The device IS being announced — decode only stumbled on the body
-                // (the pinned ironrdp-rdpeusb decoder rejects newer values such as
-                // USB 3.x SupportedUsbVersion). The forward works; full descriptor
-                // parsing is Phase 3.1b (extend/lenient the caps decoder).
+                // (e.g. an even newer caps value the vendored decoder doesn't name).
+                // The forward works; log it as a GO from the header.
                 warn!(
                     channel_id,
                     error = %e,
-                    "URBDRC ADD_DEVICE received — real device announced (GO); \
-                     pinned decoder couldn't parse its caps (full parse is Phase 3.1b)"
+                    "URBDRC ADD_DEVICE received — real device announced (GO); caps body not fully parsed"
                 );
             }
             Err(e) => {

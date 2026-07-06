@@ -1626,12 +1626,15 @@ impl RdpServer {
                     // a per-device DVC. Only the event loop can reach DrdynvcServer, so
                     // open the channel here and ship the resulting CreateRequest.
                     crate::UrbdrcServerMessage::OpenDeviceChannel => {
+                        // Clone the sender BEFORE the &mut self borrow below; the new
+                        // device processor keeps it to ship transfers back to this loop.
+                        let sender = self.ev_sender.clone();
                         let create_msg = {
                             let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
                                 warn!("No DRDYNVC channel, cannot open URBDRC device channel");
                                 continue;
                             };
-                            match drdynvc.create_channel(crate::rdpeusb::UrbdrcDeviceProcessor::new()) {
+                            match drdynvc.create_channel(crate::rdpeusb::UrbdrcDeviceProcessor::new(sender)) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     warn!(error = %e, "failed to create URBDRC device channel");
@@ -1644,6 +1647,17 @@ impl RdpServer {
                             continue;
                         };
                         let data = server_encode_svc_messages(vec![create_msg], drdynvc_channel_id, user_channel_id)?;
+                        writer.write_all(&data).await?;
+                    }
+                    // A UsbHandle wants to ship a transfer request on an open device
+                    // channel. DVC-frame the messages and write them (mirrors Echo).
+                    crate::UrbdrcServerMessage::SendMessages { channel_id, messages } => {
+                        let dvc_messages = dvc::encode_dvc_messages(channel_id, messages, ChannelFlags::empty())?;
+                        let Some(drdynvc_channel_id) = self.get_channel_id_by_type::<dvc::DrdynvcServer>() else {
+                            warn!("No DRDYNVC channel, dropping URBDRC transfer");
+                            continue;
+                        };
+                        let data = server_encode_svc_messages(dvc_messages, drdynvc_channel_id, user_channel_id)?;
                         writer.write_all(&data).await?;
                     }
                 },

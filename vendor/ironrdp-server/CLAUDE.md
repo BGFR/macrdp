@@ -1100,18 +1100,24 @@ AND released — #1276 landing is NOT sufficient.
     - `UrbdrcDeviceProcessor` (per-device channel): on open (`start`) sends its own
       `RIMCALL_RELEASE` (FreeRDP's `INIT_CHANNEL_OUT` barrier) so the client sends
       `ADD_DEVICE` with the real descriptors, which `process` decodes/logs.
-    - **Phase 3.1b(2) transfer spike (reactive):** on `ADD_DEVICE` the device
-      processor also issues a server-initiated `GET_DESCRIPTOR` control transfer —
-      a `RegisterRequestCallback` (naming the completion interface) + a
-      `TransferInRequest` with `TsUrb::CtlDescReq(GetDescriptorFromDevice)`,
-      `output_buffer_size=18`, `desc_type=1` — and decodes the `URB_COMPLETION`,
-      logging the real device descriptor (idVendor @8..10, idProduct @10..12, LE).
-      This is reactive (returned from `process()`), no `UsbHandle`/router yet —
-      it proves the transfer round-trip (server → client → physical device →
-      completion) before the async machinery is built. **VERIFIED live** with a
-      USB-3.2 flash drive over FreeRDP-with-urbdrc: `hresult=S_OK descriptor_len=18
-      vid=0x2174 pid=0x2100` (the drive's real VID/PID, read from the device).
-      macOS libusb kernel-detach for a mass-storage device was not a blocker after
+    - **Phase 3.1b(2) transfer path (async `UsbHandle`/`UsbRouter`):** transfers ride
+      an async seam modeled on `rdpdr::RdpdrHandle`/`IoRouter`. `UsbRouter` (shared
+      `Arc` inner: `AtomicU32` req id masked to 31 bits + `Mutex<HashMap<id,
+      oneshot>>`) correlates a request with its `URB_COMPLETION` by the TS_URB
+      `RequestId` the completion echoes. `UsbHandle { sender, router, channel_id,
+      device_iface }` (clone it to drive transfers from anywhere) exposes
+      `get_descriptor()`/`device_descriptor()`: register a waiter → ship the request
+      via `ServerEvent::Urbdrc(SendMessages { channel_id, messages })` → the loop
+      DVC-frames it onto the device channel (`encode_dvc_messages` → mirrors the Echo
+      arm) → `await` the completion. `UrbdrcDeviceProcessor::process()` is thin —
+      decode + route: log `ADD_DEVICE`, hand `URB_COMPLETION`s to `router.deliver`,
+      tolerate the rest. `DeviceDescriptor::parse` keeps the USB byte-layout in one
+      typed place (no inline offsets). As a **Phase 3.1b(2) spike** — a stand-in for
+      the future UserHCI driver — `spawn_descriptor_probe` fetches the device
+      descriptor once on `ADD_DEVICE` through that handle. **VERIFIED live** with a
+      USB-3.2 flash drive over FreeRDP-with-urbdrc: `vid=0x2174 pid=0x2100
+      usb_version=0x0320` (the drive's real data, read from the device). macOS libusb
+      kernel-detach for a mass-storage device was not a blocker after
       `diskutil unmountDisk`.
     - A per-connection `MAX_DEVICE_CHANNELS` (32) cap on `OpenDeviceChannel`
       requests bounds a client that spams `ADD_VIRTUAL_CHANNEL` (each opens a DVC

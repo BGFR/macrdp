@@ -1123,6 +1123,16 @@ AND released — #1276 landing is NOT sufficient.
       usb_version=0x0320` (the drive's real data, read from the device) through the
       handle. macOS libusb kernel-detach for a mass-storage device was not a blocker
       after `diskutil unmountDisk`.
+    - **Device lifetime → presenting-side teardown.** `UrbdrcDeviceProcessor` holds a
+      `watch::Sender<bool>` and hands each `UsbHandle` a subscriber; `UsbHandle::closed()`
+      awaits it. The server resets `static_channels` right after the connection loop
+      returns (`server.rs:1244`), so the per-device processor drops on disconnect → the
+      sender drops → every handle's `closed()` resolves. macrdp's `present_device` selects
+      `closed()` against its request channel and destroys the UserHCI controller when it
+      fires — so a controller no longer outlives its connection (VERIFIED: the presented
+      device disappears from `ioreg` on disconnect while the server stays up). `close()` on
+      the DVC processor is never called by the server (same gap as EGFX `on_close`), so this
+      leans on `Drop` via that `static_channels` reset, which is prompt.
     - A per-connection `MAX_DEVICE_CHANNELS` (32) cap on `OpenDeviceChannel`
       requests bounds a client that spams `ADD_VIRTUAL_CHANNEL` (each opens a DVC
       that's never pruned within a connection) from growing the DRDYNVC slab.

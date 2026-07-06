@@ -307,10 +307,16 @@ then delete; promote a parked item to *In flight* when work actually starts.
     URBDRC). **Verified entitled + FreeRDP `/usb` (flash drive): ESD310C, idVendor=0x2174 enumerates
     on macrdp's UserHCI controller** (ioreg `@80100000`), device + string descriptors (product
     "ESD310C") sourced live from the client. Non-entitled path degrades gracefully.
-  - **Phase 3.2 (next, deferred milestone)** — bulk/interrupt/isoch endpoints (make the device
-    *usable*, not just enumerable), retract/hot-unplug + per-device controller teardown,
-    non-descriptor control requests, multi-device, dispatch-priority tier. Plan:
-    `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
+  - **Phase 3.2 STARTED — teardown/lifecycle first** (2026-07-06, commit `3c85845`): the UserHCI
+    controller is now destroyed on disconnect instead of leaking until process exit.
+    `UrbdrcDeviceProcessor` holds a `watch::Sender`; each `UsbHandle` carries a subscriber +
+    `closed()`; the server's `static_channels` reset (`server.rs:1244`) drops the processor on
+    disconnect → `closed()` resolves → `present_device` breaks + destroys the controller. Verified
+    entitled + FreeRDP: the presented ESD310C disappears from `ioreg` on disconnect (server stays up).
+  - **Phase 3.2 remaining** — bulk/interrupt/isoch endpoints (make the device *usable*, not just
+    enumerable — the big one), dedup multiple device-channel announces → one controller per physical
+    device, mid-session retract without disconnect, non-descriptor control requests, multi-device,
+    dispatch-priority tier. Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
   Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].

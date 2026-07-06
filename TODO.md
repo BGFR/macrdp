@@ -244,7 +244,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   machines, which isn't a realistic target. See the "Industry status" + "P2.3 FEC capture
   RESULT" notes in `docs/rdp-udp-multitransport-feasibility.md` + `vendor/ironrdp-rdpeudp/CLAUDE.md`.
 
-- [ ] **Generic USB redirection (MS-RDPEUSB) — Phases 1 + 2 + 3.0 GO ✅, Phase 3.1 open.**
+- [ ] **Generic USB redirection (MS-RDPEUSB) — Phases 1 + 2 + 3.0 + 3.1a GO ✅, Phase 3.1b open.**
   Path: user-space virtual USB host controller via `IOUSBHostControllerInterface` (a **public,
   headered** IOUSBHost.framework API — NOT private SPI as first assumed; its doc says it
   "create[s] synthetic USB devices"). Entitlement `com.apple.developer.usb.host-controller-
@@ -263,12 +263,20 @@ then delete; promote a parked item to *In flight* when work actually starts.
     Mac has no attachable USB device to redirect. Vendored ironrdp-server **divergence 16**
     (`src/rdpeusb.rs`, `UrbdrcServer` + `UrbdrcServerFactory`); `ironrdp-rdpeusb` added as a
     git dep (PDU-only, pinned rev).
-  - **Phase 3.1 (next)** — control-only forward so a **real** client device enumerates in
-    `ioreg`: grow `UrbdrcServer` into the handshake state machine + a `UsbHandle`/`UsbRouter`
-    async transfer path, and evolve `usb_spike.m` from hardcoded+synchronous to
-    client-sourced+async (the IOUSBHost-serial-queue ↔ tokio boundary — the core engineering
-    risk). Live 3.1 verification needs a physical redirectable USB device (or mstsc + the
-    RemoteFX-USB Group Policy). Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.1.
+  - **Phase 3.1a GO** (2026-07-06, commit `38a360f`): the server opens a **per-device DVC** on
+    the client's `ADD_VIRTUAL_CHANNEL` (via `ServerEvent::Urbdrc(OpenDeviceChannel)` → the
+    `client_loop` dispatch arm → `DrdynvcServer::create_channel(UrbdrcDeviceProcessor)`), which
+    sends `RIMCALL_RELEASE` on the new channel so the client sends `ADD_DEVICE` with the real
+    descriptors. **Verified live** with a USB-3 flash drive (full handshake → per-device channel
+    → `ADD_DEVICE` = GO, session stays up). Both `process()` impls now **tolerate decode errors**
+    (never tear down the session) — the pinned `ironrdp-rdpeusb` `SupportedUsbVer` enum stops at
+    USB 2.0 and rejects the SSD's USB-3.2 `0x320` caps; adversarially code-reviewed clean.
+  - **Phase 3.1b (next)** — full descriptor parse + transfers: **vendor `ironrdp-rdpeusb`** (leaf
+    crate → one-sided path-dep + pull `ironrdp-str`) to extend `SupportedUsbVer` (0x300/0x310/
+    0x320) so USB-3 `AddDevice` caps parse; add a `UsbHandle`/`UsbRouter` async transfer path;
+    evolve `usb_spike.m` from hardcoded+synchronous to client-sourced+async (the IOUSBHost-serial-
+    queue ↔ tokio boundary — the core engineering risk). Then a **real** client device enumerates
+    in `ioreg`. Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.1.
   Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].

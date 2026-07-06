@@ -2456,11 +2456,12 @@ async fn async_main() -> Result<()> {
     // Server-direction USB redirection (--enable-usb-redirection, opt-in). Phase
     // 3.0 installs the observe-only URBDRC DVC processor (capability exchange +
     // device-announce logging). Ships inert when the flag is off.
-    let usb_factory: Option<Box<dyn ironrdp_server::UrbdrcServerFactory>> = if args.enable_usb_redirection {
-        Some(Box::new(usb_redirect::MacUsb::new()))
-    } else {
-        None
-    };
+    let usb_factory: Option<Box<dyn ironrdp_server::UrbdrcServerFactory>> =
+        if args.enable_usb_redirection {
+            Some(Box::new(usb_redirect::MacUsb::new()))
+        } else {
+            None
+        };
 
     // Auth hardening (Tier 1.2): per-IP rate-limit + lockout + audit log via the
     // server's pre-handshake/post-disconnect ConnectionHandler seam. On by default

@@ -86,10 +86,16 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   unavailable" and no-ops. Mass storage verified
                           #   end-to-end (mounts + read/write); other device classes
                           #   untested; retract/hot-unplug + multi-device not yet
-                          #   done. Client opts in too (mstsc Local Resources → More →
-                          #   USB; FreeRDP /usb:...). As far as is known, the first
-                          #   OSS RDP *server* to present a redirected USB device.
-                          #   macOS-only. See docs/usb-redirection-feasibility.md.
+                          #   done. Client opts in too. mstsc: first ENABLE the
+                          #   Group Policy "Allow RDP redirection of other supported
+                          #   RemoteFX USB devices from this computer" (Computer
+                          #   Config → Admin Templates → Windows Components → Remote
+                          #   Desktop Services → Remote Desktop Connection Client →
+                          #   RemoteFX USB Device Redirection) + reboot, THEN the
+                          #   device appears under Local Resources → More → USB;
+                          #   FreeRDP /usb:... needs no policy. As far as is known,
+                          #   the first OSS RDP *server* to present a redirected USB
+                          #   device. macOS-only. See docs/usb-redirection-feasibility.md.
 --no-lazy-paste           # Opt out of lazy Windows→Mac file paste (default ON).
                           #   Lazy streams bytes on Cmd-V (NSFilePresenter) with native
                           #   "Preparing to paste" progress and lower chunk parallelism;

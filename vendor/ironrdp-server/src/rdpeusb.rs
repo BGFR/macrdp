@@ -293,13 +293,32 @@ impl UsbHandle {
         &self.device_instance_id
     }
 
-    /// Await the device going away — the owning [`UrbdrcDeviceProcessor`] being
-    /// dropped closes the `watch` sender, which resolves this. Used by the
-    /// presenting side to stop driving + destroy its controller on disconnect.
+    /// Await the device going away, whichever way it goes: the client closing the
+    /// per-device channel (unplug/reset — the processor's `close()` flips the
+    /// `watch` value to `true`) or the whole connection dropping (the processor is
+    /// dropped, closing the `watch` sender). Used by the presenting side to stop
+    /// driving + destroy its controller. `wait_for` (not `changed`) is load-bearing:
+    /// a receiver cloned AFTER the flip considers the current value seen, so
+    /// `changed()` would hang for transfers raised after the close.
     pub async fn closed(&self) {
         let mut rx = self.closed.clone();
-        // `changed()` returns Err once the sender is dropped — either way, done.
-        let _ = rx.changed().await;
+        // Ok(_) = value flipped to true; Err = sender dropped. Either way: gone.
+        let _ = rx.wait_for(|closed| *closed).await;
+    }
+
+    /// Await a transfer completion, racing it against the device going away. The
+    /// race is LOAD-BEARING: the pending oneshot sender lives in the router map,
+    /// which this handle's own `Arc` keeps alive — so on disconnect the completion
+    /// never arrives AND the sender is never dropped, and a bare `rx.await` would
+    /// pend forever (wedging the presenting driver mid-transfer, leaking the
+    /// controller + the dedup slot until process restart). `biased` so a completion
+    /// that raced the close is still delivered.
+    async fn await_reply(&self, rx: oneshot::Receiver<UrbReply>, what: &'static str) -> Result<UrbReply> {
+        tokio::select! {
+            biased;
+            reply = rx => reply.with_context(|| format!("URBDRC: connection closed before {what} completion")),
+            () = self.closed() => anyhow::bail!("URBDRC: device channel closed while awaiting {what} completion"),
+        }
     }
 
     /// Fetch a descriptor via a `GET_DESCRIPTOR` control transfer (IN) and return
@@ -315,7 +334,14 @@ impl UsbHandle {
             }))
             .ok()
             .context("URBDRC: server event loop gone")?;
-        Ok(rx.await.context("URBDRC: connection closed before completion")?.output_buffer)
+        let reply = self.await_reply(rx, "GET_DESCRIPTOR").await?;
+        if reply.hresult != 0 {
+            // A device may legitimately stall an unsupported descriptor request; the
+            // caller turns this into a stall (NOT a success-with-0-bytes, which makes
+            // the local kernel retry the same request instead of moving on).
+            anyhow::bail!("URBDRC: GET_DESCRIPTOR failed (hresult {:#010x})", reply.hresult);
+        }
+        Ok(reply.output_buffer)
     }
 
     /// Convenience: fetch the 18-byte device descriptor and parse it.
@@ -343,7 +369,7 @@ impl UsbHandle {
             }))
             .ok()
             .context("URBDRC: server event loop gone")?;
-        let reply = rx.await.context("URBDRC: connection closed before SelectConfiguration completion")?;
+        let reply = self.await_reply(rx, "SelectConfiguration").await?;
         if reply.hresult != 0 {
             anyhow::bail!("URBDRC: SelectConfiguration failed (hresult {:#010x})", reply.hresult);
         }
@@ -366,7 +392,7 @@ impl UsbHandle {
     /// from [`select_configuration`](Self::select_configuration).
     pub async fn bulk_transfer_in(&self, pipe_handle: u32, length: u32) -> Result<Vec<u8>> {
         let (req_id, rx) = self.router.register();
-        let messages = bulk_transfer_request(self.device_iface, req_id, pipe_handle, BulkDir::In, length, Vec::new());
+        let messages = bulk_transfer_request(self.device_iface, req_id, pipe_handle, Dir::In, length, Vec::new());
         self.sender
             .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
                 channel_id: self.channel_id,
@@ -374,7 +400,7 @@ impl UsbHandle {
             }))
             .ok()
             .context("URBDRC: server event loop gone")?;
-        let reply = rx.await.context("URBDRC: connection closed before bulk-IN completion")?;
+        let reply = self.await_reply(rx, "bulk-IN").await?;
         if reply.hresult != 0 {
             anyhow::bail!("URBDRC: bulk IN failed (hresult {:#010x})", reply.hresult);
         }
@@ -386,7 +412,7 @@ impl UsbHandle {
     pub async fn bulk_transfer_out(&self, pipe_handle: u32, data: Vec<u8>) -> Result<usize> {
         let n = data.len();
         let (req_id, rx) = self.router.register();
-        let messages = bulk_transfer_request(self.device_iface, req_id, pipe_handle, BulkDir::Out, 0, data);
+        let messages = bulk_transfer_request(self.device_iface, req_id, pipe_handle, Dir::Out, 0, data);
         self.sender
             .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
                 channel_id: self.channel_id,
@@ -394,11 +420,36 @@ impl UsbHandle {
             }))
             .ok()
             .context("URBDRC: server event loop gone")?;
-        let reply = rx.await.context("URBDRC: connection closed before bulk-OUT completion")?;
+        let reply = self.await_reply(rx, "bulk-OUT").await?;
         if reply.hresult != 0 {
             anyhow::bail!("URBDRC: bulk OUT failed (hresult {:#010x})", reply.hresult);
         }
         Ok(n)
+    }
+
+    /// Forward an EP0 **control-IN** request (device→host) that isn't a standard
+    /// device-recipient `GET_DESCRIPTOR` — e.g. a class request like mass-storage
+    /// `Get Max LUN` (`0xa1/0xfe`) or a HID report-descriptor read (`0x81/0x06`) —
+    /// to the client's device via a generic `URB_FUNCTION_CONTROL_TRANSFER_EX` on
+    /// the default control pipe, returning the data-stage bytes. `setup` is the raw
+    /// 8-byte SETUP (recipient/type bits preserved, which the dedicated descriptor
+    /// URB can't carry); `max_len` bounds the reply (the data-stage buffer size,
+    /// i.e. `wLength`).
+    pub async fn control_transfer_in(&self, setup: [u8; 8], max_len: u32) -> Result<Vec<u8>> {
+        let (req_id, rx) = self.router.register();
+        let messages = control_transfer_request(self.device_iface, req_id, setup, Dir::In, max_len, Vec::new());
+        self.sender
+            .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
+                channel_id: self.channel_id,
+                messages,
+            }))
+            .ok()
+            .context("URBDRC: server event loop gone")?;
+        let reply = self.await_reply(rx, "control-IN").await?;
+        if reply.hresult != 0 {
+            anyhow::bail!("URBDRC: control IN failed (hresult {:#010x})", reply.hresult);
+        }
+        Ok(reply.output_buffer)
     }
 
     /// Forward an EP0 **control-OUT** request (host→device) to the client's device
@@ -409,7 +460,7 @@ impl UsbHandle {
     /// (empty for the no-data requests, which is the common case).
     pub async fn control_transfer_out(&self, setup: [u8; 8], data: Vec<u8>) -> Result<()> {
         let (req_id, rx) = self.router.register();
-        let messages = control_out_request(self.device_iface, req_id, setup, data);
+        let messages = control_transfer_request(self.device_iface, req_id, setup, Dir::Out, 0, data);
         self.sender
             .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
                 channel_id: self.channel_id,
@@ -417,7 +468,7 @@ impl UsbHandle {
             }))
             .ok()
             .context("URBDRC: server event loop gone")?;
-        let reply = rx.await.context("URBDRC: connection closed before control-OUT completion")?;
+        let reply = self.await_reply(rx, "control-OUT").await?;
         if reply.hresult != 0 {
             anyhow::bail!("URBDRC: control OUT failed (hresult {:#010x})", reply.hresult);
         }
@@ -425,9 +476,11 @@ impl UsbHandle {
     }
 }
 
-/// Direction of a bulk/interrupt transfer (which request PDU + transfer-flag it uses).
+/// Direction of a forwarded transfer: which request PDU carries it
+/// (IN → `TransferInRequest`, OUT → `TransferOutRequest`) and which
+/// `USBD_TRANSFER_DIRECTION` flag the URB must carry (the codec enforces the match).
 #[derive(Clone, Copy)]
-enum BulkDir {
+enum Dir {
     In,
     Out,
 }
@@ -441,7 +494,7 @@ fn bulk_transfer_request(
     device_iface: InterfaceId,
     req_id: u32,
     pipe_handle: u32,
-    dir: BulkDir,
+    dir: Dir,
     in_length: u32,
     out_data: Vec<u8>,
 ) -> Vec<DvcMessage> {
@@ -452,8 +505,8 @@ fn bulk_transfer_request(
     };
     let ts_req_id = RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
     let transfer_flags = match dir {
-        BulkDir::In => USBD_TRANSFER_DIRECTION_IN,
-        BulkDir::Out => 0,
+        Dir::In => USBD_TRANSFER_DIRECTION_IN,
+        Dir::Out => 0,
     };
     let urb = TsUrbBulkOrInterruptTransfer {
         header: TsUrbHeader {
@@ -465,13 +518,13 @@ fn bulk_transfer_request(
         transfer_flags,
     };
     let transfer = match dir {
-        BulkDir::In => dvc_msg(UrbdrcServerPdu::TransferIn(TransferInRequest {
+        Dir::In => dvc_msg(UrbdrcServerPdu::TransferIn(TransferInRequest {
             msg_id: 0,
             udev_iface: device_iface,
             ts_urb: TsUrb::BulkInterruptTransfer(urb),
             output_buffer_size: in_length,
         })),
-        BulkDir::Out => dvc_msg(UrbdrcServerPdu::TransferOut(TransferOutRequest {
+        Dir::Out => dvc_msg(UrbdrcServerPdu::TransferOut(TransferOutRequest {
             msg_id: 0,
             udev_iface: device_iface,
             ts_urb: TsUrb::BulkInterruptTransfer(urb),
@@ -481,12 +534,22 @@ fn bulk_transfer_request(
     vec![dvc_msg(UrbdrcServerPdu::RegReqCb(reg)), transfer]
 }
 
-/// Build a control-OUT transfer request: a `RegisterRequestCallback` + a
-/// `TransferOutRequest` carrying a `TS_URB_CONTROL_TRANSFER_EX` on the default
-/// control pipe (pipe handle 0 → the client maps it to endpoint 0, the default
-/// control endpoint — per MS-RDPEUSB `EndpointAddress = PipeHandle & 0xff`).
-/// `data` is the host→device payload (empty for no-data requests).
-fn control_out_request(device_iface: InterfaceId, req_id: u32, setup: [u8; 8], data: Vec<u8>) -> Vec<DvcMessage> {
+/// Build a generic EP0 control transfer request: a `RegisterRequestCallback` + a
+/// `TransferInRequest` (IN, `output_buffer_size = in_length`) or
+/// `TransferOutRequest` (OUT, `output_buffer = out_data`) carrying a
+/// `TS_URB_CONTROL_TRANSFER_EX` on the default control pipe (pipe handle 0 → the
+/// client maps it to endpoint 0 — per MS-RDPEUSB `EndpointAddress = PipeHandle &
+/// 0xff`). The raw SETUP rides verbatim, so recipient/type bits (class/vendor,
+/// interface/endpoint-directed) are preserved — which the dedicated descriptor URB
+/// can't do. The direction flag must match the request PDU (the codec enforces it).
+fn control_transfer_request(
+    device_iface: InterfaceId,
+    req_id: u32,
+    setup: [u8; 8],
+    dir: Dir,
+    in_length: u32,
+    out_data: Vec<u8>,
+) -> Vec<DvcMessage> {
     let reg = RegisterRequestCallback {
         msg_id: 0,
         udev_iface: device_iface,
@@ -500,23 +563,35 @@ fn control_out_request(device_iface: InterfaceId, req_id: u32, setup: [u8; 8], d
         index: u16::from_le_bytes([setup[4], setup[5]]),
         length: u16::from_le_bytes([setup[6], setup[7]]),
     };
+    let transfer_flags = match dir {
+        Dir::In => USBD_TRANSFER_DIRECTION_IN,
+        Dir::Out => 0,
+    };
     let urb = TsUrbControlTransferEx {
         header: TsUrbHeader {
             func: UrbFunction::ControlTransferEx,
             req_id: ts_req_id,
             no_ack: false,
         },
-        pipe: 0,           // default control endpoint (EP0)
-        transfer_flags: 0, // host→device (OUT)
+        pipe: 0, // default control endpoint (EP0)
+        transfer_flags,
         timeout: 0,
         setup_packet,
     };
-    let transfer = dvc_msg(UrbdrcServerPdu::TransferOut(TransferOutRequest {
-        msg_id: 0,
-        udev_iface: device_iface,
-        ts_urb: TsUrb::CtlTransferEx(urb),
-        output_buffer: data,
-    }));
+    let transfer = match dir {
+        Dir::In => dvc_msg(UrbdrcServerPdu::TransferIn(TransferInRequest {
+            msg_id: 0,
+            udev_iface: device_iface,
+            ts_urb: TsUrb::CtlTransferEx(urb),
+            output_buffer_size: in_length,
+        })),
+        Dir::Out => dvc_msg(UrbdrcServerPdu::TransferOut(TransferOutRequest {
+            msg_id: 0,
+            udev_iface: device_iface,
+            ts_urb: TsUrb::CtlTransferEx(urb),
+            output_buffer: out_data,
+        })),
+    };
     vec![dvc_msg(UrbdrcServerPdu::RegReqCb(reg)), transfer]
 }
 
@@ -953,6 +1028,19 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
             }
         }
         Ok(Vec::new())
+    }
+
+    fn close(&mut self, channel_id: u32) {
+        // The client closed this per-device channel — the redirected device was
+        // unplugged or reset on the client. Mark the liveness watch so every
+        // UsbHandle's `closed()` resolves: the presenting side tears its controller
+        // down (the local device disappears) and releases its dedup slot, so a
+        // reset's re-announce presents fresh instead of being skipped as a
+        // duplicate of a corpse. (Without this, the stale presentation drove a
+        // dead channel forever — observed live as a drive that never came back
+        // after resetting behind a flaky hub.)
+        info!(channel_id, "URBDRC per-device channel closed by the client (device unplugged/reset) — releasing the presenting side");
+        self.alive.send_replace(true);
     }
 }
 

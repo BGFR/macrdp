@@ -1171,8 +1171,46 @@ AND released — #1276 landing is NOT sufficient.
       control STATUS stage and excludes the standard requests the host controller /
       SelectConfiguration own (SET_ADDRESS/CONFIGURATION/INTERFACE). Regression-verified live (clean
       path unaffected — SET_CONFIGURATION correctly stays a local ACK); the forward only fires under
-      a device error/stall. Remaining: generic control-IN forwarding (GET_DESCRIPTOR-only today),
-      retract/hot-unplug.
+      a device error/stall.
+    - **Hardening pass (2026-07-07, all live-verified with the connect-while-mounted repro).**
+      Five fixes closed real gaps found reviewing the bulk/control path:
+      1. **Disconnect-race deadlock (serious).** Every `UsbHandle` transfer awaited a
+         oneshot whose sender lives in the router map, kept alive by the handle's own
+         `Arc` — so on disconnect the completion never arrives AND the sender never
+         drops, and a bare `rx.await` pends forever, wedging the presenting driver
+         mid-transfer (controller + dedup slot leaked until process exit). New
+         `UsbHandle::await_reply` races every completion against `closed()` (`biased`,
+         reply-first). ALL transfer methods route through it.
+      2. **Generic control-IN forwarding.** New `UsbHandle::control_transfer_in(setup,
+         max_len)` (generic `CONTROL_TRANSFER_EX`, IN direction, raw SETUP preserved);
+         the Obj-C side now forwards ANY device→host EP0 data stage, and the Rust
+         driver routes standard device-recipient `GET_DESCRIPTOR` (`0x80/0x06`) through
+         the dedicated descriptor URB and everything else generically. Fixes mass-storage
+         **Get Max LUN** (`0xa1/0xfe`, multi-LUN devices) — VERIFIED forwarded+answered
+         live — and unblocks HID report-descriptor reads. `control_out_request` was
+         generalized to `control_transfer_request(dir, …)` serving both directions;
+         `get_descriptor` now honors `hresult` (stalls instead of returning 0 bytes,
+         which made the kernel retry).
+      3. **Per-endpoint transfer supersession (fixes a SIGBUS).** When a slow device
+         (Get Max LUN on a flaky drive) missed the kernel's ~5 s EP0 timeout, the kernel
+         re-issued the transfer slot; the late completion of the ORIGINAL then wrote
+         through the retired ring `msg` → SIGBUS in the completion memcpy (the two prior
+         guards — endpoint liveness + object identity — couldn't catch it: same endpoint,
+         still Active, only the ring slot stale). `usb_spike.m` now tracks one outstanding
+         transfer per endpoint (`pendingByEndpoint`) and invalidates the prior on a new
+         raise / EndpointDestroy. VERIFIED: connect-while-mounted (the crash repro) now
+         mounts and stays.
+      4. **Client channel-close → presenting teardown (hot-unplug).** `UrbdrcDeviceProcessor`
+         now implements `DvcProcessor::close` (newly *invoked* by the vendored
+         `ironrdp-dvc` server — divergence 2 there): it flips the liveness `watch` so a
+         client-initiated per-device-channel close (device unplugged/reset on the client)
+         tears the controller down and releases the dedup slot, so a reset re-presents
+         fresh instead of being skipped as a duplicate of a corpse. `closed()` switched
+         from `changed()` to `wait_for(|v| *v)` so a transfer raised after the flip still
+         sees it.
+    - Remaining: retract/hot-unplug via an explicit RETRACT_DEVICE PDU (channel-close
+      covers the common case now), true multi-device (iSerialNumber), non-mass-storage
+      device classes (untested).
     - **One controller per physical device (dedup, presenting-side).** A client can
       announce ONE physical device on more than one `URBDRC` channel — FreeRDP announces
       the same drive twice with instance ids differing by a byte (`…d31`/`…d32`), plus a

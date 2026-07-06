@@ -305,20 +305,41 @@ The entitlement `com.apple.developer.usb.host-controller-interface` is **granted
   endpoint at the same key, leaving a pending transfer pointing into a freed ring). EP0
   **control-OUT** forwarding also lands (mass-storage Bulk-Only Reset / Clear-Feature ride
   `UsbHandle::control_transfer_out`, a generic `CONTROL_TRANSFER_EX`; SET_ADDRESS/CONFIGURATION/
-  INTERFACE stay local ACKs), regression-verified but only fires under a SCSI error. Remaining
-  3.2: generic control-IN forwarding (GET_DESCRIPTOR-only today), retract/hot-unplug, true
-  multi-device.
+  INTERFACE stay local ACKs), regression-verified but only fires under a SCSI error.
+
+- **Hardening pass (2026-07-07)** — five review fixes, all live-verified with the
+  connect-while-mounted repro (the drive now mounts and stays, no crash): (1) a
+  **disconnect-race deadlock** — every transfer awaited a oneshot the handle's own
+  `Arc` kept alive, so a disconnect mid-transfer pended forever and leaked the
+  controller + dedup slot; `UsbHandle::await_reply` now races every completion against
+  `closed()`. (2) **Generic control-IN forwarding** — `UsbHandle::control_transfer_in`
+  forwards any non-standard-descriptor EP0 IN with the raw SETUP preserved, so
+  mass-storage **Get Max LUN** (multi-LUN) and HID report-descriptor reads work
+  (verified forwarded+answered live). (3) **Per-endpoint transfer supersession** — a
+  slow device missing the kernel's ~5 s EP0 timeout let the kernel re-issue the ring
+  slot while the original completion was still in flight → SIGBUS through the retired
+  slot; the Obj-C side now invalidates a superseded transfer at raise time (this was
+  the connect-while-mounted crash). (4) **Client channel-close → teardown** — a
+  one-line `ironrdp-dvc` divergence now invokes the (previously-dead) `DvcProcessor::close`
+  hook, so the client closing a per-device channel (device unplug/reset) tears the
+  controller down and releases the dedup slot → hot-unplug + reset re-present. (5) the
+  Obj-C OUT data-stage reports the full accepted length.
+  **"Disk not ejected properly" on client-stop is expected/correct** — the client
+  vanished, macrdp destroys the virtual controller (verified to cleanly remove the
+  device from `ioreg`), and macOS reports the ungraceful removal exactly like yanking a
+  USB stick. Remaining 3.2: an explicit RETRACT_DEVICE PDU (channel-close covers the
+  common case), true multi-device (iSerialNumber), non-mass-storage device classes.
 
 **Merge-readiness (branch `feat/usb-redirect-spike`).** The feature is fully wired and
 opt-in: `--enable-usb-redirection` (default OFF; when off the URBDRC factory is `None`, so
 the build is inert), `ENABLE_USB_REDIRECTION` in `config.env`, `docs/cli.md` + `--help`
 documented, and the `--fork-workers` supervisor forwards it (verbatim argv). CI green;
 `cargo clippy`/`test`/`fmt` clean. It's **safe to merge as EXPERIMENTAL** (the UDP-multitransport
-precedent) — the risky robustness gap (control-OUT / mass-storage reset not forwarded) is now
-closed and the clean path is field-verified. What's genuinely deferred before it's a *supported*
-feature: generic control-IN forwarding (single-LUN only today), retract/hot-unplug, multi-device,
-and verification of device classes beyond mass storage. Presenting side is macOS-only and needs
-the entitled/provisioned build.
+precedent) — the robustness gaps found in review (disconnect-race deadlock, the connect-while-
+mounted SIGBUS, control forwarding, hot-unplug) are now closed and the clean path is
+field-verified. What's genuinely deferred before it's a *supported* feature: an explicit
+RETRACT_DEVICE PDU, true multi-device, and verification of device classes beyond mass storage.
+Presenting side is macOS-only and needs the entitled/provisioned build.
 
 Cross-reference the `docs/known-quirks.md` smart-card note (kext vs dext vs UserHCI
 rationale) and `project_usb_redirection_feasibility` memory for the running log.

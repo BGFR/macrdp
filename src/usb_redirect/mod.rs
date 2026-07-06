@@ -35,7 +35,17 @@
 //! device too, via [`UsbHandle::control_transfer_out`] (generic
 //! `URB_FUNCTION_CONTROL_TRANSFER_EX`); the standard requests the host controller /
 //! SelectConfiguration already own (SET_ADDRESS/CONFIGURATION/INTERFACE) stay a local
-//! ACK. Remaining 3.2 work: retract/hot-unplug, true multi-device. All Obj-C /
+//! ACK. EP0 **control-IN** is generic too: a standard device-recipient
+//! `GET_DESCRIPTOR` rides the dedicated descriptor URB (the verified enumeration
+//! path), and everything else — class/vendor INs like mass-storage `Get Max LUN`,
+//! interface-directed ones like a HID report-descriptor read — forwards via
+//! [`UsbHandle::control_transfer_in`] with the raw SETUP preserved. Transfers are
+//! serviced **concurrently** (one task each): the ObjC ring walk serializes per
+//! endpoint, and cross-endpoint independence is what keeps a long-outstanding
+//! transfer (an idle interrupt-IN, a wedged bulk) from blocking EP0 — notably the
+//! reset that recovers the wedge. Every transfer await races `closed()` so a
+//! disconnect mid-transfer tears down instead of wedging. Remaining 3.2 work:
+//! retract/hot-unplug, true multi-device. All Obj-C /
 //! IOUSBHost SPI touches are quarantined
 //! in `usb_spike.m` (the maintenance boundary), built + linked by `build.rs` on
 //! macOS; the standalone `--usb-spike` path still presents the hardcoded synthetic
@@ -166,6 +176,7 @@ fn drive_device(handle: UsbHandle) {
         );
         imp::present_device(handle).await;
         release_device(&key);
+        info!(identity = %key, "USB redirection: presentation ended — dedup slot released");
     });
 }
 
@@ -180,6 +191,11 @@ mod imp {
     // ---- USB standard-request constants ----
     const USB_REQ_GET_DESCRIPTOR: u8 = 0x06;
     const USB_DESCRIPTOR_TYPE_CONFIGURATION: u8 = 2;
+    /// bmRequestType of a standard, device-recipient, device-to-host request —
+    /// the exact shape of a standard `GET_DESCRIPTOR`. Class/vendor or
+    /// interface/endpoint-directed INs (Get Max LUN `0xa1`, HID report-descriptor
+    /// reads `0x81`) don't match and go through the generic control-IN forward.
+    const USB_BMREQ_STANDARD_DEVICE_IN: u8 = 0x80;
     const STATUS_OK: i32 = 0;
     const STATUS_STALL: i32 = 1;
 
@@ -335,10 +351,14 @@ mod imp {
     }
 
     /// Owns the opaque UserHCI controller handle; `destroy` on drop. Only the
-    /// thread-safe C functions (which `dispatch_async` onto the serial queue) are
-    /// called through it, so it is safe to move/share across tokio threads.
+    /// thread-safe C functions (which `dispatch_async` onto the controller's
+    /// serial queue) are called through it, so it is safe to move AND share across
+    /// tokio threads: concurrent `complete_*` calls just enqueue blocks on the one
+    /// serial queue (Send for the move into tasks, Sync for `Arc` sharing between
+    /// them; `destroy` needs `&mut`/drop, so it can't race the shared calls).
     struct ControllerHandle(*mut c_void);
     unsafe impl Send for ControllerHandle {}
+    unsafe impl Sync for ControllerHandle {}
     impl ControllerHandle {
         /// Complete an IN transfer (control-IN or bulk-IN): `bytes` are copied into
         /// the kernel's transfer buffer.
@@ -367,13 +387,14 @@ mod imp {
     }
 
     /// Present the client's device locally: create the UserHCI controller and
-    /// service its EP0 control-IN transfers from the client over `handle`. A no-op
-    /// (logs once) when the controller can't be created — e.g. a plain `cargo`
-    /// build without the `com.apple.developer.usb.host-controller-interface`
-    /// entitlement. Runs until the device goes away — either the client link
-    /// fails on a fetch, or `handle.closed()` fires (the owning device processor
-    /// dropped on disconnect) — then destroys the controller. Fuller lifecycle
-    /// (mid-session retract / multi-device) is Phase 3.2.
+    /// service its transfers (EP0 control IN/OUT + bulk/interrupt) from the client
+    /// over `handle`. A no-op (logs once) when the controller can't be created —
+    /// e.g. a plain `cargo` build without the
+    /// `com.apple.developer.usb.host-controller-interface` entitlement. Runs until
+    /// `handle.closed()` fires (the owning device processor dropped on disconnect),
+    /// then destroys the controller; every in-flight transfer await also races
+    /// `closed()` inside `UsbHandle`, so a disconnect mid-transfer can't wedge the
+    /// teardown. Fuller lifecycle (mid-session retract / multi-device) is deferred.
     pub async fn present_device(handle: UsbHandle) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TransferReq>();
         // Leak the ctx (a small, bounded per-presentation allocation) so a C
@@ -395,7 +416,10 @@ mod imp {
             warn!(err, "USB redirection: UserHCI controller unavailable (needs the entitled build) — not presenting");
             return;
         }
-        let controller = ControllerHandle(raw);
+        // Arc so per-transfer service tasks can complete after the loop exits; the
+        // ObjC controller is destroyed only when the last in-flight task drops its
+        // clone, so a completion can never race the destroy.
+        let controller = std::sync::Arc::new(ControllerHandle(raw));
         info!("USB redirection: UserHCI controller created — presenting the client's device (watch `ioreg -p IOUSB`)");
 
         // Configure the client's device + learn its endpoint pipe handles — the
@@ -425,10 +449,16 @@ mod imp {
             }
         }
 
-        // Service each raised transfer from the client. Stop when the device goes
-        // away: a control-IN fetch failure (link dead) or the device channel closing
-        // (disconnect) via handle.closed(). A bulk failure stalls that one transfer
-        // (the mass-storage driver retries / resets) without tearing down.
+        // Service each raised transfer in ITS OWN task, so endpoints don't block
+        // each other — the ObjC ring walk already serializes per endpoint (at most
+        // one outstanding forwarded transfer each), and cross-endpoint concurrency
+        // is how a real host controller behaves. Serializing everything through one
+        // await was a deadlock-by-design for any device with a long-outstanding
+        // transfer (an interrupt-IN idles until the device has data — HID) and let a
+        // wedged bulk block the mass-storage RESET control-OUT queued behind it —
+        // the exact recovery it exists for. A transfer failure stalls just that
+        // transfer (the class driver retries / resets); teardown is solely
+        // handle.closed() (link death), which also aborts every in-flight await.
         loop {
             let req = tokio::select! {
                 maybe = rx.recv() => match maybe {
@@ -446,45 +476,60 @@ mod imp {
                     setup,
                     max_len,
                 } => {
-                    if setup[1] != USB_REQ_GET_DESCRIPTOR {
-                        // Only descriptor reads are forwarded on EP0 today (enough to
-                        // enumerate); stall the rest (SET_* have no data stage).
-                        controller.complete_in(token, &[], STATUS_STALL);
-                        continue;
-                    }
-                    // GET_DESCRIPTOR wValue: high byte = type, low byte = index.
-                    let desc_index = setup[2];
-                    let desc_type = setup[3];
-                    let lang_id = u16::from_le_bytes([setup[4], setup[5]]);
-                    match handle
-                        .get_descriptor(desc_type, desc_index, lang_id, max_len)
-                        .await
-                    {
-                        Ok(bytes) => controller.complete_in(token, &bytes, STATUS_OK),
-                        Err(e) => {
-                            warn!(error = %e, token, "USB redirection: descriptor fetch failed — tearing down");
-                            controller.complete_in(token, &[], STATUS_STALL);
-                            break;
+                    let handle = handle.clone();
+                    let controller = std::sync::Arc::clone(&controller);
+                    tokio::spawn(async move {
+                        // A standard device-recipient GET_DESCRIPTOR rides the
+                        // dedicated descriptor URB (the verified enumeration path);
+                        // every other IN (class/vendor like Get Max LUN, or
+                        // interface-directed like a HID report-descriptor read)
+                        // forwards generically with its raw SETUP preserved.
+                        let result = if setup[0] == USB_BMREQ_STANDARD_DEVICE_IN
+                            && setup[1] == USB_REQ_GET_DESCRIPTOR
+                        {
+                            // GET_DESCRIPTOR wValue: high byte = type, low = index.
+                            let lang_id = u16::from_le_bytes([setup[4], setup[5]]);
+                            handle
+                                .get_descriptor(setup[3], setup[2], lang_id, max_len)
+                                .await
+                        } else {
+                            handle.control_transfer_in(setup, max_len).await
+                        };
+                        match result {
+                            Ok(bytes) => controller.complete_in(token, &bytes, STATUS_OK),
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    token,
+                                    bmreq = format_args!("{:#04x}", setup[0]),
+                                    breq = format_args!("{:#04x}", setup[1]),
+                                    "USB redirection: control-IN forward failed — stalling"
+                                );
+                                controller.complete_in(token, &[], STATUS_STALL);
+                            }
                         }
-                    }
+                    });
                 }
                 TransferReq::ControlOut { token, setup, data } => {
                     // Forward a host->device EP0 request to the real device (e.g. a
-                    // mass-storage Bulk-Only Reset / Clear-Feature(HALT)). A failure
-                    // stalls just this transfer — the driver retries — never tears down.
-                    match handle.control_transfer_out(setup, data).await {
-                        Ok(()) => controller.complete_out(token, 0, STATUS_OK),
-                        Err(e) => {
-                            warn!(
-                                error = %e,
-                                token,
-                                bmreq = format_args!("{:#04x}", setup[0]),
-                                breq = format_args!("{:#04x}", setup[1]),
-                                "USB redirection: control-OUT forward failed — stalling"
-                            );
-                            controller.complete_out(token, 0, STATUS_STALL);
+                    // mass-storage Bulk-Only Reset / Clear-Feature(HALT)).
+                    let handle = handle.clone();
+                    let controller = std::sync::Arc::clone(&controller);
+                    tokio::spawn(async move {
+                        match handle.control_transfer_out(setup, data).await {
+                            Ok(()) => controller.complete_out(token, 0, STATUS_OK),
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    token,
+                                    bmreq = format_args!("{:#04x}", setup[0]),
+                                    breq = format_args!("{:#04x}", setup[1]),
+                                    "USB redirection: control-OUT forward failed — stalling"
+                                );
+                                controller.complete_out(token, 0, STATUS_STALL);
+                            }
                         }
-                    }
+                    });
                 }
                 TransferReq::Bulk {
                     token,
@@ -501,24 +546,28 @@ mod imp {
                         controller.complete_out(token, 0, STATUS_STALL);
                         continue;
                     };
-                    if is_in {
-                        match handle.bulk_transfer_in(pipe, length).await {
-                            Ok(bytes) => controller.complete_in(token, &bytes, STATUS_OK),
-                            Err(e) => {
-                                warn!(error = %e, endpoint = format_args!("{:#04x}", endpoint_address), "USB redirection: bulk IN failed — stalling");
-                                controller.complete_in(token, &[], STATUS_STALL);
+                    let handle = handle.clone();
+                    let controller = std::sync::Arc::clone(&controller);
+                    tokio::spawn(async move {
+                        if is_in {
+                            match handle.bulk_transfer_in(pipe, length).await {
+                                Ok(bytes) => controller.complete_in(token, &bytes, STATUS_OK),
+                                Err(e) => {
+                                    warn!(error = %e, endpoint = format_args!("{:#04x}", endpoint_address), "USB redirection: bulk IN failed — stalling");
+                                    controller.complete_in(token, &[], STATUS_STALL);
+                                }
+                            }
+                        } else {
+                            let n = data.len() as u32;
+                            match handle.bulk_transfer_out(pipe, data).await {
+                                Ok(_) => controller.complete_out(token, n, STATUS_OK),
+                                Err(e) => {
+                                    warn!(error = %e, endpoint = format_args!("{:#04x}", endpoint_address), "USB redirection: bulk OUT failed — stalling");
+                                    controller.complete_out(token, 0, STATUS_STALL);
+                                }
                             }
                         }
-                    } else {
-                        let n = data.len() as u32;
-                        match handle.bulk_transfer_out(pipe, data).await {
-                            Ok(_) => controller.complete_out(token, n, STATUS_OK),
-                            Err(e) => {
-                                warn!(error = %e, endpoint = format_args!("{:#04x}", endpoint_address), "USB redirection: bulk OUT failed — stalling");
-                                controller.complete_out(token, 0, STATUS_STALL);
-                            }
-                        }
-                    }
+                    });
                 }
             }
         }

@@ -2,7 +2,7 @@
 
 Local fork of ironrdp-dvc 0.5.0, copied 2026-06-26 from upstream
 Devolutions/IronRDP@879ffed (the same rev as the other git pins) and pulled in
-via the root `Cargo.toml`. Keep this vendor dir until the divergence below is
+via the root `Cargo.toml`. Keep this vendor dir until the divergences below are
 upstreamed AND released.
 
 **Patch wiring is two-sided.** Unlike the other vendored crates, ironrdp-dvc is a
@@ -91,9 +91,25 @@ since the lib is `test = false`.
     M5b-1 hand-rolled copies in `vendor/ironrdp-rdpeudp/src/softsync.rs` were
     removed in favor of this (correct) layer; see that crate's CLAUDE.md.
 
+(2) Invoke `DvcProcessor::close` on a client-initiated channel close (2026-07-07).
+    In `src/server.rs` `DrdynvcServer::process`, the `DrdynvcClientPdu::Close` arm
+    set the channel state to `Closed` but **never called the processor's `close`
+    hook** — the trait method (`DvcProcessor::close`, default no-op, already in the
+    upstream trait) existed but was dead. Added a single line:
+    `c.processor.close(close_resp.channel_id());` after the state transition. This is
+    a **pure addition** (one line, no existing line changed) and a no-op for every
+    processor that doesn't override `close`. It's needed by the USB-redirection
+    server (vendored `ironrdp-server` divergence 16): the client closes a per-device
+    `URBDRC` channel when the redirected device is unplugged/reset, and without this
+    notification the presenting side kept driving a dead channel (a reset never
+    re-presented — observed live with a drive resetting behind a flaky USB hub). The
+    parallel path (whole-connection drop) already worked via `Drop`; this covers the
+    mid-session single-channel close.
+
 ## Upstream candidacy
 
 The Soft-Sync request/response PDUs and the two `process()` arms are a clean,
 additive feature (server-side Soft-Sync). They're a good upstream PR once the
-macrdp UDP-multitransport data path is proven end-to-end. Until then this stays
-vendored.
+macrdp UDP-multitransport data path is proven end-to-end. Divergence (2) (invoke
+the existing `close` hook on a client Close) is trivially upstreamable on its own —
+the hook is upstream's, just never called. Until then both stay vendored.

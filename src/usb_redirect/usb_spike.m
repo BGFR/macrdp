@@ -33,7 +33,7 @@
 
 // ---- bidirectional C ABI (see the bottom of the file for the functions) ------
 // ObjC -> Rust: the kernel wants a control-IN data stage serviced. The Rust side
-// must eventually call macrdp_usb_complete_control_in(handle, token, ...). The
+// must eventually call macrdp_usb_complete_transfer(handle, token, ...). The
 // callback MUST NOT retain `setup8` (it points at stack memory) — copy it and
 // return immediately (non-blocking). `max_len` is the data-stage buffer capacity.
 typedef void (*MacrdpUsbControlInFn)(void *ctx, uint64_t token, const uint8_t *setup8, uint32_t max_len);
@@ -77,10 +77,10 @@ enum {
 static const NSUInteger kSyntheticDeviceAddress = 1;
 
 // -----------------------------------------------------------------------------
-// One outstanding (raised-but-not-yet-completed) control-IN transfer, keyed by a
-// monotonic token. The raw `msg` pointer stays valid because the ring slot is
-// pinned until we enqueue its completion (and the queue is serial, so no
-// concurrent ring mutation).
+// One outstanding (raised-but-not-yet-completed) forwarded transfer — control-IN,
+// control-OUT, or bulk — keyed by a monotonic token. The raw `msg` pointer stays
+// valid because the ring slot is pinned until we enqueue its completion (and the
+// queue is serial, so no concurrent ring mutation).
 @interface MacrdpPendingTransfer : NSObject
 @property(nonatomic, assign) const IOUSBHostCIMessage *msg;
 @property(nonatomic, strong) NSNumber *endpointKey;
@@ -104,8 +104,16 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, IOUSBHostCIEndpointStateMachine *> *endpoints;
 // endpoint key -> pending 8-byte SETUP packet for the in-flight control transfer
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSData *> *pendingSetup;
-// token -> outstanding control-IN transfer awaiting an out-of-band completion
+// token -> outstanding forwarded transfer awaiting an out-of-band completion
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, MacrdpPendingTransfer *> *tokenMap;
+// endpoint key -> the token of ITS one outstanding forwarded transfer. The ring
+// walk raises at most one forwarded transfer per endpoint, so a NEW raise on an
+// endpoint with an uncompleted pending means the kernel timed out / aborted and
+// RE-ISSUED the slot — the old pending's msg pointer is retired ring memory, and
+// a late completion through it corrupts the ring (observed: SIGBUS in the
+// completion memcpy when a slow Get Max LUN answered right after the kernel's
+// ~5 s EP0 timeout re-raised the transfer). Registration supersedes the old one.
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *pendingByEndpoint;
 @property(nonatomic, assign) uint64_t nextToken;
 // ObjC -> Rust control-IN callback + its opaque context (set at create).
 @property(nonatomic, assign) MacrdpUsbControlInFn controlInCb;
@@ -127,6 +135,7 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         _pendingSetup = [NSMutableDictionary dictionary];
         _pendingOutData = [NSMutableDictionary dictionary];
         _tokenMap = [NSMutableDictionary dictionary];
+        _pendingByEndpoint = [NSMutableDictionary dictionary];
     }
     return self;
 }
@@ -312,6 +321,15 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
     if (type == IOUSBHostCIMessageTypeEndpointDestroy) {
         [self.endpoints removeObjectForKey:key];
         [self.pendingSetup removeObjectForKey:key];
+        [self.pendingOutData removeObjectForKey:key];
+        // Invalidate the endpoint's outstanding forwarded transfer outright — its
+        // msg points into the ring being destroyed (belt to the identity guard's
+        // suspenders: the guard only helps if the endpoint is later recreated).
+        NSNumber *stale = self.pendingByEndpoint[key];
+        if (stale != nil) {
+            [self.tokenMap removeObjectForKey:stale];
+            [self.pendingByEndpoint removeObjectForKey:key];
+        }
     }
     NSLog(@"[usb2] endpoint cmd type=0x%02x dev=%lu ep=0x%02lx state=%ld",
           type, (unsigned long)addr, (unsigned long)epAddr, (long)ep.endpointState);
@@ -334,10 +352,12 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 
 // ---- control-transfer (EP0) handling ----------------------------------------
 
-// Is the current transfer a control-IN data stage we forward to the client (i.e.
-// a device-to-host GET_DESCRIPTOR whose bytes must come from the real device)?
-// Those go async; everything else (SETUP, STATUS, host-to-device, non-descriptor)
-// completes synchronously on the queue in `processTransfer:`.
+// Is the current transfer a control-IN data stage we forward to the client? ANY
+// device-to-host data stage forwards — the bytes must come from the real device
+// whether it's a standard GET_DESCRIPTOR, a class request (mass-storage Get Max
+// LUN), or a vendor one; the Rust side routes by bmRequestType. Those go async;
+// everything else (SETUP, STATUS, host-to-device data) completes synchronously on
+// the queue in `processTransfer:`.
 - (BOOL)transferIsForwardedControlIn:(const IOUSBHostCIMessage *)msg endpointKey:(NSNumber *)key {
     if (msg_type(msg) != IOUSBHostCIMessageTypeNormalTransfer) {
         return NO;
@@ -347,11 +367,33 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         return NO;
     }
     const uint8_t *s = setupData.bytes;
-    return (s[0] & kUsbDirDeviceToHost) && s[1] == kUsbReqGetDescriptor;
+    return (s[0] & kUsbDirDeviceToHost) != 0;
+}
+
+// Register a newly-raised forwarded transfer as THE outstanding one for its
+// endpoint, superseding (invalidating) any prior uncompleted raise on the same
+// endpoint — the kernel timed out / aborted and re-issued the slot, so the old
+// pending's msg points into retired ring memory and its late completion must be
+// dropped, not delivered (see the pendingByEndpoint comment).
+- (uint64_t)registerPendingForMsg:(const IOUSBHostCIMessage *)msg endpointKey:(NSNumber *)key {
+    NSNumber *stale = self.pendingByEndpoint[key];
+    if (stale != nil && self.tokenMap[stale] != nil) {
+        [self.tokenMap removeObjectForKey:stale];
+        NSLog(@"[usb2] superseding stale outstanding transfer token=%llu (kernel re-raised the endpoint's slot)",
+              stale.unsignedLongLongValue);
+    }
+    uint64_t token = ++self.nextToken;
+    MacrdpPendingTransfer *p = [MacrdpPendingTransfer new];
+    p.msg = msg;
+    p.endpointKey = key;
+    p.ep = self.endpoints[key];
+    self.tokenMap[@(token)] = p;
+    self.pendingByEndpoint[key] = @(token);
+    return token;
 }
 
 // Raise a control-IN data stage to the Rust side and leave it outstanding. The
-// completion arrives later via macrdp_usb_complete_control_in(token, ...).
+// completion arrives later via macrdp_usb_complete_transfer(token, ...).
 - (void)raiseControlIn:(const IOUSBHostCIMessage *)msg endpointKey:(NSNumber *)key {
     NSData *setupData = self.pendingSetup[key];
     uint8_t setup[8] = {0};
@@ -361,12 +403,7 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
     NSUInteger bufLen = (msg->data0 & IOUSBHostCINormalTransferData0Length)
                       >> IOUSBHostCINormalTransferData0LengthPhase;
 
-    uint64_t token = ++self.nextToken;
-    MacrdpPendingTransfer *p = [MacrdpPendingTransfer new];
-    p.msg = msg;
-    p.endpointKey = key;
-    p.ep = self.endpoints[key];
-    self.tokenMap[@(token)] = p;
+    uint64_t token = [self registerPendingForMsg:msg endpointKey:key];
 
     uint16_t wValue = (uint16_t)setup[2] | ((uint16_t)setup[3] << 8);
     NSLog(@"[usb2] EP0 control-IN forwarded token=%llu wValue=0x%04x bufLen=%lu",
@@ -416,12 +453,7 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
     }
     NSData *outData = self.pendingOutData[key] ?: [NSData data];
 
-    uint64_t token = ++self.nextToken;
-    MacrdpPendingTransfer *p = [MacrdpPendingTransfer new];
-    p.msg = msg;
-    p.endpointKey = key;
-    p.ep = self.endpoints[key];
-    self.tokenMap[@(token)] = p;
+    uint64_t token = [self registerPendingForMsg:msg endpointKey:key];
 
     // The setup + data are captured into the callback now; drop the per-key state so
     // the next control transfer on EP0 starts clean.
@@ -454,12 +486,7 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
     NSUInteger bufLen = (msg->data0 & IOUSBHostCINormalTransferData0Length)
                       >> IOUSBHostCINormalTransferData0LengthPhase;
 
-    uint64_t token = ++self.nextToken;
-    MacrdpPendingTransfer *p = [MacrdpPendingTransfer new];
-    p.msg = msg;
-    p.endpointKey = key;
-    p.ep = self.endpoints[key];
-    self.tokenMap[@(token)] = p;
+    uint64_t token = [self registerPendingForMsg:msg endpointKey:key];
 
     if (!self.bulkCb) {
         [self completeTransferToken:token bytes:NULL len:0 status:IOUSBHostCIMessageStatusStallError];
@@ -499,6 +526,12 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
             return;
         }
         [self.tokenMap removeObjectForKey:@(token)];
+        // This token is the endpoint's outstanding transfer (a superseded one was
+        // already evicted from tokenMap); clear the slot so the next raise starts clean.
+        NSNumber *cur = self.pendingByEndpoint[p.endpointKey];
+        if (cur != nil && cur.unsignedLongLongValue == token) {
+            [self.pendingByEndpoint removeObjectForKey:p.endpointKey];
+        }
         IOUSBHostCIEndpointStateMachine *ep = self.endpoints[p.endpointKey];
         if (ep == nil) {
             NSLog(@"[usb2] completion token=%llu: endpoint gone", token);
@@ -584,10 +617,11 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
             return IOUSBHostCIMessageStatusSuccess;
         }
         case IOUSBHostCIMessageTypeNormalTransfer: {
-            // A data stage that reached the sync path is host->device (control-OUT
-            // data) or a non-descriptor IN. For a host->device control-OUT with data,
-            // stash the bytes so the STATUS stage can forward them with the request;
-            // otherwise accept without moving data.
+            // A data stage that reached the sync path is host->device (every
+            // device-to-host data stage forwards async). Stash the bytes so the
+            // STATUS stage can forward them with the request, and report the full
+            // length as accepted — completing an OUT data stage with 0 would tell
+            // the kernel the device took none of it.
             NSData *setupData = self.pendingSetup[key];
             if (setupData && setupData.length >= 8) {
                 const uint8_t *s = setupData.bytes;
@@ -596,6 +630,7 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
                 const void *buf = (const void *)(uintptr_t)msg->data1;
                 if (!(s[0] & kUsbDirDeviceToHost) && buf != NULL && len > 0) {
                     self.pendingOutData[key] = [NSData dataWithBytes:buf length:len];
+                    *outLen = len;
                 }
             }
             return IOUSBHostCIMessageStatusSuccess;
@@ -827,7 +862,9 @@ void macrdp_usb_controller_destroy(void *handle) {
     }
     @autoreleasepool {
         MacrdpUsbController *c = (MacrdpUsbController *)CFBridgingRelease(handle);
+        NSLog(@"[usb2] controller destroy: stopping interface");
         [c stop];
+        NSLog(@"[usb2] controller destroy: interface destroyed");
     }
 }
 
@@ -871,6 +908,16 @@ int macrdp_usb_spike_run(void) {
         g_spike_handle = NULL;
         macrdp_usb_controller_destroy(handle);
         NSLog(@"[usb2] controller destroyed; exiting");
+        // Teardown testbed: MACRDP_USB_SPIKE_LINGER_SECS keeps the process alive
+        // after destroy so `ioreg -p IOUSB` can verify the synthetic device is
+        // actually gone (process exit would reap the controller and mask a broken
+        // destroy — the exact bug class this exists to diagnose).
+        const char *linger = getenv("MACRDP_USB_SPIKE_LINGER_SECS");
+        if (linger != NULL) {
+            double secs = atof(linger);
+            NSLog(@"[usb2] lingering %.0fs post-destroy (check ioreg for the synthetic device)", secs);
+            [NSThread sleepForTimeInterval:secs];
+        }
         return 0;
     }
 }

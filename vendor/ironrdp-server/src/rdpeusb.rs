@@ -21,6 +21,8 @@ use ironrdp_core::{Encode, EncodeResult, WriteCursor, decode, impl_as_any};
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
 use ironrdp_pdu::{PduResult, decode_err};
 use ironrdp_rdpeusb::pdu::caps::{Capability, RimExchangeCapabilityRequest};
+use ironrdp_rdpeusb::pdu::header::{FunctionId, InterfaceId, Mask, SharedMsgHeader};
+use ironrdp_rdpeusb::pdu::notify::{ChannelCreated, Direction};
 use ironrdp_rdpeusb::pdu::{UrbdrcClientPdu, UrbdrcServerPdu};
 use tracing::{debug, info};
 
@@ -54,6 +56,32 @@ impl DvcEncode for UsbDvcPdu {}
 
 fn dvc_msg(pdu: UrbdrcServerPdu) -> DvcMessage {
     Box::new(UsbDvcPdu(pdu))
+}
+
+/// A bare [`SharedMsgHeader`] message with no body — used for `RIMCALL_RELEASE`,
+/// which the pinned `ironrdp-rdpeusb` has no dedicated server PDU for (it's a
+/// generic RPCE "release interface" call: just the shared header). The header
+/// itself implements `Encode`.
+struct UsbHeaderMsg(SharedMsgHeader);
+
+impl Encode for UsbHeaderMsg {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        self.0.encode(dst)
+    }
+
+    fn name(&self) -> &'static str {
+        "SharedMsgHeader"
+    }
+
+    fn size(&self) -> usize {
+        self.0.size()
+    }
+}
+
+impl DvcEncode for UsbHeaderMsg {}
+
+fn dvc_header(header: SharedMsgHeader) -> DvcMessage {
+    Box::new(UsbHeaderMsg(header))
 }
 
 /// Server-side `URBDRC` DVC processor.
@@ -111,6 +139,16 @@ impl DvcProcessor for UrbdrcServer {
                     result = format_args!("{:#010x}", resp.result),
                     "URBDRC capability response received — client accepted the exchange"
                 );
+                // MS-RDPEUSB 3.3.5.1: after the capability exchange the server sends
+                // CHANNEL_CREATED. This is the message that makes the client ANNOUNCE
+                // its redirected devices (ADD_DEVICE / ADD_VIRTUAL_CHANNEL) — without
+                // it the client registers the device locally but never tells us.
+                info!(channel_id, "URBDRC sending CHANNEL_CREATED (triggers device announcement)");
+                let created = ChannelCreated {
+                    msg_id: self.take_msg_id(),
+                    direction: Direction::ToClient,
+                };
+                return Ok(vec![dvc_msg(UrbdrcServerPdu::ChanCreated(created))]);
             }
             UrbdrcClientPdu::AddChan(add) => {
                 debug!(channel_id, msg_id = add.msg_id, "URBDRC ADD_VIRTUAL_CHANNEL");
@@ -126,6 +164,19 @@ impl DvcProcessor for UrbdrcServer {
             }
             UrbdrcClientPdu::ChanCreated(cc) => {
                 debug!(channel_id, direction = ?cc.direction, "URBDRC CHANNEL_CREATED");
+                // MS-RDPEUSB: with the channel-created handshake done, send
+                // RIMCALL_RELEASE on the channel-notification interface. This is the
+                // "ready barrier" (FreeRDP: urbdrc_device_control_channel, INIT_CHANNEL_IN)
+                // that makes the client announce its redirected devices (ADD_DEVICE /
+                // ADD_VIRTUAL_CHANNEL). It's a bare shared header, no body.
+                info!(channel_id, "URBDRC sending RIMCALL_RELEASE (device-announce barrier)");
+                let barrier = SharedMsgHeader {
+                    interface_id: InterfaceId::NOTIFY_CLIENT,
+                    mask: Mask::StreamIdProxy,
+                    msg_id: self.take_msg_id(),
+                    function_id: Some(FunctionId::RIMCALL_RELEASE),
+                };
+                return Ok(vec![dvc_header(barrier)]);
             }
             _ => {
                 debug!(channel_id, "URBDRC client PDU (unhandled in the observe-only spike)");

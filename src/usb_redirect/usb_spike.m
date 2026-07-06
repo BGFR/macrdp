@@ -37,6 +37,10 @@
 // callback MUST NOT retain `setup8` (it points at stack memory) — copy it and
 // return immediately (non-blocking). `max_len` is the data-stage buffer capacity.
 typedef void (*MacrdpUsbControlInFn)(void *ctx, uint64_t token, const uint8_t *setup8, uint32_t max_len);
+// Bulk/interrupt transfer raised to Rust: is_in != 0 = device->host read of out_len
+// bytes; else host->device write of the out_len bytes at out_data.
+typedef void (*MacrdpUsbBulkFn)(void *ctx, uint64_t token, uint32_t endpoint_address, int is_in,
+                                const uint8_t *out_data, uint32_t out_len);
 
 // ---- helpers to pull a bit-field out of an IOUSBHostCIMessage word ----------
 // The SDK phase macros expand to the low bit index; mask is (range) already
@@ -72,6 +76,12 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 @interface MacrdpPendingTransfer : NSObject
 @property(nonatomic, assign) const IOUSBHostCIMessage *msg;
 @property(nonatomic, strong) NSNumber *endpointKey;
+// The endpoint object this transfer was raised on. A device reset destroys and
+// RECREATES the endpoint at the same key (a new, Active object whose ring is
+// fresh) while `msg` still points into the OLD, freed ring — so on completion we
+// require endpoints[key] to still be THIS same object before touching `msg`. Held
+// strong so a reused address can't alias a genuinely-different recreated endpoint.
+@property(nonatomic, strong) IOUSBHostCIEndpointStateMachine *ep;
 @end
 @implementation MacrdpPendingTransfer
 @end
@@ -91,6 +101,7 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 @property(nonatomic, assign) uint64_t nextToken;
 // ObjC -> Rust control-IN callback + its opaque context (set at create).
 @property(nonatomic, assign) MacrdpUsbControlInFn controlInCb;
+@property(nonatomic, assign) MacrdpUsbBulkFn bulkCb;
 @property(nonatomic, assign) void *cbCtx;
 @property(nonatomic, assign) BOOL portConnected;
 @end
@@ -341,6 +352,7 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
     MacrdpPendingTransfer *p = [MacrdpPendingTransfer new];
     p.msg = msg;
     p.endpointKey = key;
+    p.ep = self.endpoints[key];
     self.tokenMap[@(token)] = p;
 
     uint16_t wValue = (uint16_t)setup[2] | ((uint16_t)setup[3] << 8);
@@ -351,17 +363,62 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         self.controlInCb(self.cbCtx, token, setup, (uint32_t)bufLen);
     } else {
         // No presenting side wired — we can't source the bytes, so stall.
-        [self completeControlInToken:token bytes:NULL len:0 status:IOUSBHostCIMessageStatusStallError];
+        [self completeTransferToken:token bytes:NULL len:0 status:IOUSBHostCIMessageStatusStallError];
+    }
+}
+
+// Is this a bulk/interrupt transfer (a NormalTransfer on a non-control endpoint)?
+// Those forward to the client — a device->host read (IN) or host->device write
+// (OUT) — mirroring the async control-IN path.
+- (BOOL)transferIsBulk:(const IOUSBHostCIMessage *)msg endpointKey:(NSNumber *)key {
+    if (msg_type(msg) != IOUSBHostCIMessageTypeNormalTransfer) {
+        return NO;
+    }
+    NSUInteger epAddr = [key unsignedIntegerValue] & 0xff;
+    return (epAddr & 0x7f) != 0; // endpoint number != 0 => not the control endpoint
+}
+
+// Raise a bulk/interrupt transfer to the Rust side and leave it outstanding. The
+// completion arrives later via macrdp_usb_complete_transfer(token, ...). For OUT
+// the buffer bytes are snapshotted now (the endpoint is Active mid-walk) since the
+// ring slot may be recycled before the client round-trip returns.
+- (void)raiseBulk:(const IOUSBHostCIMessage *)msg endpointKey:(NSNumber *)key {
+    NSUInteger epAddr = [key unsignedIntegerValue] & 0xff;
+    BOOL isIn = (epAddr & 0x80) != 0;
+    NSUInteger bufLen = (msg->data0 & IOUSBHostCINormalTransferData0Length)
+                      >> IOUSBHostCINormalTransferData0LengthPhase;
+
+    uint64_t token = ++self.nextToken;
+    MacrdpPendingTransfer *p = [MacrdpPendingTransfer new];
+    p.msg = msg;
+    p.endpointKey = key;
+    p.ep = self.endpoints[key];
+    self.tokenMap[@(token)] = p;
+
+    if (!self.bulkCb) {
+        [self completeTransferToken:token bytes:NULL len:0 status:IOUSBHostCIMessageStatusStallError];
+        return;
+    }
+    if (isIn) {
+        NSLog(@"[usb2] bulk IN forwarded token=%llu ep=0x%02lx len=%lu",
+              token, (unsigned long)epAddr, (unsigned long)bufLen);
+        self.bulkCb(self.cbCtx, token, (uint32_t)epAddr, 1, NULL, (uint32_t)bufLen);
+    } else {
+        const void *buf = (const void *)(uintptr_t)msg->data1;
+        NSData *data = (buf != NULL && bufLen > 0) ? [NSData dataWithBytes:buf length:bufLen] : [NSData data];
+        NSLog(@"[usb2] bulk OUT forwarded token=%llu ep=0x%02lx len=%lu",
+              token, (unsigned long)epAddr, (unsigned long)bufLen);
+        self.bulkCb(self.cbCtx, token, (uint32_t)epAddr, 0, data.bytes, (uint32_t)data.length);
     }
 }
 
 // Complete a previously-raised control-IN transfer, hopping onto the interface's
 // serial queue so the memcpy + ring enqueue + re-walk run where the ring lives.
 // Safe to call from any thread (tokio, or the built-in spike callback).
-- (void)completeControlInToken:(uint64_t)token
-                         bytes:(const uint8_t *)bytes
-                           len:(uint32_t)len
-                        status:(IOUSBHostCIMessageStatus)status {
+- (void)completeTransferToken:(uint64_t)token
+                        bytes:(const uint8_t *)bytes
+                          len:(uint32_t)len
+                       status:(IOUSBHostCIMessageStatus)status {
     // Copy the answer now — the caller's buffer may be transient.
     NSData *data = (bytes != NULL && len > 0) ? [NSData dataWithBytes:bytes length:len] : nil;
     dispatch_queue_t queue = self.interface.queue;
@@ -381,6 +438,17 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
             NSLog(@"[usb2] completion token=%llu: endpoint gone", token);
             return;
         }
+        // A device reset destroys+recreates the endpoint at the same key: the new
+        // object is Active with a fresh ring, but `p.msg` still points into the OLD,
+        // freed ring. The Active check below can't catch that (the NEW endpoint is
+        // Active), so require the endpoint to be the SAME object this transfer was
+        // raised on — else drop it (the reset re-drives fresh transfers). This is
+        // the actual fix for the reset-during-bulk SIGSEGV; the Active check handles
+        // the same-object-but-paused case.
+        if (ep != p.ep) {
+            NSLog(@"[usb2] completion token=%llu: endpoint replaced by a reset — dropping stale transfer", token);
+            return;
+        }
         // Per IOUSBHost: only an Active endpoint may inspect transfer structures,
         // read/modify IO buffers, or generate completions. If the device reset or
         // was suspended between the client round-trip and now, the endpoint is
@@ -395,14 +463,20 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         }
         const IOUSBHostCIMessage *msg = p.msg;
         NSUInteger moved = 0;
-        if (status == IOUSBHostCIMessageStatusSuccess && data != nil) {
+        if (status == IOUSBHostCIMessageStatusSuccess) {
             NSUInteger bufLen = (msg->data0 & IOUSBHostCINormalTransferData0Length)
                               >> IOUSBHostCINormalTransferData0LengthPhase;
-            void *buf = (void *)(uintptr_t)msg->data1;
-            if (buf != NULL) {
-                NSUInteger n = data.length < bufLen ? data.length : bufLen;
-                memcpy(buf, data.bytes, n);
-                moved = n;
+            if (data != nil) {
+                // IN (control-IN or bulk-IN): copy the client's bytes into the buffer.
+                void *buf = (void *)(uintptr_t)msg->data1;
+                if (buf != NULL) {
+                    NSUInteger n = data.length < bufLen ? data.length : bufLen;
+                    memcpy(buf, data.bytes, n);
+                    moved = n;
+                }
+            } else {
+                // OUT (or a zero-length IN): no copy; `len` is the bytes accepted.
+                moved = (NSUInteger)len < bufLen ? (NSUInteger)len : bufLen;
             }
         }
         NSError *e = nil;
@@ -410,7 +484,7 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
             NSLog(@"[usb2] async enqueueTransferCompletion token=%llu failed: %@", token, e);
             return;
         }
-        NSLog(@"[usb2] EP0 control-IN completed token=%llu moved=%lu status=%ld",
+        NSLog(@"[usb2] transfer completed token=%llu moved=%lu status=%ld",
               token, (unsigned long)moved, (long)status);
         // Drain the STATUS stage + any further transfers now that the ring advanced.
         [self walkEndpoint:p.endpointKey];
@@ -476,6 +550,10 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         }
         if ([self transferIsForwardedControlIn:msg endpointKey:key]) {
             [self raiseControlIn:msg endpointKey:key];
+            return; // async; completion re-walks
+        }
+        if ([self transferIsBulk:msg endpointKey:key]) {
+            [self raiseBulk:msg endpointKey:key];
             return; // async; completion re-walks
         }
         NSUInteger moved = 0;
@@ -621,10 +699,11 @@ static BOOL spike_descriptor_for_value(uint16_t wValue, const uint8_t **outBytes
 // Create the controller. `cb`/`ctx` receive each EP0 control-IN forward; may be
 // NULL (then such transfers stall). Returns an opaque, retained handle (destroy
 // releases it), or NULL on init failure with *err set.
-void *macrdp_usb_controller_create(MacrdpUsbControlInFn cb, void *ctx, int *err) {
+void *macrdp_usb_controller_create(MacrdpUsbControlInFn controlCb, MacrdpUsbBulkFn bulkCb, void *ctx, int *err) {
     @autoreleasepool {
         MacrdpUsbController *c = [[MacrdpUsbController alloc] init];
-        c.controlInCb = cb;
+        c.controlInCb = controlCb;
+        c.bulkCb = bulkCb;
         c.cbCtx = ctx;
         NSError *e = nil;
         if (![c startWithError:&e] || (e != nil && e.code != KERN_SUCCESS)) {
@@ -641,16 +720,17 @@ void *macrdp_usb_controller_create(MacrdpUsbControlInFn cb, void *ctx, int *err)
     }
 }
 
-// Complete a previously-raised control-IN transfer. status 0 = success (copy
-// `bytes`), nonzero = stall. Safe to call from any thread; hops to the queue.
-void macrdp_usb_complete_control_in(void *handle, uint64_t token,
-                                    const uint8_t *bytes, uint32_t len, int32_t status) {
+// Complete a previously-raised control-IN or bulk transfer. status 0 = success;
+// for IN `bytes`/`len` are copied into the buffer, for OUT pass bytes=NULL and
+// len=bytes-accepted. Nonzero status = stall. Safe from any thread; hops to queue.
+void macrdp_usb_complete_transfer(void *handle, uint64_t token,
+                                  const uint8_t *bytes, uint32_t len, int32_t status) {
     if (handle == NULL) {
         return;
     }
     MacrdpUsbController *c = (__bridge MacrdpUsbController *)handle;
     IOUSBHostCIMessageStatus st = (status == 0) ? IOUSBHostCIMessageStatusSuccess : IOUSBHostCIMessageStatusStallError;
-    [c completeControlInToken:token bytes:bytes len:len status:st];
+    [c completeTransferToken:token bytes:bytes len:len status:st];
 }
 
 // Stop + release a controller created by macrdp_usb_controller_create.
@@ -676,23 +756,23 @@ static void spike_control_in_cb(void *ctx, uint64_t token, const uint8_t *setup8
     uint8_t bRequest = setup8[1];
     uint16_t wValue = (uint16_t)setup8[2] | ((uint16_t)setup8[3] << 8);
     if (bRequest != kUsbReqGetDescriptor) {
-        macrdp_usb_complete_control_in(g_spike_handle, token, NULL, 0, 1); // stall
+        macrdp_usb_complete_transfer(g_spike_handle, token, NULL, 0, 1); // stall
         return;
     }
     const uint8_t *desc = NULL;
     size_t descLen = 0;
     if (!spike_descriptor_for_value(wValue, &desc, &descLen)) {
         NSLog(@"[usb2] spike: unsupported GET_DESCRIPTOR wValue=0x%04x -> STALL", wValue);
-        macrdp_usb_complete_control_in(g_spike_handle, token, NULL, 0, 1);
+        macrdp_usb_complete_transfer(g_spike_handle, token, NULL, 0, 1);
         return;
     }
-    macrdp_usb_complete_control_in(g_spike_handle, token, desc, (uint32_t)descLen, 0);
+    macrdp_usb_complete_transfer(g_spike_handle, token, desc, (uint32_t)descLen, 0);
 }
 
 int macrdp_usb_spike_run(void) {
     @autoreleasepool {
         int err = 0;
-        void *handle = macrdp_usb_controller_create(spike_control_in_cb, NULL, &err);
+        void *handle = macrdp_usb_controller_create(spike_control_in_cb, NULL, NULL, &err);
         if (handle == NULL) {
             return err != 0 ? err : -1;
         }

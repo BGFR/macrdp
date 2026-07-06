@@ -15,20 +15,26 @@
 //! creates a UserHCI controller and answers the kernel's EP0 GET_DESCRIPTOR
 //! transfers by driving the device's `UsbHandle` — so the descriptors come from
 //! the client over the wire and the client's device enumerates in `ioreg -p
-//! IOUSB` with its real VID/PID/strings. **Verified** on the entitled build: a
-//! client-redirected flash drive (ESD310C, VID 0x2174) enumerates on macrdp's
-//! controller. Phase 3.2 (usable, not just enumerable) is in progress:
-//! `select_client_config` fetches the full config descriptor and sends a
-//! `SelectConfiguration` URB to open the device's pipes (the prerequisite for
-//! bulk) — verified correct (FreeRDP parses + attempts it), but it CANNOT be
-//! completed on the loopback test because a macOS *client*'s libusb can't detach
-//! the mass-storage kernel driver to claim the interface (`LIBUSB_ERROR_ACCESS`);
-//! it times out and degrades to enumerate-only. Bulk forwarding + a
-//! claimable-interface client (real Windows/Linux) are the remaining 3.2 work,
-//! along with retract/hot-unplug and multi-device. All Obj-C / IOUSBHost SPI
-//! touches are quarantined in `usb_spike.m` (the maintenance boundary), built +
-//! linked by `build.rs` on macOS; the standalone `--usb-spike` path still presents
-//! the hardcoded synthetic device through the same async completion machinery.
+//! IOUSB` with its real VID/PID/strings. Phase 3.2 makes it USABLE, not just
+//! enumerable: `select_client_config` sends a `SelectConfiguration` URB to open the
+//! device's pipes, and [`imp::present_device`] then forwards bulk transfers on those
+//! pipes ([`UsbHandle::bulk_transfer_in`]/`bulk_transfer_out`) both directions — so
+//! the macOS mass-storage driver's SCSI (CBW/data/CSW over the bulk endpoints) rides
+//! the client's real drive. **Verified end-to-end on a real Linux FreeRDP client**
+//! (UTM-QEMU Ubuntu + a USB-2.0 hub, claimable mass-storage interface): a
+//! client-redirected flash drive (ESD310C, VID 0x2174/PID 0x2100) **mounts on the
+//! Mac and stays mounted** (1300+ steady bulk transfers, no resets/timeouts). Two
+//! correctness fixes were load-bearing for that: (1) the same physical device is
+//! deduped on its stable hardware identity (see [`PRESENTED_DEVICES`]) because the
+//! client announces it twice with differing instance ids — presenting both duels
+//! two virtual drives over one device (SCSI timeouts); (2) a completion that races a
+//! device reset (which destroys+recreates the endpoint) is dropped on the Obj-C side
+//! by endpoint-object identity, not just liveness — see `usb_spike.m`. Remaining 3.2
+//! work: control-OUT forwarding (mass-storage reset / Clear-Feature), retract/
+//! hot-unplug, true multi-device. All Obj-C / IOUSBHost SPI touches are quarantined
+//! in `usb_spike.m` (the maintenance boundary), built + linked by `build.rs` on
+//! macOS; the standalone `--usb-spike` path still presents the hardcoded synthetic
+//! device through the same async completion machinery.
 
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -85,73 +91,82 @@ impl UrbdrcServerFactory for MacUsb {
     }
 }
 
-/// Physical devices with a live presenting controller, keyed by device-instance
-/// id, so we present each device exactly once. A client can announce one physical
-/// device on more than one `URBDRC` channel (a SuperSpeed device announced as both
-/// USB-2 and USB-3, a composite device, or a mid-session re-announce); without
-/// this each announce would spin up its own UserHCI controller for the *same*
-/// device — a harmless-but-confusing duplicate in `ioreg`. An entry is removed
-/// when its controller tears down, so a later genuine re-add still presents.
+/// Physical devices with a live presenting controller, keyed by the device's
+/// stable hardware identity (VID:PID:bcdDevice), so we present each device exactly
+/// once. A client can announce ONE physical device on more than one `URBDRC`
+/// channel — e.g. FreeRDP announces the same drive twice with instance ids that
+/// differ by a byte (`…d31` / `…d32`), and a reset re-announces it. Deduping on the
+/// *client's instance id* fails there (the ids differ), so each announce would spin
+/// up its own UserHCI controller for the SAME device — two virtual drives then duel
+/// over the single client device (conflicting SCSI, 10 s timeouts, failed mount),
+/// observed live. Keying on the descriptor identity collapses that to one. An entry
+/// is removed when its controller tears down, so a genuine reset re-presents.
+///
+/// Limitation (multi-device is a deferred milestone): two *different* drives of the
+/// identical model+revision share a key and only one presents. Distinguishing them
+/// needs the iSerialNumber string — added when true multi-device lands.
 static PRESENTED_DEVICES: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Claim the presenting slot for `instance_id`. Returns `true` if this call won it
-/// (present the device), `false` if another channel already holds it (skip). A
-/// device that reports no instance id (`""`) is never deduped — better a possible
-/// duplicate than hiding a genuine second device behind an empty key.
-fn claim_device(instance_id: &str) -> bool {
-    instance_id.is_empty()
-        || PRESENTED_DEVICES
-            .lock()
-            .unwrap()
-            .insert(instance_id.to_owned())
+/// Claim the presenting slot for hardware-identity `key`. Returns `true` if this
+/// call won it (present the device), `false` if another announce already holds it.
+fn claim_device(key: &str) -> bool {
+    PRESENTED_DEVICES.lock().unwrap().insert(key.to_owned())
 }
 
-/// Release the presenting slot for `instance_id` (its controller went away).
-fn release_device(instance_id: &str) {
-    if !instance_id.is_empty() {
-        PRESENTED_DEVICES.lock().unwrap().remove(instance_id);
-    }
+/// Release the presenting slot for `key` (its controller went away).
+fn release_device(key: &str) {
+    PRESENTED_DEVICES.lock().unwrap().remove(key);
 }
 
 /// Presenting-side driver for one redirected USB device, called (with a
-/// [`UsbHandle`] onto it) when the client announces it. Dedups so one physical
-/// device gets one controller (see [`PRESENTED_DEVICES`]), fetches + logs the real
-/// device descriptor (proving the transfer path cross-platform), then hands the
-/// handle to [`imp::present_device`] — which on the entitled macOS build creates
-/// a UserHCI controller and answers the kernel's EP0 transfers by driving this
-/// same handle, so the client's device enumerates locally in `ioreg`.
+/// [`UsbHandle`] onto it) when the client announces it. Fetches the device
+/// descriptor first (proving the transfer path cross-platform) and dedups on its
+/// hardware identity so one physical device gets one controller (see
+/// [`PRESENTED_DEVICES`]), then hands the handle to [`imp::present_device`] — which
+/// on the entitled macOS build creates a UserHCI controller and answers the
+/// kernel's EP0 transfers by driving this same handle, so the client's device
+/// enumerates locally in `ioreg`.
 fn drive_device(handle: UsbHandle) {
     tokio::spawn(async move {
-        let instance_id = handle.device_instance_id().to_owned();
-        if !claim_device(&instance_id) {
+        // Fetch the descriptor BEFORE claiming: the dedup key is the device's stable
+        // hardware identity, which only the descriptor carries (the client's instance
+        // id varies per announce — see PRESENTED_DEVICES). This read is cheap and was
+        // already on the path.
+        let desc = match handle.device_descriptor().await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(error = %e, "USB redirection: device-descriptor fetch failed");
+                return;
+            }
+        };
+        let key = format!(
+            "{:04x}:{:04x}:{:04x}",
+            desc.vendor_id, desc.product_id, desc.device_release
+        );
+        if !claim_device(&key) {
             info!(
-                instance_id = %instance_id,
-                "USB redirection: device already presented on another channel — skipping duplicate"
+                identity = %key,
+                instance_id = %handle.device_instance_id(),
+                "USB redirection: device already presented (another announce of the same hardware) — skipping duplicate"
             );
             return;
         }
-        match handle.device_descriptor().await {
-            Ok(d) => info!(
-                vid = format_args!("{:#06x}", d.vendor_id),
-                pid = format_args!("{:#06x}", d.product_id),
-                usb_version = format_args!("{:#06x}", d.usb_version),
-                device_class = d.device_class,
-                "USB redirection: device descriptor received (transfer round-trip GO)"
-            ),
-            Err(e) => {
-                warn!(error = %e, "USB redirection: device-descriptor fetch failed");
-                release_device(&instance_id);
-                return;
-            }
-        }
+        info!(
+            vid = format_args!("{:#06x}", desc.vendor_id),
+            pid = format_args!("{:#06x}", desc.product_id),
+            usb_version = format_args!("{:#06x}", desc.usb_version),
+            device_class = desc.device_class,
+            "USB redirection: device descriptor received (transfer round-trip GO)"
+        );
         imp::present_device(handle).await;
-        release_device(&instance_id);
+        release_device(&key);
     });
 }
 
 #[cfg(target_os = "macos")]
 mod imp {
+    use std::collections::HashMap;
     use std::os::raw::{c_int, c_void};
 
     use ironrdp_server::{UsbHandle, UsbPipe};
@@ -167,15 +182,31 @@ mod imp {
     /// Non-blocking — copies `setup8` and pushes it to the device driver loop.
     type ControlInFn = extern "C" fn(ctx: *mut c_void, token: u64, setup8: *const u8, max_len: u32);
 
+    /// ObjC -> Rust: the kernel wants a bulk/interrupt transfer on `endpoint_address`
+    /// serviced. `is_in` != 0 is a device->host read of `out_len` bytes; else it's a
+    /// host->device write of the `out_len` bytes at `out_data`. Non-blocking.
+    type BulkFn = extern "C" fn(
+        ctx: *mut c_void,
+        token: u64,
+        endpoint_address: u32,
+        is_in: c_int,
+        out_data: *const u8,
+        out_len: u32,
+    );
+
     unsafe extern "C" {
         fn macrdp_usb_spike_run() -> c_int;
         fn macrdp_usb_controller_create(
-            cb: ControlInFn,
+            control_cb: ControlInFn,
+            bulk_cb: BulkFn,
             ctx: *mut c_void,
             err: *mut c_int,
         ) -> *mut c_void;
         fn macrdp_usb_controller_destroy(handle: *mut c_void);
-        fn macrdp_usb_complete_control_in(
+        // Completes a previously-raised control-IN OR bulk transfer. `bytes`/`len`
+        // are the IN data to copy into the transfer buffer; for an OUT transfer pass
+        // `bytes = NULL` and `len` = bytes accepted (reported as the transfer length).
+        fn macrdp_usb_complete_transfer(
             handle: *mut c_void,
             token: u64,
             bytes: *const u8,
@@ -195,19 +226,30 @@ mod imp {
         unsafe { macrdp_usb_spike_run() as i32 }
     }
 
-    /// One EP0 control-IN request raised by the kernel, to service via the client.
-    struct ControlInReq {
-        token: u64,
-        setup: [u8; 8],
-        max_len: u32,
+    /// A transfer the kernel raised, to service via the client and complete by
+    /// `token`. EP0 control-IN reads a descriptor; bulk moves data on an endpoint.
+    enum TransferReq {
+        ControlIn {
+            token: u64,
+            setup: [u8; 8],
+            max_len: u32,
+        },
+        Bulk {
+            token: u64,
+            endpoint_address: u8,
+            is_in: bool,
+            /// IN: bytes to read. OUT: `data.len()` (the write length).
+            length: u32,
+            /// OUT payload (empty for IN).
+            data: Vec<u8>,
+        },
     }
 
-    /// The ctx handed to the C callback: the channel into the driver loop. Leaked
+    /// The ctx handed to the C callbacks: the channel into the driver loop. Leaked
     /// for the controller's lifetime (a late callback after teardown is harmless —
-    /// the send just fails once the receiver is gone). Bounded per presented
-    /// device; full teardown is Phase 3.2.
+    /// the send just fails once the receiver is gone). Bounded per presented device.
     struct CallbackCtx {
-        tx: tokio::sync::mpsc::UnboundedSender<ControlInReq>,
+        tx: tokio::sync::mpsc::UnboundedSender<TransferReq>,
     }
 
     extern "C" fn control_in_cb(ctx: *mut c_void, token: u64, setup8: *const u8, max_len: u32) {
@@ -216,10 +258,36 @@ mod imp {
         let ctx = unsafe { &*(ctx as *const CallbackCtx) };
         let mut setup = [0u8; 8];
         unsafe { std::ptr::copy_nonoverlapping(setup8, setup.as_mut_ptr(), 8) };
-        let _ = ctx.tx.send(ControlInReq {
+        let _ = ctx.tx.send(TransferReq::ControlIn {
             token,
             setup,
             max_len,
+        });
+    }
+
+    extern "C" fn bulk_cb(
+        ctx: *mut c_void,
+        token: u64,
+        endpoint_address: u32,
+        is_in: c_int,
+        out_data: *const u8,
+        out_len: u32,
+    ) {
+        // SAFETY: `ctx` is the leaked CallbackCtx; for an OUT transfer `out_data`
+        // points at `out_len` readable bytes (the ObjC side's transfer buffer).
+        let ctx = unsafe { &*(ctx as *const CallbackCtx) };
+        let is_in = is_in != 0;
+        let data = if !is_in && !out_data.is_null() && out_len > 0 {
+            unsafe { std::slice::from_raw_parts(out_data, out_len as usize).to_vec() }
+        } else {
+            Vec::new()
+        };
+        let _ = ctx.tx.send(TransferReq::Bulk {
+            token,
+            endpoint_address: endpoint_address as u8,
+            is_in,
+            length: out_len,
+            data,
         });
     }
 
@@ -229,9 +297,11 @@ mod imp {
     struct ControllerHandle(*mut c_void);
     unsafe impl Send for ControllerHandle {}
     impl ControllerHandle {
-        fn complete(&self, token: u64, bytes: &[u8], status: i32) {
+        /// Complete an IN transfer (control-IN or bulk-IN): `bytes` are copied into
+        /// the kernel's transfer buffer.
+        fn complete_in(&self, token: u64, bytes: &[u8], status: i32) {
             unsafe {
-                macrdp_usb_complete_control_in(
+                macrdp_usb_complete_transfer(
                     self.0,
                     token,
                     bytes.as_ptr(),
@@ -239,6 +309,12 @@ mod imp {
                     status,
                 )
             };
+        }
+
+        /// Complete an OUT transfer: no data to copy back; `moved` is the number of
+        /// bytes the device accepted (reported as the transfer length).
+        fn complete_out(&self, token: u64, moved: u32, status: i32) {
+            unsafe { macrdp_usb_complete_transfer(self.0, token, std::ptr::null(), moved, status) };
         }
     }
     impl Drop for ControllerHandle {
@@ -256,15 +332,16 @@ mod imp {
     /// dropped on disconnect) — then destroys the controller. Fuller lifecycle
     /// (mid-session retract / multi-device) is Phase 3.2.
     pub async fn present_device(handle: UsbHandle) {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ControlInReq>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TransferReq>();
         // Leak the ctx (a small, bounded per-presentation allocation) so a C
         // callback that races teardown stays memory-safe — the send just fails
         // once `rx` is dropped. Freeing it needs a guaranteed-drained queue,
         // which the controller destroy doesn't promise; not worth the risk.
         let ctx = Box::into_raw(Box::new(CallbackCtx { tx }));
         let mut err: c_int = 0;
-        let raw =
-            unsafe { macrdp_usb_controller_create(control_in_cb, ctx as *mut c_void, &mut err) };
+        let raw = unsafe {
+            macrdp_usb_controller_create(control_in_cb, bulk_cb, ctx as *mut c_void, &mut err)
+        };
         if raw.is_null() {
             warn!(err, "USB redirection: UserHCI controller unavailable (needs the entitled build) — not presenting");
             return;
@@ -274,8 +351,10 @@ mod imp {
 
         // Configure the client's device + learn its endpoint pipe handles — the
         // prerequisite for bulk transfers (which address the endpoint by the pipe
-        // handle SelectConfiguration returns). Best-effort: control-only enumeration
-        // still works without it. Bulk forwarding (the actual mount) is the next step.
+        // handle SelectConfiguration returns). `pipe_map` maps a bulk endpoint's
+        // address (e.g. 0x01 OUT, 0x82 IN) to its client pipe handle. Best-effort:
+        // control-only enumeration still works without it (bulk just can't run).
+        let mut pipe_map: HashMap<u8, u32> = HashMap::new();
         match select_client_config(&handle).await {
             Ok(pipes) => {
                 for p in &pipes {
@@ -285,6 +364,7 @@ mod imp {
                         bulk = p.is_bulk,
                         "USB redirection: endpoint pipe opened"
                     );
+                    pipe_map.insert(p.endpoint_address, p.pipe_handle);
                 }
                 info!(
                     count = pipes.len(),
@@ -296,9 +376,10 @@ mod imp {
             }
         }
 
-        // EP0 control transfers are serialized by the kernel, so service each
-        // inline. Stop when the device goes away: a fetch failure (link dead) or
-        // the device channel closing (disconnect) via handle.closed().
+        // Service each raised transfer from the client. Stop when the device goes
+        // away: a control-IN fetch failure (link dead) or the device channel closing
+        // (disconnect) via handle.closed(). A bulk failure stalls that one transfer
+        // (the mass-storage driver retries / resets) without tearing down.
         loop {
             let req = tokio::select! {
                 maybe = rx.recv() => match maybe {
@@ -310,26 +391,67 @@ mod imp {
                     break;
                 }
             };
-            let b_request = req.setup[1];
-            if b_request != USB_REQ_GET_DESCRIPTOR {
-                // Only descriptor reads are forwarded today (enough to enumerate);
-                // stall the rest (SET_* have no data stage and never reach here).
-                controller.complete(req.token, &[], STATUS_STALL);
-                continue;
-            }
-            // GET_DESCRIPTOR wValue: high byte = descriptor type, low byte = index.
-            let desc_index = req.setup[2];
-            let desc_type = req.setup[3];
-            let lang_id = u16::from_le_bytes([req.setup[4], req.setup[5]]);
-            match handle
-                .get_descriptor(desc_type, desc_index, lang_id, req.max_len)
-                .await
-            {
-                Ok(bytes) => controller.complete(req.token, &bytes, STATUS_OK),
-                Err(e) => {
-                    warn!(error = %e, token = req.token, "USB redirection: descriptor fetch failed — tearing down");
-                    controller.complete(req.token, &[], STATUS_STALL);
-                    break;
+            match req {
+                TransferReq::ControlIn {
+                    token,
+                    setup,
+                    max_len,
+                } => {
+                    if setup[1] != USB_REQ_GET_DESCRIPTOR {
+                        // Only descriptor reads are forwarded on EP0 today (enough to
+                        // enumerate); stall the rest (SET_* have no data stage).
+                        controller.complete_in(token, &[], STATUS_STALL);
+                        continue;
+                    }
+                    // GET_DESCRIPTOR wValue: high byte = type, low byte = index.
+                    let desc_index = setup[2];
+                    let desc_type = setup[3];
+                    let lang_id = u16::from_le_bytes([setup[4], setup[5]]);
+                    match handle
+                        .get_descriptor(desc_type, desc_index, lang_id, max_len)
+                        .await
+                    {
+                        Ok(bytes) => controller.complete_in(token, &bytes, STATUS_OK),
+                        Err(e) => {
+                            warn!(error = %e, token, "USB redirection: descriptor fetch failed — tearing down");
+                            controller.complete_in(token, &[], STATUS_STALL);
+                            break;
+                        }
+                    }
+                }
+                TransferReq::Bulk {
+                    token,
+                    endpoint_address,
+                    is_in,
+                    length,
+                    data,
+                } => {
+                    let Some(&pipe) = pipe_map.get(&endpoint_address) else {
+                        warn!(
+                            endpoint = format_args!("{:#04x}", endpoint_address),
+                            "USB redirection: bulk transfer on an unmapped endpoint — stalling"
+                        );
+                        controller.complete_out(token, 0, STATUS_STALL);
+                        continue;
+                    };
+                    if is_in {
+                        match handle.bulk_transfer_in(pipe, length).await {
+                            Ok(bytes) => controller.complete_in(token, &bytes, STATUS_OK),
+                            Err(e) => {
+                                warn!(error = %e, endpoint = format_args!("{:#04x}", endpoint_address), "USB redirection: bulk IN failed — stalling");
+                                controller.complete_in(token, &[], STATUS_STALL);
+                            }
+                        }
+                    } else {
+                        let n = data.len() as u32;
+                        match handle.bulk_transfer_out(pipe, data).await {
+                            Ok(_) => controller.complete_out(token, n, STATUS_OK),
+                            Err(e) => {
+                                warn!(error = %e, endpoint = format_args!("{:#04x}", endpoint_address), "USB redirection: bulk OUT failed — stalling");
+                                controller.complete_out(token, 0, STATUS_STALL);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -405,38 +527,31 @@ mod tests {
     use super::{claim_device, release_device};
 
     // The dedup registry is a process-wide static shared across tests, so each
-    // test uses its own unique instance ids to stay independent of ordering.
+    // test uses its own unique hardware-identity keys to stay ordering-independent.
 
     #[test]
     fn claims_once_then_releases() {
-        let id = "test-instance-claims-once";
+        let id = "2174:2100:0100-claims-once";
         assert!(claim_device(id), "first claim wins");
         assert!(
             !claim_device(id),
-            "second claim on a live device is skipped"
+            "second announce of the same hardware is skipped"
         );
         release_device(id);
         assert!(
             claim_device(id),
-            "claimable again after its controller released"
+            "claimable again after its controller released (genuine reset re-add)"
         );
         release_device(id);
     }
 
     #[test]
     fn distinct_devices_are_independent() {
-        let a = "test-instance-distinct-a";
-        let b = "test-instance-distinct-b";
+        let a = "2174:2100:0100-distinct-a";
+        let b = "0781:5583:0010-distinct-b";
         assert!(claim_device(a));
         assert!(claim_device(b), "a different device presents independently");
         release_device(a);
         release_device(b);
-    }
-
-    #[test]
-    fn empty_instance_id_is_never_deduped() {
-        // An absent instance id must never merge two genuinely different devices.
-        assert!(claim_device(""));
-        assert!(claim_device(""), "empty id always presents");
     }
 }

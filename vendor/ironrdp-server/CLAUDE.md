@@ -1150,15 +1150,32 @@ AND released — #1276 landing is NOT sufficient.
       proves enumeration + encoding, and the mount needs a claimable-interface client
       (real Windows / Linux FreeRDP). macrdp bounds it with a 5 s timeout (degrade to
       enumerate-only, no hang).
-    - **One controller per physical device (dedup).** `UsbHandle` carries the client's
-      `device_instance_id` (from `ADD_DEVICE`, `Cch32String::to_native_lossy`); a client
-      can announce one physical device on more than one `URBDRC` channel (SuperSpeed
-      dual-announce, composite, re-announce), and each announce would otherwise spin up
-      its own presenting controller. The dedup is a **presenting-side policy** (macrdp's
-      `drive_device` keys a live-device set on the instance id — one controller per id,
-      released on teardown), NOT in the vendored crate: the server correctly opens the
-      channel the client asked for; only the presenting side decides not to present a
-      device twice. Empty instance ids are never deduped.
+    - **Phase 3.2 bulk transfer forwarding — the redirected drive MOUNTS (2026-07-06).**
+      `UsbHandle::bulk_transfer_in(pipe_handle, length)` / `bulk_transfer_out(pipe_handle,
+      data)` build a `TS_URB_BULK_OR_INTERRUPT_TRANSFER` (via the shared
+      `bulk_transfer_request` helper: `RegisterRequestCallback` + `TransferInRequest`
+      with `output_buffer_size` for IN / `TransferOutRequest` with `output_buffer` for
+      OUT; the `USBD_TRANSFER_DIRECTION_IN` flag MUST match the request PDU or the codec
+      rejects it) on a client `pipe_handle` from SelectConfiguration. macrdp's driver loop
+      forwards each kernel-raised bulk transfer on the mass-storage endpoints (0x01 OUT /
+      0x82 IN) so the macOS driver's SCSI (CBW → data → CSW) rides the client's real drive.
+      **VERIFIED end-to-end on a real Linux FreeRDP client** (UTM-QEMU Ubuntu + USB-2.0 hub
+      for a claimable interface): the ESD310C flash drive mounts on the Mac and stays
+      mounted, 1300+ steady bulk transfers, no resets/timeouts. Remaining: control-OUT
+      forwarding (mass-storage reset / Clear-Feature), retract/hot-unplug.
+    - **One controller per physical device (dedup, presenting-side).** A client can
+      announce ONE physical device on more than one `URBDRC` channel — FreeRDP announces
+      the same drive twice with instance ids differing by a byte (`…d31`/`…d32`), plus a
+      reset re-announces it — and presenting each spins up its own controller: two virtual
+      drives then **duel over the single client device** (conflicting SCSI, 10 s timeouts,
+      failed mount — observed live). So macrdp's `drive_device` dedups on the device's
+      **stable hardware identity** (`VID:PID:bcdDevice` from the descriptor, fetched before
+      claiming), NOT the client's per-announce `device_instance_id` (which varies). This is
+      a **presenting-side policy**, not in the vendored crate: the server correctly opens
+      the channel the client asked for; the presenting side decides not to present one
+      device twice. (`UsbHandle` still exposes `device_instance_id` for logging.) Limitation:
+      two different drives of the identical model+revision share a key — true multi-device
+      needs the iSerialNumber string, deferred.
     - A per-connection `MAX_DEVICE_CHANNELS` (32) cap on `OpenDeviceChannel`
       requests bounds a client that spams `ADD_VIRTUAL_CHANNEL` (each opens a DVC
       that's never pruned within a connection) from growing the DRDYNVC slab.

@@ -39,8 +39,8 @@ use ironrdp_rdpeusb::pdu::completion::ts_urb_result::{TsUrbResultPayload, TsUrbS
 use ironrdp_rdpeusb::pdu::header::{FunctionId, InterfaceId, Mask, SharedMsgHeader};
 use ironrdp_rdpeusb::pdu::notify::{ChannelCreated, Direction};
 use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::utils::{TsUrbHeader, TsUsbdInterfaceInfo, TsUsbdPipeInfo, UrbFunction, UsbConfigDesc};
-use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::{TsUrb, TsUrbControlDescRequest, TsUrbSelectConfig};
-use ironrdp_rdpeusb::pdu::usb_dev::{RegisterRequestCallback, TransferInRequest};
+use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::{TsUrb, TsUrbBulkOrInterruptTransfer, TsUrbControlDescRequest, TsUrbSelectConfig};
+use ironrdp_rdpeusb::pdu::usb_dev::{RegisterRequestCallback, TransferInRequest, TransferOutRequest};
 use ironrdp_rdpeusb::pdu::utils::RequestIdTransferInOut;
 use ironrdp_rdpeusb::pdu::{UrbdrcClientPdu, UrbdrcServerPdu};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -55,6 +55,9 @@ const USB_DESCRIPTOR_TYPE_INTERFACE: u8 = 4;
 const USB_DESCRIPTOR_TYPE_ENDPOINT: u8 = 5;
 /// A USB device descriptor is 18 bytes.
 const USB_DEVICE_DESCRIPTOR_LEN: u32 = 18;
+/// `USBD_TRANSFER_DIRECTION_IN` transfer flag (the vendored crate's copy is
+/// `pub(crate)`; MS-RDPEUSB fixes it at bit 0).
+const USBD_TRANSFER_DIRECTION_IN: u32 = 0x1;
 
 /// The MS-RDPEUSB dynamic virtual channel name (this rev's `ironrdp-rdpeusb`
 /// predates the upstream `CHANNEL_NAME` const, so it's spelled out here).
@@ -353,6 +356,102 @@ impl UsbHandle {
             })
             .collect())
     }
+
+    /// Bulk/interrupt **IN** transfer on `pipe_handle`: read up to `length` bytes
+    /// from the device and return what arrived (may be short). `pipe_handle` comes
+    /// from [`select_configuration`](Self::select_configuration).
+    pub async fn bulk_transfer_in(&self, pipe_handle: u32, length: u32) -> Result<Vec<u8>> {
+        let (req_id, rx) = self.router.register();
+        let messages = bulk_transfer_request(self.device_iface, req_id, pipe_handle, BulkDir::In, length, Vec::new());
+        self.sender
+            .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
+                channel_id: self.channel_id,
+                messages,
+            }))
+            .ok()
+            .context("URBDRC: server event loop gone")?;
+        let reply = rx.await.context("URBDRC: connection closed before bulk-IN completion")?;
+        if reply.hresult != 0 {
+            anyhow::bail!("URBDRC: bulk IN failed (hresult {:#010x})", reply.hresult);
+        }
+        Ok(reply.output_buffer)
+    }
+
+    /// Bulk/interrupt **OUT** transfer on `pipe_handle`: write `data` to the device.
+    /// Returns the number of bytes submitted.
+    pub async fn bulk_transfer_out(&self, pipe_handle: u32, data: Vec<u8>) -> Result<usize> {
+        let n = data.len();
+        let (req_id, rx) = self.router.register();
+        let messages = bulk_transfer_request(self.device_iface, req_id, pipe_handle, BulkDir::Out, 0, data);
+        self.sender
+            .send(ServerEvent::Urbdrc(UrbdrcServerMessage::SendMessages {
+                channel_id: self.channel_id,
+                messages,
+            }))
+            .ok()
+            .context("URBDRC: server event loop gone")?;
+        let reply = rx.await.context("URBDRC: connection closed before bulk-OUT completion")?;
+        if reply.hresult != 0 {
+            anyhow::bail!("URBDRC: bulk OUT failed (hresult {:#010x})", reply.hresult);
+        }
+        Ok(n)
+    }
+}
+
+/// Direction of a bulk/interrupt transfer (which request PDU + transfer-flag it uses).
+#[derive(Clone, Copy)]
+enum BulkDir {
+    In,
+    Out,
+}
+
+/// Build a bulk/interrupt transfer request: a `RegisterRequestCallback` + a
+/// `TransferInRequest` (IN, `output_buffer_size = length`) or `TransferOutRequest`
+/// (OUT, `output_buffer = data`) carrying a `TS_URB_BULK_OR_INTERRUPT_TRANSFER` on
+/// `pipe_handle`. The transfer-flag direction bit MUST match the request direction
+/// (the codec enforces it). Mirrors [`get_descriptor_request`].
+fn bulk_transfer_request(
+    device_iface: InterfaceId,
+    req_id: u32,
+    pipe_handle: u32,
+    dir: BulkDir,
+    in_length: u32,
+    out_data: Vec<u8>,
+) -> Vec<DvcMessage> {
+    let reg = RegisterRequestCallback {
+        msg_id: 0,
+        udev_iface: device_iface,
+        request_completion: Some(device_iface),
+    };
+    let ts_req_id = RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
+    let transfer_flags = match dir {
+        BulkDir::In => USBD_TRANSFER_DIRECTION_IN,
+        BulkDir::Out => 0,
+    };
+    let urb = TsUrbBulkOrInterruptTransfer {
+        header: TsUrbHeader {
+            func: UrbFunction::BulkOrInterruptTransfer,
+            req_id: ts_req_id,
+            no_ack: false,
+        },
+        pipe_handle,
+        transfer_flags,
+    };
+    let transfer = match dir {
+        BulkDir::In => dvc_msg(UrbdrcServerPdu::TransferIn(TransferInRequest {
+            msg_id: 0,
+            udev_iface: device_iface,
+            ts_urb: TsUrb::BulkInterruptTransfer(urb),
+            output_buffer_size: in_length,
+        })),
+        BulkDir::Out => dvc_msg(UrbdrcServerPdu::TransferOut(TransferOutRequest {
+            msg_id: 0,
+            udev_iface: device_iface,
+            ts_urb: TsUrb::BulkInterruptTransfer(urb),
+            output_buffer: out_data,
+        })),
+    };
+    vec![dvc_msg(UrbdrcServerPdu::RegReqCb(reg)), transfer]
 }
 
 /// One endpoint pipe opened by [`UsbHandle::select_configuration`]: its USB

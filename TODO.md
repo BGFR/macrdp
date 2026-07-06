@@ -244,7 +244,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   machines, which isn't a realistic target. See the "Industry status" + "P2.3 FEC capture
   RESULT" notes in `docs/rdp-udp-multitransport-feasibility.md` + `vendor/ironrdp-rdpeudp/CLAUDE.md`.
 
-- [ ] **Generic USB redirection (MS-RDPEUSB) — Phases 1 + 2 + 3.0 + 3.1a + 3.1b(1) + 3.1b(2a) GO ✅, 3.1b(2b) open.**
+- [ ] **Generic USB redirection (MS-RDPEUSB) — through Phase 3.2 bulk GO ✅✅ (a redirected USB DRIVE MOUNTS on the Mac); control-OUT + retract/multi-device remain.**
   Path: user-space virtual USB host controller via `IOUSBHostControllerInterface` (a **public,
   headered** IOUSBHost.framework API — NOT private SPI as first assumed; its doc says it
   "create[s] synthetic USB devices"). Entitlement `com.apple.developer.usb.host-controller-
@@ -321,18 +321,30 @@ then delete; promote a parked item to *In flight* when work actually starts.
     every bulk transfer needs. EP0 descriptor reads work; bulk needs a **claimable-interface client**
     (a real Windows client, or a **Linux FreeRDP** client where kernel-detach works — i.e. a second
     machine). Degrades to enumerate-only (5s timeout).
-  - **Phase 3.2 dedup — done** (2026-07-06, commit `e11eed3`): one presenting controller per
-    physical device. A client can announce one device on multiple `URBDRC` channels (SuperSpeed
-    dual-announce, composite, re-announce); `UsbHandle` now carries the client's `device_instance_id`
-    and macrdp's `drive_device` keys a live-device set on it (presenting-side policy, not vendored).
-    Unit-tested + verified no regression.
-  - **Phase 3.2 remaining** — bulk IN/OUT forwarding (`TsUrb::BulkInterruptTransfer` with the pipe
-    handles + Obj-C generalize the ring walk to EP1 endpoints), general control-OUT forwarding
-    (SET_*), **a claimable-interface test client to verify the actual mount** (a Linux FreeRDP VM
-    with USB passthrough — UTM/QEMU, Parallels, or VMware Fusion on Apple Silicon; NOT VirtualBox,
-    whose arm64 build has no USB passthrough — or a vendor-class USB device macOS doesn't claim),
-    mid-session retract, multi-device, dispatch-priority tier. Plan:
-    `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
+  - **Phase 3.2 dedup — done, then hardened** (2026-07-06, commits `e11eed3` then the bulk commit):
+    one presenting controller per physical device. Initially keyed on the client's
+    `device_instance_id`, but that FAILED live — FreeRDP announces one drive twice with instance ids
+    differing by a byte (`…d31`/`…d32`), so both presented and the two virtual drives **dueled over
+    the single client device** (10 s SCSI timeouts, failed mount). Re-keyed on the device's **stable
+    hardware identity** (`VID:PID:bcdDevice`, fetched before claiming). Unit-tested; verified live
+    (one controller, clean mount). (`UsbHandle` still exposes `device_instance_id` for logging.)
+  - **Phase 3.2 bulk IN/OUT forwarding GO ✅✅ — the redirected DRIVE MOUNTS** (2026-07-06): 
+    `UsbHandle::bulk_transfer_in/out` (`TsUrb::BulkInterruptTransfer` on the SelectConfiguration pipe
+    handles, direction-flag matched) + the Obj-C ring walk generalized to the bulk endpoints (async
+    out-of-band completion, same pattern as EP0 control-IN). **Verified end-to-end on a real Linux
+    FreeRDP client** (UTM-QEMU Ubuntu 24.04 ARM64 + a **USB-2.0 hub** to force high-speed so the
+    USB-3.2 SSD enumerates in QEMU; guest `udev MODE=0666` + `xfreerdp /usb:dbg,id:2174:2100`): the
+    ESD310C **mounts on the Mac and stays mounted**, 1300+ steady bulk transfers, no resets/timeouts.
+    Two load-bearing fixes: (1) the hardware-identity dedup above; (2) an Obj-C **endpoint-object
+    identity guard** on completion — a device reset destroys+recreates the endpoint at the same key
+    (new Active object, but `p.msg` points into the old freed ring), so the completion is dropped
+    unless `endpoints[key]` is still the same object it was raised on (fixes a reset-during-bulk
+    SIGSEGV the liveness check alone missed).
+  - **Phase 3.2 remaining** — general control-OUT forwarding (mass-storage Bulk-Only Reset `bReq=0xff`
+    + Clear-Feature(HALT), currently ACKed locally not forwarded — likely needed for robustness under
+    SCSI errors), mid-session retract/hot-unplug, true multi-device (needs iSerialNumber to
+    distinguish identical models), dispatch-priority tier. Test rig proven: UTM-QEMU Linux FreeRDP +
+    USB-2.0 hub. Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
   Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].

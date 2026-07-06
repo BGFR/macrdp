@@ -285,13 +285,18 @@ then delete; promote a parked item to *In flight* when work actually starts.
     `hresult=0x0 descriptor_len=18 vid=0x2174 pid=0x2100` — the flash drive's real VID/PID read
     from the physical device. macOS libusb kernel-detach was not a blocker after unmount. This
     de-risks the whole transfer path.
-  - **Phase 3.1b(2b) (next)** — refactor the reactive spike into a reusable **`UsbHandle`/
-    `UsbRouter`** (the RdpdrHandle pattern: `AtomicU32` req id + `Mutex<HashMap<id, oneshot>>` +
-    a `ServerEvent::Urbdrc(SendMessages)` dispatch on the device channel + completion routing) so
-    the macOS side can drive **arbitrary** transfers on demand; then evolve `usb_spike.m` from
-    hardcoded+synchronous to client-sourced+async (the IOUSBHost-serial-queue ↔ tokio boundary —
-    the core engineering risk). Needs the **entitled/provisioned build** (touches UserHCI). Then a
-    **real** client device enumerates in `ioreg`. Plan: `~/.claude/plans/wobbly-honking-minsky.md` §3.1.
+  - **Phase 3.1b(2b) part 1 GO** (2026-07-06, commit `e79fa85`): the transfer path is now a
+    reusable **async `UsbHandle`/`UsbRouter`** seam (the RdpdrHandle pattern: 31-bit req-id router +
+    `ServerEvent::Urbdrc(SendMessages)` DVC-framed dispatch + `DeviceDescriptor::parse`), and
+    `UrbdrcDeviceProcessor::process()` shrank to decode-and-route. The descriptor fetch is driven
+    through the handle. Verified live: `vid=0x2174 pid=0x2100 usb_version=0x0320`. (Elegance
+    refactor of the 2a spike.)
+  - **Phase 3.1b(2b) part 2 (next)** — evolve `usb_spike.m` from hardcoded+synchronous to
+    client-sourced+async: on the kernel's EP0 `GET_DESCRIPTOR`, drive the `UsbHandle` and complete
+    the kernel transfer out-of-band with the client's bytes (the IOUSBHost-serial-queue ↔ tokio
+    boundary — the core engineering risk). Needs the **entitled/provisioned build** (touches
+    UserHCI). Then a **real** client device enumerates in `ioreg`. Plan:
+    `~/.claude/plans/wobbly-honking-minsky.md` §3.1.
   Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].

@@ -314,6 +314,13 @@ fn get_descriptor_request(
     ]
 }
 
+/// Invoked once per redirected device, with a [`UsbHandle`] onto it, when the
+/// client announces it (`ADD_DEVICE`). This is the seam to the presenting side:
+/// the vendored server exposes the handle, and macrdp's `MacUsb` decides what to
+/// do with it (fetch descriptors, drive the macOS UserHCI controller). `Send +
+/// Sync` so a device processor on any connection can call it.
+pub type UsbDeviceCallback = Arc<dyn Fn(UsbHandle) + Send + Sync>;
+
 const MAX_DEVICE_CHANNELS: u32 = 32;
 
 /// Main server-side `URBDRC` DVC processor: drives the init handshake and, on each
@@ -468,47 +475,39 @@ impl DvcServerProcessor for UrbdrcServer {}
 /// `INIT_CHANNEL_OUT` barrier) so the client sends `ADD_DEVICE`.
 ///
 /// Its `process()` is intentionally thin — decode and route: it logs
-/// `ADD_DEVICE`, hands `URB_COMPLETION`s to the [`UsbRouter`], and tolerates
-/// anything else. Transfers themselves are issued through a [`UsbHandle`] (the
-/// async seam the macOS UserHCI side drives). As a Phase 3.1b(2) spike — a
-/// stand-in for that driver — it fetches the real device descriptor once on
-/// `ADD_DEVICE` via that same handle, proving the transfer round-trip end-to-end.
+/// `ADD_DEVICE` and hands the device's [`UsbHandle`] to the presenting side (the
+/// [`UsbDeviceCallback`]), routes `URB_COMPLETION`s back through the
+/// [`UsbRouter`], and tolerates anything else. It does NOT itself decide what to
+/// do with the device — that (fetch descriptors, drive the macOS UserHCI
+/// controller) lives in macrdp's `MacUsb`, on the other side of the callback.
 pub struct UrbdrcDeviceProcessor {
     /// Connection event sender, used to build [`UsbHandle`]s that ship transfers.
     sender: mpsc::UnboundedSender<ServerEvent>,
     /// Shared with every [`UsbHandle`] we build — completions route back through it.
     router: UsbRouter,
-    /// One-shot guard so the descriptor probe fires at most once per device.
-    descriptor_probed: bool,
+    /// The presenting side; called once with the handle when the device announces.
+    device_cb: Option<UsbDeviceCallback>,
+    /// One-shot guard so the presenting side is notified at most once per device.
+    announced: bool,
 }
 
 impl UrbdrcDeviceProcessor {
-    pub fn new(sender: mpsc::UnboundedSender<ServerEvent>) -> Self {
+    pub fn new(sender: mpsc::UnboundedSender<ServerEvent>, device_cb: Option<UsbDeviceCallback>) -> Self {
         Self {
             sender,
             router: UsbRouter::new(),
-            descriptor_probed: false,
+            device_cb,
+            announced: false,
         }
     }
 
-    /// Spike driver (stand-in for the future UserHCI side): fetch + log the real
-    /// device descriptor through the async [`UsbHandle`], off the event-loop thread.
-    fn spawn_descriptor_probe(&self, channel_id: u32, device_iface: InterfaceId) {
+    /// Hand the presenting side a [`UsbHandle`] onto the newly-announced device.
+    fn notify_device(&self, channel_id: u32, device_iface: InterfaceId) {
         let handle = UsbHandle::new(self.sender.clone(), self.router.clone(), channel_id, device_iface);
-        info!(channel_id, "URBDRC issuing GET_DESCRIPTOR probe (device descriptor)");
-        tokio::spawn(async move {
-            match handle.device_descriptor().await {
-                Ok(d) => info!(
-                    channel_id,
-                    vid = format_args!("{:#06x}", d.vendor_id),
-                    pid = format_args!("{:#06x}", d.product_id),
-                    usb_version = format_args!("{:#06x}", d.usb_version),
-                    device_class = d.device_class,
-                    "URBDRC device descriptor — real device data received (transfer round-trip GO)"
-                ),
-                Err(e) => warn!(channel_id, error = %e, "URBDRC device-descriptor probe failed"),
-            }
-        });
+        match &self.device_cb {
+            Some(cb) => cb(handle),
+            None => debug!(channel_id, "URBDRC device announced but no presenting side is wired"),
+        }
     }
 }
 
@@ -540,9 +539,9 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
                     speed = ?dev.usb_device_caps.device_speed,
                     "URBDRC ADD_DEVICE — real device descriptors received (GO)"
                 );
-                if !self.descriptor_probed {
-                    self.descriptor_probed = true;
-                    self.spawn_descriptor_probe(channel_id, dev.usb_device);
+                if !self.announced {
+                    self.announced = true;
+                    self.notify_device(channel_id, dev.usb_device);
                 }
             }
             Ok(UrbdrcClientPdu::UrbComp(comp)) => {
@@ -588,4 +587,11 @@ impl DvcServerProcessor for UrbdrcDeviceProcessor {}
 pub trait UrbdrcServerFactory: ServerEventSender + Send {
     /// Build the per-connection main `URBDRC` DVC processor.
     fn build_processor(&self) -> UrbdrcServer;
+
+    /// The presenting side, called once per redirected device with a [`UsbHandle`]
+    /// onto it (`ADD_DEVICE`). `None` (the default) drops the handle — the device
+    /// is announced but nothing drives it. macrdp's `MacUsb` returns `Some`.
+    fn device_callback(&self) -> Option<UsbDeviceCallback> {
+        None
+    }
 }

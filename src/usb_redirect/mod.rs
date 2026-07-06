@@ -17,20 +17,26 @@
 //! quarantined in `usb_spike.m` (the maintenance boundary), built + linked by
 //! `build.rs` on macOS.
 
-use ironrdp_server::{ServerEvent, ServerEventSender, UrbdrcServer, UrbdrcServerFactory};
+use std::sync::Arc;
+
+use ironrdp_server::{
+    ServerEvent, ServerEventSender, UrbdrcServer, UrbdrcServerFactory, UsbDeviceCallback, UsbHandle,
+};
 use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 /// macrdp's server-direction USB-redirection factory (`--enable-usb-redirection`).
 ///
-/// Installs the vendored `UrbdrcServer` DVC processor, which advertises the
-/// `URBDRC` channel and drives the MS-RDPEUSB init handshake. **Phase 3.1a:** it
-/// retains the connection's server-event sender (captured in `set_sender`) and
-/// hands it to each built processor so the processor can request a per-device DVC
-/// (which surfaces the real device's `ADD_DEVICE` descriptors). Transfers +
-/// the macOS UserHCI controller are Phase 3.1b.
+/// Installs the vendored `UrbdrcServer` DVC processor (advertises `URBDRC`, drives
+/// the MS-RDPEUSB init handshake, opens a per-device DVC per `ADD_DEVICE`), and —
+/// via [`device_callback`](UrbdrcServerFactory::device_callback) — receives a
+/// [`UsbHandle`] onto each announced device. [`drive_device`] is the presenting-
+/// side driver: today it fetches + logs the real descriptor over the handle;
+/// next it creates the macOS UserHCI controller (`usb_spike.m`) for the device
+/// and answers the kernel's EP0 transfers by driving that same handle.
 ///
-/// Cross-platform (pure protocol policy — no macOS APIs yet); the presenting
-/// side lives behind `--usb-spike` / the future controller module.
+/// Cross-platform (pure protocol policy — no macOS APIs yet); the UserHCI
+/// controller lives behind `--usb-spike` / the future `drive_device` body.
 pub struct MacUsb {
     sender: Option<mpsc::UnboundedSender<ServerEvent>>,
 }
@@ -57,6 +63,30 @@ impl UrbdrcServerFactory for MacUsb {
     fn build_processor(&self) -> UrbdrcServer {
         UrbdrcServer::with_sender(self.sender.clone())
     }
+
+    fn device_callback(&self) -> Option<UsbDeviceCallback> {
+        Some(Arc::new(drive_device))
+    }
+}
+
+/// Presenting-side driver for one redirected USB device, called (with a
+/// [`UsbHandle`] onto it) when the client announces it. **Phase 3.1b(2b):** fetch
+/// and log the device's real descriptor over the handle, proving the transfer
+/// path. **Next:** create the macOS UserHCI controller (`usb_spike.m`) for the
+/// device and answer the kernel's EP0 transfers by driving this same handle.
+fn drive_device(handle: UsbHandle) {
+    tokio::spawn(async move {
+        match handle.device_descriptor().await {
+            Ok(d) => info!(
+                vid = format_args!("{:#06x}", d.vendor_id),
+                pid = format_args!("{:#06x}", d.product_id),
+                usb_version = format_args!("{:#06x}", d.usb_version),
+                device_class = d.device_class,
+                "USB redirection: device descriptor received (transfer round-trip GO)"
+            ),
+            Err(e) => warn!(error = %e, "USB redirection: device-descriptor fetch failed"),
+        }
+    });
 }
 
 #[cfg(target_os = "macos")]

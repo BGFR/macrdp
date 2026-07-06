@@ -1112,13 +1112,17 @@ AND released — #1276 landing is NOT sufficient.
       arm) → `await` the completion. `UrbdrcDeviceProcessor::process()` is thin —
       decode + route: log `ADD_DEVICE`, hand `URB_COMPLETION`s to `router.deliver`,
       tolerate the rest. `DeviceDescriptor::parse` keeps the USB byte-layout in one
-      typed place (no inline offsets). As a **Phase 3.1b(2) spike** — a stand-in for
-      the future UserHCI driver — `spawn_descriptor_probe` fetches the device
-      descriptor once on `ADD_DEVICE` through that handle. **VERIFIED live** with a
-      USB-3.2 flash drive over FreeRDP-with-urbdrc: `vid=0x2174 pid=0x2100
-      usb_version=0x0320` (the drive's real data, read from the device). macOS libusb
-      kernel-detach for a mass-storage device was not a blocker after
-      `diskutil unmountDisk`.
+      typed place (no inline offsets). The DRIVER (what to do with a device) is NOT
+      in the vendored crate — `UrbdrcServerFactory::device_callback() ->
+      Option<UsbDeviceCallback>` (an `Arc<dyn Fn(UsbHandle) + Send + Sync>`) is the
+      seam: the device processor calls it once per `ADD_DEVICE` with the device's
+      handle, and macrdp's `MacUsb` (the presenting side) does the work
+      (`src/usb_redirect/mod.rs::drive_device` — fetch the descriptor now, drive the
+      UserHCI controller next). **VERIFIED live** with a USB-3.2 flash drive over
+      FreeRDP-with-urbdrc: macrdp's driver fetched `vid=0x2174 pid=0x2100
+      usb_version=0x0320` (the drive's real data, read from the device) through the
+      handle. macOS libusb kernel-detach for a mass-storage device was not a blocker
+      after `diskutil unmountDisk`.
     - A per-connection `MAX_DEVICE_CHANNELS` (32) cap on `OpenDeviceChannel`
       requests bounds a client that spams `ADD_VIRTUAL_CHANNEL` (each opens a DVC
       that's never pruned within a connection) from growing the DRDYNVC slab.

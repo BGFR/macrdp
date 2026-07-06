@@ -1626,15 +1626,17 @@ impl RdpServer {
                     // a per-device DVC. Only the event loop can reach DrdynvcServer, so
                     // open the channel here and ship the resulting CreateRequest.
                     crate::UrbdrcServerMessage::OpenDeviceChannel => {
-                        // Clone the sender BEFORE the &mut self borrow below; the new
-                        // device processor keeps it to ship transfers back to this loop.
+                        // Clone the sender + presenting-side callback BEFORE the
+                        // &mut self borrow below; the new device processor keeps them
+                        // to ship transfers and to hand the device to the macOS side.
                         let sender = self.ev_sender.clone();
+                        let device_cb = self.usb_factory.as_deref().and_then(|f| f.device_callback());
                         let create_msg = {
                             let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
                                 warn!("No DRDYNVC channel, cannot open URBDRC device channel");
                                 continue;
                             };
-                            match drdynvc.create_channel(crate::rdpeusb::UrbdrcDeviceProcessor::new(sender)) {
+                            match drdynvc.create_channel(crate::rdpeusb::UrbdrcDeviceProcessor::new(sender, device_cb)) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     warn!(error = %e, "failed to create URBDRC device channel");

@@ -100,8 +100,13 @@ impl AddDevice {
 
         ensure_size!(in: src, size: InterfaceId::FIXED_PART_SIZE);
         let usb_device = match src.read_u32() {
-            interface_id @ 0x0..=0x3 => return Err(unsupported_value_err!("UsbDevice", format!("{interface_id}"))),
-            value @ 0x4..=0x3F_FF_FF_FF => InterfaceId::try_from(value).map_err(|e|
+            // Real mstsc assigns UsbDevice=0 to a redirected device (verified live
+            // 2026-07-06), so the reserved-interface-id range 0x0..=0x3 must NOT be
+            // rejected here: the device is addressed by its own per-device DVC, so a
+            // per-channel interface id of 0 is unambiguous and valid. (FreeRDP uses a
+            // >=0x4 id — both must parse.) Only the StreamId-masked high range is an
+            // invalid plain interface id. Extends divergence (1).
+            value @ 0x0..=0x3F_FF_FF_FF => InterfaceId::try_from(value).map_err(|e|
                 // Only a map_err and not expect (value clamped) cause clippy complains
                 other_err!(source: e))?,
             value @ 0x40_00_00_00.. => return Err(unsupported_value_err!("UsbDevice", format!("{value}"))),

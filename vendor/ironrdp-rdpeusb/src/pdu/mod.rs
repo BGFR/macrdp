@@ -151,10 +151,16 @@ impl Decode<'_> for UrbdrcClientPdu {
                 if header.function_id.is_none() && header.mask == Mask::StreamIdNone {
                     RimExchangeCapabilityResponse::decode(src, header).map(Self::Caps)
                 } else {
-                    Err(invalid_field_err!(
-                        "SHARED_MSG_HEADER",
-                        "invalid RIM_EXCHANGE_CAPABILITY_RESPONSE header"
-                    ))
+                    // Real mstsc assigns UsbDevice=0 to a redirected device (verified
+                    // live 2026-07-06), so a completion for THAT device arrives on
+                    // interface_id 0 (== CAPABILITIES) — it must be dispatched by its
+                    // function id like any other device completion, NOT rejected as a
+                    // malformed caps response. A genuine caps response is the
+                    // function-less / StreamIdNone case handled above; anything else on
+                    // interface 0 is a device message. (URB_COMPLETION and ADD_DEVICE
+                    // even share function id 0x101, disambiguated only by interface +
+                    // mask — hence this can't be a plain function-id match.) Divergence (2).
+                    Self::decode_device_message(src, header)
                 }
             }
             InterfaceId::DEVICE_SINK => match (header.function_id, header.mask) {
@@ -181,22 +187,34 @@ impl Decode<'_> for UrbdrcClientPdu {
                 "SHARED_MSG_HEADER",
                 "reserved interface ID is not valid for client-to-server messages"
             )),
-            _id => match (header.function_id, header.mask) {
-                (None, Mask::StreamIdStub) => QueryDeviceTextRsp::decode(src, header).map(Self::DevTextRsp),
-                (Some(FunctionId::IOCONTROL_COMPLETION), Mask::StreamIdProxy) => {
-                    IoControlCompletion::decode(src, header).map(Self::IoctlComp)
-                }
-                (Some(FunctionId::URB_COMPLETION), Mask::StreamIdProxy) => {
-                    UrbCompletion::decode(src, header).map(Self::UrbComp)
-                }
-                (Some(FunctionId::URB_COMPLETION_NO_DATA), Mask::StreamIdProxy) => {
-                    UrbCompletionNoData::decode(src, header).map(Self::UrbCompNoData)
-                }
-                _ => Err(invalid_field_err!(
-                    "SHARED_MSG_HEADER::InterfaceId",
-                    "unknown interface id"
-                )),
-            },
+            // A device interface id (mstsc uses 0, which the CAPABILITIES arm above
+            // reroutes here; FreeRDP uses >= 0x4). Dispatch by the completion function id.
+            _id => Self::decode_device_message(src, header),
+        }
+    }
+}
+
+impl UrbdrcClientPdu {
+    /// Decode a message on a **USB Devices / Request Completion** interface, dispatched
+    /// by its function id + mask. Shared by the normal (`interface_id >= 0x4`) path and
+    /// the `interface_id == 0` path (mstsc assigns `UsbDevice=0` — see the CAPABILITIES
+    /// arm in [`decode`](Self::decode)).
+    fn decode_device_message(src: &mut ReadCursor<'_>, header: SharedMsgHeader) -> DecodeResult<Self> {
+        match (header.function_id, header.mask) {
+            (None, Mask::StreamIdStub) => QueryDeviceTextRsp::decode(src, header).map(Self::DevTextRsp),
+            (Some(FunctionId::IOCONTROL_COMPLETION), Mask::StreamIdProxy) => {
+                IoControlCompletion::decode(src, header).map(Self::IoctlComp)
+            }
+            (Some(FunctionId::URB_COMPLETION), Mask::StreamIdProxy) => {
+                UrbCompletion::decode(src, header).map(Self::UrbComp)
+            }
+            (Some(FunctionId::URB_COMPLETION_NO_DATA), Mask::StreamIdProxy) => {
+                UrbCompletionNoData::decode(src, header).map(Self::UrbCompNoData)
+            }
+            _ => Err(invalid_field_err!(
+                "SHARED_MSG_HEADER::InterfaceId",
+                "unknown interface id"
+            )),
         }
     }
 }

@@ -487,9 +487,10 @@ struct Args {
     /// supported RemoteFX USB devices from this computer" (Computer Config -> Admin
     /// Templates -> Windows Components -> Remote Desktop Services -> Remote Desktop
     /// Connection Client -> RemoteFX USB Device Redirection) + reboot, then select the
-    /// device under Local Resources -> More -> USB. On mstsc a device now enumerates
-    /// but does not stream yet (SelectConfiguration ceiling; isoch/interrupt device
-    /// classes unimplemented). macOS-only.
+    /// device under Local Resources -> More -> USB. On mstsc a device now enumerates,
+    /// configures, and negotiates its format, but the client doesn't deliver the actual
+    /// video/data frames (a webcam's video rides mstsc's separate camera-redirection
+    /// channel, not implemented). macOS-only.
     #[arg(long)]
     enable_usb_redirection: bool,
 

@@ -1226,19 +1226,45 @@ AND released — #1276 landing is NOT sufficient.
     - Remaining: retract/hot-unplug via an explicit RETRACT_DEVICE PDU (the client
       channel-close path above covers detach/reset — the common case — live-verified),
       true multi-device (iSerialNumber), non-mass-storage device classes (untested).
-    - **mstsc client — ENUMERATES end-to-end (2026-07-07), does not STREAM yet.**
-      With the three interop fixes (per-device full handshake here + `ironrdp-rdpeusb`
-      (1)/(2)), a real mstsc RemoteFX-USB device now completes the handshake, announces
-      `ADD_DEVICE`, and macrdp fetches its descriptors + presents the UserHCI controller
-      (verified live with an A4Tech camera + a USB Audio/HID device). The remaining
-      ceiling is device-class work, NOT protocol: `SelectConfiguration` fails on mstsc
-      with `hresult 0x80070057` (E_INVALIDARG) → no pipe handles → all endpoint transfers
-      stall, and the UVC/UAC class-control requests (`bmreq 0xa1/0x22`) also 0x80070057;
-      plus isoch (camera/audio) / interrupt (HID) endpoints aren't implemented. So mstsc
-      devices ENUMERATE but don't function. `SelectConfiguration`-on-mstsc is the next
-      protocol blocker (mstsc-strictness, like the handshake — FreeRDP's `SelectConfiguration`
-      succeeds and mass storage mounts). NB mstsc's RemoteFX USB list excludes mass storage
-      (that rides Drives/RDPDR), so the verified-working bulk path can't be exercised from mstsc.
+    - **mstsc client — ENUMERATES + CONFIGURES + negotiates format (2026-07-07); the
+      only gap left is the client not delivering bulk video frames.** With the handshake
+      fixes (per-device full handshake here + `ironrdp-rdpeusb` (1)/(2)) a real mstsc
+      RemoteFX-USB device announces `ADD_DEVICE` and enumerates; four further fixes then
+      carried it all the way to a streaming attempt:
+      - **`SelectConfiguration` now succeeds** (was `0x80070057`). Two bugs, both
+        mstsc-strict / FreeRDP-lenient: (a) `parse_configuration` emitted one
+        interface-info entry per interface *descriptor* — including every alternate
+        setting — producing DUPLICATE interface numbers, which real Windows rejects; it
+        now emits exactly one entry per interface **number** at alt setting 0 (the default
+        a freshly-configured device is in). (b) the URB carried only the 9-byte config
+        descriptor header while `ConfigurationDescriptorIsValid` was set — fixed by
+        `ironrdp-rdpeusb` (3) (full descriptor). Mass storage (one interface, no alts)
+        never tripped either, which is why FreeRDP worked.
+      - **Control transfers now succeed** (was `0x80070057` on every one). mstsc's URBDRC
+        rejects the generic `URB_FUNCTION_CONTROL_TRANSFER_EX`; `setup_to_typed_urb` now
+        maps each SETUP packet to the specific typed URB real Windows emits
+        (`CLASS_INTERFACE`, `GET_DESCRIPTOR_FROM_INTERFACE`, `SET_FEATURE_TO_*`, …), with
+        `CONTROL_TRANSFER_EX` kept as the fallback. 135+ control transfers succeed and the
+        **UVC VS_PROBE/COMMIT format negotiation completes** end-to-end.
+      - **`USBD_SHORT_TRANSFER_OK`** is now set on bulk/interrupt IN (a short read — a
+        video payload, a HID report — is normal, not `USBD_STATUS_ERROR_SHORT_TRANSFER` →
+        `0x8007001f`). Mass storage's exact-length SCSI reads never needed it.
+      - **`RIMCALL_RELEASE` is recognized + ignored**: mstsc sends one per completed
+        request (releasing the callback we registered) — decoded quietly instead of
+        flooding the tolerated-decode-error log.
+      After all four, a redirected **camera** enumerates, configures, and negotiates a
+      video format on mstsc; macOS then issues continuous bulk reads on the video
+      endpoint, but **mstsc never returns frame data** (of ~10 concurrent bulk reads it
+      completes one with `0x8007001f` and leaves the rest pending forever). That's a
+      **client/mstsc-side limitation** — for a webcam, Windows routes real video over the
+      **dedicated camera-redirection channel** ("Video capture devices" in mstsc), a
+      different protocol macrdp doesn't implement — not a server bug. So on mstsc: mass
+      storage rides Drives/RDPDR (excluded from the RemoteFX USB list, can't be exercised
+      here); a camera/HID/audio device fully enumerates + configures but doesn't stream.
+      The four fixes above are all in the shared path and were regression-checked against
+      FreeRDP mass storage (still mounts + read/write). True webcam support = implement the
+      camera-redirection channel (a separate feature). isoch (camera/audio) / interrupt
+      (HID) endpoints remain unimplemented.
     - **One controller per physical device (dedup, presenting-side).** A client can
       announce ONE physical device on more than one `URBDRC` channel — FreeRDP announces
       the same drive twice with instance ids differing by a byte (`…d31`/`…d32`), plus a

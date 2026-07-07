@@ -32,14 +32,18 @@
 //! by endpoint-object identity, not just liveness — see `usb_spike.m`. EP0
 //! **control-OUT** requests the local kernel issues (a mass-storage Bulk-Only Reset /
 //! Clear-Feature(HALT), needed for SCSI error recovery) are forwarded to the real
-//! device too, via [`UsbHandle::control_transfer_out`] (generic
-//! `URB_FUNCTION_CONTROL_TRANSFER_EX`); the standard requests the host controller /
-//! SelectConfiguration already own (SET_ADDRESS/CONFIGURATION/INTERFACE) stay a local
-//! ACK. EP0 **control-IN** is generic too: a standard device-recipient
-//! `GET_DESCRIPTOR` rides the dedicated descriptor URB (the verified enumeration
-//! path), and everything else — class/vendor INs like mass-storage `Get Max LUN`,
-//! interface-directed ones like a HID report-descriptor read — forwards via
-//! [`UsbHandle::control_transfer_in`] with the raw SETUP preserved. Transfers are
+//! device too, via [`UsbHandle::control_transfer_out`]; the standard requests the
+//! host controller / SelectConfiguration already own
+//! (SET_ADDRESS/CONFIGURATION/INTERFACE) stay a local ACK. EP0 **control-IN** is
+//! generic too: a standard device-recipient `GET_DESCRIPTOR` rides the dedicated
+//! descriptor URB (the verified enumeration path), and everything else — class/vendor
+//! INs like mass-storage `Get Max LUN`, interface-directed ones like a HID
+//! report-descriptor read — forwards via [`UsbHandle::control_transfer_in`] with the
+//! raw SETUP preserved. Both directions translate the SETUP packet into the specific
+//! **typed** URB function real Windows uses (`URB_FUNCTION_CLASS_INTERFACE`,
+//! `GET_DESCRIPTOR_FROM_INTERFACE`, …) rather than the generic
+//! `URB_FUNCTION_CONTROL_TRANSFER_EX`, which mstsc rejects with 0x80070057 (FreeRDP
+//! accepts either) — see the vendored server's `setup_to_typed_urb`. Transfers are
 //! serviced **concurrently** (one task each): the ObjC ring walk serializes per
 //! endpoint, and cross-endpoint independence is what keeps a long-outstanding
 //! transfer (an idle interrupt-IN, a wedged bulk) from blocking EP0 — notably the
@@ -503,6 +507,8 @@ mod imp {
                                     token,
                                     bmreq = format_args!("{:#04x}", setup[0]),
                                     breq = format_args!("{:#04x}", setup[1]),
+                                    wvalue = format_args!("{:#06x}", u16::from_le_bytes([setup[2], setup[3]])),
+                                    windex = format_args!("{:#06x}", u16::from_le_bytes([setup[4], setup[5]])),
                                     "USB redirection: control-IN forward failed — stalling"
                                 );
                                 controller.complete_in(token, &[], STATUS_STALL);
@@ -524,6 +530,8 @@ mod imp {
                                     token,
                                     bmreq = format_args!("{:#04x}", setup[0]),
                                     breq = format_args!("{:#04x}", setup[1]),
+                                    wvalue = format_args!("{:#06x}", u16::from_le_bytes([setup[2], setup[3]])),
+                                    windex = format_args!("{:#06x}", u16::from_le_bytes([setup[4], setup[5]])),
                                     "USB redirection: control-OUT forward failed — stalling"
                                 );
                                 controller.complete_out(token, 0, STATUS_STALL);
@@ -553,7 +561,7 @@ mod imp {
                             match handle.bulk_transfer_in(pipe, length).await {
                                 Ok(bytes) => controller.complete_in(token, &bytes, STATUS_OK),
                                 Err(e) => {
-                                    warn!(error = %e, endpoint = format_args!("{:#04x}", endpoint_address), "USB redirection: bulk IN failed — stalling");
+                                    warn!(error = %e, endpoint = format_args!("{:#04x}", endpoint_address), requested = length, "USB redirection: bulk IN failed — stalling");
                                     controller.complete_in(token, &[], STATUS_STALL);
                                 }
                             }

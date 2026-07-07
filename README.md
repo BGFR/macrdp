@@ -10,7 +10,7 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 ## Status
 
-v0 — daily-driver usable on a trusted LAN, and usable **over the internet** (VPN / ZeroTier / high-latency links, including mobile). **Latest release: [v0.8.28](https://github.com/clintcan/macrdp/releases/latest)** — the *gather-windows release*: an on-demand hotkey (**`Ctrl+Alt+G`**) sweeps windows stranded off the virtual display in the headless modes (`--capture-primary`/`--detach-primary`) back onto the display the client sees — manual by design, no on-connect surprise. Builds on v0.8.27, which fixed the long-standing mstsc blank-on-reconnect (it now self-heals in ~4 s with no disconnect).
+v0 — daily-driver usable on a trusted LAN, and usable **over the internet** (VPN / ZeroTier / high-latency links, including mobile). **Latest release: [v0.8.29](https://github.com/clintcan/macrdp/releases/latest)** — the *stability release*: closes a rare clipboard-churn **crash** (a use-after-free from unsynchronized `NSPasteboard` access), fixes a **scroll-wheel runaway** on the macOS Windows App (gentle scroll-down jumped to the bottom of the page — a two's-complement wheel-decode bug), keeps a redirected **Xbox controller's Guide button** from killing the USB-redirection session, and makes `make-app.sh`'s dev signing keep TCC grants across rebuilds. Builds on v0.8.28 (the gather-windows hotkey `Ctrl+Alt+G`).
 
 Full per-release notes (what shipped, what was verified live, and the war stories): **[docs/release-history.md](docs/release-history.md)**.
 

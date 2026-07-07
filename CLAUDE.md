@@ -19,7 +19,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.28** (the gather-windows release — an
+(VPN/ZeroTier). **Latest release: v0.8.29** (the stability release —
+a bug-fix roll-up over v0.8.28: closes a rare clipboard-churn **crash** (a
+use-after-free from unsynchronized `NSPasteboard` access, now serialized behind a
+process-global guard, #144); fixes a **scroll-wheel runaway** on the macOS Windows
+App where a gentle scroll-down jumped to the bottom of the page — `ironrdp-pdu`
+mis-decodes the 9-bit wheel-rotation field as sign-magnitude instead of two's
+complement, so `-1..-3` deltas arrived as `-255..-253`; corrected at the vendored
+handler (divergence (17)) plus per-event scroll accumulation, issue #113/#140;
+stops a redirected **Xbox controller's Guide button** from tearing down the
+USB-redirection session (its `SET_FEATURE` control-OUT is now routed via
+`TRANSFER_IN` and the URBDRC send path is encode-tolerant, so no malformed URB can
+kill the session); and makes `packaging/make-app.sh` auto-prefer a stable
+self-signed `macrdp-dev` signing identity so Screen-Recording/Accessibility TCC
+grants survive dev rebuilds — ad-hoc's cdhash-keyed identity does not, #141.
+Earlier: **v0.8.28** (the gather-windows release — an
 on-demand hotkey **`Ctrl+Alt+G`** (`Ctrl+Option+G`) sweeps windows stranded off
 the virtual display in the headless modes (`--capture-primary`/`--detach-primary`)
 back onto the display the client sees. In those modes the client sees the virtual

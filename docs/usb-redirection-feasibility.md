@@ -39,6 +39,25 @@ document for if/when it's ever pursued.*
 >   hardcoded+synchronous to client-sourced+async (the IOUSBHost-serial-queue ↔ tokio boundary).
 >   Live 3.1 verification needs a physical redirectable device (or mstsc + the RemoteFX-USB
 >   Group Policy). The *presenting* side still gates to the signed+provisioned entitled build.
+>
+> **UPDATE 2026-07-08 — HID-input (gamepad) VERIFIED WORKING ✅✅, first HID-class device, NO server change.**
+> A client-redirected **Xbox controller** (`045e:0b12` — vendor-class GIP, `bInterfaceClass=0xFF`,
+> not plain HID) over Linux FreeRDP is a **live, button-responsive gamepad on the Mac**:
+> macOS binds its own `XboxSeriesXGamepad` / `com.apple.gamecontroller.driver.XboxGamepad`
+> driver, and 2600+ interrupt-IN input reports (`moved=44` each) stream through and render in
+> gamepad-tester — **cold-start included** (macOS's own GIP power-on over the redirect wakes a
+> never-initialized controller; it sends the 5-byte `05 20 00 01 00` power-on **and** 13-byte
+> follow-up init on `ep=0x02`). The **interrupt-transfer path already carried this** — `raiseBulk`/
+> `completeTransferToken` in `usb_spike.m` handle interrupt endpoints as bulk (they share the
+> `TS_URB_BULK_OR_INTERRUPT_TRANSFER` URB), so **no code change was needed**. The one requirement
+> is the **standard USB-redirection client setup**: release the client's own driver so the redirect
+> can claim the interface (`sudo modprobe -r xpad` on Linux; a first attempt that showed empty
+> reads was purely `LIBUSB_ERROR_ACCESS` — xpad holding the interface — not a server gap). Two
+> minor items surfaced, neither blocking: (1) a **cold controller must have a claimable interface**
+> (client-setup, above); (2) `IOUSBHostCIMessageTypeLink` (`0x3c`) transfer-ring descriptors on
+> EP0 are dropped-and-halt the ring walk instead of being followed — a latent correctness bug on
+> EP0's ring (input rides `ep=0x82`'s own ring, so unaffected), worth a small hardening fix.
+> Other device classes (audio, printers, …) remain untested.
 
 ## TL;DR
 

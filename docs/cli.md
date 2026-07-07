@@ -84,9 +84,13 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   com.apple.developer.usb.host-controller-interface
                           #   entitlement); a plain build logs "controller
                           #   unavailable" and no-ops. Mass storage verified
-                          #   end-to-end (mounts + read/write); other device classes
-                          #   untested; retract/hot-unplug + multi-device not yet
-                          #   done. Client opts in too. mstsc: first ENABLE the
+                          #   end-to-end (mounts + read/write) AND HID-input:
+                          #   a redirected Xbox controller is a live gamepad on
+                          #   the Mac (verified Linux FreeRDP 2026-07-08, cold-start
+                          #   incl., no server change — just release the client's
+                          #   own driver so the interface is claimable). Other
+                          #   classes (audio, etc.) untested; retract/hot-unplug +
+                          #   multi-device not yet done. Client opts in too. mstsc: first ENABLE the
                           #   Group Policy "Allow RDP redirection of other supported
                           #   RemoteFX USB devices from this computer" (Computer
                           #   Config → Admin Templates → Windows Components → Remote

@@ -44,14 +44,24 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Deferred — scoped, not started
 
-- [ ] **Perf: eliminate the per-capture full-frame `last_frame` memcpy** (from the 2026-07-03
-  3-agent optimization audit — the one HIGH finding left). `capture.rs` copies the whole BGRA
-  frame into the flush-burst stash on every EGFX-accepted capture (~8 MB @1080p / ~24 MB @HiDPI
-  × 60 fps ≈ **1.4 GB/s** of memory-bus traffic competing with the encoder), yet the stash is
-  read only when SCK goes idle. Fix shape: retain the SCK `CVPixelBuffer` (refcount bump,
-  release the prior) and re-lock it during the flush burst. RISK: holding a buffer pins one
-  slot of SCK's fixed frame pool — must verify SCK keeps delivering (queue-depth interaction)
-  and A/B on a real client before landing. Do as its OWN change, not batched.
+- [~] **Perf: eliminate the per-capture full-frame `last_frame` memcpy — ASSESSED 2026-07-07,
+  DEPRIORITIZED (don't re-propose as a win).** From the 2026-07-03 audit's one HIGH finding:
+  `capture.rs` copies the whole BGRA frame into the flush-burst stash on every EGFX-accepted
+  capture (~8 MB @1080p / ~24 MB @HiDPI × 60 fps ≈ 1.4 GB/s), read only when SCK goes idle.
+  Fix shape (retain the SCK `CVPixelBuffer`, release the prior, re-lock during the flush burst)
+  is FEASIBLE and refcount-correct — confirmed `CMSampleBuffer.image_buffer()` returns an
+  independent retained ref (screencapturekit 2.1 Swift shim `Unmanaged.passRetained`),
+  `CVPixelBuffer` is `Send+Sync` with `lock()`/`Drop`. **But the risk/reward doesn't justify it:**
+  (1) reward is marginal — 1.4 GB/s is <1% of Apple-Silicon bandwidth; it removes ~200 µs
+  (1080p) to ~600 µs (HiDPI) of capture-thread memcpy/frame (~1–4% of the 60 fps budget), and
+  the capture thread isn't the bottleneck; (2) its sibling (CVPixelBufferPool for encoder input,
+  [[project_cvpixelbufferpool_no_win_reverted]]) A/B'd at PARITY and was reverted — same
+  fill-bound path, likely the same result here; (3) real risk — holding the retained buffer pins
+  one IOSurface from SCK's recycle pool (macrdp doesn't set `queueDepth`, Apple default 3), the
+  "blank after N frames" starvation class, mitigable only by a `queueDepth` bump (+~24 MB/slot);
+  (4) it's a video hot-path (`next_update`) change, which project guidance says not to touch
+  without a verified payoff. Revisit only if a HiDPI-under-contention smoothness problem is
+  actually observed and traced to this copy. **Do NOT re-list as a "clean win."**
 - [ ] **Perf (upstream candidates, vendored server — do NOT land as new divergences):** from
   the same audit: (a) `SharedWriter`/dispatch write coalescing — every fragment/event is its
   own `write_all` = 2 boxed futures + syscall + flush (`server.rs:2643` + git-pinned

@@ -585,7 +585,23 @@ fn control_transfer_request(
     // (E_INVALIDARG). FreeRDP accepted CONTROL_TRANSFER_EX, which is why it "worked"
     // there; kept as the fallback for any request we don't map.
     let ts_urb = setup_to_typed_urb(setup, transfer_flags, ts_req_id);
+    // A few typed control URBs are no-data-stage requests the MS-RDPEUSB codec only
+    // accepts inside a TRANSFER_IN_REQUEST (with OutputBufferSize 0), even though the
+    // underlying USB transfer is host->device (Dir::Out) — the URB *function* carries the
+    // direction, not the envelope. TS_URB_CONTROL_FEATURE_REQUEST (SET/CLEAR_FEATURE) is
+    // the one that reaches here as a control-OUT: mstsc issues
+    // SET_FEATURE(DEVICE_REMOTE_WAKEUP) when the Xbox controller's Guide button is pressed.
+    // Routing it as TRANSFER_OUT makes TsUrb::encode reject it ("only used with
+    // TRANSFER_IN_REQUEST"), and that encode error would otherwise propagate out of the
+    // dispatch loop and tear down the whole session.
+    let force_transfer_in = matches!(ts_urb, TsUrb::CtlFeatReq(_));
     let transfer = match dir {
+        _ if force_transfer_in => dvc_msg(UrbdrcServerPdu::TransferIn(TransferInRequest {
+            msg_id: 0,
+            udev_iface: device_iface,
+            ts_urb,
+            output_buffer_size: 0,
+        })),
         Dir::In => dvc_msg(UrbdrcServerPdu::TransferIn(TransferInRequest {
             msg_id: 0,
             udev_iface: device_iface,

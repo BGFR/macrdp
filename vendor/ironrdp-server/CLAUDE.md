@@ -1225,7 +1225,8 @@ AND released — #1276 landing is NOT sufficient.
          UserHCI controller → dedup slot released`, and re-attaching re-presented + mounted.
     - Remaining: retract/hot-unplug via an explicit RETRACT_DEVICE PDU (the client
       channel-close path above covers detach/reset — the common case — live-verified),
-      true multi-device (iSerialNumber), non-mass-storage device classes (untested).
+      true multi-device (iSerialNumber), remaining non-mass-storage device classes
+      (HID/gamepad verified 2026-07-08 on FreeRDP + mstsc; audio/others untested).
     - **mstsc client — ENUMERATES + CONFIGURES + negotiates format (2026-07-07); the
       only gap left is the client not delivering bulk video frames.** With the handshake
       fixes (per-device full handshake here + `ironrdp-rdpeusb` (1)/(2)) a real mstsc
@@ -1263,8 +1264,11 @@ AND released — #1276 landing is NOT sufficient.
       here); a camera/HID/audio device fully enumerates + configures but doesn't stream.
       The four fixes above are all in the shared path and were regression-checked against
       FreeRDP mass storage (still mounts + read/write). True webcam support = implement the
-      camera-redirection channel (a separate feature). isoch (camera/audio) / interrupt
-      (HID) endpoints remain unimplemented.
+      camera-redirection channel (a separate feature). isoch (camera/audio) endpoints
+      remain unimplemented; **interrupt (HID) endpoints work** — a redirected Xbox
+      gamepad is live + button-responsive on the Mac over BOTH FreeRDP and mstsc
+      (2026-07-08; interrupt rides the same bulk-or-interrupt URB path, no new endpoint
+      code — the only mstsc-specific fix was the SET_FEATURE/Guide-button routing above).
     - **One controller per physical device (dedup, presenting-side).** A client can
       announce ONE physical device on more than one `URBDRC` channel — FreeRDP announces
       the same drive twice with instance ids differing by a byte (`…d31`/`…d32`), plus a
@@ -1284,7 +1288,20 @@ AND released — #1276 landing is NOT sufficient.
     - **Robustness (load-bearing):** BOTH `process()` impls TOLERATE decode errors
       (log + `Ok(Vec::new())`, never propagate) — a decode error would otherwise
       propagate out of `svc.process()?` and tear down the whole RDP session for an
-      opt-in feature (same lesson as the ironrdp-dvc Soft-Sync divergence). The
+      opt-in feature (same lesson as the ironrdp-dvc Soft-Sync divergence). **The
+      SEND path is encode-tolerant too (2026-07-08):** the
+      `UrbdrcServerMessage::SendMessages` dispatch arm (server.rs) logs + drops a
+      transfer whose URB fails to encode instead of `?`-propagating (which used to
+      tear the session down) — the never-kill-the-session principle applied to the
+      encode side. That backstops the real fix: `control_transfer_request` now
+      routes `TS_URB_CONTROL_FEATURE_REQUEST` (SET/CLEAR_FEATURE) via `TRANSFER_IN`
+      (the URB *function* carries the host→device direction; the MS-RDPEUSB codec
+      only accepts feature requests in TRANSFER_IN, never TRANSFER_OUT). **Found
+      live on mstsc:** pressing the Xbox controller's **Guide button** issues
+      `SET_FEATURE(DEVICE_REMOTE_WAKEUP)`, which the old TRANSFER_OUT routing made
+      `TsUrb::encode` reject → whole-session disconnect. Now it forwards and the
+      session survives (verified live: an 81 s gamepad session through the Guide
+      press vs the old ~6 s teardown). The
       device processor also recognizes `ADD_DEVICE` from its header
       (`peek_function_id`) so a body it can't parse still logs a GO. **Phase 3.1b
       (2026-07-06): `ironrdp-rdpeusb` is now VENDORED** (`vendor/ironrdp-rdpeusb`,

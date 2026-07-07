@@ -1654,12 +1654,30 @@ impl RdpServer {
                     // A UsbHandle wants to ship a transfer request on an open device
                     // channel. DVC-frame the messages and write them (mirrors Echo).
                     crate::UrbdrcServerMessage::SendMessages { channel_id, messages } => {
-                        let dvc_messages = dvc::encode_dvc_messages(channel_id, messages, ChannelFlags::empty())?;
+                        // Tolerate an encode error instead of tearing the session down: a
+                        // malformed/unsupported URB (e.g. a control request the codec
+                        // rejects) must never kill an opt-in feature's whole connection —
+                        // same principle as the URBDRC process() decode-tolerance. Drop the
+                        // offending transfer and keep the session alive. (A real socket
+                        // error from write_all below stays fatal — that IS a dead link.)
+                        let dvc_messages = match dvc::encode_dvc_messages(channel_id, messages, ChannelFlags::empty()) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                warn!(error = %e, "URBDRC: failed to encode a transfer request — dropping it (session kept alive)");
+                                continue;
+                            }
+                        };
                         let Some(drdynvc_channel_id) = self.get_channel_id_by_type::<dvc::DrdynvcServer>() else {
                             warn!("No DRDYNVC channel, dropping URBDRC transfer");
                             continue;
                         };
-                        let data = server_encode_svc_messages(dvc_messages, drdynvc_channel_id, user_channel_id)?;
+                        let data = match server_encode_svc_messages(dvc_messages, drdynvc_channel_id, user_channel_id) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warn!(error = %e, "URBDRC: failed to SVC-encode a transfer request — dropping it (session kept alive)");
+                                continue;
+                            }
+                        };
                         writer.write_all(&data).await?;
                     }
                 },

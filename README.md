@@ -10,7 +10,7 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 ## Status
 
-v0 — daily-driver usable on a trusted LAN, and usable **over the internet** (VPN / ZeroTier / high-latency links, including mobile). **Latest release: [v0.8.27](https://github.com/clintcan/macrdp/releases/latest)** — the *reconnect-blank-cracked release*: the long-standing mstsc blank-on-reconnect (a client-side surface-retention bug documented as "not server-fixable" for months) now **self-heals in ~4 s with no disconnect** — the server detects the blank and reactivates the RDP core in place, and mstsc re-maps its stale surface and presents again. No more close-and-reopen.
+v0 — daily-driver usable on a trusted LAN, and usable **over the internet** (VPN / ZeroTier / high-latency links, including mobile). **Latest release: [v0.8.28](https://github.com/clintcan/macrdp/releases/latest)** — the *gather-windows release*: an on-demand hotkey (**`Ctrl+Alt+G`**) sweeps windows stranded off the virtual display in the headless modes (`--capture-primary`/`--detach-primary`) back onto the display the client sees — manual by design, no on-connect surprise. Builds on v0.8.27, which fixed the long-standing mstsc blank-on-reconnect (it now self-heals in ~4 s with no disconnect).
 
 Full per-release notes (what shipped, what was verified live, and the war stories): **[docs/release-history.md](docs/release-history.md)**.
 

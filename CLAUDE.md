@@ -19,7 +19,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.27** (the reconnect-blank-cracked
+(VPN/ZeroTier). **Latest release: v0.8.28** (the gather-windows release — an
+on-demand hotkey **`Ctrl+Alt+G`** (`Ctrl+Option+G`) sweeps windows stranded off
+the virtual display in the headless modes (`--capture-primary`/`--detach-primary`)
+back onto the display the client sees. In those modes the client sees the virtual
+display, which occupies a different region of global coordinate space than the
+physical panel, so a window opened on the physical panel before connecting is
+invisible/unclickable over RDP; the hotkey walks each regular Dock app's
+`AXWindows` via Accessibility and moves any window entirely off the target
+display to just inside its top-left (partly-visible windows untouched). **Manual
+by design** — an on-connect auto-gather was built first and rejected as too
+surprising; the chord is Win-key-free so mstsc forwards it, and no-op when there's
+no virtual display. Live-verified on real mstsc. See the stranded-windows quirk
+note. Earlier: **v0.8.27** (the reconnect-blank-cracked
 release — the mstsc reconnect-blank, documented for months as a not-server-
 fixable client surface-retention bug, now **self-heals in place in ~4 s with no
 disconnect**: on a detected blank the server sends a bare core RDP

@@ -7,6 +7,8 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
+- [x] **mstsc reconnect-blank SOLVED — in-place self-heal shipped (v0.8.27, #142 merged + released 2026-07-07; LIVE-VERIFIED real mstsc/WiFi 9/9 blanks healed, zero drops). (Remove this item next prune.)** The nine-pass "not server-fixable" saga is over. Root cause was mstsc retaining EGFX **surface id 0** across an in-process reconnect and compositing the stale surface (black). Every prior dislodge attempt bundled a surface delete or DVC/channel close (`resize_with_monitors` DeleteSurface, xrdp's DELETE_SURFACE+DYNVC_CLOSE) — all proven client-fatal. **Fix:** on a detected blank, send a **bare core Deactivation–Reactivation** (Server Deactivate All → new Demand Active) that touches NOTHING in the EGFX pipeline → mstsc re-maps surface 0 and presents again in place, ~1–2 s, no disconnect. Zero vendored-server change: `h264.rs` (`BlankAction::Reactivate` → `perform_blank_reactivate` stashes size in `Gfx::reactivate_request`) → `capture.rs::next_update` emits a no-op `DisplayUpdate::Resize(current)` → the server's existing `deactivate_all`+`new_deactivation_reactivation` preserves static channels so `setup_locked` skips (no resize_with_monitors/DeleteSurface). Now the **default** recovery action; the old connection-drop is only the fallback (`max_attempts` forced ≥2). Detection sped **~70 s → ~4 s** via a wall-clock fast-path (`MACRDP_BLANK_RECOVERY_MAX_WAIT_MS`/`MIN_WALL_REPORTS`); still RTT+QoE gated (FreeRDP/high-RTT untouched). `--fork-workers` no longer needed for reconnect reliability. Detail: [[project_h264_reconnect_blank]] TENTH PASS + the reconnect-blank quirk note. **DON'T re-add any surface-delete to the recovery path.**
+
 - [x] **Make blank-recovery RTT-aware — DONE, #135 merged + deployed + LIVE-VERIFIED 2026-07-05 (real mstsc over ZeroTier-on-MOBILE, link_rtt 142–161 ms: `seeding adaptive bitrate at ceiling/3` seed_bps=2000000 + `blank recovery DISARMED` both fired; session stable, user-confirmed working; config now clean — no plist override, --bitrate 6 restored). (Remove this item next prune.)** Original item: Found
   live 2026-07-05 (real mstsc over ZeroTier). The detector (`src/h264.rs`
   `should_blank_recover`) reads mstsc's QoE decode+render-time==0 as "not presenting" and
@@ -394,7 +396,9 @@ then delete; promote a parked item to *In flight* when work actually starts.
   (`--fork-workers` as default) **DECIDED 2026-07-04: NO** — single-process +
   blank-recovery + ARC stays the default (field-proven, composes with everything);
   fork-workers stays the documented opt-in for mstsc-heavy no-UDP profiles (see the
-  roadmap for the full rationale). Still open beyond the soak: Tier 3 polish. Hard
+  roadmap for the full rationale). **Reinforced 2026-07-07 (v0.8.27):** the
+  reconnect-blank now self-heals in place via core reactivation, so fork-workers'
+  reconnect-freshness rationale is moot — single-process is the clear default. Still open beyond the soak: Tier 3 polish. Hard
   ceiling (NO-GO): multi-user concurrent GUI sessions (macOS limit).
 
 ## Parked — scoped, low priority

@@ -94,14 +94,17 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   RemoteFX USB Device Redirection) + reboot, THEN the
                           #   device appears under Local Resources → More → USB;
                           #   FreeRDP /usb:... needs no policy. mstsc STATUS: a device
-                          #   now handshakes + ENUMERATES over mstsc (verified), but
-                          #   does not STREAM yet — SelectConfiguration returns
-                          #   0x80070057 and isoch/interrupt device classes are
-                          #   unimplemented (mstsc excludes mass storage from its
-                          #   RemoteFX USB list — that rides Drives/RDPDR). As far as
-                          #   is known, the first OSS RDP *server* to present a
-                          #   redirected USB device. macOS-only. See
-                          #   docs/usb-redirection-feasibility.md.
+                          #   now ENUMERATES + CONFIGURES + negotiates its format over
+                          #   mstsc (SelectConfiguration succeeds, control transfers +
+                          #   UVC probe/commit complete), but the client does NOT
+                          #   deliver the actual video/data frames — a webcam's real
+                          #   video rides mstsc's separate "Video capture devices"
+                          #   camera-redirection channel (not implemented), so a
+                          #   camera enumerates but doesn't stream. mstsc excludes
+                          #   mass storage from its RemoteFX USB list (that rides
+                          #   Drives/RDPDR). As far as is known, the first OSS RDP
+                          #   *server* to present a redirected USB device. macOS-only.
+                          #   See docs/usb-redirection-feasibility.md.
 --no-lazy-paste           # Opt out of lazy Windows→Mac file paste (default ON).
                           #   Lazy streams bytes on Cmd-V (NSFilePresenter) with native
                           #   "Preparing to paste" progress and lower chunk parallelism;

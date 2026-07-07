@@ -72,3 +72,19 @@ dropped because we live outside the IronRDP cargo workspace (mirrors
     why this can't be a plain global function-id match and must stay keyed off the
     interface arm. Verified live: the mstsc device descriptor round-trips (real
     vid/pid read back). Upstreamable alongside (1) as a real-mstsc interop fix.
+
+(3) **`UsbConfigDesc` carries the full configuration descriptor** (`src/pdu/usb_dev/
+    ts_urb/utils.rs`). `TS_URB_SELECT_CONFIGURATION` sets `ConfigurationDescriptorIsValid`
+    and then encodes a `UsbConfigDesc`, but upstream only modelled/encoded the 9-byte
+    `USB_CONFIGURATION_DESCRIPTOR` **header** (`wTotalLength` says e.g. 759 but only 9
+    bytes followed). Per MS-RDPEUSB 2.2.9.1.1 the field must be the **full** descriptor
+    (all interface/endpoint/class-specific bytes) when marked valid; real Windows / mstsc
+    walks `wTotalLength` and rejects a header-only descriptor with `0x80070057`
+    (E_INVALIDARG) — so `SelectConfiguration` failed on every mstsc device. FreeRDP's
+    client uses the interface array and ignores the descriptor bytes, which is why
+    mass storage worked there and hid it. Fix: added a `trailing: Vec<u8>` field (bytes
+    `9..total_length`); `encode` writes it after the header, `decode` reads
+    `total_length - 9` bytes (clamped, so a header-only descriptor still decodes). The
+    server's `parse_configuration` fills it from the fetched config descriptor. Verified
+    live: mstsc `SelectConfiguration` succeeds (pipe handles returned) for a camera +
+    audio/HID device; FreeRDP mass storage unaffected. Upstreamable with (1)/(2).

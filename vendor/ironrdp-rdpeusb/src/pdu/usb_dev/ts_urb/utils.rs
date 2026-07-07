@@ -663,6 +663,14 @@ pub struct UsbConfigDesc {
     pub configuration: u8,
     pub attributes: u8,
     pub max_power: u8,
+    /// The remainder of the configuration descriptor **after** the 9-byte header
+    /// (all interface / endpoint / class-specific descriptors, i.e. bytes
+    /// `9..total_length`). MS-RDPEUSB 2.2.9.1.1 requires the *full* configuration
+    /// descriptor when `ConfigurationDescriptorIsValid != 0`; real Windows (mstsc)
+    /// walks `total_length` bytes and rejects a header-only descriptor with
+    /// `0x80070057` (E_INVALIDARG). Empty ⇒ header-only (the pre-2026-07-07
+    /// behaviour, which FreeRDP tolerated).
+    pub trailing: Vec<u8>,
 }
 
 impl UsbConfigDesc {
@@ -678,7 +686,7 @@ impl UsbConfigDesc {
 
 impl Encode for UsbConfigDesc {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_fixed_part_size!(in: dst);
+        ensure_size!(in: dst, size: self.size());
 
         dst.write_u8(self.length);
         dst.write_u8(self.descriptor_type);
@@ -688,6 +696,7 @@ impl Encode for UsbConfigDesc {
         dst.write_u8(self.configuration);
         dst.write_u8(self.attributes);
         dst.write_u8(self.max_power);
+        dst.write_slice(&self.trailing);
 
         Ok(())
     }
@@ -697,7 +706,7 @@ impl Encode for UsbConfigDesc {
     }
 
     fn size(&self) -> usize {
-        Self::FIXED_PART_SIZE
+        Self::FIXED_PART_SIZE + self.trailing.len()
     }
 }
 
@@ -713,6 +722,13 @@ impl Decode<'_> for UsbConfigDesc {
         let attributes = src.read_u8();
         let max_power = src.read_u8();
 
+        // The remaining interface/endpoint/class-specific descriptors, if the sender
+        // included the full configuration descriptor (bytes 9..total_length). Clamp to
+        // what's actually present so a header-only descriptor still decodes.
+        let trailing_len = usize::from(total_length).saturating_sub(Self::FIXED_PART_SIZE);
+        let trailing_len = trailing_len.min(src.len());
+        let trailing = src.read_slice(trailing_len).to_vec();
+
         Ok(Self {
             length,
             descriptor_type,
@@ -722,6 +738,7 @@ impl Decode<'_> for UsbConfigDesc {
             configuration,
             attributes,
             max_power,
+            trailing,
         })
     }
 }

@@ -42,7 +42,9 @@ use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::utils::{
     SetupPacket, TsUrbHeader, TsUsbdInterfaceInfo, TsUsbdPipeInfo, UrbFunction, UsbConfigDesc,
 };
 use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::{
-    TsUrb, TsUrbBulkOrInterruptTransfer, TsUrbControlDescRequest, TsUrbControlTransferEx, TsUrbSelectConfig,
+    TsUrb, TsUrbBulkOrInterruptTransfer, TsUrbControlDescRequest, TsUrbControlFeatRequest,
+    TsUrbControlGetConfigRequest, TsUrbControlGetInterfaceRequest, TsUrbControlGetStatusRequest,
+    TsUrbControlTransferEx, TsUrbControlVendorClassRequest, TsUrbSelectConfig,
 };
 use ironrdp_rdpeusb::pdu::usb_dev::{RegisterRequestCallback, TransferInRequest, TransferOutRequest};
 use ironrdp_rdpeusb::pdu::utils::RequestIdTransferInOut;
@@ -62,6 +64,14 @@ const USB_DEVICE_DESCRIPTOR_LEN: u32 = 18;
 /// `USBD_TRANSFER_DIRECTION_IN` transfer flag (the vendored crate's copy is
 /// `pub(crate)`; MS-RDPEUSB fixes it at bit 0).
 const USBD_TRANSFER_DIRECTION_IN: u32 = 0x1;
+/// `USBD_SHORT_TRANSFER_OK` (bit 1) — a bulk/interrupt **IN** that returns fewer
+/// bytes than the requested buffer is normal (a UVC video payload, a short HID
+/// report, the tail of any stream), NOT an error. Without it real Windows / mstsc
+/// completes a short read as `USBD_STATUS_ERROR_SHORT_TRANSFER`, surfaced over
+/// URBDRC as `0x8007001f` (ERROR_GEN_FAILURE) — so a camera's first video payload
+/// fails and streaming never starts. Mass storage never tripped it because SCSI
+/// bulk reads are exact-length (which is why FreeRDP mass storage worked without it).
+const USBD_SHORT_TRANSFER_OK: u32 = 0x2;
 
 /// The MS-RDPEUSB dynamic virtual channel name (this rev's `ironrdp-rdpeusb`
 /// predates the upstream `CHANNEL_NAME` const, so it's spelled out here).
@@ -360,6 +370,12 @@ impl UsbHandle {
     /// header plus its interface + endpoint descriptors).
     pub async fn select_configuration(&self, config_bytes: &[u8]) -> Result<Vec<UsbPipe>> {
         let (config_desc, ifaces) = parse_configuration(config_bytes)?;
+        debug!(
+            device_iface = %self.device_iface,
+            total_len = config_desc.total_length,
+            interfaces = ifaces.len(),
+            "URBDRC SelectConfiguration"
+        );
         let (req_id, rx) = self.router.register();
         let messages = select_config_request(self.device_iface, req_id, config_desc, ifaces);
         self.sender
@@ -505,7 +521,9 @@ fn bulk_transfer_request(
     };
     let ts_req_id = RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
     let transfer_flags = match dir {
-        Dir::In => USBD_TRANSFER_DIRECTION_IN,
+        // Bulk/interrupt IN: accept a short packet (see USBD_SHORT_TRANSFER_OK) — video
+        // payloads and HID reports are routinely shorter than the read buffer.
+        Dir::In => USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK,
         Dir::Out => 0,
     };
     let urb = TsUrbBulkOrInterruptTransfer {
@@ -556,43 +574,177 @@ fn control_transfer_request(
         request_completion: Some(device_iface),
     };
     let ts_req_id = RequestIdTransferInOut::try_from(req_id).expect("router ids are masked to 31 bits");
-    let setup_packet = SetupPacket {
-        request_type: setup[0],
-        request: setup[1],
-        value: u16::from_le_bytes([setup[2], setup[3]]),
-        index: u16::from_le_bytes([setup[4], setup[5]]),
-        length: u16::from_le_bytes([setup[6], setup[7]]),
-    };
     let transfer_flags = match dir {
         Dir::In => USBD_TRANSFER_DIRECTION_IN,
         Dir::Out => 0,
     };
-    let urb = TsUrbControlTransferEx {
-        header: TsUrbHeader {
-            func: UrbFunction::ControlTransferEx,
-            req_id: ts_req_id,
-            no_ack: false,
-        },
-        pipe: 0, // default control endpoint (EP0)
-        transfer_flags,
-        timeout: 0,
-        setup_packet,
-    };
+    // Map the standard 8-byte SETUP packet to the matching **typed** URB function
+    // (URB_FUNCTION_CLASS_INTERFACE, GET_DESCRIPTOR_FROM_INTERFACE, …). Real Windows
+    // USB drivers issue these typed URBs, and mstsc's URBDRC only accepts them —
+    // the generic URB_FUNCTION_CONTROL_TRANSFER_EX is rejected with 0x80070057
+    // (E_INVALIDARG). FreeRDP accepted CONTROL_TRANSFER_EX, which is why it "worked"
+    // there; kept as the fallback for any request we don't map.
+    let ts_urb = setup_to_typed_urb(setup, transfer_flags, ts_req_id);
     let transfer = match dir {
         Dir::In => dvc_msg(UrbdrcServerPdu::TransferIn(TransferInRequest {
             msg_id: 0,
             udev_iface: device_iface,
-            ts_urb: TsUrb::CtlTransferEx(urb),
+            ts_urb,
             output_buffer_size: in_length,
         })),
         Dir::Out => dvc_msg(UrbdrcServerPdu::TransferOut(TransferOutRequest {
             msg_id: 0,
             udev_iface: device_iface,
-            ts_urb: TsUrb::CtlTransferEx(urb),
+            ts_urb,
             output_buffer: out_data,
         })),
     };
     vec![dvc_msg(UrbdrcServerPdu::RegReqCb(reg)), transfer]
+}
+
+/// Translate a standard 8-byte USB SETUP packet into the specific **typed** URB
+/// function real Windows uses for that request (e.g. a class request to an
+/// interface → `URB_FUNCTION_CLASS_INTERFACE`), because mstsc's URBDRC rejects the
+/// generic `URB_FUNCTION_CONTROL_TRANSFER_EX` with `0x80070057`. Anything we don't
+/// have a typed mapping for falls back to `CONTROL_TRANSFER_EX` (FreeRDP-friendly,
+/// and better than dropping the request). `setup` = `[bmRequestType, bRequest,
+/// wValueLo, wValueHi, wIndexLo, wIndexHi, wLengthLo, wLengthHi]`.
+fn setup_to_typed_urb(setup: [u8; 8], transfer_flags: u32, req_id: RequestIdTransferInOut) -> TsUrb {
+    let bm_request_type = setup[0];
+    let b_request = setup[1];
+    let w_value = u16::from_le_bytes([setup[2], setup[3]]);
+    let w_index = u16::from_le_bytes([setup[4], setup[5]]);
+    let w_length = u16::from_le_bytes([setup[6], setup[7]]);
+
+    // bmRequestType: bits 6:5 = type (0 std / 1 class / 2 vendor), bits 4:0 = recipient
+    // (0 device / 1 interface / 2 endpoint / 3 other).
+    let req_type = (bm_request_type >> 5) & 0x03;
+    let recipient = bm_request_type & 0x1f;
+
+    let header = |func: UrbFunction| TsUrbHeader {
+        func,
+        req_id,
+        no_ack: false,
+    };
+    let control_transfer_ex = || {
+        TsUrb::CtlTransferEx(TsUrbControlTransferEx {
+            header: header(UrbFunction::ControlTransferEx),
+            pipe: 0, // default control endpoint (EP0)
+            transfer_flags,
+            timeout: 0,
+            setup_packet: SetupPacket {
+                request_type: bm_request_type,
+                request: b_request,
+                value: w_value,
+                index: w_index,
+                length: w_length,
+            },
+        })
+    };
+
+    match req_type {
+        // Class (1) / vendor (2) request → URB_FUNCTION_{CLASS,VENDOR}_{DEVICE,INTERFACE,ENDPOINT,OTHER}.
+        1 | 2 => {
+            use UrbFunction::*;
+            let func = match (req_type, recipient) {
+                (1, 0) => ClassDevice,
+                (1, 1) => ClassInterface,
+                (1, 2) => ClassEndpoint,
+                (1, _) => ClassOther,
+                (2, 0) => VendorDevice,
+                (2, 1) => VendorInterface,
+                (2, 2) => VendorEndpoint,
+                (_, _) => VendorOther,
+            };
+            TsUrb::VendorClassReq(TsUrbControlVendorClassRequest {
+                header: header(func),
+                transfer_flags,
+                request: b_request,
+                value: w_value,
+                index: w_index,
+            })
+        }
+        // Standard request (0): pick the typed function by bRequest.
+        0 => {
+            use UrbFunction::*;
+            match b_request {
+                // GET_DESCRIPTOR (0x06) — wValue = (descType << 8) | index, wIndex = langid.
+                0x06 => {
+                    let func = match recipient {
+                        1 => GetDescriptorFromInterface,
+                        2 => GetDescriptorFromEndpoint,
+                        0 => GetDescriptorFromDevice,
+                        _ => return control_transfer_ex(),
+                    };
+                    TsUrb::CtlDescReq(TsUrbControlDescRequest {
+                        header: header(func),
+                        index: setup[2],
+                        desc_type: setup[3],
+                        lang_id: w_index,
+                    })
+                }
+                // SET_DESCRIPTOR (0x07).
+                0x07 => {
+                    let func = match recipient {
+                        1 => SetDescriptorToInterface,
+                        2 => SetDescriptorToEndpoint,
+                        0 => SetDescriptorToDevice,
+                        _ => return control_transfer_ex(),
+                    };
+                    TsUrb::CtlDescReq(TsUrbControlDescRequest {
+                        header: header(func),
+                        index: setup[2],
+                        desc_type: setup[3],
+                        lang_id: w_index,
+                    })
+                }
+                // CLEAR_FEATURE (0x01) / SET_FEATURE (0x03) — wValue = feature selector.
+                0x01 | 0x03 => {
+                    let func = match (b_request, recipient) {
+                        (0x03, 0) => SetFeatureToDevice,
+                        (0x03, 1) => SetFeatureToInterface,
+                        (0x03, 2) => SetFeatureToEndpoint,
+                        (0x01, 0) => ClearFeatureToDevice,
+                        (0x01, 1) => ClearFeatureToInterface,
+                        (0x01, 2) => ClearFeatureToEndpoint,
+                        _ => return control_transfer_ex(),
+                    };
+                    TsUrb::CtlFeatReq(TsUrbControlFeatRequest {
+                        header: header(func),
+                        feat_selector: w_value,
+                        index: w_index,
+                    })
+                }
+                // GET_STATUS (0x00) — wIndex = interface / endpoint.
+                0x00 => {
+                    let func = match recipient {
+                        0 => GetStatusFromDevice,
+                        1 => GetStatusFromInterface,
+                        2 => GetStatusFromEndpoint,
+                        _ => return control_transfer_ex(),
+                    };
+                    TsUrb::CtlGetStatus(TsUrbControlGetStatusRequest {
+                        header: header(func),
+                        index: w_index,
+                    })
+                }
+                // GET_CONFIGURATION (0x08).
+                0x08 => TsUrb::CtlGetConfig(TsUrbControlGetConfigRequest {
+                    header: header(GetConfiguration),
+                }),
+                // GET_INTERFACE (0x0a) — wIndex = interface.
+                0x0a => TsUrb::CtlGetIface(TsUrbControlGetInterfaceRequest {
+                    header: header(GetInterface),
+                    interface: w_index,
+                }),
+                // Everything else standard (SET_CONFIGURATION/SET_INTERFACE/SET_ADDRESS are
+                // handled elsewhere and shouldn't reach here) → generic fallback.
+                _ => control_transfer_ex(),
+            }
+        }
+        // Unreachable (req_type is 2 bits and 3 is caught by the vendor arm), but be safe.
+        _ => control_transfer_ex(),
+    }
 }
 
 /// One endpoint pipe opened by [`UsbHandle::select_configuration`]: its USB
@@ -614,17 +766,37 @@ fn parse_configuration(buf: &[u8]) -> Result<(UsbConfigDesc, Vec<TsUsbdInterface
         anyhow::bail!("URBDRC: not a configuration descriptor ({} bytes)", buf.len());
     }
     let u16le = |i: usize| u16::from_le_bytes([buf[i], buf[i + 1]]);
+    let total_length = u16le(2);
+    // Carry the FULL configuration descriptor (header + all interface/endpoint/CS
+    // descriptors) — real Windows/mstsc rejects a header-only descriptor with
+    // 0x80070057 when ConfigurationDescriptorIsValid is set. `buf` is the descriptor
+    // fetched to `wTotalLength`; keep bytes 9..total_length as the trailing part.
+    let desc_end = usize::from(total_length).min(buf.len()).max(9);
     let config = UsbConfigDesc {
         length: buf[0],
         descriptor_type: buf[1],
-        total_length: u16le(2),
+        total_length,
         num_interfaces: buf[4],
         configuration_value: buf[5],
         configuration: buf[6],
         attributes: buf[7],
         max_power: buf[8],
+        trailing: buf[9..desc_end].to_vec(),
     };
+    // SELECT_CONFIGURATION needs exactly ONE interface-information entry per
+    // interface NUMBER, at its **default alternate setting (0)** — the state a
+    // freshly-configured device is in (drivers later switch to a streaming/bandwidth
+    // alt via SELECT_INTERFACE). A config descriptor enumerates every
+    // (interface, alt-setting) pair, so we keep only each interface's alt-0
+    // descriptor and the endpoints belonging to that alt setting. Emitting one entry
+    // per descriptor — including alt settings — produces DUPLICATE interface numbers,
+    // which real Windows / mstsc rejects with 0x80070057 (E_INVALIDARG); a
+    // single-interface, no-alt-setting device (a mass-storage drive) never tripped it,
+    // which is why it only showed up on a multi-alt device (UVC camera / UAC audio).
     let mut ifaces: Vec<TsUsbdInterfaceInfo> = Vec::new();
+    // Whether the interface descriptor we're currently walking under is alt-0 (so its
+    // endpoints count) or a non-default alt setting (skip it and its endpoints).
+    let mut in_alt0 = false;
     let mut i = 9usize;
     while i + 2 <= buf.len() {
         let len = buf[i] as usize;
@@ -633,12 +805,21 @@ fn parse_configuration(buf: &[u8]) -> Result<(UsbConfigDesc, Vec<TsUsbdInterface
             break;
         }
         match dtype {
-            USB_DESCRIPTOR_TYPE_INTERFACE if len >= 9 => ifaces.push(TsUsbdInterfaceInfo {
-                interface_number: buf[i + 2],
-                alternate_setting: buf[i + 3],
-                ts_usbd_pipe_info: Vec::new(),
-            }),
-            USB_DESCRIPTOR_TYPE_ENDPOINT if len >= 7 => {
+            USB_DESCRIPTOR_TYPE_INTERFACE if len >= 9 => {
+                let interface_number = buf[i + 2];
+                let alternate_setting = buf[i + 3];
+                if alternate_setting == 0 {
+                    ifaces.push(TsUsbdInterfaceInfo {
+                        interface_number,
+                        alternate_setting: 0,
+                        ts_usbd_pipe_info: Vec::new(),
+                    });
+                    in_alt0 = true;
+                } else {
+                    in_alt0 = false;
+                }
+            }
+            USB_DESCRIPTOR_TYPE_ENDPOINT if len >= 7 && in_alt0 => {
                 if let Some(iface) = ifaces.last_mut() {
                     iface.ts_usbd_pipe_info.push(TsUsbdPipeInfo {
                         max_packet_size: u16le(i + 4),
@@ -1066,6 +1247,15 @@ impl DvcProcessor for UrbdrcDeviceProcessor {
                     error = %e,
                     "URBDRC ADD_DEVICE received — real device announced (GO); caps body not fully parsed"
                 );
+            }
+            Err(_) if peek_function_id(payload) == Some(FunctionId::RIMCALL_RELEASE) => {
+                // mstsc sends a RIMCALL_RELEASE (RPC-interface release) on the device
+                // interface after each request completes, to release the completion
+                // callback we registered with RegisterRequestCallback. It carries no
+                // data and needs no action — we don't hold per-request callback state —
+                // so recognize and ignore it quietly (real mstsc emits one per transfer,
+                // which would otherwise flood the log). FreeRDP doesn't send these.
+                debug!(channel_id, "URBDRC RIMCALL_RELEASE (per-request callback release) — ignored");
             }
             Err(e) => {
                 warn!(channel_id, error = %e, "URBDRC device-channel PDU decode failed (tolerated)");

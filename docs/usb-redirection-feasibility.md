@@ -352,16 +352,42 @@ The entitlement `com.apple.developer.usb.host-controller-interface` is **granted
      divergence 2.
   With all three, a real mstsc device handshakes, announces `ADD_DEVICE`, and macrdp
   fetches its descriptors + presents the UserHCI controller — **verified live with an
-  A4Tech camera (`09da:2692`) and a USB Audio/HID device (`0573:1573`)**; the FreeRDP
-  mass-storage mount was re-verified unchanged. **Ceiling reached (device-class work, not
-  protocol):** mstsc `SelectConfiguration` returns `hresult 0x80070057` (E_INVALIDARG),
-  so endpoint pipe handles aren't established → transfers stall, and the UVC/UAC
-  class-control requests (`bmreq 0xa1`/`0x22`) also fail; plus isochronous (camera/audio)
-  and interrupt (HID) endpoints aren't implemented. So **mstsc devices enumerate but
-  don't function.** `SelectConfiguration`-on-mstsc is the next protocol blocker (another
-  mstsc-strictness item; FreeRDP's succeeds and mass storage mounts). Note mstsc's
-  RemoteFX USB list **excludes mass storage** (it rides *Drives*/RDPDR), so the verified
-  bulk/mount path can't be exercised from mstsc.
+  A4Tech camera (`09da:2692`) and a USB Audio/HID device (`0573:1573`)**.
+
+- **mstsc — CONFIGURES + negotiates format end-to-end (2026-07-07); only the bulk
+  frame delivery is missing (client-side).** Four more fixes carried mstsc past
+  enumeration all the way to a streaming attempt, each another mstsc-strict /
+  FreeRDP-lenient item, all regression-checked against FreeRDP mass storage (drive still
+  mounts + read/write — the macOS "not readable" dialogs are the drive's own Linux
+  partitions, not us):
+  1. **`SelectConfiguration` (`0x80070057` → succeeds).** Two bugs, neither tripped by
+     mass storage (one interface, no alt settings): (a) `parse_configuration` emitted one
+     interface-info per interface *descriptor* — including every alternate setting —
+     producing **duplicate interface numbers**, which real Windows rejects; it now emits
+     one entry per interface **number** at alternate setting 0. (b) the URB carried only
+     the 9-byte config-descriptor header while `ConfigurationDescriptorIsValid` was set;
+     real Windows walks `wTotalLength` and rejects a truncated descriptor — fixed by
+     carrying the **full** configuration descriptor (`ironrdp-rdpeusb` divergence 3).
+  2. **Control transfers (`0x80070057` → succeed, 135+).** mstsc rejects the generic
+     `URB_FUNCTION_CONTROL_TRANSFER_EX`; `setup_to_typed_urb` maps each SETUP packet to
+     the specific typed URB real Windows emits (`CLASS_INTERFACE`,
+     `GET_DESCRIPTOR_FROM_INTERFACE`, `SET_FEATURE_TO_*`, …), keeping `CONTROL_TRANSFER_EX`
+     as a fallback. The **UVC VS_PROBE/COMMIT format negotiation completes**.
+  3. **`USBD_SHORT_TRANSFER_OK`** on bulk/interrupt IN (a short read — a video payload —
+     is normal, not `0x8007001f`). A no-op for mass storage's exact-length SCSI reads.
+  4. **`RIMCALL_RELEASE` recognized + ignored** (mstsc sends one per completed request to
+     release the callback we registered; investigated as a suspected dropped-frame path,
+     confirmed benign).
+  With a camera opened in Photo Booth on the Mac, the format negotiates and macOS issues
+  continuous bulk reads on the video endpoint — but **mstsc never returns frame data** (of
+  ~10 concurrent bulk reads it completes one with `0x8007001f` and leaves the rest pending
+  forever). This is a **client/mstsc-side limitation, not a server bug:** for a webcam,
+  Windows routes real video over the **dedicated camera-redirection channel** ("Video
+  capture devices" in mstsc), a separate high-level protocol macrdp doesn't implement —
+  true webcam support is that channel, a distinct future feature. Note mstsc's RemoteFX
+  USB list **excludes mass storage** (it rides *Drives*/RDPDR), so the verified bulk/mount
+  path can't be exercised from mstsc; isochronous (camera/audio) + interrupt (HID)
+  endpoints also remain unimplemented.
 
 **Merge-readiness (branch `feat/usb-redirect-spike`).** The feature is fully wired and
 opt-in: `--enable-usb-redirection` (default OFF; when off the URBDRC factory is `None`, so

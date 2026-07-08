@@ -447,7 +447,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   multitransport, rdpdr server-direction, smartcard, acceptor KLID+MT, audio-lag/resize/dispatch,
   server ARC auto-reconnect cookie). **#1359 (rdpsnd) + #1397 (acceptor keyboard-layout on
   `AcceptorResult`) MERGED 2026-07-01; #1373 (acceptor honor-size) MERGED 2026-07-02 (`d471bd06`).**
-  **Two clintcan PRs currently OPEN (both CI-green, MERGEABLE, awaiting review — reactive-only, do
+  **Three clintcan PRs currently OPEN (all MERGEABLE, awaiting review — reactive-only, do
   not poll/nudge):**
   - [ ] **#1404** `feat(acceptor)!: clamp honored client desktop size to an operator maximum` — the
     honor-size resource-hardening CBenoit green-lit in his #1373 approval. Replaces the `bool` with
@@ -459,7 +459,22 @@ then delete; promote a parked item to *In flight* when work actually starts.
     auto-reconnects on an ungraceful drop (mstsc won't without it). API mirrors `credential_validator`
     (builder `with_auto_reconnect_cookie` + setter). PR body flags the one open design point:
     send-only, does NOT validate the returning ARC_CS cookie (offered as a follow-up).
-  Nothing is currently de-vendorable. **Pin-bump follow-ups (when the git pin bumps past the merges):**
+  - [ ] **#1418** `feat(rdpeusb)!: tolerate unrecognized device-reported USB capability values` —
+    opened 2026-07-08. Upstreams vendored `ironrdp-rdpeusb` divergence (1) (the lenient USB-caps
+    decode): the 4 device-reported enums become data-carrying with `Other(u32)` + named
+    Usb30/31/32; framing consts (CbSize/HcdCapabilities) stay strict. Fixes a real USB-3.2 device
+    (SupportedUsbVersion `0x320`) tearing down the URBDRC channel on decode. QA'd for regression
+    (byte-identical encode; blast radius = rdpeusb + testsuite only). Scoped to (1) only — HELD
+    rdpeusb (2) `UsbDevice=0` (CONFLICTS with merged #1321, which deliberately rejects that range;
+    needs a "mstsc really sends 0 + capture" argument) and (3) full config descriptor. On
+    merge+release, most of rdpeusb divergence (1) drops.
+  Nothing whole-vendor-dir is currently de-vendorable (each fork keeps ≥1 macrdp-specific
+  server-direction divergence). **Divergence logs reconciled vs upstream/master 2026-07-08**
+  (de-drift committed `27c5a84`): six divergences are already merged upstream and become deletions
+  on the next pin bump — dvc (2) close-hook (#1302), acceptor (1)/(2) + server (9)
+  honor-size/keyboard-layout (#1373/#1397), server SuppressOutput (#1319), NSCodec (#1332), QOI
+  (#1335/#1341). Full ranked list: `project_upstream_ironrdp_open_prs` memory.
+  **Pin-bump follow-ups (when the git pin bumps past the merges):**
   (a) past `2d3bdef` → `src/audio.rs` adopts the new rdpsnd handler API (`choose_format` + fallible
   `start(&NegotiatedFormat)`), dropping the hand-rolled `wFormatNo` index logic; (b) past `d471bd06`
   → `main.rs` switches `set_honor_client_desktop_size(bool)` to the builder `with_honor_client_desktop_size`

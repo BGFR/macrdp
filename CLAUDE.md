@@ -19,7 +19,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.30** (the webcam release — a
+(VPN/ZeroTier). **Latest release: v0.8.31** (the gamepad-resilience release — a
+one-fix point release over v0.8.30 hardening HID/gamepad USB redirection: a
+redirected device's **interrupt-IN endpoint** (e.g. an Xbox controller's
+input-report pipe) no longer goes dead when the client fails a single interrupt
+read. mstsc intermittently completes an interrupt read with `hresult 0x8007001f`
+(`ERROR_GEN_FAILURE`) while the device channel is still open; surfacing that as an
+endpoint STALL made the macOS class driver give up polling the pipe (the gamepad
+"hung" after seconds). The server (`src/usb_redirect/mod.rs`) now treats a
+**channel-still-open transient failure on an interrupt endpoint as an empty poll**
+(0 bytes, success) so the OS keeps the pipe alive and re-polls — matching interrupt
+"no data ready" semantics (one dropped report is imperceptible; the next poll gets
+fresh state). Scoped strictly to interrupt endpoints (`is_bulk == false`), so
+mass-storage **bulk** keeps the strict stall (a real bulk error surfaces; a short
+read never corrupts a transfer) and link death (`channel closed`) stays fatal for
+clean teardown. Log marker: `interrupt-IN transient failure — completing as an
+empty poll to keep the pipe alive`. Field note: a physically loose/jostled USB
+cable causes the same dead-gamepad symptom (a real disconnect + re-enumeration —
+`status=11` → `endpoint created ep=0x00` in the log) and is *not* software-fixable;
+reseat the cable, which this fix correctly leaves alone.) Earlier: **v0.8.30**
+(the webcam release — a
 **bulk USB webcam redirected over FreeRDP now streams live video** into the Mac
 session (`--enable-usb-redirection`, entitled build) — as far as is known a first
 for any open-source RDP *server*. The blocker was USB **read-depth starvation**,

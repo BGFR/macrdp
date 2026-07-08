@@ -468,6 +468,15 @@ then delete; promote a parked item to *In flight* when work actually starts.
     rdpeusb (2) `UsbDevice=0` (CONFLICTS with merged #1321, which deliberately rejects that range;
     needs a "mstsc really sends 0 + capture" argument) and (3) full config descriptor. On
     merge+release, most of rdpeusb divergence (1) drops.
+  - [ ] **rdpeusb (3) full config descriptor — DRAFTED 2026-07-08, not yet filed.** Branch
+    `feat/rdpeusb-full-config-descriptor` (commit `60e50232`) in the IronRDP clone: `UsbConfigDesc`
+    gains `trailing: Vec<u8>` (bytes 9..wTotalLength) so `TS_URB_SELECT_CONFIGURATION` carries the
+    full configuration descriptor (real Windows rejects header-only with `0x80070057`). QA'd
+    ship-ready (decode clamp is safe by construction — the URB decodes from a length-delimited
+    sub-cursor). **File after #1418 gets its first review** (same young crate); flag the one design
+    point in the PR body: `total_length` not auto-derived from `trailing` — offer an
+    invariant-enforcing constructor as an option. Both rdpeusb PRs touch `tests/rdpeusb/mod.rs`
+    (one line) — rebase whichever merges second.
   Nothing whole-vendor-dir is currently de-vendorable (each fork keeps ≥1 macrdp-specific
   server-direction divergence). **Divergence logs reconciled vs upstream/master 2026-07-08**
   (de-drift committed `27c5a84`): six divergences are already merged upstream and become deletions
@@ -479,6 +488,27 @@ then delete; promote a parked item to *In flight* when work actually starts.
   `start(&NegotiatedFormat)`), dropping the hand-rolled `wFormatNo` index logic; (b) past `d471bd06`
   → `main.rs` switches `set_honor_client_desktop_size(bool)` to the builder `with_honor_client_desktop_size`
   (and, once #1404 lands, to `Some(max)` capped to the Mac's native res — see the honor-size counterpart below).
+- [ ] **THE PIN BUMP — scoped 2026-07-08, harvest-triggered, DECIDED: hold for now (do NOT bump
+  opportunistically).** Current pin `879ffed` (2026-05-25, ~6 wk stale); a bump is all-or-nothing
+  (15 git pins + all 6 vendor forks are version-coupled; breaking `core 0.1→0.2` / `pdu 0.7→0.8` /
+  `dvc 0.5→0.7` / `server 0.10→0.12`) and churns every vendored crate, so it runs as its OWN
+  dedicated effort + release, never a side task.
+  **Trigger (whichever first):** (i) the small-PR wave merges — the rdpeusb pair (#1418 + the
+  drafted config-descriptor) and #1405 (+#1415/#1404 if they land) — maximizing the harvest to
+  ~11–12 divergence deletions in ONE migration instead of two; or (ii) a **~6-week staleness cap
+  (early Aug 2026)** — upstream is refactoring code our divergences sit on (e.g. #1407 restructured
+  rdpeusb), so waiting past the cap makes the re-vendor diff hairier; bump anyway if reviews stall.
+  **Precondition:** the Tier 2.4 48–72 h soak has signed off the current baseline (don't churn the
+  base mid-soak / before sign-off).
+  **Execution checklist:** dedicated branch → re-copy the 6 forks at the new rev → DELETE the
+  upstreamed divergences (the six reconciled 2026-07-08 + whatever the trigger wave adds) →
+  re-apply the ~14 surviving divergences onto the refactored upstream code → adopt new APIs:
+  follow-ups (a)+(b) above, plus EVALUATE upstream's new `autodetect_rtt` (builder,
+  `Option<Arc<AtomicU32>>`) as a replacement for server divergence (15) RTT-cell → full gates
+  (fmt/clippy/tests both OSes) → **live re-verification on real mstsc + FreeRDP** (H.264, audio,
+  clipboard, RDPDR, blank-recovery, USB if entitled) → ship as its own release with nothing else
+  in it. **Watch items:** issue #1352 (pdu spec-line split would rename macrdp's direct
+  `ironrdp-pdu` dep) and egfx breaking changes. Est. 1–2 focused days + verification.
 - Upstream-ability of the remaining divergences was surveyed 2026-07-01 (don't re-survey; ranking
   in `project_upstream_ironrdp_open_prs` memory). The other "quick" items (RDPDR decode halves,
   AudioWave `duration_ms`, keyboard-layout handle) are **held** — no upstream consumer yet, so they

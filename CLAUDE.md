@@ -19,7 +19,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.29** (the stability release —
+(VPN/ZeroTier). **Latest release: v0.8.30** (the webcam release — a
+**bulk USB webcam redirected over FreeRDP now streams live video** into the Mac
+session (`--enable-usb-redirection`, entitled build) — as far as is known a first
+for any open-source RDP *server*. The blocker was USB **read-depth starvation**,
+not the (separate, mstsc-only) camera-channel limit: macOS double/triple-buffers a
+streaming bulk-IN endpoint (queuing several concurrent reads so the device pipe
+never runs dry), but the user-space host controller's transfer ring exposes only
+one transfer at a time, so serving reads one-at-a-time starved the camera (no data
+→ macOS tore the stream down), while re-forwarding the same read for depth dropped
+half the frame data. A **bulk-IN read-ahead engine** (`src/usb_redirect/usb_spike.m`)
+now keeps `MACRDP_USB_PREFETCH_DEPTH` (default 4) concurrent `bulk_transfer_in`
+reads in flight to the client, decoupled from the ring, buffered in **sequence
+order** and delivered one chunk per ring transfer — restoring URB depth with no
+data loss. Gated on the concurrency + large-read signal, so **mass storage**
+(regression-verified byte-exact) and **interrupt/HID** (the redirected gamepad)
+stay on the serial path. No Rust change (the URBDRC/`UsbHandle` side is already
+per-token concurrent). Verified live on an A4Tech bulk UVC cam over Linux FreeRDP
+(smooth video in Photo Booth); isochronous webcams + the mstsc camera-redirection
+channel remain unimplemented. See the USB feature note in `@docs/features.md`.
+Earlier: **v0.8.29** (the stability release —
 a bug-fix roll-up over v0.8.28: closes a rare clipboard-churn **crash** (a
 use-after-free from unsynchronized `NSPasteboard` access, now serialized behind a
 process-global guard, #144); fixes a **scroll-wheel runaway** on the macOS Windows

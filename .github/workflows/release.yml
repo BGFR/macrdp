@@ -137,9 +137,12 @@ jobs:
       - name: Stage artifact
         id: stage
         shell: bash
+        # VERSION comes from a tag name / dispatch input; pass it via env (never
+        # inline in the script) so a maliciously-named tag can't inject shell.
+        env:
+          VERSION: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          VERSION="${{ inputs.tag || github.ref_name }}"
           NAME="macrdp-${VERSION}-${{ matrix.target }}"
           mkdir -p "dist/${NAME}"
           cp "target/${{ matrix.target }}/release/macrdp" "dist/${NAME}/"
@@ -190,9 +193,11 @@ jobs:
       - name: Stage app artifact
         id: stageapp
         shell: bash
+        # VERSION via env (not inline) — same shell-injection hardening as above.
+        env:
+          VERSION: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          VERSION="${{ inputs.tag || github.ref_name }}"
           NAME="macrdp-${VERSION}-${{ matrix.target }}-app"
           mkdir -p dist
           # ditto -k preserves the bundle's signature + symlinks (plain zip won't).

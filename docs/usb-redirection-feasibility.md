@@ -405,8 +405,34 @@ The entitlement `com.apple.developer.usb.host-controller-interface` is **granted
   capture devices" in mstsc), a separate high-level protocol macrdp doesn't implement —
   true webcam support is that channel, a distinct future feature. Note mstsc's RemoteFX
   USB list **excludes mass storage** (it rides *Drives*/RDPDR), so the verified bulk/mount
-  path can't be exercised from mstsc; isochronous (camera/audio) + interrupt (HID)
-  endpoints also remain unimplemented.
+  path can't be exercised from mstsc; isochronous (camera/audio) endpoints remain
+  unimplemented (interrupt/HID is now done — the gamepad).
+
+**Bulk webcam over FreeRDP = STREAMS live video (2026-07-08) — the URB-depth read-ahead
+engine (divergence-16 refinement in `usb_spike.m`).** The same A4Tech camera that only
+enumerated over mstsc **streams smooth moving video into Photo Booth over FreeRDP** (its
+VideoStreaming EP 0x82 is **bulk**, not isochronous). The blocker was **URB-depth
+starvation**, not the mstsc camera-channel wall: macOS double/triple-buffers a streaming
+bulk-IN endpoint (it queues ~3 concurrent reads so the pipe never runs dry), but the
+UserHCI ring exposes only ONE transfer (the head) at a time (`currentTransferMessage`
+advances only on completion — no peek-ahead). The original code re-forwarded the *same*
+head on each re-doorbell → the device got depth but half the completions were dropped (a
+bulk-IN pipe is a stream) → corrupt/no picture; collapsing that to strictly one-read-at-a-
+time (a de-dup skip-guard) → the device *underran* (`moved=0`, macOS destroyed the endpoint
+after ~7 s and looped COMMIT→read→timeout→teardown forever). **Fix = a bulk-IN read-ahead
+engine:** on the re-queued-head signal AND a large read (`readLen >= 512`, so 16-byte
+interrupt polls stay serial), keep `MACRDP_USB_PREFETCH_DEPTH` (default 4; `1` disables)
+concurrent `bulk_transfer_in` reads in flight to the client — **decoupled from the ring** —
+buffered in **sequence order** (`MacrdpPrefetchRead.seq` + a reorder map, so out-of-order
+client completions can't scramble frames) and handed one chunk per ring TRB as it becomes
+the head. Restores device URB depth with **no data loss**; same UAF guards on every `msg`
+write; `tearDownStream` on EndpointDestroy. **Gated so mass storage (serial BOT — never
+re-queues) and interrupt/gamepad (single-outstanding) never engage** — regression-verified
+live: the flash drive still mounts + sha256 byte-exact with **no** `read-ahead engaged` line
+for its endpoint. No Rust change (the URBDRC/`UsbHandle`/`UsbRouter` side is already
+per-token concurrent; the completion FFI carries only a token). Log marker:
+`bulk-IN read-ahead engaged ep=0x82 depth=4 readLen=102656`. Remaining: **isochronous**
+webcams (a different transport, not yet built) and the mstsc camera-redirection channel.
 
 **Merge-readiness (branch `feat/usb-redirect-spike`).** The feature is fully wired and
 opt-in: `--enable-usb-redirection` (default OFF; when off the URBDRC factory is `None`, so

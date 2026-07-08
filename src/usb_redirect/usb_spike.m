@@ -95,6 +95,41 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 @end
 
 // -----------------------------------------------------------------------------
+// Bulk-IN read-ahead (streaming endpoints, e.g. a UVC webcam). macOS double/
+// triple-buffers a streaming bulk-IN endpoint — it queues several concurrent
+// reads on the ring so the device's pipe never runs dry. The UserHCI ring only
+// exposes ONE TRB (the head) at a time (currentTransferMessage advances only on
+// completion), so we cannot forward those queued TRBs individually. Instead we
+// keep DEPTH concurrent bulk_transfer_in reads in flight to the CLIENT
+// (decoupled from the ring), buffer their results in SEQUENCE order, and hand one
+// buffered chunk to each ring TRB as it becomes the head. This restores the
+// device-side URB depth (no underrun) WITHOUT the data loss the old
+// forward-the-same-head-twice behaviour caused. Engaged lazily only when macOS
+// demonstrates it wants concurrency (a re-doorbell of an already-outstanding
+// bulk-IN head) AND the read is large (streaming, not an interrupt-status poll),
+// so strictly request/response endpoints (mass storage) and small interrupt
+// endpoints never enter this path and stay serial.
+@interface MacrdpPrefetchRead : NSObject
+@property(nonatomic, strong) NSNumber *endpointKey;
+@property(nonatomic, assign) uint64_t seq;   // stream position, for in-order delivery
+@end
+@implementation MacrdpPrefetchRead
+@end
+
+@interface MacrdpBulkStream : NSObject
+@property(nonatomic, assign) uint32_t readLen;          // per-read length (from the ring TRB)
+@property(nonatomic, assign) NSInteger inFlight;        // client reads outstanding
+@property(nonatomic, assign) uint64_t nextIssueSeq;     // next read's sequence
+@property(nonatomic, assign) uint64_t nextDeliverSeq;   // next sequence to deliver (reorder cursor)
+@property(nonatomic, strong) NSMutableArray<NSData *> *fifo;              // in-order buffers awaiting a ring TRB
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSData *> *reorder; // seq -> out-of-order arrival
+@property(nonatomic, assign) const IOUSBHostCIMessage *pendingHead;      // ring TRB presented but not yet fed (or NULL)
+@property(nonatomic, strong) IOUSBHostCIEndpointStateMachine *pendingEp; // identity guard for pendingHead
+@end
+@implementation MacrdpBulkStream
+@end
+
+// -----------------------------------------------------------------------------
 
 @interface MacrdpUsbController : NSObject
 @property(nonatomic, strong) IOUSBHostControllerInterface *interface;
@@ -114,6 +149,12 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 // completion memcpy when a slow Get Max LUN answered right after the kernel's
 // ~5 s EP0 timeout re-raised the transfer). Registration supersedes the old one.
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *pendingByEndpoint;
+// endpoint key -> bulk-IN read-ahead stream state (streaming endpoints only)
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, MacrdpBulkStream *> *bulkStreams;
+// prefetch-read token -> its (endpoint, seq); routed AHEAD of tokenMap on completion
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, MacrdpPrefetchRead *> *prefetchReads;
+// target concurrent client reads per streaming endpoint (MACRDP_USB_PREFETCH_DEPTH)
+@property(nonatomic, assign) NSInteger prefetchDepth;
 @property(nonatomic, assign) uint64_t nextToken;
 // ObjC -> Rust control-IN callback + its opaque context (set at create).
 @property(nonatomic, assign) MacrdpUsbControlInFn controlInCb;
@@ -136,6 +177,12 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         _pendingOutData = [NSMutableDictionary dictionary];
         _tokenMap = [NSMutableDictionary dictionary];
         _pendingByEndpoint = [NSMutableDictionary dictionary];
+        _bulkStreams = [NSMutableDictionary dictionary];
+        _prefetchReads = [NSMutableDictionary dictionary];
+        const char *pd = getenv("MACRDP_USB_PREFETCH_DEPTH");
+        _prefetchDepth = pd ? atoi(pd) : 4;
+        if (_prefetchDepth < 1) _prefetchDepth = 1;
+        if (_prefetchDepth > 16) _prefetchDepth = 16;
     }
     return self;
 }
@@ -330,6 +377,9 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
             [self.tokenMap removeObjectForKey:stale];
             [self.pendingByEndpoint removeObjectForKey:key];
         }
+        // Drop any bulk-IN read-ahead state — its pendingHead msg + in-flight
+        // reads point into the ring being destroyed.
+        [self tearDownStream:key];
     }
     NSLog(@"[usb2] endpoint cmd type=0x%02x dev=%lu ep=0x%02lx state=%ld",
           type, (unsigned long)addr, (unsigned long)epAddr, (long)ep.endpointState);
@@ -368,6 +418,20 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
     }
     const uint8_t *s = setupData.bytes;
     return (s[0] & kUsbDirDeviceToHost) != 0;
+}
+
+// Is `msg` (the current ring head) already the endpoint's outstanding forwarded
+// transfer? Pointer-compare only — never dereferences `msg` or `p.msg`, and `msg`
+// was validated by msg_valid() before this is called. Used by walkEndpoint: to
+// skip re-raising a transfer that's already in flight (double-buffered reads)
+// while still letting a genuine re-issue on a DIFFERENT slot through to supersede.
+- (BOOL)ringHeadAlreadyOutstanding:(const IOUSBHostCIMessage *)msg endpointKey:(NSNumber *)key {
+    NSNumber *tok = self.pendingByEndpoint[key];
+    if (tok == nil) {
+        return NO;
+    }
+    MacrdpPendingTransfer *p = self.tokenMap[tok];
+    return (p != nil && p.msg == msg);
 }
 
 // Register a newly-raised forwarded transfer as THE outstanding one for its
@@ -520,6 +584,15 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         return;
     }
     dispatch_async(queue, ^{
+        // Read-ahead prefetch completion? Route it ahead of the tied tokenMap —
+        // these reads are not bound to a specific ring TRB; their bytes are
+        // buffered in sequence order and fed to ring TRBs as they present.
+        MacrdpPrefetchRead *pr = self.prefetchReads[@(token)];
+        if (pr != nil) {
+            [self.prefetchReads removeObjectForKey:@(token)];
+            [self handlePrefetchCompletion:pr data:data status:status];
+            return;
+        }
         MacrdpPendingTransfer *p = self.tokenMap[@(token)];
         if (p == nil) {
             NSLog(@"[usb2] completion for unknown/expired token=%llu", token);
@@ -647,6 +720,180 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
     }
 }
 
+// ---- bulk-IN read-ahead engine (streaming endpoints) ------------------------
+// Below this line: only reads with length >= this engage read-ahead — large
+// enough to be a video/streaming bulk endpoint, not a 16-byte interrupt poll.
+static const uint32_t kStreamMinReadLen = 512;
+
+// Keep DEPTH chunks in flight-or-buffered by issuing more speculative client
+// reads. Bounded by (inFlight + fifo) so a stalled consumer can't over-read the
+// device past DEPTH; refills as the FIFO drains into ring TRBs.
+- (void)topUpPrefetch:(NSNumber *)key {
+    MacrdpBulkStream *s = self.bulkStreams[key];
+    if (s == nil || !self.bulkCb) {
+        return;
+    }
+    IOUSBHostCIEndpointStateMachine *ep = self.endpoints[key];
+    if (ep == nil || ep.endpointState != IOUSBHostCIEndpointStateActive) {
+        return;
+    }
+    NSUInteger epAddr = [key unsignedIntegerValue] & 0xff;
+    while (s.inFlight + (NSInteger)s.fifo.count < self.prefetchDepth) {
+        uint64_t token = ++self.nextToken;
+        MacrdpPrefetchRead *pr = [MacrdpPrefetchRead new];
+        pr.endpointKey = key;
+        pr.seq = s.nextIssueSeq++;
+        self.prefetchReads[@(token)] = pr;
+        s.inFlight++;
+        self.bulkCb(self.cbCtx, token, (uint32_t)epAddr, 1, NULL, s.readLen);
+    }
+}
+
+// Move any consecutive-sequence buffers out of the reorder map into the FIFO, so
+// the FIFO is always in stream order regardless of client completion order.
+- (void)drainReorder:(MacrdpBulkStream *)s {
+    NSData *next;
+    while ((next = s.reorder[@(s.nextDeliverSeq)]) != nil) {
+        [s.reorder removeObjectForKey:@(s.nextDeliverSeq)];
+        [s.fifo addObject:next];
+        s.nextDeliverSeq++;
+    }
+}
+
+// Deliver `data` into ring TRB `msg`, guarded exactly like the async completion
+// path (the endpoint must still be the SAME Active object, or `msg` is retired
+// ring memory). Returns YES if the completion was enqueued.
+- (BOOL)deliverStreamData:(NSData *)data toMsg:(const IOUSBHostCIMessage *)msg
+                      key:(NSNumber *)key expectedEp:(IOUSBHostCIEndpointStateMachine *)expectedEp {
+    IOUSBHostCIEndpointStateMachine *ep = self.endpoints[key];
+    if (ep == nil || ep != expectedEp || ep.endpointState != IOUSBHostCIEndpointStateActive) {
+        return NO;
+    }
+    NSUInteger bufLen = (msg->data0 & IOUSBHostCINormalTransferData0Length)
+                        >> IOUSBHostCINormalTransferData0LengthPhase;
+    NSUInteger moved = 0;
+    if (data.length > 0) {
+        void *buf = (void *)(uintptr_t)msg->data1;
+        if (buf != NULL) {
+            moved = data.length < bufLen ? data.length : bufLen;
+            memcpy(buf, data.bytes, moved);
+        }
+    }
+    NSError *e = nil;
+    if (![ep enqueueTransferCompletionForMessage:msg status:IOUSBHostCIMessageStatusSuccess
+                                  transferLength:moved error:&e]) {
+        NSLog(@"[usb2] stream enqueueTransferCompletion failed: %@", e);
+        return NO;
+    }
+    return YES;
+}
+
+// Engage read-ahead on a bulk-IN endpoint whose head macOS just re-queued (it
+// wants URB depth). Reclassify the in-flight tied read as prefetch seq 0, mark
+// the head as awaiting its buffered chunk, and fill the pipe to DEPTH.
+- (void)engageStream:(const IOUSBHostCIMessage *)msg endpointKey:(NSNumber *)key
+                  ep:(IOUSBHostCIEndpointStateMachine *)ep {
+    uint32_t readLen = (uint32_t)((msg->data0 & IOUSBHostCINormalTransferData0Length)
+                                  >> IOUSBHostCINormalTransferData0LengthPhase);
+    if (self.prefetchDepth <= 1 || readLen < kStreamMinReadLen) {
+        // Escape hatch / interrupt-status endpoint: stay serial, just skip the dup.
+        NSLog(@"[usb2] ring head already outstanding — skipping re-raise (not streaming)");
+        return;
+    }
+    MacrdpBulkStream *s = [MacrdpBulkStream new];
+    s.readLen = readLen;
+    s.fifo = [NSMutableArray array];
+    s.reorder = [NSMutableDictionary dictionary];
+    s.pendingHead = msg;
+    s.pendingEp = ep;
+    self.bulkStreams[key] = s;
+    // Reclassify the outstanding tied read as prefetch seq 0 so its bytes feed the
+    // read-ahead FIFO (and complete the head) instead of the tied completion path.
+    NSNumber *tied = self.pendingByEndpoint[key];
+    if (tied != nil && self.tokenMap[tied] != nil) {
+        [self.tokenMap removeObjectForKey:tied];
+        [self.pendingByEndpoint removeObjectForKey:key];
+        MacrdpPrefetchRead *pr = [MacrdpPrefetchRead new];
+        pr.endpointKey = key;
+        pr.seq = s.nextIssueSeq++;   // seq 0
+        self.prefetchReads[tied] = pr;
+        s.inFlight++;
+    }
+    NSLog(@"[usb2] bulk-IN read-ahead engaged ep=0x%02lx depth=%ld readLen=%u",
+          (unsigned long)([key unsignedIntegerValue] & 0xff), (long)self.prefetchDepth, readLen);
+    [self topUpPrefetch:key];
+}
+
+// Serve a bulk-IN ring head while in read-ahead mode. Returns YES if it fed the
+// head (ring advanced — keep walking), NO if it's now awaiting data (pendingHead)
+// or the endpoint went stale.
+- (BOOL)serveStreamHead:(const IOUSBHostCIMessage *)msg endpointKey:(NSNumber *)key
+                     ep:(IOUSBHostCIEndpointStateMachine *)ep {
+    MacrdpBulkStream *s = self.bulkStreams[key];
+    [self topUpPrefetch:key];
+    if (s.pendingHead == msg) {
+        return NO;                       // already awaiting this exact head
+    }
+    if (s.fifo.count > 0) {
+        NSData *data = s.fifo.firstObject;
+        if ([self deliverStreamData:data toMsg:msg key:key expectedEp:ep]) {
+            [s.fifo removeObjectAtIndex:0];
+            return YES;                  // ring advanced
+        }
+        return NO;                       // stale endpoint — stop
+    }
+    s.pendingHead = msg;
+    s.pendingEp = ep;
+    return NO;
+}
+
+// A prefetch read returned. Buffer it in sequence order, feed a waiting head if we
+// now have the next in-order chunk, and keep the device fed.
+- (void)handlePrefetchCompletion:(MacrdpPrefetchRead *)pr data:(NSData *)data
+                          status:(IOUSBHostCIMessageStatus)status {
+    NSNumber *key = pr.endpointKey;
+    MacrdpBulkStream *s = self.bulkStreams[key];
+    if (s == nil) {
+        return;   // stream torn down (endpoint destroyed) — drop
+    }
+    s.inFlight--;
+    // Success with bytes → buffer them; a stall/zero read → an empty chunk so the
+    // ring keeps advancing (macOS handles short/zero bulk reads) rather than hangs.
+    NSData *buf = (status == IOUSBHostCIMessageStatusSuccess && data != nil) ? data : [NSData data];
+    s.reorder[@(pr.seq)] = buf;
+    [self drainReorder:s];
+    if (s.pendingHead != NULL && s.fifo.count > 0) {
+        NSData *chunk = s.fifo.firstObject;
+        const IOUSBHostCIMessage *head = s.pendingHead;
+        IOUSBHostCIEndpointStateMachine *headEp = s.pendingEp;
+        s.pendingHead = NULL;
+        s.pendingEp = nil;
+        if ([self deliverStreamData:chunk toMsg:head key:key expectedEp:headEp]) {
+            [s.fifo removeObjectAtIndex:0];
+            [self walkEndpoint:key];   // serve subsequent TRBs from the FIFO + top up
+            return;
+        }
+        // stale endpoint — the head was dropped; fall through to keep the pipe fed
+    }
+    [self topUpPrefetch:key];
+}
+
+// Drop a stream's state (endpoint destroyed). In-flight prefetch reads are
+// orphaned — their late completions find no stream and are dropped.
+- (void)tearDownStream:(NSNumber *)key {
+    if (self.bulkStreams[key] == nil) {
+        return;
+    }
+    [self.bulkStreams removeObjectForKey:key];
+    NSMutableArray<NSNumber *> *orphans = [NSMutableArray array];
+    for (NSNumber *tok in self.prefetchReads) {
+        if ([self.prefetchReads[tok].endpointKey isEqual:key]) {
+            [orphans addObject:tok];
+        }
+    }
+    [self.prefetchReads removeObjectsForKeys:orphans];
+}
+
 // Walk an endpoint's transfer ring, completing sync stages inline and stopping at
 // the first stage that must be forwarded to the client (which is raised async and
 // re-enters this walk from its completion). Runs on the serial queue.
@@ -663,6 +910,37 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         const IOUSBHostCIMessage *msg = ep.currentTransferMessage;
         if (msg == NULL || !msg_valid(msg)) {
             break;
+        }
+        NSUInteger epNum = [key unsignedIntegerValue] & 0xff;
+        BOOL isBulkIn = (epNum & 0x80) != 0 && (epNum & 0x7f) != 0
+                        && msg_type(msg) == IOUSBHostCIMessageTypeNormalTransfer;
+        // Bulk-IN read-ahead: once a streaming endpoint is engaged, serve its ring
+        // TRBs from the prefetch FIFO (never a fresh tied raise).
+        if (isBulkIn && self.bulkStreams[key] != nil) {
+            if ([self serveStreamHead:msg endpointKey:key ep:ep]) {
+                continue;   // fed the head from read-ahead; ring advanced
+            }
+            return;         // awaiting data — a prefetch completion re-walks
+        }
+        // If this exact ring head is ALREADY forwarded and awaiting a client
+        // completion, do NOT re-raise it. The ring only advances on
+        // enqueueTransferCompletionForMessage: (from the completion path), so a
+        // doorbell re-entering the walk while a transfer is outstanding re-reads
+        // the SAME unadvanced head. For a streaming bulk-IN endpoint that
+        // re-doorbell means macOS wants URB depth (double/triple buffering), so we
+        // ENGAGE the read-ahead engine — the old serial one-read-at-a-time path
+        // starved the device's pipe (it produced zero bytes and macOS tore the
+        // stream down). For control / bulk-OUT we just skip the duplicate: the
+        // outstanding transfer's completion re-walks. A genuine kernel timeout/
+        // abort re-issues a DIFFERENT ring slot (different msg), so this returns NO
+        // and registerPendingForMsg: supersedes it as designed.
+        if ([self ringHeadAlreadyOutstanding:msg endpointKey:key]) {
+            if (isBulkIn) {
+                [self engageStream:msg endpointKey:key ep:ep];
+                return;
+            }
+            NSLog(@"[usb2] ring head already outstanding — skipping re-raise (double-buffered)");
+            return;
         }
         if ([self transferIsForwardedControlIn:msg endpointKey:key]) {
             [self raiseControlIn:msg endpointKey:key];

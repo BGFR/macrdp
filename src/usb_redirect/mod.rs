@@ -186,7 +186,7 @@ fn drive_device(handle: UsbHandle) {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::os::raw::{c_int, c_void};
 
     use ironrdp_server::{UsbHandle, UsbPipe};
@@ -432,6 +432,10 @@ mod imp {
         // address (e.g. 0x01 OUT, 0x82 IN) to its client pipe handle. Best-effort:
         // control-only enumeration still works without it (bulk just can't run).
         let mut pipe_map: HashMap<u8, u32> = HashMap::new();
+        // Non-bulk (interrupt) IN endpoints must not HALT on a transient failure —
+        // see the bulk-IN error arm below. Track them so mass-storage BULK pipes
+        // keep the strict stall.
+        let mut interrupt_eps: HashSet<u8> = HashSet::new();
         match select_client_config(&handle).await {
             Ok(pipes) => {
                 for p in &pipes {
@@ -442,6 +446,9 @@ mod imp {
                         "USB redirection: endpoint pipe opened"
                     );
                     pipe_map.insert(p.endpoint_address, p.pipe_handle);
+                    if !p.is_bulk {
+                        interrupt_eps.insert(p.endpoint_address);
+                    }
                 }
                 info!(
                     count = pipes.len(),
@@ -554,6 +561,7 @@ mod imp {
                         controller.complete_out(token, 0, STATUS_STALL);
                         continue;
                     };
+                    let is_interrupt = interrupt_eps.contains(&endpoint_address);
                     let handle = handle.clone();
                     let controller = std::sync::Arc::clone(&controller);
                     tokio::spawn(async move {
@@ -561,8 +569,30 @@ mod imp {
                             match handle.bulk_transfer_in(pipe, length).await {
                                 Ok(bytes) => controller.complete_in(token, &bytes, STATUS_OK),
                                 Err(e) => {
-                                    warn!(error = %e, endpoint = format_args!("{:#04x}", endpoint_address), requested = length, "USB redirection: bulk IN failed — stalling");
-                                    controller.complete_in(token, &[], STATUS_STALL);
+                                    // An INTERRUPT-IN endpoint must not HALT on a
+                                    // transient device failure. mstsc intermittently
+                                    // fails an interrupt read with hresult 0x8007001f
+                                    // (ERROR_GEN_FAILURE); completing that as a STALL
+                                    // makes the macOS class driver give up polling the
+                                    // pipe — e.g. a redirected gamepad goes dead
+                                    // ("hang") after a few seconds. Treat a transient
+                                    // failure as an EMPTY poll (0 bytes, success) so the
+                                    // OS keeps the pipe alive and re-polls (interrupt
+                                    // "no data ready" semantics — one dropped report is
+                                    // imperceptible, and the next poll gets fresh state).
+                                    // Link death (channel closed) is fatal → stall so
+                                    // teardown proceeds. BULK endpoints (mass storage)
+                                    // keep the strict stall: a real bulk error must
+                                    // surface, and faking a short read would corrupt the
+                                    // transfer.
+                                    let fatal = e.to_string().contains("channel closed");
+                                    if is_interrupt && !fatal {
+                                        info!(error = %e, endpoint = format_args!("{:#04x}", endpoint_address), "USB redirection: interrupt-IN transient failure — completing as an empty poll to keep the pipe alive");
+                                        controller.complete_in(token, &[], STATUS_OK);
+                                    } else {
+                                        warn!(error = %e, endpoint = format_args!("{:#04x}", endpoint_address), requested = length, "USB redirection: bulk IN failed — stalling");
+                                        controller.complete_in(token, &[], STATUS_STALL);
+                                    }
                                 }
                             }
                         } else {

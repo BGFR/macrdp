@@ -130,8 +130,9 @@ AND released — #1276 landing is NOT sufficient.
     PCM-only constant to any advertised codec); offer it upstream alongside the
     SuppressOutput work. Until then it rides with this fork.
 
-(9) Honor-client-desktop-size plumbing (NOT upstreamed; pairs with the
-    `vendor/ironrdp-acceptor` divergence (1)): `RdpServer` gains a
+(9) Honor-client-desktop-size plumbing (UPSTREAMED as #1373, MERGED 2026-07-02
+    — DROP ON PIN BUMP; pairs with the `vendor/ironrdp-acceptor` divergence (1),
+    also #1373): `RdpServer` gains a
     `honor_client_desktop_size: bool` (default false) + setter
     `set_honor_client_desktop_size`, forwarded in `run_connection` to each
     connection's `Acceptor` via the vendored
@@ -146,7 +147,9 @@ AND released — #1276 landing is NOT sufficient.
     request (verified empirically with sdl-freerdp `/size:1024x768`:
     confirm-active echoed the server's 1512×982). macrdp wires this from
     its default-on client-resolution auto-adopt (`--no-client-resolution`
-    opts out). Offer upstream together with the acceptor change.
+    opts out). Upstream form is the builder method
+    `RdpServerBuilder::with_honor_client_desktop_size` (#1373); on the next pin
+    bump, drop this divergence and switch main.rs's setter call to the builder.
 
 (11) Server-side RDPDR (drive redirection) static channel (NOT upstreamed;
     added 2026-06-16; depends on vendored `ironrdp-rdpdr` divergence (1)):

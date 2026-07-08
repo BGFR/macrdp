@@ -5,8 +5,10 @@ Local fork of ironrdp-acceptor 0.8.0, copied 2026-06-12 from upstream master
 use) and pulled in via `[patch.crates-io]` in the root Cargo.toml. Keep this
 vendor dir until divergence (1) is upstreamed AND released.
 
-(1) Honor the client's requested desktop size from Client Core Data (NOT
-    upstreamed): `Acceptor` gains a `honor_client_desktop_size: bool`
+(1) Honor the client's requested desktop size from Client Core Data
+    (UPSTREAMED as #1373, MERGED 2026-07-02 — DROP ON PIN BUMP; still vendored
+    only because macrdp's pin `879ffed` predates the merge): `Acceptor` gains
+    a `honor_client_desktop_size: bool`
     (default false, setter `set_honor_client_desktop_size`, carried across
     `new_deactivation_reactivation`). When set, the
     `BasicSettingsWaitInitial` state reads `gcc_blocks.core.desktop_width/
@@ -37,14 +39,15 @@ vendor dir until divergence (1) is upstreamed AND released.
     `request_initial_size` call, because the client's Confirm Active echo
     now equals the adopted size.
 
-    Upstream shape when offering this: likely the same flag + an
-    `Acceptor::desktop_size()` getter, or a builder option; CBenoit may
-    prefer exposing the raw core-data size in `AcceptorResult` instead and
-    leaving adoption to the server crate — either works for macrdp, adapt
-    on review.
+    Upstream status: MERGED as #1373 (2026-07-02) with the builder shape
+    (`RdpServerBuilder::with_honor_client_desktop_size` + a helper refactor).
+    On the next pin bump past it, delete this divergence and adopt the upstream
+    API (main.rs switches the `set_honor_client_desktop_size` setter to the
+    builder method). Verified redundant vs upstream/master 2026-07-08. (Follow-up
+    #1404 — clamp the honored size to an operator max — is still OPEN.)
 
-(2) Expose the client's keyboard-layout id from Client Core Data (NOT
-    upstreamed; added 2026-06-16): `Acceptor` gains a private
+(2) Expose the client's keyboard-layout id from Client Core Data (UPSTREAMED
+    as #1397, MERGED 2026-07-01 — DROP ON PIN BUMP; added 2026-06-16): `Acceptor` gains a private
     `client_keyboard_layout: u32` (captured in `BasicSettingsWaitInitial`
     from `gcc_blocks.core.keyboard_layout`, alongside the size read in (1),
     but UNCONDITIONALLY — it's free and harmless), carried across
@@ -53,9 +56,9 @@ vendor dir until divergence (1) is upstreamed AND released.
     Consumed by `vendor/ironrdp-server` divergence (10), which publishes it
     to a shared cell macrdp's input handler reads to auto-select a non-US
     keyboard layout (`src/keyboard_layout.rs`). Purely additive (a new struct
-    field + a new private field), so trivially upstreamable — offer alongside
-    (1), since exposing core-data fields on `AcceptorResult` is the same shape
-    CBenoit floated for the desktop size. See the keyboard-layout quirk note
+    field + a new private field). Upstreamed as #1397 (MERGED 2026-07-01, same
+    `AcceptorResult` field shape); drop on the next pin bump past it. Verified
+    redundant vs upstream/master 2026-07-08. See the keyboard-layout quirk note
     in docs/known-quirks.md.
 
 (3) Expose the client's multitransport (MS-RDPEMT) support flags from its GCC

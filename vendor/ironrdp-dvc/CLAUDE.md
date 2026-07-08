@@ -112,6 +112,16 @@ since the lib is `test = false`.
 
 The Soft-Sync request/response PDUs and the two `process()` arms are a clean,
 additive feature (server-side Soft-Sync). They're a good upstream PR once the
-macrdp UDP-multitransport data path is proven end-to-end. Divergence (2) (invoke
-the existing `close` hook on a client Close) is trivially upstreamable on its own —
-the hook is upstream's, just never called. Until then both stay vendored.
+macrdp UDP-multitransport data path is proven end-to-end.
+
+Divergence (2) (invoke the `close` hook on a client Close) is **ALREADY FIXED
+upstream and needs no PR** — verified 2026-07-08 against `upstream/master`. Upstream
+PR **#1302** ("feat(dvc): close channel API for server and client", commit
+`196d18df`, merged after macrdp's `879ffed` pin) added `impl Drop for
+DynamicChannel { fn drop … if state == Opened { self.processor.close(…) } }` and
+rewrote the client-`Close` arm to `self.remove_by_channel_id(channel_id)`, which
+removes+drops the channel → fires `processor.close`. That's a cleaner, more robust
+form of macrdp's inline call (no error on closing a non-Opened channel). **Action:
+on the next pin bump past #1302, DELETE macrdp's divergence (2) and rely on
+upstream's Drop-based close** (the USB per-device teardown still fires). Only the
+Soft-Sync divergence (1) then keeps this crate vendored.

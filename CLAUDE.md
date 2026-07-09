@@ -19,7 +19,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.31** (the gamepad-resilience release — a
+(VPN/ZeroTier). **Latest release: v0.8.32** (the security-hardening release — a
+security-focused roll-up over v0.8.31, no change to the default runtime path.
+**Fuzzed the network-facing protocol decoders** with new in-tree `cargo-fuzz`
+harnesses: `ironrdp-rdpeudp` (raw-UDP multitransport) came through ~250M execs
+clean, but `ironrdp-rdpeusb` (URBDRC / USB-redirection PDUs) surfaced **3 real
+panics** — unchecked `read_slice` on a truncated PDU in `TsUrbResult` /
+`IoControlCompletion` / `TsUsbdInterfaceInfoResult` — now `ensure_size!`-guarded
+(107M execs clean after; already fixed upstream, so they drop on the pin bump).
+**`--max-client-size WxH`** (config `MAX_CLIENT_SIZE`) caps the client-requested
+auto-adopt resolution, closing the audit residual where an authenticated client
+could request 8192×8192 (~256 MB BGRA/frame); clamps in-band per-dimension,
+refuses out-of-band, opt-in + byte-identical when unset, mirrors upstream #1404.
+**Bounded the smart-card IFD-bridge `CMD_TRANSMIT`** allocation (was a 4 GB local
+DoS on an unbounded wire `u32`) and documented the unauthenticated-loopback trust
+boundary for the three helper channels. Added **scheduled `cargo-deny`** dep-vuln
+scanning (daily, hardened runner, separate workflow). Plus **`--alt-backtick-switch`**
+(Option+\` cycles the current app's windows, the Option analogue of
+`--alt-tab-switch`; also fixes headless frontmost detection to read the AX
+system-wide focused app), and the **blank-recovery + auto-reconnect tunables are
+now `config.env` keys** (`BLANK_RECOVERY=0` etc. no longer need a plist edit).
+Two contributions from Anton Mostovoy: the alt-backtick work and a
+virtual-display descriptor-serial fix (per-pid, so two concurrent vd instances
+don't collide). Earlier: **v0.8.31** (the gamepad-resilience release — a
 one-fix point release over v0.8.30 hardening HID/gamepad USB redirection: a
 redirected device's **interrupt-IN endpoint** (e.g. an Xbox controller's
 input-report pipe) no longer goes dead when the client fails a single interrupt

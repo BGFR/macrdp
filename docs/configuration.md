@@ -185,7 +185,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           interactive. Size-bounded; see MACRDP_LOG_MAX_BYTES /
                           MACRDP_LOG_MAX_FILES below. Config: LOG_DIR.
 --audit-file PATH         Additionally write the security audit events (connection
-                          accept/reject/disconnect) to PATH as JSON lines for a
+                          accept/reject/auth/disconnect) to PATH as JSON lines for a
                           SIEM/SOC log collector. OFF by default; audit lines still
                           appear in macrdp.log. Self-rotating. MACRDP_AUDIT_JSON=1
                           enables it at the default <log-dir>/macrdp-audit.log.
@@ -275,8 +275,10 @@ the fail-fast window (~3s, i.e. never authenticated) counts as a failure, so a r
 real client (mstsc reconnect-blank, flaky link) and a single benign disconnect (mstsc's
 first-connect cert-prompt "Broken pipe") never lock you out. Audit lines are
 tagged `macrdp::audit`: `grep 'macrdp::audit' ~/Library/Logs/macrdp.log` shows
-`event="accept|reject|disconnect"` with `src_ip`/`src_port`, and (for rejects) the reason and
-retry-after. **Upgrade note:** these human-readable audit fields were renamed for a stable
+`event="accept|reject|auth|disconnect"` with `src_ip`/`src_port`, and (for rejects) the reason
+and retry-after. The `auth` event is the explicit CredSSP/NLA login verdict
+(`outcome="success"` or `"did_not_complete"` + a `reason`), emitted once per connection when
+authentication resolves (single-process path). **Upgrade note:** these human-readable audit fields were renamed for a stable
 schema — `ip`→`src_ip`, `port`→`src_port`, plus new `schema_version`/`macrdp_version`/`host` —
 so re-point any parser you run against the `macrdp.log` audit lines (the structured JSON stream
 below is the intended parse target going forward).

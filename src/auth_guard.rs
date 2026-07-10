@@ -479,6 +479,84 @@ pub fn audit_disconnect(ip: IpAddr, port: u16, duration: Duration, outcome: Outc
     }
 }
 
+/// Cap on the auth-failure `reason` length (chars). The reason is an sspi error
+/// description (error kind + a generic message like "logon denied") — never the
+/// client's NTLM response or password — but bound it as defense-in-depth against
+/// an unexpectedly verbose error chain landing in the audit stream.
+const MAX_AUDIT_REASON: usize = 200;
+
+/// Sanitize (and default/bound) the auth-failure reason for the audit record.
+/// The reason derives from `accept_credssp`'s error string — i.e. content
+/// produced while handling an *unauthenticated* client's CredSSP/NTLM exchange —
+/// so it must be treated as untrusted for the log sink. Two hardening steps:
+///  - **Strip control characters** (newlines, CR, tab, ANSI ESC, …). The JSON
+///    audit sink escapes them (serde), but the human-readable logfmt `macrdp.log`
+///    sink writes a display-recorded field verbatim, so an embedded `\n` could
+///    forge/split an audit line (log injection into a security log) and an ESC
+///    could smuggle ANSI into a terminal viewing it. Replace each with a space so
+///    the field stays a single printable token in both sinks.
+///  - **Cap the length** at [`MAX_AUDIT_REASON`] chars (char boundary, never
+///    mid-UTF-8) against an unexpectedly verbose error chain.
+///
+/// `None` becomes `"unknown"`. Returns borrowed when the input is already clean
+/// and short (the common case), owned only when it had to be rewritten.
+fn bound_reason(reason: Option<&str>) -> std::borrow::Cow<'_, str> {
+    let r = match reason {
+        None => return std::borrow::Cow::Borrowed("unknown"),
+        Some(r) => r,
+    };
+    // Fast path: already a single short printable token — borrow it unchanged.
+    if r.chars().take(MAX_AUDIT_REASON + 1).count() <= MAX_AUDIT_REASON
+        && !r.chars().any(|c| c.is_control())
+    {
+        return std::borrow::Cow::Borrowed(r);
+    }
+    std::borrow::Cow::Owned(
+        r.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(MAX_AUDIT_REASON)
+            .collect(),
+    )
+}
+
+/// Audit-log the CredSSP/NLA authentication verdict for a connection, emitted once
+/// per connection when the exchange resolves. `success` is whether the client's
+/// credentials validated; `reason` is a short failure description (only used when
+/// `success` is false — auth did not complete). Correlates with the preceding
+/// `accept` on the `(src_ip, src_port)` tuple.
+pub fn audit_auth(ip: IpAddr, port: u16, success: bool, reason: Option<&str>) {
+    if !audit_enabled() {
+        return;
+    }
+    if success {
+        tracing::info!(
+            target: "macrdp::audit",
+            schema_version = AUDIT_SCHEMA_VERSION,
+            macrdp_version = env!("CARGO_PKG_VERSION"),
+            host = host(),
+            event = "auth",
+            src_ip = %ip,
+            src_port = port,
+            outcome = "success",
+        );
+    } else {
+        // "did_not_complete" (not "failure"): an Err is dominated by bad
+        // credentials but also covers a client aborting the credential dialog or
+        // a rare mid-CredSSP transport error — the `reason` disambiguates.
+        tracing::warn!(
+            target: "macrdp::audit",
+            schema_version = AUDIT_SCHEMA_VERSION,
+            macrdp_version = env!("CARGO_PKG_VERSION"),
+            host = host(),
+            event = "auth",
+            src_ip = %ip,
+            src_port = port,
+            outcome = "did_not_complete",
+            reason = %bound_reason(reason),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Single-process ConnectionHandler adapter
 // ---------------------------------------------------------------------------
@@ -487,19 +565,29 @@ pub fn audit_disconnect(ip: IpAddr, port: u16, duration: Duration, outcome: Outc
 /// the single-process server path. Constructed via [`AuthGuardHandler::from_env`].
 pub struct AuthGuardHandler {
     core: AuthGuardCore,
+    /// The most recently accepted peer, stashed in `on_accept` so `on_authenticated`
+    /// (whose vendored hook takes no peer) can correlate the auth event. Reliable
+    /// because the single-process accept loop is serial — `on_accept` always runs
+    /// immediately before the connection it belongs to.
+    last_peer: Option<std::net::SocketAddr>,
 }
 
 impl AuthGuardHandler {
     /// Build the boxed handler, or `None` when the guard is disabled (so the
     /// builder gets `None` and the vendored default accept-all path runs).
     pub fn from_env() -> Option<Box<dyn ironrdp_server::ConnectionHandler>> {
-        AuthGuardCore::from_env()
-            .map(|core| Box::new(Self { core }) as Box<dyn ironrdp_server::ConnectionHandler>)
+        AuthGuardCore::from_env().map(|core| {
+            Box::new(Self {
+                core,
+                last_peer: None,
+            }) as Box<dyn ironrdp_server::ConnectionHandler>
+        })
     }
 }
 
 impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
     fn on_accept(&mut self, peer: std::net::SocketAddr) -> bool {
+        self.last_peer = Some(peer);
         match self.core.decide(Instant::now(), peer.ip()) {
             Decision::Accept => {
                 audit_accept(peer.ip(), peer.port());
@@ -509,6 +597,14 @@ impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
                 audit_reject(peer.ip(), reject);
                 false
             }
+        }
+    }
+
+    fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
+        // `last_peer` is always set here in single-process operation (on_accept
+        // precedes the connection); guard defensively rather than assume it.
+        if let Some(peer) = self.last_peer {
+            audit_auth(peer.ip(), peer.port(), success, reason);
         }
     }
 
@@ -808,5 +904,121 @@ mod tests {
         for _ in 0..1000 {
             assert_eq!(c.decide(t0, peer), Decision::Accept);
         }
+    }
+
+    #[test]
+    fn bound_reason_caps_and_defaults() {
+        assert_eq!(bound_reason(None), "unknown");
+        assert_eq!(bound_reason(Some("logon denied")), "logon denied");
+        // Over-long ASCII truncates to the cap.
+        let long = "x".repeat(500);
+        assert_eq!(bound_reason(Some(&long)).chars().count(), MAX_AUDIT_REASON);
+        // Truncation lands on a char boundary (multi-byte input, no panic).
+        let multibyte = "é".repeat(500);
+        assert_eq!(
+            bound_reason(Some(&multibyte)).chars().count(),
+            MAX_AUDIT_REASON
+        );
+    }
+
+    #[test]
+    fn bound_reason_length_boundary() {
+        // Exactly at the cap: unchanged, still MAX chars.
+        let at = "a".repeat(MAX_AUDIT_REASON);
+        assert_eq!(bound_reason(Some(&at)), at.as_str());
+        // One over: truncated to the cap.
+        let over = "a".repeat(MAX_AUDIT_REASON + 1);
+        assert_eq!(bound_reason(Some(&over)).chars().count(), MAX_AUDIT_REASON);
+        // A control char past the cap is truncated away; the output has none, and
+        // truncation never panics on a char boundary.
+        let mut long = "a".repeat(MAX_AUDIT_REASON + 50);
+        long.push('\n');
+        let out = bound_reason(Some(&long));
+        assert_eq!(out.chars().count(), MAX_AUDIT_REASON);
+        assert!(!out.chars().any(|c| c.is_control()));
+    }
+
+    #[test]
+    fn bound_reason_strips_control_chars_log_injection() {
+        // A newline/CR/tab in the (untrusted) error string must not survive into
+        // the log — otherwise it could forge/split an audit line in the logfmt
+        // sink. Each control char becomes a space; the field stays single-line.
+        assert_eq!(
+            bound_reason(Some("logon denied\n2026 INFO forged event=\"auth\"")),
+            "logon denied 2026 INFO forged event=\"auth\""
+        );
+        assert_eq!(bound_reason(Some("a\r\n\tb")), "a   b");
+        // ANSI ESC (0x1b) is a control char → neutralized.
+        assert_eq!(bound_reason(Some("x\u{1b}[31mred")), "x [31mred");
+        // The sanitized result contains no control characters at all.
+        let cleaned = bound_reason(Some("m\u{0}i\u{7}x\u{1b}ed\nline"));
+        assert!(!cleaned.chars().any(|c| c.is_control()));
+    }
+
+    /// A cloneable `MakeWriter` that captures emitted log lines into a shared
+    /// buffer, so we can assert the auth audit event's fields.
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn on_authenticated_emits_auth_audit_event() {
+        use ironrdp_server::ConnectionHandler;
+
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+
+        let peer = std::net::SocketAddr::from((Ipv4Addr::new(203, 0, 113, 5), 51000));
+        tracing::subscriber::with_default(subscriber, || {
+            let mut handler = AuthGuardHandler {
+                core: AuthGuardCore::with_config(test_cfg()),
+                last_peer: None,
+            };
+            // on_accept stashes the peer for on_authenticated to correlate.
+            assert!(handler.on_accept(peer));
+            handler.on_authenticated(true, None);
+            handler.on_authenticated(false, Some("logon denied"));
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        // Success event, correlated to the accepted peer.
+        assert!(out.contains("event=\"auth\""), "no auth event:\n{out}");
+        assert!(out.contains("outcome=\"success\""), "{out}");
+        assert!(out.contains("src_ip=203.0.113.5"), "{out}");
+        assert!(out.contains("src_port=51000"), "{out}");
+        // Failure event carries the (bounded) reason.
+        assert!(out.contains("outcome=\"did_not_complete\""), "{out}");
+        assert!(out.contains("reason=logon denied"), "{out}");
+    }
+
+    #[test]
+    fn on_authenticated_without_accept_does_not_panic() {
+        use ironrdp_server::ConnectionHandler;
+        let mut handler = AuthGuardHandler {
+            core: AuthGuardCore::with_config(test_cfg()),
+            last_peer: None,
+        };
+        // No preceding on_accept → last_peer is None; must be a graceful no-op.
+        handler.on_authenticated(true, None);
+        handler.on_authenticated(false, Some("x"));
     }
 }

@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(17)/(18) below are upstreamed
 AND released — #1276 landing is NOT sufficient.
 
 (1) The original "keep newest queued waves on per-batch overflow"
@@ -1342,3 +1342,31 @@ AND released — #1276 landing is NOT sufficient.
     Windows App client, whose fine-grained ±1..±3 deltas exposed it; mstsc's
     whole ±120 notches masked it. Delete once ironrdp-pdu's decode is fixed
     upstream and the pin moves past it.
+
+(18) ConnectionHandler auth-outcome hook (NOT upstreamed; added 2026-07-10).
+    Adds `fn on_authenticated(&mut self, success: bool, reason: Option<&str>)`
+    (default no-op) to the `ConnectionHandler` trait, and calls it in
+    `run_connection` around the Hybrid/CredSSP `accept_credssp` — `Ok` →
+    `on_authenticated(true, None)`, `Err(e)` → `on_authenticated(false,
+    Some(&e.to_string()))` then propagate the error unchanged (`auth_result?`).
+    macrdp is **always** Hybrid + always sets the static credential, so this
+    runs on every connection and `Ok` = the client's NTLM response validated
+    (unambiguous); `Err` = auth did not complete (dominated by bad
+    credentials, but also a client abort or a rare post-TLS mid-CredSSP
+    transport error), so the hook carries the error string as a `reason` for a
+    SOC to distinguish logon-denied from a reset. The call fires exactly once
+    per TCP connection (reactivation reuses the connection, no re-auth) and is
+    ordered AFTER `mark_security_upgrade_as_done()`, so a pre-TLS nego blip
+    (mstsc's cert-prompt broken pipe) can't false-fire a failure. The `pub_key`
+    is cloned out of `self.opts.security` before the call so the
+    `self.connection_handler.as_mut()` borrow is disjoint. macrdp's
+    `AuthGuardHandler` implements it → an explicit `event="auth"` audit record
+    on the SIEM JSON stream (`src/auth_guard.rs::audit_auth`), replacing the
+    connection-duration inference for the login verdict. Additive +
+    upstreamable (an auth-lifecycle hook is generally useful — metrics, audit,
+    fail2ban); offer it upstream as an `on_authenticated` (or a
+    `credential_validator`-shaped) hook. **Scope:** single-process only — under
+    `--fork-workers` the verdict happens in a worker running with
+    `connection_handler = None`, so the hook doesn't fire there (fork-workers
+    keeps its exit-code-derived accept/disconnect audit); documented as a v1
+    boundary.

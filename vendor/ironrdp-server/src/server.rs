@@ -87,6 +87,16 @@ pub trait ConnectionHandler: Send {
         let _ = (peer, duration, error);
         PostConnectionAction::Continue
     }
+
+    /// Called once per connection after the CredSSP/NLA exchange resolves (only
+    /// under Hybrid security). `success` is whether the client's credentials
+    /// validated; `reason` is a short error description when they did not (auth
+    /// did not complete — dominated by bad credentials, but also a client abort
+    /// or a mid-exchange transport error). Correlate with [`Self::on_accept`],
+    /// which runs immediately before, for the peer. Default: no-op.
+    fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
+        let _ = (success, reason);
+    }
 }
 
 #[derive(Clone)]
@@ -1140,21 +1150,43 @@ impl RdpServer {
 
                 acceptor.mark_security_upgrade_as_done();
 
-                if let RdpServerSecurity::Hybrid((_, pub_key)) = &self.opts.security {
+                // Clone the public key out of self.opts first, so the auth-outcome
+                // hook below can borrow self.connection_handler without a conflict
+                // (the `if let` borrow of self.opts.security would otherwise live
+                // to the end of the block).
+                let hybrid_pub_key = match &self.opts.security {
+                    RdpServerSecurity::Hybrid((_, pub_key)) => Some(pub_key.clone()),
+                    _ => None,
+                };
+                if let Some(pub_key) = hybrid_pub_key {
                     // Generic streams don't expose peer address. Use a neutral
                     // placeholder; it's unclear whether CredSSP/NTLM actually
                     // uses this value in practice.
                     let client_name = "rdp-client".to_owned();
 
-                    ironrdp_acceptor::accept_credssp(
+                    let auth_result = ironrdp_acceptor::accept_credssp(
                         &mut framed,
                         &mut acceptor,
                         &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
                         client_name.into(),
-                        pub_key.clone(),
+                        pub_key,
                         None,
                     )
-                    .await?;
+                    .await;
+
+                    // (vendored, divergence 18) Report the CredSSP/NLA verdict to the
+                    // connection handler once per connection: Ok = credentials
+                    // validated, Err = auth did not complete (dominated by bad
+                    // credentials). Reactivation reuses the connection and does not
+                    // re-run accept_credssp, so this fires exactly once per login.
+                    if let Some(handler) = self.connection_handler.as_mut() {
+                        match &auth_result {
+                            Ok(()) => handler.on_authenticated(true, None),
+                            Err(e) => handler.on_authenticated(false, Some(&e.to_string())),
+                        }
+                    }
+
+                    auth_result?;
                 }
 
                 let framed = self.accept_finalize(framed, acceptor).await?;

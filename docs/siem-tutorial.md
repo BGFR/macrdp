@@ -1,12 +1,17 @@
-# Tutorial: forward the macrdp audit stream to a SIEM (OpenSearch)
+# Tutorial: forward the macrdp audit stream to a SIEM (OpenSearch, or lighter Grafana + Loki)
 
 A complete, copy-paste walkthrough that stands up a real open-source SIEM on your Mac and
 detects an RDP brute-force against macrdp — end to end, in about 15 minutes.
 
-It uses **[OpenSearch]** + **OpenSearch Dashboards** (the Apache-2.0 fork of Elasticsearch /
-Kibana). OpenSearch ships a bundled **Security Analytics** plugin — a genuine SIEM with
-Sigma-based detection rules, findings, and alerts — so this is "forward to a SIEM," not just
-"ship logs to a search box." Everything here is free, self-hosted, and runs on one laptop.
+The main path uses **[OpenSearch]** + **OpenSearch Dashboards** (the Apache-2.0 fork of
+Elasticsearch / Kibana). OpenSearch ships a bundled **Security Analytics** plugin — a genuine
+SIEM with Sigma-based detection rules, findings, and alerts — so this is "forward to a SIEM,"
+not just "ship logs to a search box." Everything here is free, self-hosted, and runs on one
+laptop.
+
+> **Want a lighter box?** A fully worked **[Grafana + Loki variant](#lighter-alternative-grafana--loki)**
+> (≈⅓–½ the RAM, LogQL + Grafana Alerting) is at the end — it reuses Step 1 and swaps only the
+> backend. Both variants were validated end-to-end against live stacks.
 
 ```
  macrdp  ──(--audit-file)──▶  ~/Library/Logs/macrdp-audit.log
@@ -390,13 +395,185 @@ touches real traffic:
 - **Schema-version your rules.** Key detections off `schema_version` — it only bumps on a
   breaking field change, so a rule pinned to `schema_version: 1` won't silently mis-parse a
   future format.
+- **(Grafana + Loki variant)** Turn **off** `GF_AUTH_ANONYMOUS_ENABLED` and set a real admin
+  password / OAuth on Grafana, put TLS + auth in front of Loki's push and query endpoints (they
+  are unauthenticated in the demo), and switch the collector's Loki output to `https` with
+  credentials. The off-loopback-bind and collector-as-a-service points above apply identically.
+
+## Lighter alternative: Grafana + Loki
+
+Prefer the smallest possible footprint? **Grafana + Loki** runs the same end-to-end pipeline in
+roughly **a third to a half of the RAM** — both are Go (no JVM), and Loki indexes only stream
+*labels*, not the log body (no full-text index). The trade-off: it's a **log platform with
+alerting**, not a Sigma-rule SIEM — you query with **LogQL** and detect with **Grafana
+Alerting** instead of Security Analytics detectors/findings. For the low-volume, structured
+macrdp audit stream it's an excellent fit. (This is the validated, concrete version of
+[Adapting to a different SIEM](#adapting-to-a-different-siem) below.)
+
+**Reuse Step 1 unchanged** — macrdp writing the JSON audit file. Everything here replaces
+Steps 2–6.
+
+### L1 — Stand up Loki + Grafana
+
+```bash
+mkdir -p ~/macrdp-loki && cd ~/macrdp-loki
+```
+
+`~/macrdp-loki/docker-compose.yml`:
+
+```yaml
+services:
+  loki:
+    image: grafana/loki:3.2.1
+    container_name: macrdp-loki
+    command: -config.file=/etc/loki/local-config.yaml   # the image's built-in single-node config
+    ports: ["3100:3100"]
+    networks: [obs]
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: macrdp-grafana
+    environment:
+      # Demo-only: anonymous Admin, no login. See hardening before real use.
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    ports: ["3000:3000"]
+    volumes:
+      - ./grafana-datasource.yaml:/etc/grafana/provisioning/datasources/loki.yaml:ro
+    depends_on: [loki]
+    networks: [obs]
+networks:
+  obs:
+```
+
+`~/macrdp-loki/grafana-datasource.yaml` (auto-adds the Loki datasource, so you skip the click):
+
+```yaml
+apiVersion: 1
+datasources:
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: true
+```
+
+Bring it up — it's ready in **seconds**, not the minute-plus OpenSearch needs:
+
+```bash
+docker compose up -d
+until [ "$(curl -s http://localhost:3100/ready)" = "ready" ]; do sleep 2; done; echo "loki ready"
+```
+
+Grafana is at **http://localhost:3000** with **anonymous Admin** — no login (demo-only). Loki
+has no UI of its own; you query it through Grafana.
+
+### L2 — Ship events with Fluent Bit → Loki
+
+Reuse the **same native Fluent Bit** from [Step 3](#step-3--ship-events-with-fluent-bit) — only
+the output changes. Copy that `fluent-bit.conf` (its `[SERVICE]`/`[INPUT]`/parser are identical)
+and replace the `[OUTPUT]` block with Loki:
+
+```ini
+[OUTPUT]
+    Name        loki
+    Match       macrdp.audit
+    Host        localhost
+    Port        3100
+    Labels      job=macrdp-audit
+    Line_format json
+```
+
+Keep the JSON fields (`src_ip`, `outcome`, …) **inside the log line** and use just one
+**low-cardinality** stream label (`job`) — Loki labels must be low-cardinality, so making
+`src_ip` a label would explode the stream count. You'll pull `src_ip` out of the line at query
+time with LogQL `| json`. Run it and confirm ingestion:
+
+```bash
+cd ~/macrdp-loki && fluent-bit -c fluent-bit.conf   # in its own terminal
+curl -sG http://localhost:3100/loki/api/v1/query_range \
+  --data-urlencode 'query={job="macrdp-audit"}' --data-urlencode 'limit=3' | python3 -m json.tool | head -30
+```
+
+### L3 — Explore in Grafana
+
+Open Grafana → **Explore** → the **Loki** datasource, and query with **LogQL**:
+
+- All audit events: `{job="macrdp-audit"} | json`
+- Just auth failures: `{job="macrdp-audit"} | json | event="auth" | outcome="did_not_complete"`
+
+(`| json` parses the JSON line so you can filter on `event`, `outcome`, `src_ip`, etc. Loki 3.x
+also auto-attaches `detected_level` / `service_name` labels — harmless.)
+
+![Grafana Explore with the Loki datasource — the LogQL query {job="macrdp-audit"} | json | event="auth" | outcome="did_not_complete", a logs-volume histogram, and the parsed macrdp audit failure log lines with their fields](images/siem-loki-explore.png)
+
+### L4 — Alert on the brute-force (Grafana Alerting)
+
+**Alerting → Alert rules → New alert rule**. Give it a **Loki** query with this metric LogQL —
+the LogQL equivalent of the Sigma aggregation rule:
+
+```logql
+sum by (src_ip) (count_over_time({job="macrdp-audit"} | json | event="auth" | outcome="did_not_complete" [5m]))
+```
+
+- **Condition**: `IS ABOVE 5` — fires per `src_ip` with more than 5 failures in 5 minutes.
+- **Evaluation**: every `1m`, `for: 0s` (fire on the first breach). Pick a folder + evaluation
+  group, name it `macrdp brute force`. A contact point (email/Slack/webhook) is optional; the
+  rule shows under **Alerting → Alert rules** regardless.
+
+Running that same metric query in Explore shows the per-`src_ip` failure count spiking past the
+threshold during the burst — the value the alert condition tests:
+
+![Grafana Explore graph of the metric LogQL sum by (src_ip) count_over_time(...[5m]) — the series {src_ip="127.0.0.1"} spikes to 8, above the alert's "IS ABOVE 5" threshold](images/siem-loki-detection.png)
+
+### L5 — Trigger it
+
+Create the alert rule **first** (Grafana, like any alerting engine, only evaluates data that
+arrives after the rule exists), then fire the same burst as Step 6:
+
+```bash
+for i in $(seq 1 8); do
+  sdl-freerdp /v:127.0.0.1:3390 /u:audittest /p:'WRONG-PASSWORD' \
+    /cert:ignore +auth-only /log-level:ERROR
+done
+```
+
+Watch **Alerting → Alert rules** flip `macrdp brute force` to **Pending → Firing** (one series
+per offending `src_ip`), while **Explore** shows the underlying failures. Same detection as the
+OpenSearch path, on a fraction of the resources.
+
+You can confirm the detection logic straight from Loki's API, no UI needed (the same query the
+alert runs):
+
+```bash
+curl -sG http://localhost:3100/loki/api/v1/query --data-urlencode \
+  'query=sum by (src_ip) (count_over_time({job="macrdp-audit"} | json | event="auth" | outcome="did_not_complete" [5m]))'
+```
+
+Any `src_ip` whose value is above 5 is one the alert fires on.
+
+### Cleanup
+
+```bash
+# Ctrl-C Fluent Bit + macrdp, then:
+cd ~/macrdp-loki && docker compose down -v
+```
+
+### OpenSearch or Loki — which?
+
+- **OpenSearch + Security Analytics** — a genuine SIEM: Sigma detection rules, a rule library,
+  findings, correlation. Heavier (~2 GB+). Pick it when you want real SIEM workflows.
+- **Grafana + Loki** — lightest (~400 MB–1 GB), LogQL + Grafana Alerting, and doubles as your
+  observability stack. Pick it for a small footprint or if you already run Grafana.
+
+Both ingest the identical macrdp audit stream — the macrdp side never changes.
 
 ## Adapting to a different SIEM
 
 The macrdp side never changes — it's just a JSON file. Swap **Step 3's Fluent Bit output** (or
 use Vector / rsyslog instead) for your SIEM's sink; [`siem-forwarding.md`](siem-forwarding.md)
 has Splunk-HEC / Elasticsearch / syslog examples. Everything upstream of the collector is
-identical.
+identical. The [Grafana + Loki section](#lighter-alternative-grafana--loki) above is a fully
+worked, validated example of exactly this swap.
 
 ## See also
 

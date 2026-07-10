@@ -60,6 +60,16 @@ static inline BOOL msg_no_response(const IOUSBHostCIMessage *m) {
     return (m->control & IOUSBHostCIMessageControlNoResponse) != 0;
 }
 
+// Monotonic nanoseconds (for observing isoch service cadence). Cheap; the
+// timebase is cached after the first call.
+static inline uint64_t macrdp_now_ns(void) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) {
+        mach_timebase_info(&tb);
+    }
+    return mach_absolute_time() * tb.numer / tb.denom;
+}
+
 // USB standard request / descriptor-type constants.
 enum {
     kUsbDirDeviceToHost   = 0x80,
@@ -72,7 +82,34 @@ enum {
     kUsbDescDevice        = 0x01,
     kUsbDescConfiguration = 0x02,
     kUsbDescString        = 0x03,
+    kUsbDescEndpoint      = 0x05,
+    kUsbEpTypeMask        = 0x03, // bmAttributes bits 1:0 (0=ctrl,1=isoch,2=bulk,3=intr)
+    kUsbEpTypeIsoch       = 0x01,
 };
+
+// Read an endpoint descriptor's transfer-type bits from the descriptor pointer a
+// UserHCI EndpointCreate command hands us (data1). It may point at a single
+// ENDPOINT descriptor or a synthetic container of descriptors, so scan bounded for
+// the first ENDPOINT (0x05) and return its bmAttributes&0x03; -1 if none/invalid.
+// Observe-only helper (isoch go/no-go) — bounded so a bad pointer can't run away.
+static int macrdp_ep_transfer_type(uint64_t descAddr) {
+    const uint8_t *p = (const uint8_t *)(uintptr_t)descAddr;
+    if (p == NULL) {
+        return -1;
+    }
+    for (int i = 0; i < 32; i++) {
+        uint8_t bLength = p[0];
+        uint8_t bType = p[1];
+        if (bLength < 2) {
+            return -1; // malformed / terminator
+        }
+        if (bType == kUsbDescEndpoint) {
+            return bLength >= 4 ? (p[3] & kUsbEpTypeMask) : -1;
+        }
+        p += bLength; // next descriptor in the container
+    }
+    return -1;
+}
 
 static const NSUInteger kSyntheticDeviceAddress = 1;
 
@@ -151,6 +188,9 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *pendingByEndpoint;
 // endpoint key -> bulk-IN read-ahead stream state (streaming endpoints only)
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, MacrdpBulkStream *> *bulkStreams;
+// M0 isoch observe-only: endpoint key -> TRB count / last-service ns (cadence).
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *isochCount;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *isochLastNs;
 // prefetch-read token -> its (endpoint, seq); routed AHEAD of tokenMap on completion
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, MacrdpPrefetchRead *> *prefetchReads;
 // target concurrent client reads per streaming endpoint (MACRDP_USB_PREFETCH_DEPTH)
@@ -178,6 +218,8 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         _tokenMap = [NSMutableDictionary dictionary];
         _pendingByEndpoint = [NSMutableDictionary dictionary];
         _bulkStreams = [NSMutableDictionary dictionary];
+        _isochCount = [NSMutableDictionary dictionary];
+        _isochLastNs = [NSMutableDictionary dictionary];
         _prefetchReads = [NSMutableDictionary dictionary];
         const char *pd = getenv("MACRDP_USB_PREFETCH_DEPTH");
         _prefetchDepth = pd ? atoi(pd) : 4;
@@ -348,8 +390,14 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         }
         NSNumber *key = [self endpointKeyForDevice:ep.deviceAddress endpoint:ep.endpointAddress];
         self.endpoints[key] = ep;
-        NSLog(@"[usb2] endpoint created dev=%lu ep=0x%02lx state=%ld",
-              (unsigned long)ep.deviceAddress, (unsigned long)ep.endpointAddress, (long)ep.endpointState);
+        // M0 isoch observe-only: note whether this is an isochronous endpoint so a
+        // later 0x3b TRB is expected (not "unexpected"). Detection only — no path change.
+        uint64_t descAddr = (command->data1 & IOUSBHostCIEndpointCreateCommandData1Descriptor)
+                          >> IOUSBHostCIEndpointCreateCommandData1DescriptorPhase;
+        int epType = macrdp_ep_transfer_type(descAddr);
+        NSLog(@"[usb2] endpoint created dev=%lu ep=0x%02lx state=%ld type=%d%@",
+              (unsigned long)ep.deviceAddress, (unsigned long)ep.endpointAddress, (long)ep.endpointState,
+              epType, epType == kUsbEpTypeIsoch ? @" (ISOCHRONOUS)" : @"");
         return;
     }
 
@@ -380,6 +428,9 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         // Drop any bulk-IN read-ahead state — its pendingHead msg + in-flight
         // reads point into the ring being destroyed.
         [self tearDownStream:key];
+        // Drop M0 isoch observe counters for this endpoint.
+        [self.isochCount removeObjectForKey:key];
+        [self.isochLastNs removeObjectForKey:key];
     }
     NSLog(@"[usb2] endpoint cmd type=0x%02x dev=%lu ep=0x%02lx state=%ld",
           type, (unsigned long)addr, (unsigned long)epAddr, (long)ep.endpointState);
@@ -894,6 +945,36 @@ static const uint32_t kStreamMinReadLen = 512;
     [self.prefetchReads removeObjectsForKeys:orphans];
 }
 
+// M0 isoch observe-only: record + log an isochronous TRB's shape and the service
+// cadence macOS maintains, WITHOUT forwarding it to the client. Answers the
+// go/no-go question "does macOS submit forwardable isoch TRBs to our virtual
+// controller, and at what rate/depth?" before we build the isoch forward path.
+- (void)observeIsochTransfer:(const IOUSBHostCIMessage *)msg
+                 endpointKey:(NSNumber *)key
+                          ep:(IOUSBHostCIEndpointStateMachine *)ep {
+    uint32_t frame = (uint32_t)((msg->control & IOUSBHostCIIsochronousTransferControlFrameNumber)
+                                >> IOUSBHostCIIsochronousTransferControlFrameNumberPhase);
+    BOOL asap = (msg->control & IOUSBHostCIIsochronousTransferControlASAP) != 0;
+    NSUInteger len = (msg->data0 & IOUSBHostCIIsochronousTransferData0Length)
+                   >> IOUSBHostCIIsochronousTransferData0LengthPhase;
+    uint64_t buf = msg->data1 & IOUSBHostCIIsochronousTransferData1Buffer;
+
+    uint64_t nowNs = macrdp_now_ns();
+    uint64_t count = self.isochCount[key].unsignedLongLongValue;
+    NSNumber *lastNsObj = self.isochLastNs[key];
+    self.isochCount[key] = @(count + 1);
+    self.isochLastNs[key] = @(nowNs);
+
+    // Full detail for the first 32 TRBs (shape + cadence), then a throttled summary
+    // every 256th so a steady stream doesn't flood the log.
+    if (count < 32 || (count % 256) == 0) {
+        double gapMs = lastNsObj ? (double)(nowNs - lastNsObj.unsignedLongLongValue) / 1.0e6 : 0.0;
+        NSLog(@"[usb2] ISOCH observe ep=0x%02lx trb#=%llu frame=%u asap=%d len=%lu buf=0x%llx gap=%.3fms (NOT forwarded — M0 go/no-go)",
+              (unsigned long)([key unsignedIntegerValue] & 0xff), count, frame, asap ? 1 : 0,
+              (unsigned long)len, buf, gapMs);
+    }
+}
+
 // Walk an endpoint's transfer ring, completing sync stages inline and stopping at
 // the first stage that must be forwarded to the client (which is raised async and
 // re-enters this walk from its completion). Runs on the serial queue.
@@ -941,6 +1022,21 @@ static const uint32_t kStreamMinReadLen = 512;
             }
             NSLog(@"[usb2] ring head already outstanding — skipping re-raise (double-buffered)");
             return;
+        }
+        // M0 isoch observe-only: an isochronous TRB (type 0x3b) is NOT forwarded
+        // yet — log its shape/cadence and complete it as a zero-length success so
+        // the ring advances and we can watch how macOS schedules the stream. This
+        // is the go/no-go gate before building the isoch forward path (M1).
+        if (msg_type(msg) == IOUSBHostCIMessageTypeIsochronousTransfer) {
+            [self observeIsochTransfer:msg endpointKey:key ep:ep];
+            if (![ep enqueueTransferCompletionForMessage:msg
+                                                 status:IOUSBHostCIMessageStatusSuccess
+                                         transferLength:0
+                                                  error:&e]) {
+                NSLog(@"[usb2] isoch observe enqueueTransferCompletion failed: %@", e);
+                break;
+            }
+            continue; // ring advanced; keep walking queued isoch TRBs
         }
         if ([self transferIsForwardedControlIn:msg endpointKey:key]) {
             [self raiseControlIn:msg endpointKey:key];

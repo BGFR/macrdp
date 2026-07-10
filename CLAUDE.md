@@ -19,7 +19,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.32** (the security-hardening release — a
+(VPN/ZeroTier). **Latest release: v0.8.33** (the audit-forwarding release — a
+SIEM/SOC observability roll-up over v0.8.32, no change to the default runtime
+path; everything here is opt-in + default-off and byte-identical when off. **Opt-in
+structured JSON audit stream** (`--audit-file` / `MACRDP_AUDIT_JSON=1`, config
+`AUDIT_FILE`): the per-connection `macrdp::audit` events (accept / reject / auth /
+disconnect, with source IP+port, reason, outcome) are also written as one
+schema-versioned JSON object per line on a dedicated self-rotating file for a
+standard log collector (Vector / Fluent Bit / rsyslog / Splunk UF) to tail and
+forward to a SIEM — macrdp deliberately does **not** speak network syslog (the
+collector owns TLS/buffering/backpressure; macOS has no syslogd). The
+human-readable `macrdp.log` audit lines are unchanged; the JSON file is an
+additional sink, emitted **independent of `RUST_LOG`** (a `Targets` filter pins
+`macrdp::audit=INFO`) so a quiet operational filter never suppresses security
+events. New explicit **`event="auth"` login verdict** (`outcome="success"` when
+CredSSP/NLA validates, else `"did_not_complete"` + a short `reason`), emitted once
+per connection **after** the TLS upgrade — single-process path — so a SOC sees the
+real authentication result instead of inferring it from the connection-duration
+heuristic (under `--fork-workers` the accept/disconnect audit is unchanged but no
+`auth` event fires). The audit `reason` is **control-char-stripped** (log-injection
+defense for the human-readable logfmt sink, which writes fields verbatim; the JSON
+sink was already serde-safe) and length-bounded, never carrying credential
+material. New `docs/audit-log.md` (per-event/-field interpretation guide with
+worked examples) + `docs/siem-forwarding.md` (collector configs). An **end-to-end
+CI job** drives a real FreeRDP `+auth-only` CredSSP handshake (correct + wrong
+password) against a loopback server and asserts the JSON audit writes
+(`scripts/test-audit-log.sh`) — a `cargo test` can't drive CredSSP (the harness is
+TLS-only). Also lands inert isoch-USB observe-only groundwork (no functional
+change).) Earlier: **v0.8.32** (the security-hardening release — a
 security-focused roll-up over v0.8.31, no change to the default runtime path.
 **Fuzzed the network-facing protocol decoders** with new in-tree `cargo-fuzz`
 harnesses: `ironrdp-rdpeudp` (raw-UDP multitransport) came through ~250M execs

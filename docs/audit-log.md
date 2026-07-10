@@ -192,6 +192,16 @@ out or treat them as low signal in a SOC.
   upgrades; key alerts off `schema_version` so an additive field never breaks a
   parser.
 
+## Verifying it locally
+
+[`scripts/test-audit-log.sh`](../scripts/test-audit-log.sh) exercises the whole
+path end-to-end with no real password and no GUI: it starts a loopback macrdp
+(`--skip-auth` against a throwaway credential), drives one correct- and one
+wrong-password `sdl-freerdp +auth-only` connection, and asserts the JSON audit
+stream recorded `auth` `success` / `did_not_complete` (with a clean `reason`) plus
+the `accept`/`disconnect` correlation. Needs `sdl-freerdp` (`brew install
+freerdp`); exit 0 = pass.
+
 ## See also
 - [`siem-forwarding.md`](siem-forwarding.md) — forwarding the JSON stream to a SIEM (Vector / Fluent Bit / rsyslog).
 - [`configuration.md`](configuration.md) — `--audit-file`, `MACRDP_AUDIT_*`, and the connection-guard thresholds.

@@ -9,6 +9,10 @@ line** — a stable, versioned contract a log collector can tail and forward to 
 > normal session, a wrong password, a brute-force lockout, etc.), see the
 > companion [`audit-log.md`](audit-log.md). This page is about getting the stream
 > off-box.
+>
+> Want a runnable end-to-end example? [`siem-tutorial.md`](siem-tutorial.md) stands up a real
+> open-source SIEM (OpenSearch) on your Mac and detects an RDP brute-force against macrdp,
+> copy-paste, in ~15 minutes.
 
 macrdp deliberately does **not** speak network syslog itself. Getting logs off-box reliably
 (TLS, buffering, reconnect, backpressure) is a solved problem owned by collector agents; a

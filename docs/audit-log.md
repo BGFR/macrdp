@@ -204,4 +204,5 @@ freerdp`); exit 0 = pass.
 
 ## See also
 - [`siem-forwarding.md`](siem-forwarding.md) — forwarding the JSON stream to a SIEM (Vector / Fluent Bit / rsyslog).
+- [`siem-tutorial.md`](siem-tutorial.md) — a runnable end-to-end walkthrough: OpenSearch SIEM on your Mac detecting an RDP brute-force.
 - [`configuration.md`](configuration.md) — `--audit-file`, `MACRDP_AUDIT_*`, and the connection-guard thresholds.

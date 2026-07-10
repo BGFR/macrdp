@@ -184,6 +184,12 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           headless (e.g. under the LaunchAgent), or stdout when
                           interactive. Size-bounded; see MACRDP_LOG_MAX_BYTES /
                           MACRDP_LOG_MAX_FILES below. Config: LOG_DIR.
+--audit-file PATH         Additionally write the security audit events (connection
+                          accept/reject/disconnect) to PATH as JSON lines for a
+                          SIEM/SOC log collector. OFF by default; audit lines still
+                          appear in macrdp.log. Self-rotating. MACRDP_AUDIT_JSON=1
+                          enables it at the default <log-dir>/macrdp-audit.log.
+                          Config: AUDIT_FILE. See docs/siem-forwarding.md.
 --virtual-display         Serve a headless virtual display at --width × --height
                           instead of mirroring the primary panel — local screen
                           stays untouched. Requires --width and --height.
@@ -269,11 +275,24 @@ the fail-fast window (~3s, i.e. never authenticated) counts as a failure, so a r
 real client (mstsc reconnect-blank, flaky link) and a single benign disconnect (mstsc's
 first-connect cert-prompt "Broken pipe") never lock you out. Audit lines are
 tagged `macrdp::audit`: `grep 'macrdp::audit' ~/Library/Logs/macrdp.log` shows
-`event="accept|reject|disconnect"` with the source IP and (for rejects) the reason and
-retry-after.
+`event="accept|reject|disconnect"` with `src_ip`/`src_port`, and (for rejects) the reason and
+retry-after. **Upgrade note:** these human-readable audit fields were renamed for a stable
+schema — `ip`→`src_ip`, `port`→`src_port`, plus new `schema_version`/`macrdp_version`/`host` —
+so re-point any parser you run against the `macrdp.log` audit lines (the structured JSON stream
+below is the intended parse target going forward).
+
+**For a SIEM/SOC**, point `--audit-file` (or `MACRDP_AUDIT_JSON=1`) at a dedicated file to
+get those same audit events as structured **JSON lines** (with a versioned `schema_version`,
+`src_ip`/`src_port`, `event`, `reason`, `outcome`, …) on their own self-rotating stream — the
+format a log collector (Vector / Fluent Bit / rsyslog / Splunk UF / Elastic Agent) tails and
+forwards. The JSON stream is emitted independent of `RUST_LOG`, so a quiet operational filter
+never suppresses security events. macOS ships no first-class network-syslog daemon (unified
+logging replaced it), so a collector agent is the supported path off-box. Full schema +
+copy-paste collector configs: **`docs/siem-forwarding.md`**.
 
 (Log rotation is likewise env-tunable: `MACRDP_LOG_MAX_BYTES` (default 10 MiB) and
-`MACRDP_LOG_MAX_FILES` (default 5); see `--log-dir`.)
+`MACRDP_LOG_MAX_FILES` (default 5); see `--log-dir`. The audit file has its own
+`MACRDP_AUDIT_LOG_MAX_BYTES` / `MACRDP_AUDIT_LOG_MAX_FILES`.)
 
 ### Blank recovery + auto-reconnect (on by default with `--enable-h264`)
 

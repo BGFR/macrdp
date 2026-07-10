@@ -283,6 +283,19 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   dropping the oldest. Tunables: MACRDP_LOG_MAX_BYTES
                           #   (default 10 MiB), MACRDP_LOG_MAX_FILES (default 5).
                           #   Config key: LOG_DIR.
+--audit-file PATH         # Additionally write the security AUDIT events
+                          #   (connection accept/reject/disconnect, with source
+                          #   IP+port, reason, outcome) to PATH as one JSON object
+                          #   per line, for a SIEM/SOC log collector (Vector /
+                          #   Fluent Bit / rsyslog / Splunk UF) to tail + forward.
+                          #   OFF by default; the human-readable audit lines still
+                          #   appear in macrdp.log unchanged. Self-rotating
+                          #   (MACRDP_AUDIT_LOG_MAX_BYTES / _MAX_FILES, same
+                          #   defaults as the main log). MACRDP_AUDIT_JSON=1 enables
+                          #   it at the default <log-dir>/macrdp-audit.log without
+                          #   naming a file. AUDIT_LOG=1 (default) still gates
+                          #   whether the events emit at all. Config key: AUDIT_FILE.
+                          #   Schema + collector configs: docs/siem-forwarding.md.
 ```
 
 Auth hardening (env-only, **on by default**). macrdp rate-limits and briefly

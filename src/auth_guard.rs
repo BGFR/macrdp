@@ -46,6 +46,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Hard cap on distinct tracked IPs, to bound memory under a spoofed-source-IP
@@ -368,6 +369,39 @@ fn escalated_cooldown(n: u32, threshold: u32, base: Duration, max: Duration) -> 
 // Audit log
 // ---------------------------------------------------------------------------
 
+/// Version of the audit-event **field schema** (the `macrdp::audit` records). It
+/// is stamped on every audit line so a SIEM/collector can pin a stable contract;
+/// **bump it only on a breaking field change** (a rename/removal/semantic shift),
+/// not for additive fields. See `docs/siem-forwarding.md`.
+pub const AUDIT_SCHEMA_VERSION: u32 = 1;
+
+/// The host's name, cached once, for the audit records (so the JSON stream is
+/// self-describing even before a collector adds its own host field). Best-effort:
+/// `"unknown"` if `gethostname` fails. Cross-platform (POSIX `gethostname`).
+fn host() -> &'static str {
+    static HOST: OnceLock<String> = OnceLock::new();
+    HOST.get_or_init(|| {
+        // `c_char` is `i8` on x86_64 but `u8` on aarch64 (Linux) — use the alias
+        // so this compiles on every target, not just the CI host.
+        let mut buf = [0 as libc::c_char; 256];
+        // SAFETY: `buf` is a valid, correctly-sized writable buffer; gethostname
+        // writes at most `len` bytes and NUL-terminates on success.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
+        if rc != 0 {
+            return "unknown".to_string();
+        }
+        // Read up to the first NUL. `c as u8` is an identity on u8 targets and a
+        // bit-reinterpret on i8 targets — correct for the raw byte either way.
+        let bytes: Vec<u8> = buf
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+    .as_str()
+}
+
 /// Whether the audit log is enabled (`MACRDP_AUDIT_LOG`, default on). Independent
 /// of the guard so audit lines flow even with enforcement disabled.
 pub fn audit_enabled() -> bool {
@@ -377,7 +411,15 @@ pub fn audit_enabled() -> bool {
 /// Audit-log an accepted connection.
 pub fn audit_accept(ip: IpAddr, port: u16) {
     if audit_enabled() {
-        tracing::info!(target: "macrdp::audit", event = "accept", %ip, port);
+        tracing::info!(
+            target: "macrdp::audit",
+            schema_version = AUDIT_SCHEMA_VERSION,
+            macrdp_version = env!("CARGO_PKG_VERSION"),
+            host = host(),
+            event = "accept",
+            src_ip = %ip,
+            src_port = port,
+        );
     }
 }
 
@@ -390,18 +432,24 @@ pub fn audit_reject(ip: IpAddr, decision: Decision) {
         Decision::RejectRateLimit { window_attempts } => {
             tracing::warn!(
                 target: "macrdp::audit",
+                schema_version = AUDIT_SCHEMA_VERSION,
+                macrdp_version = env!("CARGO_PKG_VERSION"),
+                host = host(),
                 event = "reject",
                 reason = "rate_limit",
-                %ip,
+                src_ip = %ip,
                 window_attempts,
             );
         }
         Decision::RejectCooldown { retry_after } => {
             tracing::warn!(
                 target: "macrdp::audit",
+                schema_version = AUDIT_SCHEMA_VERSION,
+                macrdp_version = env!("CARGO_PKG_VERSION"),
+                host = host(),
                 event = "reject",
                 reason = "lockout",
-                %ip,
+                src_ip = %ip,
                 retry_after_secs = retry_after.as_secs(),
             );
         }
@@ -409,13 +457,19 @@ pub fn audit_reject(ip: IpAddr, decision: Decision) {
     }
 }
 
-/// Audit-log a finished connection and its classified outcome.
-pub fn audit_disconnect(ip: IpAddr, duration: Duration, outcome: Outcome) {
+/// Audit-log a finished connection and its classified outcome. `port` is the
+/// peer's source port, carried so a collector can correlate this `disconnect`
+/// with its matching `accept` on the `(src_ip, src_port)` tuple.
+pub fn audit_disconnect(ip: IpAddr, port: u16, duration: Duration, outcome: Outcome) {
     if audit_enabled() {
         tracing::info!(
             target: "macrdp::audit",
+            schema_version = AUDIT_SCHEMA_VERSION,
+            macrdp_version = env!("CARGO_PKG_VERSION"),
+            host = host(),
             event = "disconnect",
-            %ip,
+            src_ip = %ip,
+            src_port = port,
             duration_ms = duration.as_millis() as u64,
             outcome = match outcome {
                 Outcome::Success => "success",
@@ -466,7 +520,7 @@ impl ironrdp_server::ConnectionHandler for AuthGuardHandler {
     ) -> ironrdp_server::PostConnectionAction {
         let outcome = classify_outcome(error.is_some(), duration, self.core.failfast_window());
         self.core.record_outcome(Instant::now(), peer.ip(), outcome);
-        audit_disconnect(peer.ip(), duration, outcome);
+        audit_disconnect(peer.ip(), peer.port(), duration, outcome);
         // The guard must never halt the server.
         ironrdp_server::PostConnectionAction::Continue
     }

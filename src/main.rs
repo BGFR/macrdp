@@ -260,6 +260,17 @@ struct Args {
     #[arg(long)]
     log_dir: Option<PathBuf>,
 
+    /// Additionally write the security **audit** events (connection
+    /// accept/reject/disconnect) to this file as one JSON object per line, for a
+    /// SIEM/SOC log collector (Vector / Fluent Bit / rsyslog / Splunk UF) to tail
+    /// and forward. Off by default; the human-readable audit lines still appear in
+    /// the main log. The file self-rotates (MACRDP_AUDIT_LOG_MAX_BYTES /
+    /// MACRDP_AUDIT_LOG_MAX_FILES). Setting MACRDP_AUDIT_JSON=1 enables it at the
+    /// default path `<log-dir>/macrdp-audit.log` without naming a file here. See
+    /// docs/siem-forwarding.md. Config key: AUDIT_FILE.
+    #[arg(long)]
+    audit_file: Option<PathBuf>,
+
     /// Show debug-level logs from macrdp and the underlying ironrdp / rustls
     /// crates. Without this, known-noisy lines (TLS SNI warnings, the
     /// "Encoding bitmap took N ms" timer, the cert-acceptance "Broken pipe"
@@ -843,10 +854,16 @@ async fn run_fork_supervisor(
     // after fixing the worker to process::exit — a fast reconnect could still
     // overlap the new worker's capture with the dying worker's not-yet-released
     // SCStream.
-    // Tuple carries the peer IP + spawn instant alongside the child so, when this
-    // worker is drained on the NEXT accept, the auth guard can classify its outcome
-    // (exit code + session duration) and record it against the right IP.
-    let mut prev_worker: Option<(std::process::Child, std::net::IpAddr, std::time::Instant)> = None;
+    // Tuple carries the peer socket addr (IP + port) + spawn instant alongside the
+    // child so, when this worker is drained on the NEXT accept, the auth guard can
+    // classify its outcome (exit code + session duration) and record it against the
+    // right IP, and the audit `disconnect` can carry the source port for
+    // accept↔disconnect correlation.
+    let mut prev_worker: Option<(
+        std::process::Child,
+        std::net::SocketAddr,
+        std::time::Instant,
+    )> = None;
 
     // Auth hardening (Tier 1.2): the fork-workers supervisor owns its own accept
     // loop (it never builds an RdpServer), so it drives the shared AuthGuardCore
@@ -899,7 +916,7 @@ async fn run_fork_supervisor(
         // Drain the previous worker FIRST (before the rate-limit gate) so its
         // outcome is recorded and its capture slot is freed regardless of whether
         // THIS connection is accepted.
-        if let Some((prev, prev_ip, started)) = prev_worker.take() {
+        if let Some((prev, prev_peer, started)) = prev_worker.take() {
             let prev_pid = prev.id();
             let dur = started.elapsed();
             let waited = tokio::time::timeout(
@@ -934,9 +951,9 @@ async fn run_fork_supervisor(
                 );
             }
             if let Some(g) = guard.as_mut() {
-                g.record_outcome(std::time::Instant::now(), prev_ip, outcome);
+                g.record_outcome(std::time::Instant::now(), prev_peer.ip(), outcome);
             }
-            auth_guard::audit_disconnect(prev_ip, dur, outcome);
+            auth_guard::audit_disconnect(prev_peer.ip(), prev_peer.port(), dur, outcome);
             // Let SCK's daemon release the capture slot before the next SCStream.
             tokio::time::sleep(sck_settle).await;
         }
@@ -1014,11 +1031,13 @@ async fn run_fork_supervisor(
                     fd,
                     "spawned worker process for connection"
                 );
-                // Hold the child (+ peer IP and spawn instant) so the NEXT accept
+                // Hold the child (+ peer addr and spawn instant) so the NEXT accept
                 // waits for it to exit before spawning (the serialization above) —
                 // that wait is also what reaps it (never a lingering zombie) and
-                // what feeds the auth guard this worker's outcome.
-                prev_worker = Some((child, peer.ip(), std::time::Instant::now()));
+                // what feeds the auth guard this worker's outcome. The full
+                // SocketAddr (not just the IP) lets the audit `disconnect` carry the
+                // source port for accept↔disconnect correlation.
+                prev_worker = Some((child, peer, std::time::Instant::now()));
             }
             Err(e) => error!(error = ?e, "failed to spawn worker process"),
         }
@@ -1692,6 +1711,12 @@ fn args_from_config(path: &Path) -> Result<Args> {
             argv.push(dir.clone());
         }
     }
+    if let Some(path) = cfg.get("AUDIT_FILE") {
+        if !path.is_empty() {
+            argv.push("--audit-file".into());
+            argv.push(path.clone());
+        }
+    }
     if let Some(path) = cfg.get("TLS_CERT") {
         if !path.is_empty() {
             argv.push("--cert".into());
@@ -1827,7 +1852,29 @@ async fn async_main() -> Result<()> {
             "info,rustls=error,ironrdp_server::encoder=error,ironrdp_server::server=error",
         )
     };
-    logging::init(filter, args.log_dir.as_deref());
+    // Resolve the JSON audit-stream sink (SIEM/SOC): an explicit --audit-file /
+    // AUDIT_FILE wins; otherwise MACRDP_AUDIT_JSON=1 enables it at the default
+    // `<log-dir-or-~/Library/Logs>/macrdp-audit.log`. Off (None) by default, so the
+    // logging setup is byte-identical unless an operator opts in.
+    let audit_json_env = std::env::var("MACRDP_AUDIT_JSON").ok().is_some_and(|v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        )
+    });
+    let audit_file: Option<PathBuf> = args.audit_file.clone().or_else(|| {
+        if audit_json_env {
+            let dir = args
+                .log_dir
+                .clone()
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Logs")))
+                .unwrap_or_else(|| PathBuf::from("."));
+            Some(dir.join("macrdp-audit.log"))
+        } else {
+            None
+        }
+    });
+    logging::init(filter, args.log_dir.as_deref(), audit_file.as_deref());
 
     // Sweep leftovers from a PRIOR macrdp that died uncleanly (SIGKILL / panic /
     // power-loss skip Drop AND the signal handler, stranding NFS mounts + paste

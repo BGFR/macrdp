@@ -36,15 +36,84 @@ const DEFAULT_MAX_FILES: usize = 5;
 /// Initialize the global tracing subscriber.
 ///
 /// `filter` is the already-resolved [`EnvFilter`]. `log_dir_override` is the
-/// `--log-dir` / `LOG_DIR` value, if any. Resolution:
+/// `--log-dir` / `LOG_DIR` value, if any. Main-sink resolution:
 /// - `Some(dir)` → rotating file in `dir` (explicit override, even interactively).
 /// - else stdout-is-a-TTY → stdout (interactive / `cargo run`).
 /// - else → rotating file in `~/Library/Logs` (headless under launchd).
 ///
-/// Any failure to set up the file sink falls back to stdout with an `eprintln!`
-/// note (which, under launchd, lands in `StandardErrorPath` = `macrdp.err.log`).
-pub fn init(filter: EnvFilter, log_dir_override: Option<&Path>) {
-    let dir = match log_dir_override {
+/// `audit_file` is the optional dedicated **JSON audit stream** (`--audit-file` /
+/// `AUDIT_FILE` / `MACRDP_AUDIT_JSON`, off by default). When `Some`, the
+/// `macrdp::audit` target is *additionally* written there as one JSON object per
+/// line — independent of `RUST_LOG` (a `Targets` per-layer filter pins it to
+/// `INFO`, so a quiet operational filter never suppresses security events) — for
+/// a SIEM collector to tail. The human-readable audit lines still appear in the
+/// main log unchanged. **When `audit_file` is `None` the setup is byte-identical
+/// to before** (the audit-off path below).
+///
+/// Any failure to set up a file sink falls back to stdout with an `eprintln!`
+/// note (which, under launchd, lands in `StandardErrorPath` = `macrdp.err.log`);
+/// an unopenable audit file disables only the JSON stream, never startup.
+pub fn init(filter: EnvFilter, log_dir_override: Option<&Path>, audit_file: Option<&Path>) {
+    let dir = resolve_main_dir(log_dir_override);
+
+    // Audit-off (default): the exact prior single-sink behavior, unchanged.
+    let Some(audit_file) = audit_file else {
+        init_main_only(filter, dir);
+        return;
+    };
+
+    // Audit-on: add a JSON `macrdp::audit` layer alongside the main sink. If the
+    // audit file can't be opened, fall back to main-only — telemetry setup must
+    // never fail startup.
+    let audit_layer = match build_audit_layer(audit_file) {
+        Ok(layer) => layer,
+        Err(e) => {
+            eprintln!("macrdp: cannot open audit file {audit_file:?}: {e}; audit JSON disabled");
+            init_main_only(filter, dir);
+            return;
+        }
+    };
+
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+
+    // Build the main layer (stdout or rotating file) as a boxed layer so both
+    // sub-cases share one registry init. The `EnvFilter` is a per-layer filter on
+    // the main layer only, so it governs operational verbosity without touching
+    // the audit stream. A `Vec<Box<dyn Layer>>` collapses the heterogeneous
+    // main+audit layers into one — the canonical way to compose a dynamic set.
+    let mut main_is_file = false;
+    let main_layer: Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync> = match &dir {
+        None => tracing_subscriber::fmt::layer().with_filter(filter).boxed(),
+        Some(d) => match make_file_writer(d) {
+            Some(writer) => {
+                main_is_file = true;
+                tracing_subscriber::fmt::layer()
+                    .with_writer(writer)
+                    .with_ansi(false)
+                    .with_filter(filter)
+                    .boxed()
+            }
+            None => tracing_subscriber::fmt::layer().with_filter(filter).boxed(),
+        },
+    };
+
+    let layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+        vec![main_layer, audit_layer];
+    tracing_subscriber::registry().with(layers).init();
+
+    if main_is_file {
+        install_panic_hook();
+        tracing::info!(dir = ?dir, "logging to rotating file ({BASE})");
+    }
+    tracing::info!(audit_file = ?audit_file, "JSON audit stream enabled (macrdp::audit)");
+}
+
+/// Resolve the main-sink directory (see [`init`]): explicit `--log-dir` wins,
+/// else a file when headless (stdout not a TTY), else stdout (interactive).
+fn resolve_main_dir(log_dir_override: Option<&Path>) -> Option<PathBuf> {
+    match log_dir_override {
         Some(d) => Some(d.to_path_buf()),
         None => {
             if std::io::stdout().is_terminal() {
@@ -53,8 +122,12 @@ pub fn init(filter: EnvFilter, log_dir_override: Option<&Path>) {
                 default_log_dir()
             }
         }
-    };
+    }
+}
 
+/// The prior audit-off setup: a single sink (stdout or rotating file) with the
+/// `EnvFilter` global. Kept verbatim so the default path is byte-identical.
+fn init_main_only(filter: EnvFilter, dir: Option<PathBuf>) {
     let Some(dir) = dir else {
         // Interactive / no HOME: plain stdout, ANSI on. Unchanged dev behavior.
         tracing_subscriber::fmt().with_env_filter(filter).init();
@@ -83,6 +156,77 @@ pub fn init(filter: EnvFilter, log_dir_override: Option<&Path>) {
         .init();
     install_panic_hook();
     tracing::info!(dir = ?dir, "logging to rotating file ({BASE})");
+}
+
+/// Create the main rotating-file writer for the audit-on path, or `None` (with an
+/// `eprintln!`) so the caller falls back to a stdout main layer.
+fn make_file_writer(dir: &Path) -> Option<RotatingWriter> {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("macrdp: cannot create log dir {dir:?}: {e}; logging to stdout");
+        return None;
+    }
+    match RotatingWriter::new(dir) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!("macrdp: cannot open log file in {dir:?}: {e}; logging to stdout");
+            None
+        }
+    }
+}
+
+/// Split an audit-file path into `(parent_dir, filename)`, defaulting a bare
+/// filename to the current dir and a **directory** target (an existing dir, or a
+/// path written with a trailing separator) to `<dir>/macrdp-audit.log`.
+fn split_audit_path(path: &Path) -> (PathBuf, String) {
+    const DEFAULT: &str = "macrdp-audit.log";
+    // Treat the whole path as a directory when it's an existing dir or was written
+    // with a trailing separator (e.g. `/var/log/`) — otherwise `file_name()` would
+    // pick the last component (`log`) and write `/var/log/log`.
+    let looks_like_dir = path.is_dir()
+        || path
+            .as_os_str()
+            .to_string_lossy()
+            .ends_with(std::path::MAIN_SEPARATOR);
+    if looks_like_dir {
+        return (path.to_path_buf(), DEFAULT.to_string());
+    }
+    let base = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT.to_string());
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    (dir, base)
+}
+
+/// Build the JSON `macrdp::audit` layer: a self-rotating file, one JSON object per
+/// line, filtered to the `macrdp::audit` target at `INFO` **independent of
+/// `RUST_LOG`**. Boxed so it composes with either main-sink variant.
+fn build_audit_layer(
+    audit_file: &Path,
+) -> io::Result<Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>> {
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::Layer;
+
+    let (dir, base) = split_audit_path(audit_file);
+    std::fs::create_dir_all(&dir)?;
+    let max_bytes = env_u64("MACRDP_AUDIT_LOG_MAX_BYTES", DEFAULT_MAX_BYTES);
+    let max_files = env_usize("MACRDP_AUDIT_LOG_MAX_FILES", DEFAULT_MAX_FILES);
+    let writer = RotatingWriter::with_base(&dir, base, max_bytes, max_files)?;
+
+    let layer = tracing_subscriber::fmt::layer()
+        .json()
+        .flatten_event(true)
+        .with_current_span(false)
+        .with_span_list(false)
+        .with_ansi(false)
+        .with_writer(writer)
+        .with_filter(Targets::new().with_target("macrdp::audit", LevelFilter::INFO))
+        .boxed();
+    Ok(layer)
 }
 
 /// `~/Library/Logs` (mirrors `main::default_cert_dir`'s HOME resolution).
@@ -124,6 +268,10 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// (`std::sync::Mutex` is non-reentrant) — errors are reported via `eprintln!`.
 struct Rotator {
     dir: PathBuf,
+    /// The live filename (e.g. `macrdp.log` or `macrdp-audit.log`); archives are
+    /// `<base>.1`, `.2`, … . Parameterized so the same rotation code backs both
+    /// the operational log and the dedicated JSON audit stream.
+    base: String,
     file: File,
     written: u64,
     max_bytes: u64,
@@ -131,14 +279,15 @@ struct Rotator {
 }
 
 impl Rotator {
-    fn open(dir: PathBuf, max_bytes: u64, max_files: usize) -> io::Result<Self> {
-        let path = dir.join(BASE);
+    fn open(dir: PathBuf, base: String, max_bytes: u64, max_files: usize) -> io::Result<Self> {
+        let path = dir.join(&base);
         // Append + seed the counter from the existing length so a KeepAlive
         // restart continues the same file instead of truncating it.
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let written = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self {
             dir,
+            base,
             file,
             written,
             max_bytes,
@@ -146,20 +295,20 @@ impl Rotator {
         })
     }
 
-    /// `macrdp.log → .1 → .2 → … → .max_files` (oldest dropped), then reopen a
-    /// fresh empty `macrdp.log`. `rename` replaces the destination atomically on
-    /// unix, so the cascade alone drops the oldest.
+    /// `<base> → .1 → .2 → … → .max_files` (oldest dropped), then reopen a fresh
+    /// empty `<base>`. `rename` replaces the destination atomically on unix, so
+    /// the cascade alone drops the oldest.
     fn rotate(&mut self) -> io::Result<()> {
         self.file.flush()?;
-        let base = self.dir.join(BASE);
+        let base = self.dir.join(&self.base);
         for n in (1..self.max_files).rev() {
-            let from = self.dir.join(format!("{BASE}.{n}"));
+            let from = self.dir.join(format!("{}.{n}", self.base));
             if from.exists() {
-                std::fs::rename(&from, self.dir.join(format!("{BASE}.{}", n + 1)))?;
+                std::fs::rename(&from, self.dir.join(format!("{}.{}", self.base, n + 1)))?;
             }
         }
         if self.max_files >= 1 {
-            std::fs::rename(&base, self.dir.join(format!("{BASE}.1")))?;
+            std::fs::rename(&base, self.dir.join(format!("{}.1", self.base)))?;
         } else {
             std::fs::remove_file(&base)?;
         }
@@ -205,7 +354,19 @@ impl RotatingWriter {
     pub fn new(dir: &Path) -> io::Result<Self> {
         let max_bytes = env_u64("MACRDP_LOG_MAX_BYTES", DEFAULT_MAX_BYTES);
         let max_files = env_usize("MACRDP_LOG_MAX_FILES", DEFAULT_MAX_FILES);
-        let rot = Rotator::open(dir.to_path_buf(), max_bytes, max_files)?;
+        Self::with_base(dir, BASE.to_string(), max_bytes, max_files)
+    }
+
+    /// Open `dir/<base>` (append) with explicit rotation limits — used for the
+    /// dedicated JSON audit stream (`macrdp-audit.log`), independent of the
+    /// operational log's size/count knobs.
+    pub fn with_base(
+        dir: &Path,
+        base: String,
+        max_bytes: u64,
+        max_files: usize,
+    ) -> io::Result<Self> {
+        let rot = Rotator::open(dir.to_path_buf(), base, max_bytes, max_files)?;
         Ok(Self(Arc::new(Mutex::new(rot))))
     }
 }
@@ -251,7 +412,7 @@ mod tests {
     #[test]
     fn rotates_at_threshold() {
         let dir = unique_dir("rotate");
-        let mut r = Rotator::open(dir.clone(), 100, 5).unwrap();
+        let mut r = Rotator::open(dir.clone(), BASE.to_string(), 100, 5).unwrap();
         // Two ~80-byte writes: the first fits, the second crosses 100 → rotates.
         r.write_all(&[b'a'; 80]).unwrap();
         assert!(!dir.join("macrdp.log.1").exists());
@@ -269,7 +430,7 @@ mod tests {
     fn respects_max_files_cap() {
         let dir = unique_dir("cap");
         let max_files = 2;
-        let mut r = Rotator::open(dir.clone(), 50, max_files).unwrap();
+        let mut r = Rotator::open(dir.clone(), BASE.to_string(), 50, max_files).unwrap();
         // Force several rotations.
         for _ in 0..6 {
             r.write_all(&[b'x'; 60]).unwrap();
@@ -289,7 +450,7 @@ mod tests {
     fn appends_and_seeds_counter_on_open() {
         let dir = unique_dir("seed");
         std::fs::write(dir.join("macrdp.log"), b"preexisting-content").unwrap();
-        let r = Rotator::open(dir.clone(), 1024, 5).unwrap();
+        let r = Rotator::open(dir.clone(), BASE.to_string(), 1024, 5).unwrap();
         assert_eq!(r.written, "preexisting-content".len() as u64);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -304,6 +465,104 @@ mod tests {
         assert_eq!(
             env_usize("MACRDP_LOG_MAX_FILES_NOPE", DEFAULT_MAX_FILES),
             DEFAULT_MAX_FILES
+        );
+    }
+
+    #[test]
+    fn custom_base_rotates_under_its_own_name() {
+        let dir = unique_dir("audit-base");
+        let mut r = Rotator::open(dir.clone(), "macrdp-audit.log".to_string(), 100, 5).unwrap();
+        r.write_all(&[b'a'; 80]).unwrap();
+        r.write_all(&[b'b'; 80]).unwrap(); // crosses 100 → rotates
+        r.flush().unwrap();
+        assert!(
+            dir.join("macrdp-audit.log.1").exists(),
+            "archives under base"
+        );
+        assert!(
+            !dir.join("macrdp.log").exists(),
+            "must not touch the main-log name"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_audit_path_variants() {
+        let (d, b) = split_audit_path(Path::new("/var/log/macrdp-audit.log"));
+        assert_eq!(d, PathBuf::from("/var/log"));
+        assert_eq!(b, "macrdp-audit.log");
+        // Bare filename → current dir.
+        let (d, b) = split_audit_path(Path::new("audit.log"));
+        assert_eq!(d, PathBuf::from("."));
+        assert_eq!(b, "audit.log");
+        // Trailing-separator directory → default filename inside it (not `/var/log/log`).
+        let (d, b) = split_audit_path(Path::new("/var/log/"));
+        assert_eq!(d, PathBuf::from("/var/log/"));
+        assert_eq!(b, "macrdp-audit.log");
+    }
+
+    /// The load-bearing guarantee: the audit JSON sink receives `macrdp::audit`
+    /// events at INFO **even when the operational filter is `warn`** — i.e.
+    /// `RUST_LOG` can't suppress security events from the SIEM stream.
+    #[test]
+    fn audit_layer_bypasses_operational_filter() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::filter::{LevelFilter, Targets};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::{EnvFilter, Layer};
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        struct BufW(Arc<Mutex<Vec<u8>>>);
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = BufW;
+            fn make_writer(&'a self) -> BufW {
+                BufW(self.0.clone())
+            }
+        }
+        impl Write for BufW {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let main_buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let audit_buf = Buf(Arc::new(Mutex::new(Vec::new())));
+
+        let main_layer = tracing_subscriber::fmt::layer()
+            .with_writer(main_buf.clone())
+            .with_ansi(false)
+            .with_filter(EnvFilter::new("warn"));
+        let audit_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_writer(audit_buf.clone())
+            .with_filter(Targets::new().with_target("macrdp::audit", LevelFilter::INFO));
+
+        let subscriber = tracing_subscriber::registry()
+            .with(main_layer)
+            .with(audit_layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "macrdp::audit", event = "accept", src_ip = "203.0.113.5");
+            tracing::info!("an operational info line");
+        });
+
+        let audit = String::from_utf8(audit_buf.0.lock().unwrap().clone()).unwrap();
+        let main = String::from_utf8(main_buf.0.lock().unwrap().clone()).unwrap();
+        // Reached the audit sink as JSON despite the `warn` operational filter.
+        assert!(
+            audit.contains("\"event\":\"accept\"") && audit.contains("203.0.113.5"),
+            "audit sink should carry the event as JSON: {audit}"
+        );
+        // The `warn` main filter dropped both info lines from the operational sink.
+        assert!(
+            !main.contains("accept") && !main.contains("operational info line"),
+            "main warn filter must drop info-level lines: {main}"
         );
     }
 }

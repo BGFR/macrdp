@@ -7,6 +7,26 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
+- [x] **SIEM/SOC audit forwarding — Tier 0 (structured JSON audit stream) — IMPLEMENTED +
+  verified 2026-07-10 (uncommitted on `main`; commit when ready).** macrdp's `macrdp::audit`
+  events (connection accept/reject/disconnect, source IP+port, reason, outcome) are
+  additionally written as **one JSON object per line** to a dedicated self-rotating file
+  (`--audit-file` / `AUDIT_FILE` / `MACRDP_AUDIT_JSON=1`) for a log collector (Vector /
+  Fluent Bit / rsyslog / Splunk UF) to tail → SIEM. macrdp deliberately does **not** speak
+  network syslog (the collector owns TLS/buffering; macOS has no `syslogd` — unified logging
+  replaced it). **Opt-in, default OFF, byte-identical when off.** Two tracing layers: the
+  audit JSON layer's `Targets` filter is **RUST_LOG-independent** (a quiet operational filter
+  can't suppress security events); main layer keeps `EnvFilter`. Schema v1 (`AUDIT_SCHEMA_VERSION`
+  const, versioned contract; (src_ip,src_port) correlation, conn_id deferred additive). 170
+  tests pass incl. a new RUST_LOG-independence test; clippy/fmt clean; **end-to-end `nc` smoke
+  produced a correlated accept+disconnect JSON pair.** Files: Cargo.toml (json feat),
+  src/{logging,auth_guard,main}.rs, packaging/config.env.example, docs/{cli,configuration}.md,
+  NEW docs/siem-forwarding.md (schema + collector configs). Tiers 1 (collector configs) shipped
+  as docs; **Tier 2 (native RFC5424/CEF-over-TLS emitter) deferred** — only if a deployment
+  can't run a collector. Follow-on (additive, no schema bump): promote cert-expiry /
+  health-bounce / active-redirection-features / session-start onto `macrdp::audit`. Plan:
+  `~/.claude/plans/tier0-siem-audit-json.md`; [[project_siem_audit_json_tier0]].
+
 - [ ] **Tier 2.4 — multi-day soak (foundation core PASSED 31 h 2026-07-03; full 48–72 h on
   v0.8.24 still needed).** The last leg of the production-readiness trio (TLS ✓ #104, auth ✓
   #105). Tooling: `scripts/soak-monitor.sh monitor` samples a resource CSV; `… analyze`

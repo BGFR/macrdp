@@ -5,6 +5,11 @@ with source IP+port, reason, and outcome) on a dedicated `macrdp::audit` tracing
 `--audit-file` at a file and those events are additionally written as **one JSON object per
 line** — a stable, versioned contract a log collector can tail and forward to a SIEM.
 
+> For what each event and field **means** and how to read them (patterns for a
+> normal session, a wrong password, a brute-force lockout, etc.), see the
+> companion [`audit-log.md`](audit-log.md). This page is about getting the stream
+> off-box.
+
 macrdp deliberately does **not** speak network syslog itself. Getting logs off-box reliably
 (TLS, buffering, reconnect, backpressure) is a solved problem owned by collector agents; a
 software RDP server should not re-implement it on its hot path. And on macOS there is no
@@ -51,7 +56,7 @@ One JSON object per line. `schema_version` pins the contract — it bumps only o
 field change (rename/removal/semantic shift), never for additive fields, so detection/parse
 rules can key off it safely.
 
-Fields on **every** event:
+Fields common to the events (all carry these except where the `src_port` row notes otherwise):
 
 | field | type | notes |
 |---|---|---|
@@ -63,7 +68,7 @@ Fields on **every** event:
 | `host` | string | server hostname (a collector usually adds its own too) |
 | `event` | string | `accept` \| `reject` \| `auth` \| `disconnect` |
 | `src_ip` | string | peer IP — correlation key |
-| `src_port` | int | peer source port — correlation key |
+| `src_port` | int | peer source port — correlation key (present on `accept`/`auth`/`disconnect`; **absent on `reject`**, which is a per-IP decision) |
 
 Event-specific:
 

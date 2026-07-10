@@ -246,7 +246,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
     `[patch.crates-io]`) with a **lenient `UsbDeviceCaps` decode**: `SupportedUsbVer`/`UsbdiVer`/
     `UsbBusIfaceVer`/`DeviceSpeed` are data-carrying enums with the named values + an `Other(u32)`
     fallback (named `Usb30/31/32` added), so a modern USB-3 device's `0x320` caps parse instead of
-    erroring. Verified live with a USB-3.2 flash drive. New vendored crate divergence.
+    erroring. Verified live with a USB-3.2 flash drive. New vendored crate divergence. **NOTE: the
+    upstream form (#1418) was reshaped to newtype-over-`u32` + consts at CBenoit's request — so at
+    pin-bump this vendored `Other(u32)` shape is REPLACED and call sites shift
+    `SupportedUsbVer::Usb32`→`::USB_32`; see the Upstreaming-watch #1418 entry.**
   - **Phase 3.1b(2a) GO** (2026-07-06, commit `5ef8e4b`): a server-initiated **`GET_DESCRIPTOR`
     control transfer round-trips REAL device data** — proven observe-only (plain `cargo build`).
     On `ADD_DEVICE` the device processor reactively sends `RegisterRequestCallback` +
@@ -323,6 +326,34 @@ then delete; promote a parked item to *In flight* when work actually starts.
     mid-session retract/hot-unplug, true multi-device (needs iSerialNumber to distinguish identical
     models), dispatch-priority tier. Test rig proven: UTM-QEMU Linux FreeRDP + USB-2.0 hub. Plan:
     `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
+  - **Phase 3.3 ISOCHRONOUS transfer spike — M0 (observe-only) LANDED, live go/no-go DEFERRED**
+    (2026-07-10, user away from the USB rig). Isoch is the last missing transfer type
+    (control/bulk/interrupt all work); it blocks isoch webcams + **USB audio** (mic/speaker).
+    Staged M0 (observe) → M1 (forward isoch-IN), **IN-only**, a USB **mic** as the lowest-bandwidth
+    go/no-go device. **Key finding: the vendored `ironrdp-rdpeusb` PDU layer is already isoch-ready**
+    (`UrbFunction::IsochTransfer`(10) + `TsUrb::IsochTransfer` encode/decode/size; rides the existing
+    TransferIn/Out envelope; `UrbCompletion::decode` auto-synthesizes the per-packet IN result) —
+    **NO ironrdp-rdpeusb change needed for an IN spike.** **M0 code is written + compiles
+    warning-free + an entitled `.app` is built/installed to `/Applications`** (uncommitted
+    working-tree changes on `main`, ALL in `src/usb_redirect/usb_spike.m` only; default path
+    byte-identical since USB redir is opt-in): (1) `macrdp_ep_transfer_type()` reads the
+    EndpointCreate descriptor ptr (`data1`) → `bmAttributes&0x03`; create log tags `(ISOCHRONOUS)`.
+    (2) `walkEndpoint:` catches `IOUSBHostCIMessageTypeIsochronousTransfer` (0x3b) before the
+    default "unexpected type" path. (3) `observeIsochTransfer:` logs each TRB's frame#/ASAP/len/buf
+    + inter-TRB **gap (ms)** for cadence and completes it **zero-length success** (NOT forwarded);
+    throttled first-32-then-every-256th; counters cleaned on EndpointDestroy.
+    **PENDING LIVE TEST:** `launchctl bootout gui/$(id -u)/com.clintcan.macrdp`, run foreground
+    `/Applications/macrdp.app/Contents/MacOS/macrdp --keychain --enable-usb-redirection 2>&1 |
+    grep -E 'usb2|ISOCH'`, FreeRDP `/usb:id,<vid>:<pid>` a mic (release the client's own audio
+    driver first), open **Audio MIDI Setup**/QuickTime to open the isoch EP. **GREEN** = steady
+    `ISOCH observe … gap≈1.000ms` lines → build **M1** (mirror the bulk path across all 3 layers:
+    `isoch_transfer_in` UsbHandle method + `TransferReq::Isoch` arm + isoch endpoint classification
+    out of `interrupt_eps`; expect to need DEPTH like the bulk read-ahead engine). **RED** = no
+    lines / immediate teardown / sub-ms bursts we can't meet over the network → document the ceiling
+    and stop (like the UDP client-support finding). Core risk M0 answers: can isoch meet macOS's
+    timing over a network redirect (no retransmit + tight service intervals) at all. OUT/speakers
+    would need the full `UsbdIsoPacketDesc` back (out of scope; IN-only). Plan:
+    `~/.claude/plans/wobbly-honking-minsky.md`.
   Gates to the official signed+provisioned build for the *presenting* side (entitlement baked
   into the signature). See `docs/usb-redirection-feasibility.md` +
   [[project_usb_redirection_feasibility]].
@@ -387,7 +418,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   multitransport, rdpdr server-direction, smartcard, acceptor KLID+MT, audio-lag/resize/dispatch,
   server ARC auto-reconnect cookie). **#1359 (rdpsnd) + #1397 (acceptor keyboard-layout on
   `AcceptorResult`) MERGED 2026-07-01; #1373 (acceptor honor-size) MERGED 2026-07-02 (`d471bd06`).**
-  **Three clintcan PRs currently OPEN (all MERGEABLE, awaiting review — reactive-only, do
+  **Four clintcan PRs currently OPEN (all MERGEABLE, awaiting review — reactive-only, do
   not poll/nudge):**
   - [ ] **#1404** `feat(acceptor)!: clamp honored client desktop size to an operator maximum` — the
     honor-size resource-hardening CBenoit green-lit in his #1373 approval. Replaces the `bool` with
@@ -401,22 +432,28 @@ then delete; promote a parked item to *In flight* when work actually starts.
     send-only, does NOT validate the returning ARC_CS cookie (offered as a follow-up).
   - [ ] **#1418** `feat(rdpeusb)!: tolerate unrecognized device-reported USB capability values` —
     opened 2026-07-08. Upstreams vendored `ironrdp-rdpeusb` divergence (1) (the lenient USB-caps
-    decode): the 4 device-reported enums become data-carrying with `Other(u32)` + named
-    Usb30/31/32; framing consts (CbSize/HcdCapabilities) stay strict. Fixes a real USB-3.2 device
-    (SupportedUsbVersion `0x320`) tearing down the URBDRC channel on decode. QA'd for regression
-    (byte-identical encode; blast radius = rdpeusb + testsuite only). Scoped to (1) only — HELD
+    decode): fixes a real USB-3.2 device (SupportedUsbVersion `0x320`) tearing down the URBDRC
+    channel on decode. **REVIEW ADDRESSED 2026-07-10 (commit `80c7c8b9`):** CBenoit REQUIRED
+    dropping the `Other(u32)` fallback (it can alias a named value → breaks round-trip/Eq, a pattern
+    they're purging codebase-wide), so the 4 device-reported fields are now **newtype structs over
+    `u32` with named associated consts** (the `http::StatusCode` shape; matches the crate's own
+    `UrbFunction`) — one representation per wire value, no aliasing. Added his requested
+    decode-from-raw-bytes test + rstest round-trip. **Double-checked 2026-07-10: build + `clippy -D`
+    + tests + fmt all clean, no external consumers.** Awaiting re-review. Scoped to (1) only — HELD
     rdpeusb (2) `UsbDevice=0` (CONFLICTS with merged #1321, which deliberately rejects that range;
-    needs a "mstsc really sends 0 + capture" argument) and (3) full config descriptor. On
-    merge+release, most of rdpeusb divergence (1) drops.
-  - [ ] **rdpeusb (3) full config descriptor — DRAFTED 2026-07-08, not yet filed.** Branch
-    `feat/rdpeusb-full-config-descriptor` (commit `60e50232`) in the IronRDP clone: `UsbConfigDesc`
-    gains `trailing: Vec<u8>` (bytes 9..wTotalLength) so `TS_URB_SELECT_CONFIGURATION` carries the
-    full configuration descriptor (real Windows rejects header-only with `0x80070057`). QA'd
-    ship-ready (decode clamp is safe by construction — the URB decodes from a length-delimited
-    sub-cursor). **File after #1418 gets its first review** (same young crate); flag the one design
-    point in the PR body: `total_length` not auto-derived from `trailing` — offer an
-    invariant-enforcing constructor as an option. Both rdpeusb PRs touch `tests/rdpeusb/mod.rs`
-    (one line) — rebase whichever merges second.
+    needs a "mstsc really sends 0 + capture" argument). On merge+release, most of rdpeusb divergence
+    (1) drops. **Pin-bump churn: macrdp-side call sites shift `SupportedUsbVer::Usb32`→`::USB_32`
+    consts (mechanical, only at bump).**
+  - [ ] **#1420** `feat(rdpeusb)!: carry the full configuration descriptor in UsbConfigDesc` —
+    FILED 2026-07-09 (was the drafted rdpeusb div (3)). `UsbConfigDesc` gains `trailing: Vec<u8>`
+    (bytes 9..wTotalLength) so `TS_URB_SELECT_CONFIGURATION` carries the full configuration
+    descriptor (real Windows rejects header-only with `0x80070057`). **REVIEW ADDRESSED 2026-07-10
+    (commit `2cde264f`):** added Copilot's asked-for encode-time validation — `bLength`==9-byte
+    header AND `wTotalLength`==header+trailing, so a caller can't emit a descriptor whose
+    `wTotalLength` disagrees with the payload (+ `inconsistent_header_fails_to_encode` test).
+    **Double-checked 2026-07-10: build/clippy-D/tests/fmt clean; amendment is purely additive
+    validation.** Only Copilot has reviewed (no human yet). Independent of #1418 (different
+    file/type); both touch `tests/rdpeusb/mod.rs` (one line) → rebase whichever merges second.
   Nothing whole-vendor-dir is currently de-vendorable (each fork keeps ≥1 macrdp-specific
   server-direction divergence). **Divergence logs reconciled vs upstream/master 2026-07-08**
   (de-drift committed `27c5a84`): six divergences are already merged upstream and become deletions
@@ -433,8 +470,8 @@ then delete; promote a parked item to *In flight* when work actually starts.
   (15 git pins + all 6 vendor forks are version-coupled; breaking `core 0.1→0.2` / `pdu 0.7→0.8` /
   `dvc 0.5→0.7` / `server 0.10→0.12`) and churns every vendored crate, so it runs as its OWN
   dedicated effort + release, never a side task.
-  **Trigger (whichever first):** (i) the small-PR wave merges — the rdpeusb pair (#1418 + the
-  drafted config-descriptor) and #1405 (+#1415/#1404 if they land) — maximizing the harvest to
+  **Trigger (whichever first):** (i) the small-PR wave merges — the rdpeusb pair (#1418 + #1420)
+  and #1405 (+#1415/#1404 if they land) — maximizing the harvest to
   ~11–12 divergence deletions in ONE migration instead of two; or (ii) a **~6-week staleness cap
   (early Aug 2026)** — upstream is refactoring code our divergences sit on (e.g. #1407 restructured
   rdpeusb), so waiting past the cap makes the re-vendor diff hairier; bump anyway if reviews stall.

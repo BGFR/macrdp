@@ -110,3 +110,53 @@ jobs:
         env:
           RUSTFLAGS: '-D warnings'
         run: cargo test --locked --target aarch64-apple-darwin
+
+  # End-to-end integration test for the security AUDIT LOG. A cargo test can't
+  # drive CredSSP/NLA (the harness is TLS-only), so this runs a real loopback
+  # macrdp + a real FreeRDP client (`+auth-only`, no GUI) and asserts the JSON
+  # audit stream records the right accept/auth/disconnect events. macOS-only
+  # (it runs the macOS server binary) and needs FreeRDP, so it's its own job.
+  audit-integration:
+    name: audit log (macos integration)
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit # macOS runners only support audit mode
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          toolchain: '1.95.0'
+          target: aarch64-apple-darwin
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: audit-integration
+
+      # sdl-freerdp is the RDP client the test drives. brew ships it in the
+      # `freerdp` formula.
+      - name: Install FreeRDP
+        run: brew install freerdp
+
+      # Build the server the script will launch (debug is fine — the test only
+      # exercises the CredSSP handshake, not capture/encode).
+      - name: Build macrdp
+        run: cargo build --locked
+
+      # The script starts macrdp on loopback (--skip-auth, throwaway credential),
+      # runs one correct- and one wrong-password +auth-only connection, and
+      # asserts the audit JSON. SDL_VIDEODRIVER=dummy guards against a headless
+      # runner having no display (auth-only never opens a window anyway).
+      - name: Run audit-log integration test
+        env:
+          SDL_VIDEODRIVER: dummy
+        run: ./scripts/test-audit-log.sh

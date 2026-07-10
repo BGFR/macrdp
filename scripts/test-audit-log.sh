@@ -56,7 +56,7 @@ run_to() {
 
 echo "== starting macrdp (loopback :$PORT, --skip-auth, audit -> audit.jsonl) =="
 MACRDP_HEALTHCHECK=0 "$BIN" \
-  --bind "127.0.0.1:$PORT" --skip-auth \
+  --bind "127.0.0.1:$PORT" --skip-auth --allow-sleep \
   --username "$USER_NAME" --password "$GOOD_PW" \
   --audit-file "$AUDIT" --cert-dir "$WORK/certs" \
   >"$SRVLOG" 2>&1 &

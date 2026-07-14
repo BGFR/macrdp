@@ -4,6 +4,15 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.8.34 — the gamepad-input fix
+
+A one-fix point release over v0.8.33. It repairs a real regression in **USB redirection** (`--enable-usb-redirection`, experimental / opt-in / entitled-build-only): a redirected **HID gamepad enumerated but its buttons did nothing** — broken since v0.8.30 and present in v0.8.31/32/33. Nothing outside the opt-in USB feature changes.
+
+- **Redirected HID input works again.** A client-redirected Xbox controller would appear on the Mac (visible in `ioreg`, macOS binding its own gamepad driver, descriptors and `SelectConfiguration` and endpoint pipes all succeeding) while **no button or stick input registered** — and the device would periodically drop and re-enumerate. Its interrupt-IN input reports were arriving roughly **once every 20 seconds** instead of every ~8 ms.
+- **Cause: the bulk-IN read-ahead engine (added in v0.8.30 for webcam streaming) was matching interrupt endpoints.** Its "is this a streaming bulk-IN pipe?" test was *address-only* — a non-EP0 IN endpoint carrying a normal transfer — which an **interrupt-IN pipe also satisfies** (an HID input-report endpoint is exactly that; only isochronous transfers carry a distinct message type). macOS double-buffers interrupt endpoints too, so its re-doorbell of the still-unadvanced transfer-ring head pushed the gamepad into the streaming branch instead of the plain "skip the duplicate, the outstanding transfer's completion will re-walk the ring" path. A large-read threshold stopped the read-ahead *stream* from actually engaging on a 64-byte report — which is why the bug hid for four releases — but the control flow had already diverged, so the pipe was only serviced when something else happened to force a ring re-walk.
+- **Fix: gate read-ahead on the endpoint's real transfer type.** The server already learns each endpoint's true type authoritatively from the client's `SelectConfiguration` pipe info; it now hands that to the virtual host controller (before the kernel creates the endpoints, so it is always known before the first ring walk). An unrecognized endpoint defaults to *not* bulk, so the fail-safe is the serial path. Mass storage and the bulk UVC webcam keep read-ahead exactly as before; interrupt endpoints can no longer enter the streaming path at all.
+- Live-verified on a real redirected Xbox controller (`045e:0b12`): steady input, no dropouts, no re-enumeration.
+
 ## v0.8.33 — the audit-forwarding release
 
 A SIEM/SOC observability roll-up over v0.8.32. It turns macrdp's existing security audit events into a structured stream a log collector can forward, adds an explicit authentication-outcome event, and guards the whole path with an end-to-end CI test. **No change to the default runtime path — everything here is opt-in and default-off, and the default path is byte-identical when it's off.**

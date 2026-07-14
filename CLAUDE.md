@@ -19,7 +19,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.33** (the audit-forwarding release — a
+(VPN/ZeroTier). **Latest release: v0.8.34** (the gamepad-input fix — a one-fix
+point release over v0.8.33 repairing a regression in the opt-in USB-redirection
+feature: a redirected **HID gamepad enumerated but its buttons did nothing**
+(broken v0.8.30 → v0.8.33). The v0.8.30 bulk-IN read-ahead engine's `isBulkIn`
+test was address-only (non-EP0 IN + NormalTransfer), which an **interrupt-IN pipe
+also satisfies** — macOS double-buffers interrupt endpoints too, so its
+re-doorbell routed the gamepad into the streaming branch instead of the "skip the
+duplicate, the outstanding completion re-walks" path, and the pipe was only
+serviced when something else forced a re-walk (input reports at ~20 s instead of
+~8 ms). The `readLen >= 512` threshold stopped the *stream* engaging but NOT the
+control-flow divergence — which is why it hid for four releases and why the old
+docs wrongly credited it. Read-ahead is now gated on the endpoint's **real
+transfer type** (the client's SelectConfiguration pipe info, pushed to the ObjC
+controller via `macrdp_usb_set_endpoint_bulk()`); unknown ⇒ not-bulk (fail-safe =
+serial). Mass storage + the bulk UVC webcam unchanged; interrupt endpoints can no
+longer enter the streaming path. Live-verified on a real redirected Xbox
+controller. **Don't re-break it: at the UserHCI ring an interrupt endpoint is
+indistinguishable from a bulk one by address + msg-type alone.**) Earlier:
+**v0.8.33** (the audit-forwarding release — a
 SIEM/SOC observability roll-up over v0.8.32, no change to the default runtime
 path; everything here is opt-in + default-off and byte-identical when off. **Opt-in
 structured JSON audit stream** (`--audit-file` / `MACRDP_AUDIT_JSON=1`, config

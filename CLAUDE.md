@@ -100,9 +100,13 @@ half the frame data. A **bulk-IN read-ahead engine** (`src/usb_redirect/usb_spik
 now keeps `MACRDP_USB_PREFETCH_DEPTH` (default 4) concurrent `bulk_transfer_in`
 reads in flight to the client, decoupled from the ring, buffered in **sequence
 order** and delivered one chunk per ring transfer — restoring URB depth with no
-data loss. Gated on the concurrency + large-read signal, so **mass storage**
-(regression-verified byte-exact) and **interrupt/HID** (the redirected gamepad)
-stay on the serial path. No Rust change (the URBDRC/`UsbHandle` side is already
+data loss. Gated on the endpoint's **real transfer type** (the client's
+SelectConfiguration pipe info), so **mass storage** (regression-verified
+byte-exact) streams and **interrupt/HID** (the redirected gamepad) stays on the
+serial path. That gate was originally address-only and silently broke HID input
+from v0.8.30 to v0.8.33 — a redirected gamepad enumerated but its buttons did
+nothing; fixed 2026-07-14, see the USB quirk note. No Rust change to the
+transfer path (the URBDRC/`UsbHandle` side is already
 per-token concurrent). Verified live on an A4Tech bulk UVC cam over Linux FreeRDP
 (smooth video in Photo Booth); isochronous webcams + the mstsc camera-redirection
 channel remain unimplemented. See the USB feature note in `@docs/features.md`.

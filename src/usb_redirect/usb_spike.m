@@ -188,6 +188,11 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *pendingByEndpoint;
 // endpoint key -> bulk-IN read-ahead stream state (streaming endpoints only)
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, MacrdpBulkStream *> *bulkStreams;
+// endpoint ADDRESS (e.g. 0x82) -> @(YES) iff it is a true BULK pipe. Registered by
+// Rust from the client's SelectConfiguration pipe info (the authoritative source),
+// before the kernel creates any endpoint. Read-ahead is gated on this: an INTERRUPT
+// endpoint must never enter the streaming path (see -walkEndpoint:).
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *bulkEndpoints;
 // M0 isoch observe-only: endpoint key -> TRB count / last-service ns (cadence).
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *isochCount;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *isochLastNs;
@@ -218,6 +223,7 @@ static const NSUInteger kSyntheticDeviceAddress = 1;
         _tokenMap = [NSMutableDictionary dictionary];
         _pendingByEndpoint = [NSMutableDictionary dictionary];
         _bulkStreams = [NSMutableDictionary dictionary];
+        _bulkEndpoints = [NSMutableDictionary dictionary];
         _isochCount = [NSMutableDictionary dictionary];
         _isochLastNs = [NSMutableDictionary dictionary];
         _prefetchReads = [NSMutableDictionary dictionary];
@@ -842,6 +848,26 @@ static const uint32_t kStreamMinReadLen = 512;
 // Engage read-ahead on a bulk-IN endpoint whose head macOS just re-queued (it
 // wants URB depth). Reclassify the in-flight tied read as prefetch seq 0, mark
 // the head as awaiting its buffered chunk, and fill the pipe to DEPTH.
+// Record whether an endpoint address is a true BULK pipe (vs interrupt/isoch).
+// Called from Rust once SelectConfiguration returns the client's pipe info — which
+// lands BEFORE the kernel creates the endpoints, so the flag is always registered
+// before -walkEndpoint: can consult it. Hops to the interface queue, where the
+// dictionary is read.
+- (void)setEndpointBulk:(uint32_t)endpointAddress isBulk:(BOOL)isBulk {
+    dispatch_queue_t queue = self.interface.queue;
+    if (queue == nil) {
+        return;
+    }
+    dispatch_async(queue, ^{
+        self.bulkEndpoints[@(endpointAddress & 0xff)] = @(isBulk);
+    });
+}
+
+// YES only for an endpoint Rust told us is BULK. Unknown => NO (stay serial).
+- (BOOL)endpointIsBulk:(NSUInteger)endpointAddress {
+    return [self.bulkEndpoints[@(endpointAddress & 0xff)] boolValue];
+}
+
 - (void)engageStream:(const IOUSBHostCIMessage *)msg endpointKey:(NSNumber *)key
                   ep:(IOUSBHostCIEndpointStateMachine *)ep {
     uint32_t readLen = (uint32_t)((msg->data0 & IOUSBHostCINormalTransferData0Length)
@@ -993,8 +1019,20 @@ static const uint32_t kStreamMinReadLen = 512;
             break;
         }
         NSUInteger epNum = [key unsignedIntegerValue] & 0xff;
+        // A read-ahead candidate must be a device->host (IN) pipe, a non-EP0
+        // NormalTransfer, AND a true BULK endpoint. The bulk test is load-bearing:
+        // an INTERRUPT-IN pipe (an HID gamepad's input-report endpoint) is ALSO a
+        // non-EP0 IN NormalTransfer, so without it the gamepad was routed into the
+        // streaming branch below — macOS double-buffers interrupt endpoints too, so
+        // its re-doorbell hit -engageStream: instead of the plain "skip the dup, the
+        // outstanding completion re-walks" path, and the pipe was only serviced when
+        // something else forced a re-walk (buttons went dead / the device dropped and
+        // re-enumerated). The bulk flag comes from the client's SelectConfiguration
+        // pipe info via -setEndpointBulk:isBulk: and defaults to NO for an unknown
+        // endpoint, so the safe (serial) path is the fallback.
         BOOL isBulkIn = (epNum & 0x80) != 0 && (epNum & 0x7f) != 0
-                        && msg_type(msg) == IOUSBHostCIMessageTypeNormalTransfer;
+                        && msg_type(msg) == IOUSBHostCIMessageTypeNormalTransfer
+                        && [self endpointIsBulk:epNum];
         // Bulk-IN read-ahead: once a streaming endpoint is engaged, serve its ring
         // TRBs from the prefetch FIFO (never a fresh tied raise).
         if (isBulkIn && self.bulkStreams[key] != nil) {
@@ -1214,6 +1252,18 @@ void *macrdp_usb_controller_create(MacrdpUsbControlInFn controlCb, MacrdpUsbCont
         }
         return (void *)CFBridgingRetain(c);
     }
+}
+
+// Tell the controller whether an endpoint address is a true BULK pipe. Rust calls
+// this for each pipe SelectConfiguration returns, before any transfer runs. Only a
+// registered-bulk IN endpoint is eligible for the read-ahead engine — an interrupt
+// (HID) pipe must stay on the serial path. Safe from any thread; hops to the queue.
+void macrdp_usb_set_endpoint_bulk(void *handle, uint32_t endpoint_address, int is_bulk) {
+    if (handle == NULL) {
+        return;
+    }
+    MacrdpUsbController *c = (__bridge MacrdpUsbController *)handle;
+    [c setEndpointBulk:endpoint_address isBulk:(is_bulk != 0)];
 }
 
 // Complete a previously-raised control-IN or bulk transfer. status 0 = success;

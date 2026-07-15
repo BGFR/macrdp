@@ -17,13 +17,28 @@ for if/when it's ever pursued. Motivated by the ground-truth finding below.*
 >   negative result: mstsc refuses every URBDRC camera transfer (`0x8007001f`)
 >   because the video never rides USB. **No amount of USB-redirection work can
 >   ever surface an mstsc webcam** — it is a *missing protocol*, not a USB bug.
-> - **The webcam rides a dedicated RDP video-redirection channel.** In that Win10
->   capture the channels were `Microsoft::Windows::RDS::Video::Control::v08.01`
->   + `::Video::Data::v08.01` (+ `::Geometry::v08.01`); on a modern (Win11 /
->   Server 2022) client/server the equivalent is **MS-RDPECAM**, the documented
->   Video Capture Virtual Channel Extension, channel `RDCamera_Device_Enumerator`.
+> - **The webcam rides a dedicated RDP video-redirection channel** — specifically
+>   **MS-RDPECAM** (Video Capture Virtual Channel Extension), whose enumeration
+>   channel is `RDCamera_Device_Enumerator`. That is the protocol to implement.
 > - **The camera rode the reliable UDP multitransport tunnel** (no DTLS/lossy flow
 >   present) — a transport macrdp already implements for EGFX.
+>
+> **Correction (from MS-* spec research, 2026-07-16):** the decrypted *TCP* control
+> census showed `Microsoft::Windows::RDS::Video::Control/Data::v08.01` +
+> `::Geometry::v08.01`, and an earlier read wrongly attributed the webcam to
+> `Video::Data`. Those are **MS-RDPEVOR** (Video *Optimized Remoting*) + **MS-RDPEGT**
+> (Geometry) — and MS-RDPEVOR is defined as **server→client** (it streams the *host's*
+> rapidly-changing desktop graphics *down to the client*, dependent on the EGFX/
+> Graphics channel). So those channels carried the desktop's optimized video
+> downstream, **not** the webcam. The webcam's 50 MB client→server was simply **not
+> in the TCP census** because the MS-RDPECAM camera channel was created and carried
+> **inside the reliable UDP tunnel** (after the DRDYNVC Soft-Sync migrated onto UDP),
+> where the TCP-side decryption can't see it — which is exactly why no
+> `RDCamera_Device_Enumerator` appeared on TCP. The tunnel's own TLS ServerHello
+> selected `0x009d` (RSA-KX), so `rdpkey.pem` *could* decrypt it, but tshark doesn't
+> chain RDPEUDP→TLS, so reading the camera PDUs from the capture needs custom tooling
+> (see "Can the capture decode the video?" below). This does not change the plan —
+> macrdp is the *server* and should advertise **MS-RDPECAM** regardless.
 >
 > So client-webcam-into-a-Mac-session is a **reachable feature**, not a dead end
 > like the USB path was. This doc scopes it.
@@ -206,19 +221,47 @@ staged:
    (reuse the existing inbound tunnel path) so the stream doesn't contend with EGFX
    on the TCP writer; lifecycle (device add/remove, stop-on-disconnect, teardown).
 
-## The client-version wrinkle (target MS-RDPECAM, not the Win10 channels)
+## Don't be misled by the `RDS::Video` channels — they aren't the camera
 
-The decrypted capture that motivated this used the older
-`Microsoft::Windows::RDS::Video::*::v08.01` channels because the **Win10 RDS host was
-the server** and advertised those. **macrdp is the server**, so *macrdp* chooses what
-to advertise — and it should advertise the **documented MS-RDPECAM**
-`RDCamera_Device_Enumerator`, then test against a client whose Windows build speaks it
-(Win10 1903+ / Win11 mstsc, which is the common case today). Building against the
-published spec with a matching test client beats reverse-engineering the legacy
-`RDS::Video` mechanism from an encrypted UDP tunnel (which tshark can't even decrypt —
-the samples are TLS-inside-RDPEUDP, custom-tooling territory). If a target
-deployment is pinned to a pre-1903 client that only offers the legacy channels, that
-becomes a separate, harder investigation — but it is not the mainstream case.
+The decrypted capture's TCP control channel showed
+`Microsoft::Windows::RDS::Video::Control/Data::v08.01` + `::Geometry::v08.01`, and it
+is tempting to treat those as the camera transport. They are **not**. They are
+**MS-RDPEVOR** (Video *Optimized Remoting*) + **MS-RDPEGT** (Geometry), and per the
+MS-RDPEVOR spec they redirect *"rapidly changing graphics content as a video stream
+**from the remote desktop host to the remote desktop client**"* — i.e. **server→client**
+desktop-video optimization, dependent on the EGFX/Graphics channel. They carried the
+*host's* desktop video downstream to the mstsc client, not the webcam upstream.
+
+The actual camera channel (**MS-RDPECAM**, `RDCamera_Device_Enumerator` + a per-device
+channel) never appeared in the TCP census because it was created and carried **inside
+the reliable UDP multitransport tunnel**, after the DRDYNVC Soft-Sync migrated the
+dynamic-channel layer onto UDP — encrypted where the TCP-side decryption can't see it.
+
+None of this changes the plan: **macrdp is the server**, so *macrdp* chooses what to
+advertise. Advertise the **documented MS-RDPECAM** `RDCamera_Device_Enumerator` and
+test against a client whose Windows build speaks it (Win10 1903+ / Win11 mstsc, the
+common case today). Building against the published spec with a matching live client is
+far cheaper than trying to recover the protocol from the encrypted tunnel.
+
+## Can the capture decode the video? (Possible, but not needed)
+
+Yes in principle, no in practice-without-effort:
+
+- **The key would work.** The reliable UDP tunnel is TLS, and its ServerHello selected
+  `0x009d` (`TLS_RSA_WITH_AES_256_GCM_SHA384`, RSA key exchange, no forward secrecy) —
+  so `rdpkey.pem` can decrypt the tunnel, exactly as it decrypts the TCP side.
+- **tshark can't do it.** Wireshark/tshark do not chain the custom RDPEUDP transport
+  into TLS, so nothing dissects the tunnel automatically.
+- **Full decode = writing a partial RDP client for the recording:** parse RDPEUDP
+  headers and reassemble the reliable byte stream (in-order, dedup) → extract + decrypt
+  the TLS records → un-wrap MS-RDPEMT tunnel data → DRDYNVC → find the MS-RDPECAM DVC →
+  parse the media-type negotiation → concatenate the sample payloads → H.264/MJPEG
+  decode. A few days of work, and it yields *one recorded session*, not a capability.
+- **It is not a prerequisite.** Both protocols are fully documented (below), so
+  implementing against the spec with a live client (Phase 0) is the real path. If you
+  ever want a *cheaper* slice than full video decode, stop after the DRDYNVC layer and
+  just read the camera **channel name + media-type negotiation** to confirm the codec —
+  but a live Win11 test gets the same answer with less effort.
 
 ## Distribution / packaging implications
 
@@ -264,12 +307,22 @@ tractable where the USB path was not: the right layer already exists on both end
 ## Sources
 
 - **MS-RDPECAM** — *Remote Desktop Protocol: Video Capture Virtual Channel Extension*
-  (Microsoft Open Specifications). Channel `RDCamera_Device_Enumerator`; enumerator +
-  per-device message sets; `CAM_MEDIA_TYPE_DESCRIPTION` formats.
+  (Microsoft Open Specifications, fully documented + PDF). Channel
+  `RDCamera_Device_Enumerator`; enumerator + per-device message sets;
+  `CAM_MEDIA_TYPE_DESCRIPTION` formats. **This is the camera protocol to implement.**
+  <https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpecam/>
+- **MS-RDPEVOR** — *Video Optimized Remoting Virtual Channel Extension* (channels
+  `Microsoft::Windows::RDS::Video::Control/Data::v08.01`) — for context / to *avoid
+  confusion*: this is **server→client** desktop-video optimization (dependent on the
+  Graphics channel), **not** camera redirection. Seen in the capture but a red herring
+  for the webcam. <https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpevor/>
 - Ground-truth capture `~/mstscpcap_camera3.pcapng` (mstsc → Win10 Pro RDS, decrypted
-  2026-07-16): no `URBDRC`, camera on `RDS::Video::*::v08.01`, 50 MB client→server on
-  the reliable UDP tunnel, no DTLS. Decryption method + full DVC census in the
-  `project_usb_redirection_feasibility` memory.
+  2026-07-16): no `URBDRC`; the webcam's 50 MB client→server rode the reliable UDP
+  tunnel (no DTLS) as an **MS-RDPECAM** channel *inside* the tunnel — invisible to the
+  TCP-side census (which showed only the server→client MS-RDPEVOR `RDS::Video` channels
+  above). The tunnel's TLS is RSA-KX (ServerHello `0x009d`), so `rdpkey.pem` could
+  decrypt it, but tshark can't chain RDPEUDP→TLS. Decryption method + full DVC census +
+  the MS-RDPEVOR correction in the `project_usb_redirection_feasibility` memory.
 - Apple: **Creating a camera extension with Core Media I/O** (`CMIOExtension`,
   System Extension packaging + `SystemExtensions.framework` activation).
 - Cross-reference: `docs/usb-redirection-feasibility.md` (why the webcam is NOT USB),

@@ -13,6 +13,7 @@ mod audio;
 mod auth;
 mod auth_guard;
 mod avc444;
+mod camera;
 mod capture;
 mod clipboard;
 #[cfg(test)]
@@ -504,6 +505,17 @@ struct Args {
     /// channel, not implemented). macOS-only.
     #[arg(long)]
     enable_usb_redirection: bool,
+
+    /// EXPERIMENTAL, opt-in (default OFF). Camera redirection (MS-RDPECAM) —
+    /// **Phase 0 protocol gate only**. Advertises the `RDCamera_Device_Enumerator`
+    /// DVC and logs the client's camera announcement (`DEVICE_ADDED_NOTIFICATION`)
+    /// so we can confirm a modern mstsc/Win11 will hand macrdp a redirected webcam
+    /// over MS-RDPECAM. It does NOT present a camera yet (no per-device channel, no
+    /// stream, no macOS code). The client must opt in too (mstsc: Local Resources ->
+    /// More -> "Video capture devices"). Cross-platform (pure protocol). See
+    /// docs/rdp-camera-redirection-feasibility.md.
+    #[arg(long)]
+    enable_camera_redirection: bool,
 
     /// EXPERIMENTAL, opt-in (default OFF). Offer RDP UDP multitransport
     /// (MS-RDPEMT over reliable RDPEUDP) to clients that advertise it, and bind a
@@ -1667,6 +1679,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ENABLE_USB_REDIRECTION", false) {
         argv.push("--enable-usb-redirection".into());
     }
+    if on("ENABLE_CAMERA_REDIRECTION", false) {
+        argv.push("--enable-camera-redirection".into());
+    }
     if on("ENABLE_UDP_MULTITRANSPORT", false) {
         argv.push("--enable-udp-multitransport".into());
     }
@@ -2609,6 +2624,17 @@ async fn async_main() -> Result<()> {
             None
         };
 
+    // Camera redirection (--enable-camera-redirection, opt-in) — Phase 0 protocol
+    // gate. Installs the MS-RDPECAM enumeration processor that advertises
+    // RDCamera_Device_Enumerator and logs the client's camera announcement. Ships
+    // inert when the flag is off.
+    let camera_factory: Option<Box<dyn ironrdp_server::RdCameraServerFactory>> =
+        if args.enable_camera_redirection {
+            Some(Box::new(camera::MacCamera::new()))
+        } else {
+            None
+        };
+
     // Auth hardening (Tier 1.2): per-IP rate-limit + lockout + audit log via the
     // server's pre-handshake/post-disconnect ConnectionHandler seam. On by default
     // (MACRDP_CONN_GUARD=0 disables). A fork *worker* bypasses the accept loop
@@ -2629,6 +2655,7 @@ async fn async_main() -> Result<()> {
         .with_sound_factory(Some(sound))
         .with_rdpdr_factory(rdpdr_factory)
         .with_usb_factory(usb_factory)
+        .with_camera_factory(camera_factory)
         .with_bitmap_codecs(bitmap_codecs())
         .with_gfx_factory(gfx_factory)
         .with_connection_handler(conn_handler)

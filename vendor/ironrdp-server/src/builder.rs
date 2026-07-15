@@ -10,7 +10,10 @@ use super::display::{DesktopSize, RdpServerDisplay};
 use super::gfx::GfxServerFactory;
 use super::handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use super::server::{ConnectionHandler, RdpServer, RdpServerOptions, RdpServerSecurity};
-use crate::{DisplayUpdate, RdpServerDisplayUpdates, RdpdrServerFactory, SoundServerFactory, UrbdrcServerFactory};
+use crate::{
+    DisplayUpdate, RdCameraServerFactory, RdpServerDisplayUpdates, RdpdrServerFactory, SoundServerFactory,
+    UrbdrcServerFactory,
+};
 
 pub struct WantsAddr {}
 pub struct WantsSecurity {
@@ -36,6 +39,7 @@ pub struct BuilderDone {
     sound_factory: Option<Box<dyn SoundServerFactory>>,
     rdpdr_factory: Option<Box<dyn RdpdrServerFactory>>,
     usb_factory: Option<Box<dyn UrbdrcServerFactory>>,
+    camera_factory: Option<Box<dyn RdCameraServerFactory>>,
     connection_handler: Option<Box<dyn ConnectionHandler>>,
     #[cfg(feature = "egfx")]
     gfx_factory: Option<Box<dyn GfxServerFactory>>,
@@ -133,6 +137,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 cliprdr_factory: None,
                 rdpdr_factory: None,
                 usb_factory: None,
+                camera_factory: None,
                 connection_handler: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
                 max_request_size: RdpServerOptions::DEFAULT_MAX_REQUEST_SIZE,
@@ -153,6 +158,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 cliprdr_factory: None,
                 rdpdr_factory: None,
                 usb_factory: None,
+                camera_factory: None,
                 connection_handler: None,
                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
                 max_request_size: RdpServerOptions::DEFAULT_MAX_REQUEST_SIZE,
@@ -196,6 +202,14 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// Configure server-direction MS-RDPECAM (camera redirection) — the Phase-0
+    /// protocol gate. When set, the `RDCamera_Device_Enumerator` DVC is advertised
+    /// and the client's camera announcements are logged.
+    pub fn with_camera_factory(mut self, camera_factory: Option<Box<dyn RdCameraServerFactory>>) -> Self {
+        self.state.camera_factory = camera_factory;
+        self
+    }
+
     pub fn with_bitmap_codecs(mut self, codecs: BitmapCodecs) -> Self {
         self.state.codecs = codecs;
         self
@@ -233,6 +247,7 @@ impl RdpServerBuilder<BuilderDone> {
             self.state.cliprdr_factory,
             self.state.rdpdr_factory,
             self.state.usb_factory,
+            self.state.camera_factory,
             self.state.connection_handler,
             #[cfg(feature = "egfx")]
             self.state.gfx_factory,

@@ -394,6 +394,10 @@ pub struct RdpServer {
     // (divergence 16) server-direction MS-RDPEUSB (URBDRC) USB redirection.
     // Ships inert: the URBDRC DVC is advertised only when this is `Some`.
     usb_factory: Option<Box<dyn crate::UrbdrcServerFactory>>,
+    // (divergence 19) server-direction MS-RDPECAM camera redirection — Phase-0
+    // protocol gate. The `RDCamera_Device_Enumerator` DVC is advertised only when
+    // this is `Some`; byte-identical when None.
+    camera_factory: Option<Box<dyn crate::RdCameraServerFactory>>,
     echo_handle: EchoServerHandle,
     #[cfg(feature = "egfx")]
     gfx_factory: Option<Box<dyn GfxServerFactory>>,
@@ -624,6 +628,7 @@ impl RdpServer {
         mut cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
         mut rdpdr_factory: Option<Box<dyn crate::RdpdrServerFactory>>,
         mut usb_factory: Option<Box<dyn crate::UrbdrcServerFactory>>,
+        camera_factory: Option<Box<dyn crate::RdCameraServerFactory>>,
         connection_handler: Option<Box<dyn ConnectionHandler>>,
         #[cfg(feature = "egfx")] mut gfx_factory: Option<Box<dyn GfxServerFactory>>,
     ) -> Self {
@@ -660,6 +665,7 @@ impl RdpServer {
             cliprdr_factory,
             rdpdr_factory,
             usb_factory,
+            camera_factory,
             echo_handle: EchoServerHandle::new(ev_sender.clone()),
             #[cfg(feature = "egfx")]
             gfx_factory,
@@ -993,6 +999,16 @@ impl RdpServer {
             let mut dvc = dvc;
             if let Some(usb_factory) = self.usb_factory.as_deref() {
                 dvc = dvc.with_dynamic_channel(usb_factory.build_processor());
+            }
+            dvc
+        };
+
+        // (divergence 19) server-direction MS-RDPECAM camera redirection (Phase-0
+        // gate). Advertised only when a factory is installed; byte-identical when None.
+        let dvc = {
+            let mut dvc = dvc;
+            if let Some(camera_factory) = self.camera_factory.as_deref() {
+                dvc = dvc.with_dynamic_channel(camera_factory.build_processor());
             }
             dvc
         };

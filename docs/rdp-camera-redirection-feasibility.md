@@ -201,12 +201,22 @@ the extension. MJPG decodes via VT/vImage; raw NV12/I420/YUY2 wrap directly into
 A phased build, each phase separately testable, mirroring how USB redirection was
 staged:
 
-1. **[Phase 0 — cheap gate]** Advertise `RDCamera_Device_Enumerator` from a
-   throwaway server processor and confirm a **modern mstsc client** (Win10 1903+ /
-   Win11, "Video capture devices" enabled in Local Resources → More) answers with a
-   `DEVICE_ADDED_NOTIFICATION` for its webcam. This proves the client speaks
-   MS-RDPECAM to macrdp before any decode/presentation work. **No entitled build, no
-   macOS camera code** — pure protocol, like the URBDRC Phase-3.0 observe slice.
+1. **[Phase 0 — cheap gate] ✅ BUILT (2026-07-16), pending a live mstsc test.**
+   Advertise `RDCamera_Device_Enumerator` from a throwaway server processor and
+   confirm a **modern mstsc client** (Win10 1903+ / Win11, "Video capture devices"
+   enabled in Local Resources → More) answers with a `DEVICE_ADDED_NOTIFICATION` for
+   its webcam. This proves the client speaks MS-RDPECAM to macrdp before any
+   decode/presentation work. **No entitled build, no macOS camera code** — pure
+   protocol, like the URBDRC Phase-3.0 observe slice.
+   *Implemented:* `vendor/ironrdp-server/src/rdcamera.rs` (`RdCameraServer`
+   `DvcProcessor` — SHARED_MSG_HEADER parse, SelectVersion negotiation, and the
+   `DEVICE_ADDED_NOTIFICATION` log = the GREEN signal), the `camera_factory` DVC seam
+   (divergence 19: field + `new()` param + `attach_channels` advertise +
+   `with_camera_factory`), the cross-platform `src/camera/mod.rs` (`MacCamera`
+   factory, no macOS code), and the `--enable-camera-redirection` flag /
+   `ENABLE_CAMERA_REDIRECTION` env. Byte-identical when off. **Next: set
+   `ENABLE_CAMERA_REDIRECTION=1`, connect a real mstsc with the webcam checked, and
+   watch for `MS-RDPECAM DEVICE_ADDED_NOTIFICATION … (Phase-0 GREEN)` in the log.**
 2. **[Phase 1]** MS-RDPECAM PDU layer + `RdCameraServer` `DvcProcessor` (vendored
    `ironrdp-server` divergence, riding a new `camera_factory` seam): enumerator
    handshake → per-device channel → stream/media-type enumeration → **Start Streams**
@@ -288,10 +298,14 @@ Yes in principle, no in practice-without-effort:
   macOS side. Every part is something macrdp has already shown it can do (DVC channels
   ✓, reliable UDP multitransport + inbound tunnel path ✓, VideoToolbox ✓, presenting a
   redirected device as a real macOS device ✓ for USB/drives/smart cards).
-- **It's a strong candidate for another OSS-RDP-server first** — no open-source RDP
-  server presents a client-redirected webcam. Weigh that against the reality that
-  client-camera-into-a-remote-session is a narrower use case than drives or the
-  desktop itself.
+- **Not an OSS-first, but there's a reference implementation.** Unlike URBDRC (where
+  macrdp was first), **FreeRDP already implements the server side of MS-RDPECAM**
+  (`channels/rdpecam/server/camera_device_enumerator_main.c` +
+  `camera_device_main.c`) — it decodes the same PDUs we need. That's a working
+  reference for the exact wire handling (and a heads-up: it had an out-of-bounds read
+  in the `DeviceName`/`VirtualChannelName` scan before 3.28.0, CVE-2026-57157 — bound
+  those reads). macrdp presenting the result as a real *macOS* camera would still be
+  novel, but frame the value as "a genuinely useful capability," not a first.
 - **Prefer this over any further USB-side effort for webcams.** The URBDRC path is
   proven dead for mstsc cameras; MS-RDPECAM is the only route that can work.
 

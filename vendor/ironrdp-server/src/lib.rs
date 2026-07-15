@@ -20,6 +20,7 @@ mod handler;
 mod helper;
 #[cfg(feature = "multitransport")]
 mod multitransport;
+mod rdcamera;
 mod rdpdr;
 mod rdpeusb;
 mod server;
@@ -47,6 +48,7 @@ pub use rdpdr::{
     RdpdrServerMessage, RdpdrStatus, SCARD_EJECT_CARD, SCARD_LEAVE_CARD, SCARD_RESET_CARD, SCARD_SHARE_DIRECT,
     SCARD_SHARE_EXCLUSIVE, SCARD_SHARE_SHARED, SCARD_UNPOWER_CARD,
 };
+pub use rdcamera::{RDCAMERA_CHANNEL_NAME, RdCameraServer, RdCameraServerFactory};
 pub use rdpeusb::{
     DeviceDescriptor, URBDRC_CHANNEL_NAME, UrbdrcServer, UrbdrcServerFactory, UrbdrcServerMessage, UsbDeviceCallback,
     UsbHandle, UsbPipe,

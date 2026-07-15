@@ -4,6 +4,14 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.8.35 — the USB read-ahead gate fix
+
+A one-fix point release over v0.8.34. It reworks *how* the v0.8.34 gamepad fix distinguishes a streaming bulk endpoint from an HID interrupt endpoint, because v0.8.34's method silently broke the **webcam**. Scope is the opt-in USB feature only (`--enable-usb-redirection`, experimental / entitled-build-only); nothing else changes.
+
+- **v0.8.34 fixed the gamepad but broke the bulk webcam.** v0.8.34 scoped the bulk-IN read-ahead engine (added in v0.8.30 for webcam streaming) to *true* BULK endpoints by pushing the client's `SelectConfiguration` `is_bulk` flag into the virtual host controller. That kept the gamepad's interrupt-IN pipe off the streaming path — but a **UVC video endpoint is frequently reported over the wire with `is_bulk=false`** (measured 69 of 81 times on a redirected A4Tech cam), so the declared-type gate *wrongly excluded the webcam*: read-ahead never engaged, so the video pipe ran dry and there was no image.
+- **Fix: gate read-ahead on the transfer's read LENGTH, not its declared type.** Read length is a reliable physical signal where the declared transfer type is not — a webcam's streaming bulk read is tens of KB (102656 B observed), while an HID interrupt-IN poll is at most `wMaxPacketSize` (64 B). The read-ahead gate now engages only when the read is ≥ 512 B, so the webcam's large reads stream (byte-identical to the known-good v0.8.33 path) while the gamepad's tiny polls stay serial. Moving that size check up into the ring-walk gate — not just inside the engage step, where v0.8.30–0.8.33 had it — is what stops an interrupt endpoint's control flow from diverging into the streaming branch in the first place. The now-unneeded `is_bulk` plumbing is removed.
+- Live-verified: the redirected Xbox controller's buttons work (1140 input reports, pipe stayed serial) and the webcam's read-ahead engages (`readLen=102656`, depth 4). Note that whether *mstsc* actually delivers a redirected webcam's frames is a client-side matter — mstsc prefers its dedicated camera-redirection channel and can refuse the raw-USB transfers (`0x8007001f`); the FreeRDP bulk-webcam path (the one originally verified in v0.8.30) is unchanged.
+
 ## v0.8.34 — the gamepad-input fix
 
 A one-fix point release over v0.8.33. It repairs a real regression in **USB redirection** (`--enable-usb-redirection`, experimental / opt-in / entitled-build-only): a redirected **HID gamepad enumerated but its buttons did nothing** — broken since v0.8.30 and present in v0.8.31/32/33. Nothing outside the opt-in USB feature changes.

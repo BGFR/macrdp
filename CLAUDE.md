@@ -19,25 +19,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.34** (the gamepad-input fix — a one-fix
-point release over v0.8.33 repairing a regression in the opt-in USB-redirection
-feature: a redirected **HID gamepad enumerated but its buttons did nothing**
-(broken v0.8.30 → v0.8.33). The v0.8.30 bulk-IN read-ahead engine's `isBulkIn`
-test was address-only (non-EP0 IN + NormalTransfer), which an **interrupt-IN pipe
-also satisfies** — macOS double-buffers interrupt endpoints too, so its
-re-doorbell routed the gamepad into the streaming branch instead of the "skip the
-duplicate, the outstanding completion re-walks" path, and the pipe was only
-serviced when something else forced a re-walk (input reports at ~20 s instead of
-~8 ms). The `readLen >= 512` threshold stopped the *stream* engaging but NOT the
-control-flow divergence — which is why it hid for four releases and why the old
-docs wrongly credited it. Read-ahead is now gated on the endpoint's **real
-transfer type** (the client's SelectConfiguration pipe info, pushed to the ObjC
-controller via `macrdp_usb_set_endpoint_bulk()`); unknown ⇒ not-bulk (fail-safe =
-serial). Mass storage + the bulk UVC webcam unchanged; interrupt endpoints can no
-longer enter the streaming path. Live-verified on a real redirected Xbox
-controller. **Don't re-break it: at the UserHCI ring an interrupt endpoint is
-indistinguishable from a bulk one by address + msg-type alone.**) Earlier:
-**v0.8.33** (the audit-forwarding release — a
+(VPN/ZeroTier). **Latest release: v0.8.35** (the USB read-ahead gate fix — a
+one-fix point release over v0.8.34 reworking *how* the bulk-IN read-ahead engine
+tells a streaming BULK endpoint apart from an HID interrupt endpoint, because
+v0.8.34's method silently broke the **webcam**. Background: the v0.8.30 read-ahead
+engine's `isBulkIn` test was address-only (non-EP0 IN + NormalTransfer), which an
+**interrupt-IN pipe also satisfies**, so a redirected **gamepad enumerated but its
+buttons did nothing** (v0.8.30 → v0.8.33; input reports at ~20 s instead of ~8 ms —
+its interrupt pipe was routed into the streaming branch and only serviced on a
+forced re-walk). **v0.8.34** gated instead on the endpoint's **declared** transfer
+type (`is_bulk` from the client's SelectConfiguration pipe info, pushed to the ObjC
+controller via `macrdp_usb_set_endpoint_bulk()`) — which fixed the gamepad but
+**wrongly excluded the webcam**: a UVC video endpoint is frequently reported over
+the wire with `is_bulk=false` (measured **69/81** on a redirected A4Tech cam), so
+read-ahead never engaged and there was no image. **v0.8.35 gates on the transfer's
+read LENGTH instead** — a reliable physical signal where the declared type is not:
+a webcam's streaming bulk read is tens of KB (102656 B observed), an HID interrupt
+poll is ≤ `wMaxPacketSize` (64 B), so the `isBulkIn` gate now requires
+`normalReadLen >= 512`. The webcam's large reads engage read-ahead (byte-identical
+to the known-good v0.8.33 path) while the gamepad's tiny polls stay serial; the
+`is_bulk` plumbing is removed. Load-bearing: moving the size check up into the
+`walkEndpoint:` gate — not just inside `engageStream:`, where v0.8.30–0.8.33 had it
+— is what stops an interrupt endpoint's control flow from diverging into the
+streaming branch at all. Live-verified: gamepad buttons work (1140 reports, stayed
+serial), webcam read-ahead engages (`readLen=102656`, depth 4). **Don't re-break
+it: at the UserHCI ring an interrupt endpoint is indistinguishable from a bulk one
+by address + msg-type, AND by the wire-declared `is_bulk` flag — only the read
+length reliably separates them. Whether *mstsc* then delivers a webcam's frames is
+client-side (it prefers its own camera-redirection channel and can refuse the
+raw-USB transfers with `0x8007001f`); the FreeRDP bulk-webcam path is unchanged.**)
+Earlier: **v0.8.34** (the gamepad-input fix — the first repair of the above
+gamepad regression, via the `is_bulk` declared-type gate that v0.8.35 replaces).
+Earlier: **v0.8.33** (the audit-forwarding release — a
 SIEM/SOC observability roll-up over v0.8.32, no change to the default runtime
 path; everything here is opt-in + default-off and byte-identical when off. **Opt-in
 structured JSON audit stream** (`--audit-file` / `MACRDP_AUDIT_JSON=1`, config

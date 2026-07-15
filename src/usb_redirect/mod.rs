@@ -241,11 +241,6 @@ mod imp {
             err: *mut c_int,
         ) -> *mut c_void;
         fn macrdp_usb_controller_destroy(handle: *mut c_void);
-        // Registers whether `endpoint_address` is a true BULK pipe. Only a
-        // registered-bulk IN endpoint is eligible for the ObjC read-ahead engine;
-        // an interrupt (HID) pipe must stay on the serial path. Unknown endpoints
-        // default to not-bulk on the ObjC side, so this is fail-safe.
-        fn macrdp_usb_set_endpoint_bulk(handle: *mut c_void, endpoint_address: u32, is_bulk: c_int);
         // Completes a previously-raised control-IN OR bulk transfer. `bytes`/`len`
         // are the IN data to copy into the transfer buffer; for an OUT transfer pass
         // `bytes = NULL` and `len` = bytes accepted (reported as the transfer length).
@@ -453,20 +448,6 @@ mod imp {
                     pipe_map.insert(p.endpoint_address, p.pipe_handle);
                     if !p.is_bulk {
                         interrupt_eps.insert(p.endpoint_address);
-                    }
-                    // Tell the ObjC controller the endpoint's real transfer type. The
-                    // read-ahead engine is BULK-only: an interrupt-IN pipe looks
-                    // identical at the ring (a non-EP0 IN NormalTransfer), so without
-                    // this it would be routed into the streaming path and only get
-                    // serviced when something forced a re-walk — a redirected gamepad
-                    // went dead / re-enumerated. This lands before the kernel creates
-                    // the endpoints, so it is always registered before the first walk.
-                    unsafe {
-                        macrdp_usb_set_endpoint_bulk(
-                            controller.0,
-                            u32::from(p.endpoint_address),
-                            c_int::from(p.is_bulk),
-                        );
                     }
                 }
                 info!(

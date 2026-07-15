@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(17)/(18) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(17)/(18)/(19) below are upstreamed
 AND released — #1276 landing is NOT sufficient.
 
 (1) The original "keep newest queued waves on per-batch overflow"
@@ -1370,3 +1370,41 @@ AND released — #1276 landing is NOT sufficient.
     `connection_handler = None`, so the hook doesn't fire there (fork-workers
     keeps its exit-code-derived accept/disconnect audit); documented as a v1
     boundary.
+
+(19) Server-direction MS-RDPECAM camera redirection — **Phase 0 protocol gate
+    only** (NOT upstreamed; added 2026-07-16; behind macrdp's
+    `--enable-camera-redirection`, opt-in). New `src/rdcamera.rs` houses
+    `RdCameraServer` (a `DvcProcessor`+`DvcServerProcessor` on the
+    `RDCamera_Device_Enumerator` DVC) that advertises the MS-RDPECAM enumeration
+    channel, answers the client's version negotiation, and LOGS the client's
+    `DEVICE_ADDED_NOTIFICATION`. That log line is the go/no-go signal that a modern
+    mstsc/Win11 will hand macrdp a client-redirected webcam over MS-RDPECAM — the
+    channel the decrypted pcap proved the camera actually rides (NOT URBDRC/USB; see
+    `docs/rdp-camera-redirection-feasibility.md` + the
+    `project_camera_redirection_feasibility` memory). It opens NO per-device channel,
+    drives NO stream, decodes NO samples, touches NO macOS code — a cheap gate before
+    the multi-week presentation work (per-device channels, media-type negotiation,
+    H.264 sample decode, a macOS CoreMediaIO Camera Extension).
+    - Handshake (MS-RDPECAM 3.1/3.2): every message starts with a 2-byte
+      `SHARED_MSG_HEADER` = `Version(u8)` + `MessageId(u8)`. The CLIENT speaks first
+      (`SelectVersionRequest` 0x03, its max version) once the server opens the DVC, so
+      `start()` returns empty; `process()` decodes the header and, on 0x03, replies
+      `SelectVersionResponse` (0x04) with `min(client, OUR_MAX=2).max(1)`; on
+      `DEVICE_ADDED_NOTIFICATION` (0x05) parses `DeviceName` (null-term UTF-16LE) +
+      `VirtualChannelName` (null-term ASCII) with reads bounded to the payload
+      (CVE-2026-57157 was an OOB scan for those terminators in FreeRDP <3.28.0) and
+      logs the GREEN line; on 0x06 logs; else debug. `SelectVersionResponse` is a
+      2-byte `Encode`+`DvcEncode` newtype (mirrors `UsbHeaderMsg` in rdpeusb.rs).
+    - Robustness: `process()` TOLERATES every decode (log + `Ok(Vec::new())`, never
+      propagates) — a decode error would otherwise tear down the whole session for an
+      opt-in gate (same lesson as divergences 16/the ironrdp-dvc Soft-Sync one).
+    - Wiring: `camera_factory: Option<Box<dyn RdCameraServerFactory>>` field + `new`
+      param + struct init + `builder.with_camera_factory` + `.with_dynamic_channel`
+      in `attach_channels` (advertised only when `Some` — byte-identical when off).
+      UNLIKE the URBDRC factory, `RdCameraServerFactory: Send` has NO
+      `ServerEventSender` supertrait and no `set_sender` — Phase 0 replies inline from
+      `process()` and never asks the event loop to open a channel. macrdp's
+      cross-platform `src/camera/mod.rs` (`MacCamera`) is the factory; no macOS code.
+    Cleanly upstreamable as the server counterpart to a (nonexistent-upstream)
+    client MS-RDPECAM — but it's a gate, so hold until Phase 1 shapes the real API.
+    Reference: FreeRDP `channels/rdpecam/server/` implements this server side.

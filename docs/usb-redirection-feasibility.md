@@ -447,3 +447,41 @@ Presenting side is macOS-only and needs the entitled/provisioned build.
 
 Cross-reference the `docs/known-quirks.md` smart-card note (kext vs dext vs UserHCI
 rationale) and `project_usb_redirection_feasibility` memory for the running log.
+
+## 2026-07-16 — webcam verification: FreeRDP GREEN on v0.8.35, mstsc refusal packet-proven
+
+A full-day webcam-redirect verification pass against the shipped **v0.8.35** entitled build
+produced two durable findings.
+
+- **FreeRDP: webcam works end-to-end — regression PASS.** The A4Tech FHD 1080P
+  (`09da:2692`, bulk UVC) redirected from a FreeRDP client streams live video into Photo
+  Booth on the Mac. macrdp's URBDRC path is intact: it dedups FreeRDP's double-announce
+  (`…d33`/`…d32` → one UserHCI controller, `skipping duplicate identity=09da:2692:0100`),
+  engages read-ahead (`ep=0x82 depth=4 readLen=102656`), forwards the video reads, and
+  returns **zero `0x8007001f`**. **Testing-rig gotcha (cost a day to isolate):** a UVC
+  webcam *cannot* be passed through to a UTM/QEMU guest running on the **same** Mac —
+  macOS's DriverKit camera stack (`com.apple.cmio.videodriverkithostextension` /
+  `UVCAssistant`) binds the camera and there is **no macOS equivalent of Linux
+  `modprobe -r uvcvideo`**, so the host keeps the cam (`ioreg` shows it `matched` even with
+  the client stopped), the guest's raw-USB reads complete `moved=0`, and the redirect
+  starves → black Photo Booth. Tell-tale: two identical A4Tech entries in Photo Booth (the
+  physical cam the host still holds + macrdp's redirect), one black. **Fix: run the FreeRDP
+  client on a SEPARATE physical machine** — Linux `modprobe -r uvcvideo` + `/usb:dev:09da:2692`,
+  or Windows Zadig→WinUSB + `/usb:` — verified working from another machine's UTM the same
+  day. Mass storage + gamepad pass through the same-Mac rig fine (macOS doesn't lock those).
+  A `build-freerdp-urbdrc.sh` helper (FreeRDP 3.x, `WITH_URBDRC=ON` + `libusb-1.0-0-dev`,
+  +FFmpeg H.264/AAC) stands up a Debian client.
+
+- **mstsc: webcam-over-URBDRC is NOT server-fixable — proven at the packet level.** A
+  decrypted TCP capture of mstsc→macrdp (`SSLKEYLOGFILE`, TLS 1.3; tshark
+  `-o tls.keylog_file:… -d tcp.port==3390,tpkt -d tls.port==3390,tpkt` — the second decode-as
+  routes decrypted payload back through TPKT→RDP so `rdp_drdynvc` dissects) shows URBDRC on
+  DRDYNVC channel `0x05`: macrdp requests the `102656`-byte (`0x19100`) bulk reads on ep 0x82,
+  and mstsc answers **35 completions carrying hresult `0x8007001f` with zero transferred bytes**
+  (`…08001b00 040000c0 1f000780 00000000`). The largest single client→server payload is **795 B**
+  (a config descriptor) with **no DATA_FIRST fragmentation anywhere** — i.e. mstsc ships no webcam
+  data at all, while the desktop H.264 (11 MB) flowed on the same TLS connection throughout. So
+  it's a client-side refusal, not a macrdp drop/encode/transport issue. Identity spoofing (RDP
+  version, OS platform), RDCamera-channel presence, and TCP-only were all separately ruled out.
+  mstsc routes webcams over its own **MS-RDPECAM** camera channel (Phase-0 protocol gate landed —
+  see the camera-redirection feasibility doc), not raw URBDRC — **do not re-chase this.**

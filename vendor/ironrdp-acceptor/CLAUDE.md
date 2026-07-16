@@ -79,8 +79,13 @@ vendor dir until divergence (1) is upstreamed AND released.
     in docs/known-quirks.md.
 
 (3) Expose the client's multitransport (MS-RDPEMT) support flags from its GCC
-    MultiTransportChannelData block (NOT upstreamed; added 2026-06-25 for UDP
-    multitransport M1): `Acceptor` gains a private
+    MultiTransportChannelData block. **The READ-side (surfacing the flags on
+    `AcceptorResult`) is UPSTREAMED as #1453 (OPEN 2026-07-17) — a line-for-line
+    twin of the merged #1397/#1373 GCC-surfacing; drop it from this fork on the
+    pin bump past its merge. The M3c advertise/emit/offer half below stays
+    vendored (macrdp UDP-offer policy), so #1453 does NOT de-vendor the
+    acceptor.** Added 2026-06-25 for UDP
+    multitransport M1: `Acceptor` gains a private
     `client_multitransport: gcc::MultiTransportFlags` (captured in
     `BasicSettingsWaitInitial` alongside (1)/(2), UNCONDITIONALLY — free and
     harmless; empty if the client sent no block), carried across

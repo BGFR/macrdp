@@ -472,6 +472,15 @@ then delete; promote a parked item to *In flight* when work actually starts.
     **Double-checked 2026-07-10: build/clippy-D/tests/fmt clean; amendment is purely additive
     validation.** Only Copilot has reviewed (no human yet). Independent of #1418 (different
     file/type); both touch `tests/rdpeusb/mod.rs` (one line) → rebase whichever merges second.
+  - [ ] **#1453** `feat(acceptor): expose client multitransport flags on AcceptorResult` — opened
+    2026-07-17. Upstreams the READ-side of vendored `ironrdp-acceptor` divergence (3): surfaces
+    `pub multitransport_flags: gcc::MultiTransportFlags` (the client's GCC `MultiTransportChannelData`,
+    MS-RDPBCGR §2.2.1.3.8, which the acceptor already parses then discards) so a UDP-capable server
+    can decide whether to send a Server Initiate Multitransport Request. **Purely additive, zero
+    behavior change** — a line-for-line twin of the merged `keyboard_layout` (#1397) / desktop-size
+    (#1373) surfacing at all six touch points. No test (matches #1397/#1373 precedent; acceptor lib is
+    `test=false`). clippy/fmt clean. The bulky M3c advertise/emit/offer HALF of divergence (3) stays
+    vendored as macrdp UDP policy, so even merged+released this does NOT de-vendor the acceptor.
   Nothing whole-vendor-dir is currently de-vendorable (each fork keeps ≥1 macrdp-specific
   server-direction divergence). **Divergence logs reconciled vs upstream/master 2026-07-08**
   (de-drift committed `27c5a84`): six divergences are already merged upstream and become deletions

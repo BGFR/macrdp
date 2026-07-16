@@ -4,6 +4,13 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.8.36 — the fork-workers removal
+
+A cleanup release: it removes the experimental `--fork-workers` process model (superseded, and a net-negative for interactive mstsc) and lands opt-in, default-off groundwork for a future camera-redirection feature. **The default runtime path is unchanged** — single-process was already the default.
+
+- **Removed the `--fork-workers` per-connection process model.** It ran a thin supervisor that `fork+exec`'d a fresh worker process per RDP connection (xrdp's model), built to dodge mstsc's H.264 EGFX reconnect-blank by giving each connection a fresh process. That blank has **self-healed in place since v0.8.27** — a bare core Deactivation–Reactivation (which preserves the EGFX channel/surface) plus the Server Auto-Reconnect Cookie — and an exhaustive live A/B found the process model was actually a *net-negative* for interactive mstsc: mstsc opens an abandoned extra TCP connection on each reconnect attempt, and because the supervisor serialized workers, that stalled the real connection's worker slot. Single-process + `--enable-h264` + blank-recovery + the auto-reconnect cookie is now the only, field-proven model. A stale `FORK_WORKERS=1` left in a deployed `config.env` is simply ignored (unknown key), so existing installs keep working; the GUI's "Per-connection workers" toggle is removed too. Net −756 lines (−691 in `main.rs`).
+- **Experimental camera-redirection groundwork (Phase 0, opt-in, inert by default).** A new `--enable-camera-redirection` flag negotiates the MS-RDPECAM `RDCamera_Device_Enumerator` channel and logs the client announcing its redirected webcam — the protocol gate proving a modern mstsc/Win11 will hand macrdp a camera over MS-RDPECAM (the dedicated camera channel that generic USB redirection can't reach). It does **not** present a camera yet: no per-device stream, no macOS capture path. Nothing changes when the flag is off. This is groundwork for a future feature that presents a client's webcam as a native macOS camera.
+
 ## v0.8.35 — the USB read-ahead gate fix
 
 A one-fix point release over v0.8.34. It reworks *how* the v0.8.34 gamepad fix distinguishes a streaming bulk endpoint from an HID interrupt endpoint, because v0.8.34's method silently broke the **webcam**. Scope is the opt-in USB feature only (`--enable-usb-redirection`, experimental / entitled-build-only); nothing else changes.

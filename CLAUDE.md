@@ -19,7 +19,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.35** (the USB read-ahead gate fix — a
+(VPN/ZeroTier). **Latest release: v0.8.36** (the fork-workers removal — a
+cleanup release with **no change to the default runtime path** (single-process
+was already the default). Removes the experimental **`--fork-workers`**
+per-connection process model: a supervisor that `fork+exec`'d a fresh worker
+process per RDP connection (xrdp's model), built to dodge mstsc's H.264 EGFX
+reconnect-blank by giving each connection a fresh process. That blank has
+**self-healed in place since v0.8.27** (a bare core Deactivation–Reactivation +
+the Server Auto-Reconnect Cookie), and an exhaustive 2026-07-07 A/B found the
+process model was a **net-negative** for interactive mstsc — mstsc opens an
+abandoned extra TCP connection on each reconnect attempt, which stalled the
+supervisor's serialized worker slot. So single-process + `--enable-h264` +
+blank-recovery + ARC is now the only, field-proven model; a stale
+`FORK_WORKERS=1` in a deployed `config.env` is ignored (unknown key), so existing
+installs don't break. Net **−756 LOC** (−691 in `main.rs`); the GUI's
+"Per-connection workers" toggle is gone too. Also lands **experimental
+camera-redirection groundwork** (Phase 0, opt-in, inert by default):
+**`--enable-camera-redirection`** negotiates the MS-RDPECAM
+`RDCamera_Device_Enumerator` DVC and logs the client announcing its redirected
+webcam — the protocol gate proving a modern mstsc/Win11 will hand macrdp a camera
+over MS-RDPECAM (the channel USB redirection can't reach). It does **not** present
+a camera yet (no per-device stream, no macOS capture); nothing changes when the
+flag is off. Groundwork for a future native-macOS-camera feature.) Earlier:
+**v0.8.35** (the USB read-ahead gate fix — a
 one-fix point release over v0.8.34 reworking *how* the bulk-IN read-ahead engine
 tells a streaming BULK endpoint apart from an HID interrupt endpoint, because
 v0.8.34's method silently broke the **webcam**. Background: the v0.8.30 read-ahead

@@ -418,9 +418,27 @@ then delete; promote a parked item to *In flight* when work actually starts.
 - [ ] **`cycle_apps` lock nesting (`CYCLE_SESSION` → `mru`).** Currently safe by consistent
   acquire order; de-nest as a follow-up to the PR #84 hardening if revisiting that area.
 
+- [x] **On-demand A/V resync hotkey (`Ctrl+Alt+Shift+R`) — DONE v0.8.38 (#159, 2026-07-17).**
+  Manual recovery of a session gone stale after a long idle — a blanked screen and/or drifted
+  audio (mstsc; the audiodg drift is client-side and un-observable from the server, so
+  auto-detection is a dead end — this is a lever the user presses when they *see* it). Video
+  forces a clean IDR keyframe (`Gfx::force_keyframe`, repaint the stale presentation); audio
+  rebuilds its SCK stream via the existing self-heal `'reconnect` (a brief gap drains the
+  client's backlog + re-baselines timing, like a minimize→unminimize). No disconnect;
+  always-on like `Ctrl+Alt+G`; Win-key-free so mstsc forwards it. **Load-bearing: video uses a
+  forced IDR, NOT the core reactivation** — the reactivation un-blanks too but on the
+  `--virtual-display`/`--capture-primary` headless path cascades into a visible ~1–2 s session
+  re-cycle (vd re-mod → #155 live-resize surface reset → SessionTracker teardown + headless
+  re-capture); the IDR is flicker-free. `Gfx::request_reactivation` kept `#[allow(dead_code)]`
+  as the escalation for a surface-retention blank an IDR can't clear. Live-verified on real
+  mstsc (un-blanked smoothly, audio resynced, zero flicker). See the quirk note in
+  `docs/known-quirks.md`.
+
 - [ ] **Auto-mute on silence (audio-only).** Long-idle YouTube unpause loses audio
   (Windows audiodg suspends after hours of digital silence). Must be audio-only (not the
-  shared `display_suppressed` gate, which would freeze the desktop).
+  shared `display_suppressed` gate, which would freeze the desktop). Note: the
+  `Ctrl+Alt+Shift+R` resync hotkey (above, DONE) is the *manual* answer to this idle-audio
+  drift; an *automatic* audio-only mute-on-silence is the still-parked hands-free version.
 
 - [ ] **AVC444 (4:4:4 chroma).** YUV-pack module + bench scaffold landed; `--avc444` not
   wired. VT hw-encoder serializes → 1080p-comfortable, 4K doesn't fit. Resume only if

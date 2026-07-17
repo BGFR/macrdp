@@ -457,7 +457,13 @@ then delete; promote a parked item to *In flight* when work actually starts.
     `u32` with named associated consts** (the `http::StatusCode` shape; matches the crate's own
     `UrbFunction`) — one representation per wire value, no aliasing. Added his requested
     decode-from-raw-bytes test + rstest round-trip. **Double-checked 2026-07-10: build + `clippy -D`
-    + tests + fmt all clean, no external consumers.** Awaiting re-review. Scoped to (1) only — HELD
+    + tests + fmt all clean, no external consumers.** **2026-07-15: uchouT (community) CHANGES_REQUESTED
+    a `check_device_speed` edge — the constraint compared `== HIGH_SPEED` but per MS-RDPEUSB 2.2.11
+    `DeviceIsHighSpeed` MUST be 0 at bus-iface-version 0, so a lenient newtype could wrongly accept a
+    non-`0x1` non-zero speed. FIXED 2026-07-16 (`04c76e7a`): compare `!= FULL_SPEED` (any non-zero) +
+    a 4-case raw-decode rstest. 2026-07-17: uchouT ENDORSED merge (pinged CBenoit "can we just merge
+    this?") — community review done, awaiting only CBenoit's merge click. Do NOT double-nudge.**
+    Scoped to (1) only — HELD
     rdpeusb (2) `UsbDevice=0` (CONFLICTS with merged #1321, which deliberately rejects that range;
     needs a "mstsc really sends 0 + capture" argument). On merge+release, most of rdpeusb divergence
     (1) drops. **Pin-bump churn: macrdp-side call sites shift `SupportedUsbVer::Usb32`→`::USB_32`

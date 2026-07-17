@@ -19,7 +19,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.36** (the fork-workers removal — a
+(VPN/ZeroTier). **Latest release: v0.8.37** (live resize + the webcam stall
+watchdog — two opt-in-path additions, **no change to the default runtime path**.
+**Live client-driven resize (MS-RDPEDISP)**: when the client drags its window,
+macrdp re-negotiates the session at the new size on the fly via a core
+Deactivation–Reactivation (the same in-place machinery the mstsc blank-recovery
+uses), re-moding a `--virtual-display` like a monitor changing resolution;
+debounced so a drag settles to one reactivation. Verified on Windows App for
+macOS (all session modes) + FreeRDP; a clean **no-op on mstsc** (it doesn't emit
+the MS-RDPEDISP monitor-layout PDU on a window drag — DVC-traced — so no
+regression). Contributed by Anton Mostovoy (#155). **USB webcam stall watchdog**:
+a bulk webcam redirected over FreeRDP could stream then **freeze after a while
+while the rest of the session kept working** — the read-ahead engine delivers
+frame reads strictly in sequence order, and a bulk read the client never
+completes (the camera stalls host-side: USB autosuspend / uvcvideo timeout /
+bandwidth) was a permanent gap with no timeout, so the stream wedged until
+re-attach. A `dispatch_source` watchdog (`usb_spike.m`) detects a stream waiting
+with no in-order data for `MACRDP_USB_STREAM_STALL_MS` (default 3000; 0 disables),
+completes the waiting ring head with a zero-length read → macOS re-COMMITs →
+read-ahead re-engages when the client resumes, turning a transient host-side
+stall into a self-recovering hiccup instead of a permanent freeze. The USB
+read-ahead knobs (`USB_STREAM_STALL_MS`, `USB_PREFETCH_DEPTH`) are now
+`config.env`-bridged. LIVE-VERIFIED on FreeRDP + an A4Tech webcam: a client-side
+stall froze the picture, the watchdog fired at ~1.7–2.2 s, and the video resumed
+in Photo Booth with no disconnect/crash (#158). Plus a README **Hotkeys**
+section.) Earlier: **v0.8.36** (the fork-workers removal — a
 cleanup release with **no change to the default runtime path** (single-process
 was already the default). Removes the experimental **`--fork-workers`**
 per-connection process model: a supervisor that `fork+exec`'d a fresh worker

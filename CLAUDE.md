@@ -19,7 +19,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.37** (live resize + the webcam stall
+(VPN/ZeroTier). **Latest release: v0.8.38** (the A/V resync hotkey — a small
+feature release, **no change to the default runtime path**. Adds an on-demand
+**`Ctrl+Alt+Shift+R`** to recover a session gone stale after a long idle: an
+mstsc session left idle for hours can blank the picture and drift the audio
+(Windows' audiodg buffers playback downstream where the server can't observe it,
+so auto-detection is a dead end). The chord — always-on like `Ctrl+Alt+G`,
+Win-key-free so mstsc forwards it — forces a clean **IDR keyframe** (video, to
+repaint the stale presentation) and **rebuilds the audio SCK stream** (so the
+client's drifted backlog drains and re-syncs, the same effect as a
+minimize→unminimize), with **no disconnect**. Live-verified on real mstsc:
+un-blanked smoothly, audio resynced, zero flicker. The video uses an IDR rather
+than the heavier core reactivation (`Gfx::request_reactivation`, kept as an
+escalation) — the reactivation un-blanks too but on the
+`--virtual-display`/`--capture-primary` headless path cascades into a visible
+~1–2 s session re-cycle; the IDR is lighter and flicker-free. #159.) Earlier:
+**v0.8.37** (live resize + the webcam stall
 watchdog — two opt-in-path additions, **no change to the default runtime path**.
 **Live client-driven resize (MS-RDPEDISP)**: when the client drags its window,
 macrdp re-negotiates the session at the new size on the fly via a core

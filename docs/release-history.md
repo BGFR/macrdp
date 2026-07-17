@@ -4,6 +4,12 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.8.38 — the A/V resync hotkey
+
+A small feature release: an on-demand hotkey to recover a session that's gone stale after a long idle — a blanked screen and/or drifted audio — without disconnecting. **The default runtime path is unchanged.**
+
+- **`Ctrl+Alt+Shift+R` — on-demand A/V resync.** An mstsc session left idle for hours can go stale on the client side: the picture blanks and the audio drifts (Windows' `audiodg` buffers playback downstream where the server can't observe it, so auto-detection is a dead end). This adds a manual lever you press when you *see* the drift — the **video** path forces a clean IDR keyframe to repaint the stale presentation, and the **audio** path rebuilds its capture stream so the client's drifted backlog drains and re-syncs (the same effect as a minimize→unminimize). No disconnect. Always-on like the existing `Ctrl+Alt+G` gather-windows hotkey, and Win-key-free so mstsc forwards it. Live-verified on real mstsc: un-blanked smoothly, audio resynced, zero flicker. The video deliberately uses an IDR rather than the heavier core reactivation — the reactivation un-blanks too, but on the `--virtual-display`/`--capture-primary` headless path it cascades into a visible ~1–2 s session re-cycle; the IDR is lighter and flicker-free.
+
 ## v0.8.37 — live resize + the webcam stall watchdog
 
 Two additions on opt-in paths: the session can now **resize live when the client drags its window** (MS-RDPEDISP), and a **redirected USB webcam that freezes now recovers on its own** instead of staying stuck. **The default runtime path is unchanged.**

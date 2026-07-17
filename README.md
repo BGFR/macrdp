@@ -49,6 +49,22 @@ Common flags to try next (full reference: [docs/configuration.md](docs/configura
 ./macrdp --map-ctrl-to-cmd                  # Windows Ctrl+C/V/X muscle memory drives macOS copy/paste
 ```
 
+## Hotkeys
+
+macrdp reimplements the macOS symbolic hotkeys in user space (WindowServer won't fire them for forwarded events). On a **Windows client the Cmd key is the Windows key**, so press the Win-key equivalent:
+
+| Keys (on the client) | Action |
+|---|---|
+| **Cmd+Tab** / **Cmd+Shift+Tab** | Cycle apps (forward / back); the app you land on is surfaced |
+| **Cmd+\`** / **Cmd+Shift+\`** | Cycle windows of the current app |
+| **Cmd+Space** | Spotlight |
+| **Cmd+Shift+3 / 4 / 5** | Screenshots (full screen / region / Screenshot.app) |
+| **Ctrl+Alt+G** | Gather windows stranded off the virtual display (headless `--capture-primary`/`--detach-primary` modes) |
+
+Optional flags: `--alt-tab-switch` / `--alt-backtick-switch` accept **Option+Tab** / **Option+\`** as the same triggers; `--app-switcher-hud` draws a visible switcher overlay; `--map-ctrl-to-cmd` remaps Windows **Ctrl+C/V/X/…** editing shortcuts to their **Cmd** equivalents.
+
+> **mstsc tip:** if **Cmd+Tab** seems ignored, set **Local Resources → Keyboard → "Apply Windows key combinations"** to **"On the remote computer"** (or go full-screen) — the windowed default eats **Win+Tab** locally as Task View.
+
 ## Auto-start at login (launchd)
 
 ```bash

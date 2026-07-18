@@ -74,7 +74,11 @@ then delete; promote a parked item to *In flight* when work actually starts.
   discards. A new per-client-type mechanism in the vendored server's RDPSND path (mstsc-useless, so
   gate on the fingerprint/QoE signal). Sharp, bounded win for the choppy-FreeRDP case. Client-side
   companion (no server change): `/sound:latency:100` raises FreeRDP's overrun cap + (Pulse) requests
-  a real sink buffer. See docs/known-quirks.md "Why mstsc audio is mostly smooth" +
+  a real sink buffer. **SCOPED 2026-07-19 → `~/.claude/plans/freerdp-render-latency-estimator.md`**
+  (key findings: WaveConfirm is git-pinned-rdpsnd-DROPPED today → needs a new small vendored
+  rdpsnd fork to surface it; self-gates on FreeRDP's two-confirms-per-block so mstsc stays inert
+  with no fingerprint dependency; staged Phase 1 observe-only + live go/no-go before touching the
+  hot path). See docs/known-quirks.md "Why mstsc audio is mostly smooth" +
   [[project_av_choppiness_contention]] + [[project_waveconfirm_not_playback_position]].
 
 - [~] **Perf: eliminate the per-capture full-frame `last_frame` memcpy — ASSESSED 2026-07-07,

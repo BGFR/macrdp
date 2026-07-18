@@ -411,9 +411,33 @@ then delete; promote a parked item to *In flight* when work actually starts.
   a DIFFERENT signature. The 2026-06-28 `UNKNOWN_0x32` pthread crash is a separate,
   still-open one-off.
 
-- [ ] **Auto-sized virtual display.** Resize the vdisplay to the client's resolution on
-  connect (avoids the mirror-primary scaling lag). Risk: does `CGVirtualDisplay applySettings`
-  live-resize cleanly or need recreate? Needs a real mstsc test. (No code.)
+- [x] **Auto-sized virtual display — SUPERSEDED/ANSWERED by #155 + v0.8.39.** The open
+  question ("does `CGVirtualDisplay applySettings` live-resize cleanly or need recreate?") is
+  answered: **it live-resizes cleanly** (`VirtualDisplay::resize` re-applies a single mode via
+  the shared `apply_single_mode`; the descriptor's 8192×8192 max is a lifetime cap). The
+  feature itself shipped as live client-driven resize (MS-RDPEDISP, #155/v0.8.37, antonmos) —
+  the vdisplay re-modes to the client's requested size on connect AND on every window
+  drag/maximize — then v0.8.39 (#160 + #162) made it smooth on the headless path (see below).
+
+- [x] **Smooth-resize on the headless path — DONE v0.8.39 (#160 + #162, closes #161,
+  2026-07-18).** A live resize needs a core reactivation, which on
+  `--capture-primary`/`--detach-primary` cascaded into a visible session re-cycle (gamma
+  flicker + audio restart) and stranded windows/Dock. Fixes: **(1)** the overlay watcher polls
+  through the reactivation's transient 1→0→1 session flap (2.5 s grace; the gap is variable
+  ~0.5–0.9 s — a fixed sleep was proven insufficient) instead of tearing down the headless
+  capture (#160); **(2) ROOT CAUSE of the Dock/window churn:** the vd's `(0,0)`/main
+  placement was `ConfigureForAppOnly` — process-scoped, never persisted — so **every
+  `applySettings` re-mode re-derived the arrangement from the WindowServer's session store**
+  ("physical is main") and snapped the vd off `(0,0)`: Dock jumped to the blanked panel, and
+  a variable-timing relayout kept re-stranding windows AFTER the post-resize gather placed
+  them (both sweeps at +0.7 s/+1.7 s re-finding all 8 — sweep-retry is whack-a-mole, don't
+  extend it). Fixed with **`ConfigureForSession`** (the store agrees → nothing to snap back
+  to); crash-safety unchanged. Defense-in-depth kept: a **synchronous** `reanchor_as_main`
+  after each re-mode (off-thread is too late — the Dock has already settled and won't
+  re-follow) + a two-sweep post-resize auto-gather (#162). Live-verified consistent across
+  maximize + drag-between-monitors on real mstsc. Full lesson: the vd-arrangement quirk note
+  in `docs/known-quirks.md`. `DetachedPrimary` keeps `ForAppOnly` deliberately (its disable
+  tx must auto-revert on SIGKILL); revisit only with live evidence of the same bug on detach.
 
 - [ ] **`cycle_apps` lock nesting (`CYCLE_SESSION` → `mru`).** Currently safe by consistent
   acquire order; de-nest as a follow-up to the PR #84 hardening if revisiting that area.

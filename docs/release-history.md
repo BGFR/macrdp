@@ -4,6 +4,14 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.8.39 — the smooth-resize release
+
+Polish for live client-driven resize (the v0.8.37 feature) on the **headless** path (`--virtual-display` + `--capture-primary`/`--detach-primary`): resizing/maximizing the client window — including dragging between monitors of different resolutions — is now smooth and consistent. Scope is the headless resize path only; **the default runtime path is unchanged.**
+
+- **No more session re-cycle on resize (flicker + sound cut).** A live resize needs a core deactivation–reactivation (the resolution genuinely changes), and the headless overlay watcher used to read the reactivation's brief session-count flap (1→0→1) as a real disconnect — dropping and re-engaging the headless capture (a visible gamma flicker) and restarting audio. The watcher now **polls for the session to come back** (up to a 2.5 s grace) instead of tearing down on the transient zero; only a count that *stays* zero is a real disconnect. The flap gap is variable (~0.5–0.9 s — it includes the virtual-display re-mode), which is why an earlier fixed-delay debounce wasn't enough. (#160)
+- **The Dock and your windows now stay put across a resize.** Two stacked fixes: **(1) Root cause** — the headless mode places the virtual display at `(0,0)` to make it the system *main* display (that's what anchors the menu bar + Dock to it), but did so with a process-scoped, never-persisted setting (`ConfigureForAppOnly`), so **every re-mode re-derived the arrangement from the WindowServer's session store** — which still said "physical is main" — snapping the vd off `(0,0)`: the Dock jumped to the blanked physical panel and a variable-timing window relayout kept re-stranding app windows. Now the placement is **persisted for the session** (`ConfigureForSession`), so a re-mode has nothing to snap back to; crash-safety is unchanged (capture/gamma stay process-scoped, and a dead process's vanishing vd makes the physical main again automatically). **(2)** After each re-mode, macrdp re-asserts the vd as main (a now-no-op drift-catcher) and **auto-gathers** any window stranded off the re-moded display — the same sweep as `Ctrl+Alt+G`, run automatically because a resize is exactly when you expect your windows to follow. (#162, closes #161)
+- Live-verified end-to-end on real mstsc over capture-primary: repeated maximize + drag-between-monitors with the Dock staying, windows staying, minimal sound interruption, and zero arrangement drift in the log.
+
 ## v0.8.38 — the A/V resync hotkey
 
 A small feature release: an on-demand hotkey to recover a session that's gone stale after a long idle — a blanked screen and/or drifted audio — without disconnecting. **The default runtime path is unchanged.**

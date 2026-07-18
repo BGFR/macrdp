@@ -19,7 +19,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.38** (the A/V resync hotkey — a small
+(VPN/ZeroTier). **Latest release: v0.8.39** (the smooth-resize release —
+polish for live client-driven resize on the **headless** path, **no change to
+the default runtime path**. Two fixes: **(1)** the headless overlay watcher
+now **polls through the reactivation's transient session flap** (1→0→1, up to
+a 2.5 s grace) instead of tearing down + re-engaging the headless capture on
+every resize — killing the gamma flicker and the audio restart (#160); **(2)**
+**the Dock + windows stay put across a re-mode** — root cause was the vd's
+`(0,0)`/main placement being `ConfigureForAppOnly` (process-scoped, never
+persisted), so every `applySettings` re-mode re-derived the arrangement from
+the WindowServer's session store ("physical is main") and snapped the vd off
+`(0,0)`: the Dock jumped to the blanked panel and a variable-timing relayout
+kept re-stranding windows (sweep-retry proved whack-a-mole). Fixed with
+**`ConfigureForSession`** — the store agrees, a re-mode has nothing to snap
+back to; crash-safety unchanged (capture/gamma stay process-scoped; a dead
+process's vanishing vd auto-restores the physical as main). Defense-in-depth:
+a **synchronous** `reanchor_as_main` after each re-mode (off-thread it's too
+late — the Dock has already settled) + a two-sweep post-resize auto-gather
+(#162, closes #161). Live-verified consistent across maximize +
+drag-between-monitors on real mstsc. See the vd-arrangement quirk note.)
+Earlier: **v0.8.38** (the A/V resync hotkey — a small
 feature release, **no change to the default runtime path**. Adds an on-demand
 **`Ctrl+Alt+Shift+R`** to recover a session gone stale after a long idle: an
 mstsc session left idle for hours can blank the picture and drift the audio

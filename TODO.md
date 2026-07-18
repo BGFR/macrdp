@@ -74,11 +74,17 @@ then delete; promote a parked item to *In flight* when work actually starts.
   discards. A new per-client-type mechanism in the vendored server's RDPSND path (mstsc-useless, so
   gate on the fingerprint/QoE signal). Sharp, bounded win for the choppy-FreeRDP case. Client-side
   companion (no server change): `/sound:latency:100` raises FreeRDP's overrun cap + (Pulse) requests
-  a real sink buffer. **SCOPED 2026-07-19 → `~/.claude/plans/freerdp-render-latency-estimator.md`**
-  (key findings: WaveConfirm is git-pinned-rdpsnd-DROPPED today → needs a new small vendored
-  rdpsnd fork to surface it; self-gates on FreeRDP's two-confirms-per-block so mstsc stays inert
-  with no fingerprint dependency; staged Phase 1 observe-only + live go/no-go before touching the
-  hot path). See docs/known-quirks.md "Why mstsc audio is mostly smooth" +
+  a real sink buffer. **SCOPED + Phase-1 GREEN → `~/.claude/plans/freerdp-render-latency-estimator.md`.**
+  Phase 1 (observe-only harness, new `vendor/ironrdp-rdpsnd` fork, self-gates on FreeRDP's
+  two-confirms-per-block so mstsc stays inert without a fingerprint dependency) is **BANKED on
+  branch `feat/audio-render-latency-phase1`** (NOT on main). LIVE-VERIFIED GREEN 2026-07-19 on
+  Thincast: signal tracks stress (client-queue depth 0.3ms→380ms + ship→play 4ms→15.5s under
+  `netshape.sh --loss 6 --delay 40`) and drains back after `off`; the multi-second backlog is
+  real and the current send-side drop-stale model MISSES it (backlog sits in the kernel socket
+  buffer past `write_all`). **Phase 2 (act) = pending user go** — must add a wrap-safe monotonic
+  seq + time eviction (the u8 block_no wrap trap, validated live) before feeding measured depth
+  into `dispatch_audio`'s trim. Only worth it if choppy FreeRDP/Thincast audio is hit in practice
+  (it needed a 6%-loss stress test to surface). See docs/known-quirks.md "Why mstsc audio is mostly smooth" +
   [[project_av_choppiness_contention]] + [[project_waveconfirm_not_playback_position]].
 
 - [~] **Perf: eliminate the per-capture full-frame `last_frame` memcpy — ASSESSED 2026-07-07,

@@ -7,8 +7,9 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
-- [x] **SIEM/SOC audit forwarding — Tier 0 (structured JSON audit stream) — IMPLEMENTED +
-  verified 2026-07-10 (uncommitted on `main`; commit when ready).** macrdp's `macrdp::audit`
+- [x] **SIEM/SOC audit forwarding — Tier 0 (structured JSON audit stream) — SHIPPED (v0.8.33);
+  `event="auth"` (div18) + `event="fingerprint"` which-client (PR #163, 2026-07-18, merged, awaits
+  next release) added since.** macrdp's `macrdp::audit`
   events (connection accept/reject/disconnect, source IP+port, reason, outcome) are
   additionally written as **one JSON object per line** to a dedicated self-rotating file
   (`--audit-file` / `AUDIT_FILE` / `MACRDP_AUDIT_JSON=1`) for a log collector (Vector /
@@ -47,6 +48,34 @@ then delete; promote a parked item to *In flight* when work actually starts.
   "GREEN" status lines are demoted WARN→DEBUG. See `docs/production-readiness-roadmap.md` Tier 2.4.
 
 ## Deferred — scoped, not started
+
+- [ ] **Camera redirection Phases 1–4 — present the client's webcam as a macOS camera (MS-RDPECAM).**
+  Phase 0 protocol gate is LANDED + LIVE-VERIFIED GREEN (v0.8.39-era, f2d54e5: vendored server
+  divergence (19) `rdcamera.rs` + `camera_factory` seam + `src/camera/MacCamera` +
+  `--enable-camera-redirection`; real mstsc SelectVersion v2 → DEVICE_ADDED over MS-RDPECAM —
+  proving a modern mstsc/Win11 hands us the webcam over the RDCamera DVC, the channel USB
+  redirection can't reach). **Remaining = the real presentation work, ~multi-week:** (1) open the
+  per-device stream channel; (2) media-type negotiation (the client offers H.264/MJPEG/uncompressed
+  formats); (3) VideoToolbox H.264 decode of the incoming samples; (4) surface it as a macOS
+  camera via a **CoreMediaIO Camera Extension** (self-serviceable entitlement; VT-decoded frames
+  → CMIO). This is the standout next capability — gives mstsc webcam support the raw-USB path
+  can't (mstsc refuses macrdp's bulk-video reads with 0x8007001f and routes real video over
+  MS-RDPECAM instead). Full plan + the decrypted-pcap evidence:
+  `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].
+
+- [ ] **FreeRDP audio smoothness — server-side render-latency estimator (from the 2026-07-18 audio
+  research).** FreeRDP has NO deep jitter buffer (plays each wave synchronously on arrival) AND an
+  active overrun dropper that silently discards PCM queued beyond ~2 wave-durations — so on a
+  video-contended TCP socket (FreeRDP/Thincast can't get the lossy-UDP audio path mstsc gets) late
+  waves glitch. The lever the research surfaced: **FreeRDP sends TWO WaveConfirms per wave, and the
+  second's timestamp includes the backend-reported render latency** (Pulse `pa_stream_get_latency`,
+  ALSA `snd_pcm_avail_delay`) — unlike mstsc's consume-time confirms, so a server-side estimator
+  CAN see real playout delay for FreeRDP-family clients and pace/trim before the client's dropper
+  discards. A new per-client-type mechanism in the vendored server's RDPSND path (mstsc-useless, so
+  gate on the fingerprint/QoE signal). Sharp, bounded win for the choppy-FreeRDP case. Client-side
+  companion (no server change): `/sound:latency:100` raises FreeRDP's overrun cap + (Pulse) requests
+  a real sink buffer. See docs/known-quirks.md "Why mstsc audio is mostly smooth" +
+  [[project_av_choppiness_contention]] + [[project_waveconfirm_not_playback_position]].
 
 - [~] **Perf: eliminate the per-capture full-frame `last_frame` memcpy — ASSESSED 2026-07-07,
   DEPRIORITIZED (don't re-propose as a win).** From the 2026-07-03 audit's one HIGH finding:

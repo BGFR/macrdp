@@ -370,10 +370,12 @@ then delete; promote a parked item to *In flight* when work actually starts.
     (clean mount + file copy + remove/reattach unaffected; the one SET_CONFIGURATION seen was correctly
     NOT forwarded). The forward path itself only fires under a SCSI error/stall, which didn't occur, so
     it's implemented + regression-safe but not yet observed firing.
-  - **Phase 3.2 remaining** — generic control-IN forwarding (currently GET_DESCRIPTOR-only; a class/
-    vendor control-IN like Get Max LUN is stalled → assumed 1 LUN, wrong for a multi-LUN device),
-    mid-session retract/hot-unplug, true multi-device (needs iSerialNumber to distinguish identical
-    models), dispatch-priority tier. Test rig proven: UTM-QEMU Linux FreeRDP + USB-2.0 hub. Plan:
+  - **Phase 3.2 remaining** (generic control-IN forwarding is DONE — the 2026-07-07 hardening pass
+    added `UsbHandle::control_transfer_in`; Get Max LUN verified forwarded+answered live). Left:
+    **(a)** explicit `RETRACT_DEVICE` PDU — SMALL but low value, the client channel-close path already
+    covers detach/reset live-verified; **(b)** true multi-device — MEDIUM, needs the iSerialNumber
+    string descriptor to distinguish identical models + two identical devices to test; **(c)**
+    dispatch-priority tier. Test rig proven: UTM-QEMU Linux FreeRDP + USB-2.0 hub. Plan:
     `~/.claude/plans/wobbly-honking-minsky.md` §3.2.
   - **Phase 3.3 ISOCHRONOUS transfer spike — M0 (observe-only) LANDED, live go/no-go DEFERRED**
     (2026-07-10, user away from the USB rig). Isoch is the last missing transfer type

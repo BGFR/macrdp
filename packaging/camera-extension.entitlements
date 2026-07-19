@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the macrdp Camera CoreMediaIO system extension
+  (camera redirection Phase 3). Used by packaging/make-camera-extension.sh when it
+  signs the extension executable + bundle.
+
+  A system extension MUST be app-sandboxed (CMIO launches it under a role account
+  with a sandbox profile regardless). The App Group is what lets CMIO's
+  CMIOExtensionMachServiceName resolve — the service name in camera-Info.plist is
+  set byte-identical to this group id (the proven-safe form: it satisfies both the
+  Team-ID-prefix and app-group-prefix rules at once).
+
+  NO `com.apple.security.device.camera` here: this is a VIRTUAL camera fed decoded
+  frames by macrdp — the extension never opens the Mac's physical camera — so the
+  camera device entitlement is not needed (matches Apple's ldenoue/SinkCam sample,
+  which omits it on the extension).
+
+  The App Group id (__APP_GROUP__, substituted by the packaging script, e.g.
+  QGLA89KHM7.com.clintcan.macrdp) MUST be registered in the Apple Developer portal
+  and assigned to THIS extension's App ID (com.clintcan.macrdp.controller.camera).
+  The container controller app does NOT need the group (it only activates the
+  extension; the decoded-frame feed comes from macrdp.app via the CoreMediaIO
+  client API, not an App-Group channel).
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>__APP_GROUP__</string>
+    </array>
+</dict>
+</plist>

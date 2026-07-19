@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist template for the macrdp Camera CoreMediaIO **system extension**
+  (camera redirection Phase 3). Assembled into
+    macrdp-camera.systemextension/Contents/Info.plist
+  by packaging/make-camera-extension.sh (which substitutes the __PLACEHOLDERS__).
+
+  Placeholders (make-camera-extension.sh):
+    __VERSION__     macrdp version (Cargo.toml)
+    __CAMERA_ID__   extension bundle id — MUST be a child of the container app id
+                    (e.g. com.clintcan.macrdp.controller.camera; macOS enforces the
+                    prefix for an embedded system extension)
+    __MACH_SVC__    CMIOExtensionMachServiceName — set byte-identical to the shared
+                    App Group id (e.g. QGLA89KHM7.com.clintcan.macrdp): that single
+                    value satisfies BOTH the Team-ID-prefix and app-group-prefix
+                    rules CMIO enforces on the service name.
+
+  KEY NOTES (verify against the CMIO-packaging research before first activation):
+    * CFBundlePackageType is SYSX for a system extension (NOT APPL/XPC!).
+    * A CMIO camera extension does NOT use the NSExtension mechanism — it declares
+      the top-level `CMIOExtension` dict with `CMIOExtensionMachServiceName`.
+    * The MachServiceName must live inside an App Group shared with the container
+      app (see camera-extension.entitlements) or CMIO won't launch the extension.
+    * LSMinimumSystemVersion 12.3 — the floor for CMIOExtension.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>macrdp Camera</string>
+    <key>CFBundleDisplayName</key>
+    <string>macrdp Camera</string>
+    <key>CFBundleIdentifier</key>
+    <string>__CAMERA_ID__</string>
+    <key>CFBundleExecutable</key>
+    <string>macrdpcamera</string>
+    <key>CFBundlePackageType</key>
+    <string>SYSX</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.3</string>
+    <key>NSSystemExtensionUsageDescription</key>
+    <string>macrdp Camera presents a webcam redirected from a connected RDP client as a macOS camera.</string>
+    <key>CMIOExtension</key>
+    <dict>
+        <key>CMIOExtensionMachServiceName</key>
+        <string>__MACH_SVC__</string>
+    </dict>
+</dict>
+</plist>

@@ -60,15 +60,35 @@ then delete; promote a parked item to *In flight* when work actually starts.
   camera via a **CoreMediaIO Camera Extension** (self-serviceable entitlement; VT-decoded frames
   → CMIO). This is the standout next capability — gives mstsc webcam support the raw-USB path
   can't (mstsc refuses macrdp's bulk-video reads with 0x8007001f and routes real video over
-  MS-RDPECAM instead). **Phase 1 SCOPED 2026-07-20 → `~/.claude/plans/camera-redirection-phase1.md`**
-  (full per-device negotiation → sample PDUs over TCP + logging; NO decode/present/UDP). Protocol
-  nailed from primary sources — and **FreeRDP HAS a full `rdpecam` SERVER**
-  (`channels/rdpecam/server/`), so Phase 1 is *mirror a known-good state machine*, not
-  reverse-engineer (corrected the wrong "no OSS server" claim in the feasibility doc). Mirrors the
-  URBDRC per-device model (divergence 16). **THE go/no-go risk:** does mstsc push samples over plain
-  TCP DRDYNVC, or withhold them until Soft-Sync-migrated to UDP (the capture showed the camera on
-  the UDP tunnel)? Answerable in the first live run — test TCP-first. Full plan + the decrypted-pcap
-  evidence: `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].
+  MS-RDPECAM instead). **Phase 1 DONE — LIVE-VERIFIED GREEN 2026-07-20** (on branch
+  `feat/camera-redirection-phase1`, not yet merged to main): real mstsc streamed a redirected
+  A4Tech webcam as **H.264 1080p over plain TCP DRDYNVC** (350+ frames, steady ~20 fps,
+  ~18 KB/frame) — the full MS-RDPECAM server state machine (enumerate → open the client-named
+  per-device channel → ActivateDevice → StreamList → media-type negotiation picking H.264 →
+  StartStreams → the SampleRequest↔SampleResponse pull loop), mirroring FreeRDP's `rdpecam`
+  server + the URBDRC per-device model (divergence 16). **GO/NO-GO answered GREEN: samples flow
+  over TCP, so UDP (Phase 4) is NOT a prerequisite.** First known OSS RDP *server* to receive a
+  webcam over MS-RDPECAM. **Phase 2 DONE — LIVE-VERIFIED GREEN 2026-07-20** (same branch):
+  VideoToolbox decodes the webcam end-to-end — 500+ frames, zero errors, real color
+  `CVPixelBuffer` at 1080p (the decoded grayscale-Y dump is the user's real camera view;
+  color CVPixelBuffer, luma-only PNG). Both technical unknowns now GREEN (protocol over TCP +
+  VT decode). **Phase 3 IN PROGRESS → `~/.claude/plans/camera-redirection-phase3.md`** (CoreMediaIO Camera
+  Extension: the webcam as a selectable macOS camera). **3a BUILT + VERIFIED-LOCALLY 2026-07-20**: the CMIO
+  system extension (static test pattern; `swift build`, no Xcode) + controller `OSSystemExtensionRequest`
+  activation + hand-assembled `.systemextension` packaging, all research-reconciled (child-of-app-id,
+  MachServiceName=AppGroup, unsandboxed controller w/ self-serviceable `system-extension.install`, SYSX) and
+  ad-hoc assemble/sign-verified. **Remaining for 3a-GREEN = the activation spike** (user's Apple portal +
+  entitled notarized build to `/Applications` + `systemextensionsctl developer on` + approve → Photo Booth
+  test pattern; runbook `docs/camera-extension-setup.md`). **3b + 3c BUILT 2026-07-20** — the full Phase-3 code is written + building: 3b (extension `.sink` stream +
+  consume loop + Rust `CameraFeed` CMIO producer, GetCount/GetCapacity guard + CFRetain-before-enqueue) and
+  3c (420v format match on both streams + NV12 test pattern; sink producer authentication —
+  signingID pre-filter + Team-ID-pinned SecCode check; lifecycle correct by construction). **The single
+  remaining gate for ALL of Phase 3 is the activation spike** (`docs/camera-extension-setup.md`) — one run on
+  the user's Apple account + machine closes 3a/3b/3c-GREEN. BIG de-risk confirmed: the SINK feed is CoreMediaIO C client API
+  (FFI) — no Swift hot path, no per-frame IPC, zero-copy IOSurface. Self-serviceable entitlement (no Apple grant).
+  Then **Phase 4 SCOPED 2026-07-20 → `~/.claude/plans/camera-redirection-phase4.md`** (Soft-Sync the RDCamera DVC onto the reliable UDP tunnel like `--udp-migrate-egfx`) — **LOW priority, recommend DEFER**: TCP camera is proven GREEN, and the value is partly self-cancelling (clean LAN = TCP already fine; lossy/roaming = the RTT-gate disables the UDP offer anyway). Go/no-go risk = the untested inbound-DVC Soft-Sync direction (macrdp has only ever migrated outbound EGFX). Not a prereq for anything. Full plan +
+  the live-debugged wire lessons: `~/.claude/plans/camera-redirection-phase1.md` +
+  `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].
 
 - [x] **FreeRDP audio smoothness — server-side render-latency estimator — DROPPED 2026-07-20
   (built + tested, no perceptible benefit).** From the 2026-07-18 audio research: FreeRDP sends

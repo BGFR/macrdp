@@ -79,8 +79,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
   MachServiceName=AppGroup, unsandboxed controller w/ self-serviceable `system-extension.install`, SYSX) and
   ad-hoc assemble/sign-verified. **Remaining for 3a-GREEN = the activation spike** (user's Apple portal +
   entitled notarized build to `/Applications` + `systemextensionsctl developer on` + approve → Photo Booth
-  test pattern; runbook `docs/camera-extension-setup.md`). Then **3b** = Rust CMIO client feeds the real
-  webcam into the sink; **3c** = lifecycle. BIG de-risk confirmed: the SINK feed is CoreMediaIO C client API
+  test pattern; runbook `docs/camera-extension-setup.md`). **3b BUILT 2026-07-20** (both halves compile; extension `.sink` stream + consume loop, and the Rust
+  `CameraFeed` CMIO client that enqueues decoded frames — GetCount/GetCapacity guard + CFRetain-before-enqueue
+  handled; end-to-end waits on the 3a activation spike). Then **3c** = lifecycle (feed only while redirected)
+  + sink-client validation. BIG de-risk confirmed: the SINK feed is CoreMediaIO C client API
   (FFI) — no Swift hot path, no per-frame IPC, zero-copy IOSurface. Self-serviceable entitlement (no Apple grant).
   Then **Phase 4 SCOPED 2026-07-20 → `~/.claude/plans/camera-redirection-phase4.md`** (Soft-Sync the RDCamera DVC onto the reliable UDP tunnel like `--udp-migrate-egfx`) — **LOW priority, recommend DEFER**: TCP camera is proven GREEN, and the value is partly self-cancelling (clean LAN = TCP already fine; lossy/roaming = the RTT-gate disables the UDP offer anyway). Go/no-go risk = the untested inbound-DVC Soft-Sync direction (macrdp has only ever migrated outbound EGFX). Not a prereq for anything. Full plan +
   the live-debugged wire lessons: `~/.claude/plans/camera-redirection-phase1.md` +

@@ -609,6 +609,9 @@ pub enum ServerEvent {
     /// Server-loop actions for server-direction USB redirection (MS-RDPEUSB) that
     /// the `URBDRC` processor can't do itself — currently opening a per-device DVC.
     Urbdrc(crate::UrbdrcServerMessage),
+    /// Server-loop actions for server-direction camera redirection (MS-RDPECAM):
+    /// the enumerator processor asks the loop to open a per-device DVC.
+    Camera(crate::CameraServerMessage),
     Echo(EchoServerMessage),
     SetCredentials(Credentials),
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
@@ -644,7 +647,7 @@ impl RdpServer {
         mut cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
         mut rdpdr_factory: Option<Box<dyn crate::RdpdrServerFactory>>,
         mut usb_factory: Option<Box<dyn crate::UrbdrcServerFactory>>,
-        camera_factory: Option<Box<dyn crate::RdCameraServerFactory>>,
+        mut camera_factory: Option<Box<dyn crate::RdCameraServerFactory>>,
         connection_handler: Option<Box<dyn ConnectionHandler>>,
         #[cfg(feature = "egfx")] mut gfx_factory: Option<Box<dyn GfxServerFactory>>,
     ) -> Self {
@@ -667,6 +670,9 @@ impl RdpServer {
         }
         if let Some(usb) = usb_factory.as_mut() {
             usb.set_sender(ev_sender.clone());
+        }
+        if let Some(camera) = camera_factory.as_mut() {
+            camera.set_sender(ev_sender.clone());
         }
         #[cfg(feature = "egfx")]
         if let Some(gfx) = gfx_factory.as_mut() {
@@ -1758,6 +1764,36 @@ impl RdpServer {
                                 continue;
                             }
                         };
+                        writer.write_all(&data).await?;
+                    }
+                },
+                ServerEvent::Camera(msg) => match msg {
+                    // (divergence 19, Phase 1) The MS-RDPECAM enumerator announced a
+                    // camera and needs a per-device DVC opened with the CLIENT-given
+                    // channel name. Only the event loop reaches DrdynvcServer. The
+                    // device processor drives the whole negotiation + sample pull loop
+                    // from its own start()/process() return values, so no sender is
+                    // threaded into it. Mirrors the URBDRC OpenDeviceChannel arm.
+                    crate::CameraServerMessage::OpenDeviceChannel { channel_name, version } => {
+                        let create_msg = {
+                            let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
+                                warn!("No DRDYNVC channel, cannot open MS-RDPECAM device channel");
+                                continue;
+                            };
+                            let proc = crate::RdCameraDeviceProcessor::new(channel_name, version);
+                            match drdynvc.create_channel(proc) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    warn!(error = %e, "failed to create MS-RDPECAM device channel");
+                                    continue;
+                                }
+                            }
+                        };
+                        let Some(drdynvc_channel_id) = self.get_channel_id_by_type::<dvc::DrdynvcServer>() else {
+                            warn!("No DRDYNVC channel id, dropping MS-RDPECAM device channel");
+                            continue;
+                        };
+                        let data = server_encode_svc_messages(vec![create_msg], drdynvc_channel_id, user_channel_id)?;
                         writer.write_all(&data).await?;
                     }
                 },

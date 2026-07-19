@@ -80,7 +80,14 @@ final class MacrdpCameraProviderSource: NSObject, CMIOExtensionProviderSource {
 final class MacrdpCameraDeviceSource: NSObject, CMIOExtensionDeviceSource {
     private(set) var device: CMIOExtensionDevice!
     private var _streamSource: MacrdpCameraStreamSource!
+    private var _streamSink: MacrdpCameraStreamSink!
     private var _streamingCounter: UInt32 = 0
+    private var _sinkCounter: UInt32 = 0
+    // True once a producer (macrdp.app) is feeding real webcam frames into the
+    // sink — the test-pattern timer stands down so the live picture shows through.
+    // Read on the timer queue, written on the CMIO client queue; a benign race just
+    // costs one extra test frame.
+    private var _sinkActive = false
     private var _timer: DispatchSourceTimer?
     private let _timerQueue = DispatchQueue(
         label: "com.clintcan.macrdp.camera.timer", qos: .userInteractive)
@@ -126,8 +133,14 @@ final class MacrdpCameraDeviceSource: NSObject, CMIOExtensionDeviceSource {
             streamID: UUID(),
             streamFormat: videoStreamFormat,
             device: device)
+        _streamSink = MacrdpCameraStreamSink(
+            localizedName: "macrdp Camera.Video.Sink",
+            streamID: UUID(),
+            streamFormat: videoStreamFormat,
+            device: device)
         do {
             try device.addStream(_streamSource.stream)
+            try device.addStream(_streamSink.stream)
         } catch {
             fatalError("failed to add stream: \(error.localizedDescription)")
         }
@@ -178,10 +191,60 @@ final class MacrdpCameraDeviceSource: NSObject, CMIOExtensionDeviceSource {
         }
     }
 
+    // MARK: sink (producer → source) — Phase 3b
+
+    // A producer (macrdp.app) started feeding the sink. Ref-count concurrent
+    // producers and kick off the consume loop on the first.
+    func startStreamingFromSink(_ client: CMIOExtensionClient) {
+        _sinkCounter += 1
+        if _sinkCounter == 1 {
+            consumeBuffer(client)
+            os_log(.info, log: logger, "sink producer connected — forwarding real frames")
+        }
+    }
+
+    func stopStreamingFromSink() {
+        if _sinkCounter > 1 {
+            _sinkCounter -= 1
+        } else {
+            _sinkCounter = 0
+            _sinkActive = false
+            os_log(.info, log: logger, "sink producer disconnected — back to test pattern")
+        }
+    }
+
+    // Pull one buffer the producer enqueued to the sink and re-send it on the
+    // source stream apps consume; re-arm for the next. Self-recursive completion
+    // loop (the SinkCam pattern).
+    private func consumeBuffer(_ client: CMIOExtensionClient) {
+        guard _sinkCounter >= 1 else { return }
+        _streamSink.stream.consumeSampleBuffer(from: client) {
+            [weak self] sbuf, seq, _, _, err in
+            guard let self = self else { return }
+            if let sbuf = sbuf {
+                self._sinkActive = true
+                let now = CMClockGetTime(CMClockGetHostTimeClock())
+                let hostNs = UInt64(now.seconds * Double(NSEC_PER_SEC))
+                if self._streamingCounter > 0 {
+                    self._streamSource.stream.send(
+                        sbuf, discontinuity: [], hostTimeInNanoseconds: hostNs)
+                }
+                // Tell the sink the buffer was consumed (releases the producer's slot).
+                self._streamSink.stream.notifyScheduledOutputChanged(
+                    CMIOExtensionScheduledOutput(
+                        sequenceNumber: seq, hostTimeInNanoseconds: hostNs))
+            } else if let err = err {
+                os_log(.debug, log: logger, "sink consume ended: %{public}@", err.localizedDescription)
+            }
+            self.consumeBuffer(client)
+        }
+    }
+
     // Draw one test-pattern frame (gray field, a white stripe sweeping down) and
-    // send it on the source stream. Phase 3b replaces this body with a forward of
-    // the sink's latest buffer.
+    // send it on the source stream — only while NO producer is feeding the sink
+    // (once macrdp pushes real webcam frames, `_sinkActive` stands this down).
     private func emitTestFrame() {
+        if _sinkActive { return }
         var pixelBuffer: CVPixelBuffer?
         let err = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
             kCFAllocatorDefault, _bufferPool,
@@ -286,6 +349,76 @@ final class MacrdpCameraStreamSource: NSObject, CMIOExtensionStreamSource {
             fatalError("unexpected device source type")
         }
         deviceSource.stopStreaming()
+    }
+}
+
+// MARK: - Stream sink (the .sink stream the producer feeds)
+
+final class MacrdpCameraStreamSink: NSObject, CMIOExtensionStreamSource {
+    private(set) var stream: CMIOExtensionStream!
+    let device: CMIOExtensionDevice
+    private let _streamFormat: CMIOExtensionStreamFormat
+    private var _client: CMIOExtensionClient?
+
+    init(
+        localizedName: String, streamID: UUID, streamFormat: CMIOExtensionStreamFormat,
+        device: CMIOExtensionDevice
+    ) {
+        self.device = device
+        self._streamFormat = streamFormat
+        super.init()
+        stream = CMIOExtensionStream(
+            localizedName: localizedName, streamID: streamID, direction: .sink,
+            clockType: .hostTime, source: self)
+    }
+
+    var formats: [CMIOExtensionStreamFormat] { [_streamFormat] }
+
+    var availableProperties: Set<CMIOExtensionProperty> {
+        [
+            .streamActiveFormatIndex, .streamFrameDuration,
+            .streamSinkBufferQueueSize, .streamSinkBuffersRequiredForStartup,
+            .streamSinkBufferUnderrunCount, .streamSinkEndOfData,
+        ]
+    }
+
+    func streamProperties(forProperties properties: Set<CMIOExtensionProperty>) throws
+        -> CMIOExtensionStreamProperties
+    {
+        let props = CMIOExtensionStreamProperties(dictionary: [:])
+        if properties.contains(.streamActiveFormatIndex) {
+            props.activeFormatIndex = 0
+        }
+        if properties.contains(.streamFrameDuration) {
+            props.frameDuration = CMTime(value: 1, timescale: Int32(kFrameRate))
+        }
+        if properties.contains(.streamSinkBufferQueueSize) {
+            props.sinkBufferQueueSize = 3
+        }
+        if properties.contains(.streamSinkBuffersRequiredForStartup) {
+            props.sinkBuffersRequiredForStartup = 1
+        }
+        return props
+    }
+
+    func setStreamProperties(_ streamProperties: CMIOExtensionStreamProperties) throws {}
+
+    // Capture the producer client here — the device's consume loop pulls from it.
+    func authorizedToStartStream(for client: CMIOExtensionClient) -> Bool {
+        _client = client
+        return true
+    }
+
+    func startStream() throws {
+        guard let deviceSource = device.source as? MacrdpCameraDeviceSource,
+            let client = _client
+        else { return }
+        deviceSource.startStreamingFromSink(client)
+    }
+
+    func stopStream() throws {
+        guard let deviceSource = device.source as? MacrdpCameraDeviceSource else { return }
+        deviceSource.stopStreamingFromSink()
     }
 }
 

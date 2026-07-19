@@ -68,9 +68,13 @@ then delete; promote a parked item to *In flight* when work actually starts.
   StartStreams → the SampleRequest↔SampleResponse pull loop), mirroring FreeRDP's `rdpecam`
   server + the URBDRC per-device model (divergence 16). **GO/NO-GO answered GREEN: samples flow
   over TCP, so UDP (Phase 4) is NOT a prerequisite.** First known OSS RDP *server* to receive a
-  webcam over MS-RDPECAM. **NEXT = Phase 2** (VideoToolbox H.264 Annex-B decode → `CVPixelBuffer`
-  → confirm a live image), then **Phase 3** (CoreMediaIO Camera Extension — the macOS piece so the
-  webcam shows up in Photo Booth/Zoom), then **Phase 4** (UDP migration + lifecycle). Full plan +
+  webcam over MS-RDPECAM. **Phase 2 DONE — LIVE-VERIFIED GREEN 2026-07-20** (same branch):
+  VideoToolbox decodes the webcam end-to-end — 500+ frames, zero errors, real color
+  `CVPixelBuffer` at 1080p (the decoded grayscale-Y dump is the user's real camera view;
+  color CVPixelBuffer, luma-only PNG). Both technical unknowns now GREEN (protocol over TCP +
+  VT decode). **NEXT = Phase 3** (CoreMediaIO Camera Extension consuming the `CVPixelBuffer`s →
+  the webcam as a selectable macOS camera in Photo Booth/Zoom — the genuinely-new macOS piece +
+  app↔extension frame IPC), then **Phase 4** (UDP migration + lifecycle). Full plan +
   the live-debugged wire lessons: `~/.claude/plans/camera-redirection-phase1.md` +
   `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].
 

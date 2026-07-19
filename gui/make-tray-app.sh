@@ -90,11 +90,9 @@ if [ "${CAMERA_EXTENSION:-0}" = "1" ]; then
     mkdir -p "$STAGE/Contents/Library/SystemExtensions"
     cp -R "$EXT_SRC" "$STAGE/Contents/Library/SystemExtensions/"
     echo "==> embedded macrdp-camera.systemextension"
-    # Controller entitlements (system-extension.install + the shared App Group).
-    CTRL_ENT="$REPO_ROOT/target/macrdp-controller.entitlements"
-    sed -e "s#__APP_GROUP__#$APP_GROUP#g" \
-        "$REPO_ROOT/packaging/macrdp-controller.entitlements" > "$CTRL_ENT"
-    CTRL_ENT_ARG="--entitlements $CTRL_ENT"
+    # Controller entitlements: just system-extension.install (unsandboxed, no App
+    # Group — the group lives only on the extension; see macrdp-controller.entitlements).
+    CTRL_ENT_ARG="--entitlements $REPO_ROOT/packaging/macrdp-controller.entitlements"
     # Embed the controller's own provisioning profile (system-extension capability).
     if [ -n "${PROVISION_PROFILE:-}" ]; then
         [ -f "$PROVISION_PROFILE" ] || { echo "PROVISION_PROFILE not found: $PROVISION_PROFILE" >&2; exit 1; }

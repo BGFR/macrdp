@@ -8,10 +8,13 @@
 
   Placeholders (make-camera-extension.sh):
     __VERSION__     macrdp version (Cargo.toml)
-    __CAMERA_ID__   extension bundle id   (e.g. com.clintcan.macrdp.camera)
-    __MACH_SVC__    CMIOExtensionMachServiceName — MUST be prefixed by an App Group
-                    the extension belongs to, i.e. <TeamID>.<group>[.suffix]
-                    (e.g. QGLA89KHM7.com.clintcan.macrdp.camera)
+    __CAMERA_ID__   extension bundle id — MUST be a child of the container app id
+                    (e.g. com.clintcan.macrdp.controller.camera; macOS enforces the
+                    prefix for an embedded system extension)
+    __MACH_SVC__    CMIOExtensionMachServiceName — set byte-identical to the shared
+                    App Group id (e.g. QGLA89KHM7.com.clintcan.macrdp): that single
+                    value satisfies BOTH the Team-ID-prefix and app-group-prefix
+                    rules CMIO enforces on the service name.
 
   KEY NOTES (verify against the CMIO-packaging research before first activation):
     * CFBundlePackageType is SYSX for a system extension (NOT APPL/XPC!).
@@ -41,6 +44,8 @@
     <string>__VERSION__</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.3</string>
+    <key>NSSystemExtensionUsageDescription</key>
+    <string>macrdp Camera presents a webcam redirected from a connected RDP client as a macOS camera.</string>
     <key>CMIOExtension</key>
     <dict>
         <key>CMIOExtensionMachServiceName</key>

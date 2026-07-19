@@ -4,29 +4,31 @@
   Entitlements for macrdpController.app when it embeds + activates the macrdp
   Camera system extension (camera redirection Phase 3).
 
-  Only used when gui/make-tray-app.sh is run with PROVISION_PROFILE=<...> set (the
+  Only used when gui/make-tray-app.sh is run with CAMERA_EXTENSION=1 (the
   camera-extension build); the normal controller build signs with NO entitlements
   and does NOT embed the extension (unchanged, byte-identical).
 
+  ONE entitlement, and deliberately so:
   * com.apple.developer.system-extension.install — lets this app request activation
     of a system extension it embeds (OSSystemExtensionRequest). SELF-SERVICEABLE in
     the Apple Developer portal (add the "System Extension" capability to the App ID;
-    no Apple approval request, unlike the USB host-controller entitlement).
-  * The App Group is shared with the extension so CMIO associates them; the
-    controller lists it too. __APP_GROUP__ is substituted by make-tray-app.sh.
+    no Apple approval request, unlike DriverKit / the USB host-controller path).
+
+  The controller is deliberately NOT sandboxed and does NOT list the App Group:
+    - macrdpController drives `launchctl`, edits ~/Library, opens files — app-sandbox
+      would break all of it. An unsandboxed Developer-ID app CAN hold
+      system-extension.install and activate a CMIO extension (OBS does exactly this).
+    - The App Group belongs only on the EXTENSION (it names the extension's CMIO
+      Mach service). The controller merely activates; the decoded-frame feed to the
+      extension comes from macrdp.app via the CoreMediaIO client API, not the group.
 
   This set MUST be a subset of the controller's provisioning profile's entitlements
-  or codesign fails. VERIFY against the CMIO-packaging research whether the
-  container app strictly needs the App Group for activation (some samples omit it
-  on the app and keep it only on the extension).
+  or codesign fails. Because system-extension.install is a restricted entitlement,
+  the controller app also embeds its provisioning profile (make-tray-app.sh).
 -->
 <plist version="1.0">
 <dict>
     <key>com.apple.developer.system-extension.install</key>
     <true/>
-    <key>com.apple.security.application-groups</key>
-    <array>
-        <string>__APP_GROUP__</string>
-    </array>
 </dict>
 </plist>

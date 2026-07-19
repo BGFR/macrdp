@@ -29,7 +29,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PKG_DIR="$REPO_ROOT/packaging"
 GUI_DIR="$REPO_ROOT/gui"
 BUNDLE_PREFIX="${BUNDLE_PREFIX:-com.clintcan}"
-CAMERA_ID="$BUNDLE_PREFIX.macrdp.camera"
+# The extension bundle id MUST be a child of the container (controller) app id —
+# macOS enforces that an embedded system extension's id is prefixed by the host
+# app's id, or activation fails validation.
+CONTROLLER_ID="$BUNDLE_PREFIX.macrdp.controller"
+CAMERA_ID="$CONTROLLER_ID.camera"
 IDENTITY="${CODESIGN_IDENTITY:--}"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/target}"
 
@@ -49,7 +53,10 @@ if [ -z "${TEAM_ID:-}" ]; then
     fi
 fi
 APP_GROUP="${APP_GROUP:-$TEAM_ID.$BUNDLE_PREFIX.macrdp}"
-MACH_SVC="$APP_GROUP.camera"
+# The CMIO Mach service name is set byte-identical to the App Group id — that
+# single value satisfies both the Team-ID-prefix and app-group-prefix rules CMIO
+# enforces (the proven-safe form from Apple's sample).
+MACH_SVC="$APP_GROUP"
 
 echo "==> macrdp-camera.systemextension v$VERSION"
 echo "    id=$CAMERA_ID  team=$TEAM_ID  group=$APP_GROUP  mach=$MACH_SVC  identity=$IDENTITY"

@@ -26,14 +26,15 @@ final class CameraExtensionManager: NSObject, OSSystemExtensionRequestDelegate {
     static let shared = CameraExtensionManager()
 
     /// MUST match the embedded extension bundle's `CFBundleIdentifier`
-    /// (packaging/make-camera-extension.sh + camera-Info.plist). Derived from the
-    /// controller's own bundle id so a non-default BUNDLE_PREFIX still lines up:
-    /// `<prefix>.macrdp.controller` → `<prefix>.macrdp.camera`.
+    /// (packaging/make-camera-extension.sh + camera-Info.plist). The extension id is
+    /// a **child of this controller app's id** — macOS enforces that an embedded
+    /// system extension is prefixed by the host app's id — so it's simply
+    /// `<controller-id>.camera`, correct for any BUNDLE_PREFIX.
     var extensionIdentifier: String {
-        if let bid = Bundle.main.bundleIdentifier, bid.hasSuffix(".macrdp.controller") {
-            return String(bid.dropLast(".controller".count)) + ".camera"
+        if let bid = Bundle.main.bundleIdentifier {
+            return bid + ".camera"
         }
-        return "com.clintcan.macrdp.camera"
+        return "com.clintcan.macrdp.controller.camera"
     }
 
     private var onResult: ((Result<String, Error>) -> Void)?

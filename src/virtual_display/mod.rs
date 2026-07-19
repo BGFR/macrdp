@@ -593,6 +593,15 @@ mod macos {
         fn CGDisplayRestoreColorSyncSettings();
     }
 
+    // NOTE: a CGDisplayRegisterReconfigurationCallback-based re-blank was tried
+    // and REMOVED (2026-07-19). The vd live re-mode is a private CGVirtualDisplay
+    // `applySettings`, which resets the physical panels' gamma but does NOT emit a
+    // public CGDisplay reconfiguration notification — verified live: the callback
+    // registered fine but never fired across many resizes. So the gamma re-assert
+    // is driven from the capture path instead (an immediate one after the re-mode
+    // + one after each post-resize window-gather sweep, which is the relayout that
+    // actually re-resets the gamma ~700 ms in). See capture.rs `sync_virtual_display`.
+
     /// Alternative "headless while connected" mechanism that takes
     /// **exclusive capture** of every physical display via the public
     /// `CGDisplayCapture` API and forces each captured panel's gamma
@@ -743,6 +752,33 @@ mod macos {
                 captured: held,
             })
         }
+
+        /// Re-apply the all-black gamma LUT to every captured panel. Needed
+        /// after a live re-mode (`applySettings` when the client maximizes /
+        /// moves to a different-resolution monitor): a display reconfiguration
+        /// **resets the gamma tables**, so the blanking installed at `install`
+        /// time is lost and the physical panel shows the desktop again. The
+        /// capture tokens survive the re-mode (they're process-held), so only
+        /// the gamma needs re-asserting. Called SYNCHRONOUSLY from the capture
+        /// path right after the re-mode (same timing rule as `reanchor_as_main`
+        /// — a few hundred ms late and the desktop has already flashed).
+        /// Returns the number of panels that could not be re-blanked (0 = all ok).
+        pub fn reassert_blanking(&self) -> usize {
+            let mut failed = 0usize;
+            for (id, _) in &self.captured {
+                let err = unsafe {
+                    CGSetDisplayTransferByFormula(*id, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0)
+                };
+                if err != 0 {
+                    failed += 1;
+                    tracing::warn!(
+                        "reassert_blanking: CGSetDisplayTransferByFormula(display={id}) \
+                         returned CGError {err}"
+                    );
+                }
+            }
+            failed
+        }
     }
 
     impl Drop for CapturedPrimary {
@@ -795,8 +831,20 @@ mod macos {
                 self.virtual_old_origin.0,
                 self.virtual_old_origin.1,
             );
+            // ConfigureForSession (NOT ForAppOnly) — MUST match `install`'s
+            // ConfigureForSession. `install` persists "vd@(0,0) is main" into the
+            // WindowServer's session store; if this restore reverts the origins
+            // only process-scoped (ForAppOnly), that store STILL says the vd is
+            // main while the live arrangement puts the physical back at (0,0) —
+            // and the Dock/menu bar (which follow the main display) then
+            // *sometimes* follow the persisted vd off-screen on disconnect
+            // ("the Dock disappears"). Persisting the restore updates the store to
+            // "physical@(0,0) is main again", so it agrees with reality and the
+            // Dock stays put. Crash-safety is unchanged: on SIGKILL/panic drop
+            // never runs, the vd vanishes with the process, and the lone physical
+            // auto-becomes main at (0,0); logout clears the session store.
             if let Err(e) =
-                any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+                any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
             {
                 tracing::warn!(
                     "displays released but reposition-tx failed (CGError {e}); \
@@ -863,6 +911,9 @@ mod stub {
     impl CapturedPrimary {
         pub fn install(_virtual_display_id: u32) -> Result<Self> {
             Err(anyhow!("primary-display capture is macOS-only"))
+        }
+        pub fn reassert_blanking(&self) -> usize {
+            0
         }
     }
 }

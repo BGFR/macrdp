@@ -77,7 +77,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   feeds the extension's SINK stream directly via the CoreMediaIO C client API (FFI) — no Swift hot path, no
   per-frame IPC, zero-copy IOSurface. Entitlement is self-serviceable (no Apple grant). ~1 week, dominated
   by signing/activation/reboot friction not algorithms; 3a (static-frame bring-up) isolates that risk first.
-  Then **Phase 4** (UDP migration — not a prereq, TCP proven). Full plan +
+  Then **Phase 4 SCOPED 2026-07-20 → `~/.claude/plans/camera-redirection-phase4.md`** (Soft-Sync the RDCamera DVC onto the reliable UDP tunnel like `--udp-migrate-egfx`) — **LOW priority, recommend DEFER**: TCP camera is proven GREEN, and the value is partly self-cancelling (clean LAN = TCP already fine; lossy/roaming = the RTT-gate disables the UDP offer anyway). Go/no-go risk = the untested inbound-DVC Soft-Sync direction (macrdp has only ever migrated outbound EGFX). Not a prereq for anything. Full plan +
   the live-debugged wire lessons: `~/.claude/plans/camera-redirection-phase1.md` +
   `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].
 

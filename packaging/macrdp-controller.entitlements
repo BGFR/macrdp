@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for macrdpController.app when it embeds + activates the macrdp
+  Camera system extension (camera redirection Phase 3).
+
+  Only used when gui/make-tray-app.sh is run with PROVISION_PROFILE=<...> set (the
+  camera-extension build); the normal controller build signs with NO entitlements
+  and does NOT embed the extension (unchanged, byte-identical).
+
+  * com.apple.developer.system-extension.install — lets this app request activation
+    of a system extension it embeds (OSSystemExtensionRequest). SELF-SERVICEABLE in
+    the Apple Developer portal (add the "System Extension" capability to the App ID;
+    no Apple approval request, unlike the USB host-controller entitlement).
+  * The App Group is shared with the extension so CMIO associates them; the
+    controller lists it too. __APP_GROUP__ is substituted by make-tray-app.sh.
+
+  This set MUST be a subset of the controller's provisioning profile's entitlements
+  or codesign fails. VERIFY against the CMIO-packaging research whether the
+  container app strictly needs the App Group for activation (some samples omit it
+  on the app and keep it only on the extension).
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.system-extension.install</key>
+    <true/>
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>__APP_GROUP__</string>
+    </array>
+</dict>
+</plist>

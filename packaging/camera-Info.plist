@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist template for the macrdp Camera CoreMediaIO **system extension**
+  (camera redirection Phase 3). Assembled into
+    macrdp-camera.systemextension/Contents/Info.plist
+  by packaging/make-camera-extension.sh (which substitutes the __PLACEHOLDERS__).
+
+  Placeholders (make-camera-extension.sh):
+    __VERSION__     macrdp version (Cargo.toml)
+    __CAMERA_ID__   extension bundle id   (e.g. com.clintcan.macrdp.camera)
+    __MACH_SVC__    CMIOExtensionMachServiceName — MUST be prefixed by an App Group
+                    the extension belongs to, i.e. <TeamID>.<group>[.suffix]
+                    (e.g. QGLA89KHM7.com.clintcan.macrdp.camera)
+
+  KEY NOTES (verify against the CMIO-packaging research before first activation):
+    * CFBundlePackageType is SYSX for a system extension (NOT APPL/XPC!).
+    * A CMIO camera extension does NOT use the NSExtension mechanism — it declares
+      the top-level `CMIOExtension` dict with `CMIOExtensionMachServiceName`.
+    * The MachServiceName must live inside an App Group shared with the container
+      app (see camera-extension.entitlements) or CMIO won't launch the extension.
+    * LSMinimumSystemVersion 12.3 — the floor for CMIOExtension.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>macrdp Camera</string>
+    <key>CFBundleDisplayName</key>
+    <string>macrdp Camera</string>
+    <key>CFBundleIdentifier</key>
+    <string>__CAMERA_ID__</string>
+    <key>CFBundleExecutable</key>
+    <string>macrdpcamera</string>
+    <key>CFBundlePackageType</key>
+    <string>SYSX</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.3</string>
+    <key>CMIOExtension</key>
+    <dict>
+        <key>CMIOExtensionMachServiceName</key>
+        <string>__MACH_SVC__</string>
+    </dict>
+</dict>
+</plist>

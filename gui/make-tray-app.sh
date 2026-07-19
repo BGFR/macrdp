@@ -69,10 +69,49 @@ fi
 # Ad-hoc ("-") can't use a secure timestamp; a real Developer ID must
 # (notarization requires it).
 if [ "$IDENTITY" = "-" ]; then TS="--timestamp=none"; else TS="--timestamp"; fi
-echo "==> codesign (hardened runtime, ts: $TS)"
-codesign --force --options runtime $TS -s "$IDENTITY" "$STAGE/Contents/MacOS/macrdptray"
-codesign --force --options runtime $TS -s "$IDENTITY" "$STAGE"
-codesign --verify --deep --strict "$STAGE"
+
+# Optional: embed + activate the macrdp Camera CoreMediaIO system extension
+# (camera redirection Phase 3). CAMERA_EXTENSION=1 builds the extension via
+# packaging/make-camera-extension.sh, embeds it in Contents/Library/
+# SystemExtensions/, and signs THIS controller with the system-extension.install
+# entitlement + a provisioning profile so OSSystemExtensionRequest can activate it.
+# Unset (the normal controller build) → no extension, no entitlements, unchanged.
+CTRL_ENT_ARG=""
+if [ "${CAMERA_EXTENSION:-0}" = "1" ]; then
+    [ "$IDENTITY" != "-" ] || echo "==> WARNING: ad-hoc camera-extension build won't activate (Developer ID + profiles needed)" >&2
+    TEAM_ID="${TEAM_ID:-$(printf '%s' "$IDENTITY" | sed -n 's/.*(\([A-Z0-9]\{10\}\)).*/\1/p')}"
+    APP_GROUP="${APP_GROUP:-${TEAM_ID:-TEAMIDXXXX}.$BUNDLE_PREFIX.macrdp}"
+    # Build + sign the extension bundle (its own entitlements/profile).
+    OUT_DIR="$REPO_ROOT/target" TEAM_ID="${TEAM_ID:-}" APP_GROUP="$APP_GROUP" \
+        CODESIGN_IDENTITY="$IDENTITY" BUNDLE_PREFIX="$BUNDLE_PREFIX" \
+        "$REPO_ROOT/packaging/make-camera-extension.sh"
+    EXT_SRC="$REPO_ROOT/target/macrdp-camera.systemextension"
+    [ -d "$EXT_SRC" ] || { echo "extension not built at $EXT_SRC" >&2; exit 1; }
+    mkdir -p "$STAGE/Contents/Library/SystemExtensions"
+    cp -R "$EXT_SRC" "$STAGE/Contents/Library/SystemExtensions/"
+    echo "==> embedded macrdp-camera.systemextension"
+    # Controller entitlements (system-extension.install + the shared App Group).
+    CTRL_ENT="$REPO_ROOT/target/macrdp-controller.entitlements"
+    sed -e "s#__APP_GROUP__#$APP_GROUP#g" \
+        "$REPO_ROOT/packaging/macrdp-controller.entitlements" > "$CTRL_ENT"
+    CTRL_ENT_ARG="--entitlements $CTRL_ENT"
+    # Embed the controller's own provisioning profile (system-extension capability).
+    if [ -n "${PROVISION_PROFILE:-}" ]; then
+        [ -f "$PROVISION_PROFILE" ] || { echo "PROVISION_PROFILE not found: $PROVISION_PROFILE" >&2; exit 1; }
+        cp "$PROVISION_PROFILE" "$STAGE/Contents/embedded.provisionprofile"
+        echo "==> embedded controller provisioning profile"
+    elif [ "$IDENTITY" != "-" ]; then
+        echo "==> WARNING: CAMERA_EXTENSION=1 without PROVISION_PROFILE — activation needs the controller profile" >&2
+    fi
+fi
+
+echo "==> codesign (hardened runtime, ts: $TS${CTRL_ENT_ARG:+, entitlements})"
+codesign --force --options runtime $TS $CTRL_ENT_ARG -s "$IDENTITY" "$STAGE/Contents/MacOS/macrdptray"
+# NOTE: no --deep on the sign — the embedded .systemextension is already signed
+# with its OWN entitlements; a --deep re-sign would strip them. Signing the outer
+# bundle seals the pre-signed extension by reference.
+codesign --force --options runtime $TS $CTRL_ENT_ARG -s "$IDENTITY" "$STAGE"
+codesign --verify --strict "$STAGE"
 
 # Optional notarization (NOTARIZE=1, real Developer ID + NOTARY_PROFILE).
 if [ "${NOTARIZE:-0}" = "1" ]; then

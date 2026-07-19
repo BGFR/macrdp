@@ -19,6 +19,8 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 
+use super::feed::CameraFeed;
+
 type OsStatus = i32;
 type CfTypeRef = *const c_void;
 type CmFormatDescriptionRef = CfTypeRef;
@@ -210,6 +212,10 @@ struct CallbackState {
     errors: u64,
     last_log: Option<Instant>,
     dumped_pngs: u64,
+    /// Phase 3b: the CoreMediaIO sink feed. Each decoded frame is enqueued here so
+    /// the "macrdp Camera" presents the live webcam. `None` when the camera
+    /// extension isn't active (decode-only).
+    feed: Option<CameraFeed>,
 }
 
 extern "C" fn decode_output(
@@ -233,6 +239,12 @@ extern "C" fn decode_output(
         return;
     }
     state.decoded += 1;
+    // Phase 3b: present this frame as the macrdp Camera (best-effort; drops if the
+    // sink queue is full). The CVImageBuffer is IOSurface-backed → zero-copy to the
+    // extension.
+    if let Some(feed) = state.feed.as_mut() {
+        feed.enqueue(image_buffer);
+    }
     let now = Instant::now();
     if state
         .last_log
@@ -290,12 +302,13 @@ pub struct H264Decoder {
 unsafe impl Send for H264Decoder {}
 
 impl H264Decoder {
-    pub fn new(width: u32, height: u32) -> Result<Self> {
+    pub fn new(width: u32, height: u32, feed: Option<CameraFeed>) -> Result<Self> {
         let cb_state = Box::into_raw(Box::new(CallbackState {
             decoded: 0,
             errors: 0,
             last_log: None,
             dumped_pngs: 0,
+            feed,
         }));
         Ok(Self {
             width,

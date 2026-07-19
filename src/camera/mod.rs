@@ -34,9 +34,17 @@ use ironrdp_server::{
 
 #[cfg(target_os = "macos")]
 mod decode;
+#[cfg(target_os = "macos")]
+mod feed;
 
 /// MS-RDPECAM `CAM_MEDIA_FORMAT` for H.264.
 const FORMAT_H264: u8 = 0x01;
+
+/// Stable UID of the "macrdp Camera" virtual device — MUST match the `deviceID`
+/// UUID the CoreMediaIO extension sets (`gui/Sources/macrdpcamera/main.swift`). The
+/// sink-feed producer (`feed.rs`) matches the CMIO device on this exact string.
+#[cfg(target_os = "macos")]
+const MACRDP_CAMERA_DEVICE_UID: &str = "6F1B2C3D-4E5A-6B7C-8D9E-A0B1C2D3E4F0";
 
 /// Phase-2a verification sink: writes the raw H.264 **Annex-B elementary stream**
 /// to a file so it can be played back (`ffplay`/VLC) to confirm the redirected
@@ -108,10 +116,20 @@ impl CameraSampleSink for CameraSink {
                 "camera Phase-2a: non-H.264 format — raw-stream dump skipped"
             );
         }
-        // Phase 2b (macOS): stand up the VideoToolbox decoder for H.264.
+        // Phase 2b/3b (macOS): stand up the VideoToolbox decoder for H.264, and
+        // (Phase 3b) a CoreMediaIO sink feed to present the decoded frames as the
+        // "macrdp Camera". The feed is best-effort — if the camera system extension
+        // isn't installed/active there's no device to feed, so we just decode.
         #[cfg(target_os = "macos")]
         if format == FORMAT_H264 {
-            match decode::H264Decoder::new(width, height) {
+            let feed = match feed::CameraFeed::new() {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    tracing::info!(error = %e, "camera Phase-3b: no sink feed (extension inactive?) — decoding only");
+                    None
+                }
+            };
+            match decode::H264Decoder::new(width, height, feed) {
                 Ok(d) => self.decoder = Some(d),
                 Err(e) => tracing::warn!(error = %e, "camera: VideoToolbox decoder init failed"),
             }

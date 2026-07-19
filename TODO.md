@@ -72,11 +72,16 @@ then delete; promote a parked item to *In flight* when work actually starts.
   VideoToolbox decodes the webcam end-to-end — 500+ frames, zero errors, real color
   `CVPixelBuffer` at 1080p (the decoded grayscale-Y dump is the user's real camera view;
   color CVPixelBuffer, luma-only PNG). Both technical unknowns now GREEN (protocol over TCP +
-  VT decode). **Phase 3 SCOPED 2026-07-20 → `~/.claude/plans/camera-redirection-phase3.md`** (CoreMediaIO Camera
-  Extension: the webcam as a selectable macOS camera). BIG de-risk from the research: macrdp's Rust process
-  feeds the extension's SINK stream directly via the CoreMediaIO C client API (FFI) — no Swift hot path, no
-  per-frame IPC, zero-copy IOSurface. Entitlement is self-serviceable (no Apple grant). ~1 week, dominated
-  by signing/activation/reboot friction not algorithms; 3a (static-frame bring-up) isolates that risk first.
+  VT decode). **Phase 3 IN PROGRESS → `~/.claude/plans/camera-redirection-phase3.md`** (CoreMediaIO Camera
+  Extension: the webcam as a selectable macOS camera). **3a BUILT + VERIFIED-LOCALLY 2026-07-20**: the CMIO
+  system extension (static test pattern; `swift build`, no Xcode) + controller `OSSystemExtensionRequest`
+  activation + hand-assembled `.systemextension` packaging, all research-reconciled (child-of-app-id,
+  MachServiceName=AppGroup, unsandboxed controller w/ self-serviceable `system-extension.install`, SYSX) and
+  ad-hoc assemble/sign-verified. **Remaining for 3a-GREEN = the activation spike** (user's Apple portal +
+  entitled notarized build to `/Applications` + `systemextensionsctl developer on` + approve → Photo Booth
+  test pattern; runbook `docs/camera-extension-setup.md`). Then **3b** = Rust CMIO client feeds the real
+  webcam into the sink; **3c** = lifecycle. BIG de-risk confirmed: the SINK feed is CoreMediaIO C client API
+  (FFI) — no Swift hot path, no per-frame IPC, zero-copy IOSurface. Self-serviceable entitlement (no Apple grant).
   Then **Phase 4 SCOPED 2026-07-20 → `~/.claude/plans/camera-redirection-phase4.md`** (Soft-Sync the RDCamera DVC onto the reliable UDP tunnel like `--udp-migrate-egfx`) — **LOW priority, recommend DEFER**: TCP camera is proven GREEN, and the value is partly self-cancelling (clean LAN = TCP already fine; lossy/roaming = the RTT-gate disables the UDP offer anyway). Go/no-go risk = the untested inbound-DVC Soft-Sync direction (macrdp has only ever migrated outbound EGFX). Not a prereq for anything. Full plan +
   the live-debugged wire lessons: `~/.claude/plans/camera-redirection-phase1.md` +
   `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].

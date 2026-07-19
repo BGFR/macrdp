@@ -4,18 +4,18 @@
 // surfaces the redirected webcam (decoded to CVPixelBuffers by Phases 1+2) as a
 // real macOS capture device.
 //
-// PHASE 3a (this file, as it stands): the device exposes a single **source**
-// stream that emits a STATIC test pattern (a white stripe sweeping down a gray
-// field) on a timer. It has NO sink and NO connection to macrdp yet — the point of
-// 3a is purely to bring the *device* up and prove the whole
-// signing/activation/CMIO-wiring path works before any real pixels flow. GREEN for
-// 3a = "macrdp Camera" appears in Photo Booth showing the sweeping stripe.
+// The device exposes a **source** stream (apps consume) and a **sink** stream (a
+// producer feeds). macrdp's Rust process is the CMIO client: it enqueues the decoded
+// webcam frames onto the sink (CMIOStreamCopyBufferQueue + CMSimpleQueueEnqueue), and
+// the device's consume loop forwards each sink buffer onto the source. A static test
+// pattern (a white stripe sweeping down a gray field) plays until a producer feeds
+// real frames, then stands down. See ~/.claude/plans/camera-redirection-phase3.md.
 //
-// PHASE 3b (next): add a second **sink** stream. macrdp's Rust process becomes the
-// CMIO client and feeds the sink directly via the CoreMediaIO C client API
-// (CMIOStreamCopyBufferQueue + CMSimpleQueueEnqueue); the device's consume loop
-// forwards sink buffers onto the source, replacing the test pattern with the live
-// redirected webcam. See ~/.claude/plans/camera-redirection-phase3.md.
+// - 3a: device bring-up (source + test pattern) — the signing/activation spike.
+// - 3b: the sink stream + consume loop + macrdp's Rust CMIO producer.
+// - 3c: the frames are NV12 `420v` (matching VideoToolbox decode output — advertised
+//   on both streams so CMIO passes them through with no transcode), and the sink
+//   accepts frames ONLY from macrdp.app (Team-ID-pinned code-signing check).
 //
 // Structure mirrors Apple's "Creating a camera extension with Core Media I/O"
 // sample (WWDC22 s10022) + Halle/SinkCam: a Provider owns one Device, the Device
@@ -25,14 +25,30 @@
 // provider to CMIOExtensionProvider.startService and runs the CFRunLoop.
 
 import CoreMediaIO
+import CoreVideo
 import Foundation
 import IOKit.audio
+import Security
 import os.log
 
 private let kFrameRate = 30
 private let kWidth: Int32 = 1280
 private let kHeight: Int32 = 720
+// The virtual camera's pixel format. NV12 video-range (`420v`) — matches
+// VideoToolbox's decode output, so macrdp's producer feeds the sink zero-copy and
+// the extension forwards to the source with NO conversion. CMIO does not transcode,
+// so the advertised stream format MUST equal the format of the buffers sent.
+private let kPixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
 private let logger = OSLog(subsystem: "com.clintcan.macrdp.camera", category: "extension")
+
+// Sink producer authentication (Phase 3c): only macrdp.app may feed the sink.
+// `signingID` is an OS-derived pre-filter; the authoritative check pins the Team ID
+// + identifier via a code-signing requirement (signingID alone is signer-chosen and
+// could be reused by an adversary).
+private let kProducerSigningID = "com.clintcan.macrdp"
+private let kProducerRequirement =
+    "anchor apple generic and certificate leaf[subject.OU] = \"QGLA89KHM7\" "
+    + "and identifier \"com.clintcan.macrdp\""
 
 // MARK: - Provider (one virtual device)
 
@@ -108,7 +124,7 @@ final class MacrdpCameraDeviceSource: NSObject, CMIOExtensionDeviceSource {
         let dims = CMVideoDimensions(width: kWidth, height: kHeight)
         CMVideoFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
-            codecType: kCVPixelFormatType_32BGRA,
+            codecType: kPixelFormat,
             width: dims.width, height: dims.height,
             extensions: nil, formatDescriptionOut: &_videoDescription)
 
@@ -251,19 +267,24 @@ final class MacrdpCameraDeviceSource: NSObject, CMIOExtensionDeviceSource {
             _bufferAuxAttributes as CFDictionary?, &pixelBuffer)
         guard err == kCVReturnSuccess, let pb = pixelBuffer else { return }
 
+        // NV12 (`420v`): plane 0 = luma (Y), plane 1 = interleaved CbCr. Gray field
+        // + a white stripe sweeping down; neutral chroma (0x80) → grayscale.
         CVPixelBufferLockBaseAddress(pb, [])
-        if let base = CVPixelBufferGetBaseAddress(pb) {
-            let width = CVPixelBufferGetWidth(pb)
-            let height = CVPixelBufferGetHeight(pb)
-            let rowBytes = CVPixelBufferGetBytesPerRow(pb)
-            // Gray background.
-            memset(base, 0x40, rowBytes * height)
-            // A 24px white stripe at the current row (wrapping).
-            let stripe = Int(_stripeRow) % height
-            let top = base.advanced(by: stripe * rowBytes)
-            for r in 0..<min(24, height - stripe) {
-                memset(top.advanced(by: r * rowBytes), 0xFF, width * 4)
+        if let yBase = CVPixelBufferGetBaseAddressOfPlane(pb, 0) {
+            let yStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+            let yW = CVPixelBufferGetWidthOfPlane(pb, 0)
+            let yH = CVPixelBufferGetHeightOfPlane(pb, 0)
+            memset(yBase, 0x7D, yStride * yH)  // mid gray (video-range luma)
+            let stripe = Int(_stripeRow) % yH
+            for r in 0..<min(24, yH - stripe) {
+                // Only yW bytes wide — the stride may be padded past the visible width.
+                memset(yBase.advanced(by: (stripe + r) * yStride), 0xEB, yW)  // ~white
             }
+        }
+        if let cBase = CVPixelBufferGetBaseAddressOfPlane(pb, 1) {
+            let cStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 1)
+            let cH = CVPixelBufferGetHeightOfPlane(pb, 1)
+            memset(cBase, 0x80, cStride * cH)  // neutral chroma → grayscale
         }
         CVPixelBufferUnlockBaseAddress(pb, [])
         _stripeRow = (_stripeRow + 4) % UInt32(kHeight)
@@ -403,9 +424,55 @@ final class MacrdpCameraStreamSink: NSObject, CMIOExtensionStreamSource {
 
     func setStreamProperties(_ streamProperties: CMIOExtensionStreamProperties) throws {}
 
-    // Capture the producer client here — the device's consume loop pulls from it.
+    // The sink is an open injection target — any local process aware of it could push
+    // video into "macrdp Camera". Accept only macrdp.app's producer, and capture it
+    // for the device's consume loop. This is the correct per-stream choke point (vs
+    // `connect(to:)`, which is device-wide and would also gate source consumers).
     func authorizedToStartStream(for client: CMIOExtensionClient) -> Bool {
+        guard isTrustedProducer(client) else {
+            os_log(
+                .error, log: logger,
+                "sink: REJECTED producer signingID=%{public}@ pid=%d",
+                client.signingID ?? "nil", client.pid)
+            return false
+        }
         _client = client
+        return true
+    }
+
+    // Layered producer check: `signingID` is OS-derived (a client can't assert an
+    // arbitrary one) but is signer-chosen, so it's only a pre-filter; the
+    // authoritative gate pins the Team ID + identifier via a code-signing
+    // requirement evaluated against the client pid. If the Security API can't
+    // evaluate the process (e.g. blocked in the sandbox), fall back to the
+    // signingID match already established (documented degrade).
+    private func isTrustedProducer(_ client: CMIOExtensionClient) -> Bool {
+        guard let signingID = client.signingID, signingID == kProducerSigningID else {
+            return false
+        }
+        var code: SecCode?
+        let attrs = [kSecGuestAttributePid: NSNumber(value: client.pid)] as CFDictionary
+        let copyStatus = SecCodeCopyGuestWithAttributes(nil, attrs, [], &code)
+        guard copyStatus == errSecSuccess, let code = code else {
+            os_log(
+                .info, log: logger,
+                "sink: SecCode unavailable (status %d) — accepting on signingID", copyStatus)
+            return true
+        }
+        var requirement: SecRequirement?
+        guard
+            SecRequirementCreateWithString(kProducerRequirement as CFString, [], &requirement)
+                == errSecSuccess, let requirement = requirement
+        else {
+            return true  // couldn't build the requirement — rely on the signingID match
+        }
+        let valid = SecCodeCheckValidity(code, [], requirement)
+        if valid != errSecSuccess {
+            os_log(
+                .error, log: logger,
+                "sink: producer failed the Team-ID requirement (status %d)", valid)
+            return false
+        }
         return true
     }
 

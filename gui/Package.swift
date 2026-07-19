@@ -27,7 +27,10 @@ let package = Package(
         .executableTarget(
             name: "macrdpcamera",
             path: "Sources/macrdpcamera",
-            linkerSettings: [.linkedFramework("CoreMediaIO")]
+            linkerSettings: [
+                .linkedFramework("CoreMediaIO"),
+                .linkedFramework("Security"),
+            ]
         ),
     ]
 )

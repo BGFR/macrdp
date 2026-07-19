@@ -79,10 +79,12 @@ then delete; promote a parked item to *In flight* when work actually starts.
   MachServiceName=AppGroup, unsandboxed controller w/ self-serviceable `system-extension.install`, SYSX) and
   ad-hoc assemble/sign-verified. **Remaining for 3a-GREEN = the activation spike** (user's Apple portal +
   entitled notarized build to `/Applications` + `systemextensionsctl developer on` + approve → Photo Booth
-  test pattern; runbook `docs/camera-extension-setup.md`). **3b BUILT 2026-07-20** (both halves compile; extension `.sink` stream + consume loop, and the Rust
-  `CameraFeed` CMIO client that enqueues decoded frames — GetCount/GetCapacity guard + CFRetain-before-enqueue
-  handled; end-to-end waits on the 3a activation spike). Then **3c** = lifecycle (feed only while redirected)
-  + sink-client validation. BIG de-risk confirmed: the SINK feed is CoreMediaIO C client API
+  test pattern; runbook `docs/camera-extension-setup.md`). **3b + 3c BUILT 2026-07-20** — the full Phase-3 code is written + building: 3b (extension `.sink` stream +
+  consume loop + Rust `CameraFeed` CMIO producer, GetCount/GetCapacity guard + CFRetain-before-enqueue) and
+  3c (420v format match on both streams + NV12 test pattern; sink producer authentication —
+  signingID pre-filter + Team-ID-pinned SecCode check; lifecycle correct by construction). **The single
+  remaining gate for ALL of Phase 3 is the activation spike** (`docs/camera-extension-setup.md`) — one run on
+  the user's Apple account + machine closes 3a/3b/3c-GREEN. BIG de-risk confirmed: the SINK feed is CoreMediaIO C client API
   (FFI) — no Swift hot path, no per-frame IPC, zero-copy IOSurface. Self-serviceable entitlement (no Apple grant).
   Then **Phase 4 SCOPED 2026-07-20 → `~/.claude/plans/camera-redirection-phase4.md`** (Soft-Sync the RDCamera DVC onto the reliable UDP tunnel like `--udp-migrate-egfx`) — **LOW priority, recommend DEFER**: TCP camera is proven GREEN, and the value is partly self-cancelling (clean LAN = TCP already fine; lossy/roaming = the RTT-gate disables the UDP offer anyway). Go/no-go risk = the untested inbound-DVC Soft-Sync direction (macrdp has only ever migrated outbound EGFX). Not a prereq for anything. Full plan +
   the live-debugged wire lessons: `~/.claude/plans/camera-redirection-phase1.md` +

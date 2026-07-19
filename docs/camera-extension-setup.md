@@ -90,12 +90,28 @@ installs to `/Applications/macrdpController.app`.
 4. Check state: `systemextensionsctl list` → `activated enabled` for
    `com.clintcan.macrdp.controller.camera`.
 
-## Verify (Phase 3a GREEN)
+## Verify (Phases 3a + 3b + 3c GREEN, one run)
 
-Open **Photo Booth** (or QuickTime → New Movie → camera dropdown, or Zoom video
-settings) → pick **macrdp Camera** → you should see the **sweeping-white-stripe test
-pattern**. That confirms the whole signing/activation/CMIO-wiring path works —
-Phase 3a done.
+1. **3a** — Open **Photo Booth** (or QuickTime → New Movie → camera dropdown, or Zoom
+   video settings) → pick **macrdp Camera** → you should see the **sweeping-white-stripe
+   test pattern**. That confirms the signing/activation/CMIO-wiring path works.
+2. **3b + 3c** — With the extension active, connect an RDP client, redirect a webcam
+   (Video capture devices) with `--enable-camera-redirection` on, and the **live webcam
+   should replace the test pattern** in Photo Booth. This confirms the sink feed +
+   the `420v` format + the producer authentication all work end-to-end.
+
+**The producer must be the signed `macrdp.app`.** Phase 3c authenticates the sink
+producer — the extension accepts frames only from a binary signed as
+`com.clintcan.macrdp` under Team `QGLA89KHM7`. A plain unsigned `cargo build` macrdp
+feeding the sink is **rejected** (you'd see the test pattern, not the webcam, and an
+`sink: REJECTED producer` line in the extension log). Run the Developer-ID
+`macrdp.app`. Watch the extension log to see which auth path fired (and whether
+`SecCode` is available in the extension sandbox — it falls back to the `signingID`
+match if not):
+
+```
+log stream --predicate 'subsystem == "com.clintcan.macrdp.camera"'
+```
 
 ## Dev iteration & teardown
 

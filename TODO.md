@@ -60,15 +60,19 @@ then delete; promote a parked item to *In flight* when work actually starts.
   camera via a **CoreMediaIO Camera Extension** (self-serviceable entitlement; VT-decoded frames
   → CMIO). This is the standout next capability — gives mstsc webcam support the raw-USB path
   can't (mstsc refuses macrdp's bulk-video reads with 0x8007001f and routes real video over
-  MS-RDPECAM instead). **Phase 1 SCOPED 2026-07-20 → `~/.claude/plans/camera-redirection-phase1.md`**
-  (full per-device negotiation → sample PDUs over TCP + logging; NO decode/present/UDP). Protocol
-  nailed from primary sources — and **FreeRDP HAS a full `rdpecam` SERVER**
-  (`channels/rdpecam/server/`), so Phase 1 is *mirror a known-good state machine*, not
-  reverse-engineer (corrected the wrong "no OSS server" claim in the feasibility doc). Mirrors the
-  URBDRC per-device model (divergence 16). **THE go/no-go risk:** does mstsc push samples over plain
-  TCP DRDYNVC, or withhold them until Soft-Sync-migrated to UDP (the capture showed the camera on
-  the UDP tunnel)? Answerable in the first live run — test TCP-first. Full plan + the decrypted-pcap
-  evidence: `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].
+  MS-RDPECAM instead). **Phase 1 DONE — LIVE-VERIFIED GREEN 2026-07-20** (on branch
+  `feat/camera-redirection-phase1`, not yet merged to main): real mstsc streamed a redirected
+  A4Tech webcam as **H.264 1080p over plain TCP DRDYNVC** (350+ frames, steady ~20 fps,
+  ~18 KB/frame) — the full MS-RDPECAM server state machine (enumerate → open the client-named
+  per-device channel → ActivateDevice → StreamList → media-type negotiation picking H.264 →
+  StartStreams → the SampleRequest↔SampleResponse pull loop), mirroring FreeRDP's `rdpecam`
+  server + the URBDRC per-device model (divergence 16). **GO/NO-GO answered GREEN: samples flow
+  over TCP, so UDP (Phase 4) is NOT a prerequisite.** First known OSS RDP *server* to receive a
+  webcam over MS-RDPECAM. **NEXT = Phase 2** (VideoToolbox H.264 Annex-B decode → `CVPixelBuffer`
+  → confirm a live image), then **Phase 3** (CoreMediaIO Camera Extension — the macOS piece so the
+  webcam shows up in Photo Booth/Zoom), then **Phase 4** (UDP migration + lifecycle). Full plan +
+  the live-debugged wire lessons: `~/.claude/plans/camera-redirection-phase1.md` +
+  `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].
 
 - [x] **FreeRDP audio smoothness — server-side render-latency estimator — DROPPED 2026-07-20
   (built + tested, no perceptible benefit).** From the 2026-07-18 audio research: FreeRDP sends

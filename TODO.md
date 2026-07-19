@@ -60,8 +60,15 @@ then delete; promote a parked item to *In flight* when work actually starts.
   camera via a **CoreMediaIO Camera Extension** (self-serviceable entitlement; VT-decoded frames
   → CMIO). This is the standout next capability — gives mstsc webcam support the raw-USB path
   can't (mstsc refuses macrdp's bulk-video reads with 0x8007001f and routes real video over
-  MS-RDPECAM instead). Full plan + the decrypted-pcap evidence:
-  `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].
+  MS-RDPECAM instead). **Phase 1 SCOPED 2026-07-20 → `~/.claude/plans/camera-redirection-phase1.md`**
+  (full per-device negotiation → sample PDUs over TCP + logging; NO decode/present/UDP). Protocol
+  nailed from primary sources — and **FreeRDP HAS a full `rdpecam` SERVER**
+  (`channels/rdpecam/server/`), so Phase 1 is *mirror a known-good state machine*, not
+  reverse-engineer (corrected the wrong "no OSS server" claim in the feasibility doc). Mirrors the
+  URBDRC per-device model (divergence 16). **THE go/no-go risk:** does mstsc push samples over plain
+  TCP DRDYNVC, or withhold them until Soft-Sync-migrated to UDP (the capture showed the camera on
+  the UDP tunnel)? Answerable in the first live run — test TCP-first. Full plan + the decrypted-pcap
+  evidence: `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].
 
 - [x] **FreeRDP audio smoothness — server-side render-latency estimator — DROPPED 2026-07-20
   (built + tested, no perceptible benefit).** From the 2026-07-18 audio research: FreeRDP sends

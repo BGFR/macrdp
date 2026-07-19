@@ -141,9 +141,15 @@ decode and picks H.264 when present.
 server processor ourselves, the same pattern as server-direction RDPDR (divergence
 11), RDPESC, and RDPEUSB/URBDRC (divergence 16): a small PDU module + an
 `RdCameraServer` `DvcProcessor` riding a new `Option<Box<dyn CameraFactory>>` seam on
-`RdpServer`, byte-identical when the feature is off. As with URBDRC, this is likely
-**unprecedented on the server side** — Windows RDS does it with closed components;
-no OSS RDP server implements it.
+`RdpServer`, byte-identical when the feature is off. **CORRECTION (2026-07-20, from
+a primary-source Phase-1 scoping pass — supersedes an earlier "unprecedented / no OSS
+server" claim here): FreeRDP HAS a full working `rdpecam` *server*** —
+`channels/rdpecam/server/{camera_device_main.c,camera_device_enumerator_main.c}` +
+shared struct encode/decode in `channels/rdpecam/common/` (and the mirror client in
+`channels/rdpecam/client/`). So this is **not** unprecedented and **not** a
+reverse-engineer: Phase 1 is *mirror FreeRDP's known-good server state machine + wire
+format*. (macrdp presenting the camera on macOS via CoreMediaIO is still likely a
+first for an OSS RDP server, but the *protocol* half has a reference.)
 
 **Transport is already solved.** The camera channel is a normal DVC, so it works
 over **TCP DRDYNVC** out of the box (macrdp receives inbound DVC data on TCP today).

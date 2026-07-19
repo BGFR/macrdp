@@ -233,6 +233,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "Smart-card redirection", key: "ENABLE_SMARTCARD_REDIRECTION", cfg: cfg,
             sel: #selector(toggleSmartcardRedirection)))
         opts.addItem(item("Install smart-card handler…", #selector(installSmartcardHandler)))
+        opts.addItem(toggle(
+            "Camera redirection", key: "ENABLE_CAMERA_REDIRECTION", cfg: cfg,
+            sel: #selector(toggleCameraRedirection)))
+        opts.addItem(item("Enable macrdp Camera…", #selector(enableCameraRedirection)))
         opts.addItem(.separator())
         // Keyboard layout (radio) — translate the client's keys against a
         // non-US layout without changing the Mac's own input source.
@@ -607,6 +611,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleAltTabSwitch() { flip("ALT_TAB_SWITCH") }
     @objc func toggleDriveRedirection() { flip("ENABLE_DRIVE_REDIRECTION") }
     @objc func toggleSmartcardRedirection() { flip("ENABLE_SMARTCARD_REDIRECTION") }
+    @objc func toggleCameraRedirection() { flip("ENABLE_CAMERA_REDIRECTION") }
     @objc func toggleMapCtrlToCmd() { flip("MAP_CTRL_TO_CMD") }
 
     /// Parse NO_REMAP_APPS (comma-separated bundle ids) into an ordered list.

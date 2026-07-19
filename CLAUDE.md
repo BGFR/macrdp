@@ -19,7 +19,40 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.39** (the smooth-resize release —
+(VPN/ZeroTier). **Latest release: v0.8.40** (the headless-laptop release —
+three fixes for daily headless-laptop use plus a which-client audit signal, **no
+change to the default runtime path**; the first three are opt-in or headless-only.
+**(1) Opt-in `--restore-windows-on-disconnect`** (config
+`RESTORE_WINDOWS_ON_DISCONNECT=1`) makes windows follow you: the process-lifetime
+virtual display strands its windows off-screen on disconnect (invisible on a
+laptop's built-in panel), so this sweeps them back onto the built-in on disconnect
+(Mac usable locally) and auto-gathers them onto the vd on reconnect (no
+`Ctrl+Alt+G`) — reuses the gather machinery, default OFF (a remote-only server
+wants windows to stay on the vd). Live-verified: 6 windows swept home. **(2) Dock
+no longer disappears on disconnect** — follow-on to v0.8.39: `CapturedPrimary::
+install` persists vd-as-main via `ConfigureForSession`, but `drop` reverted only
+`ConfigureForAppOnly` (process-scoped), so the session store still said "vd is
+main" while the physical went back to (0,0) and the Dock sometimes followed the
+phantom vd off-screen; `drop` now persists the restore too (symmetric). **(3)
+`--capture-primary` blanking survives a live resize** — a re-mode (`applySettings`)
+is a display reconfiguration and macOS resets the gamma tables on one, un-blanking
+the panel (which v0.8.39 keeps engaged, so nothing re-applied it → the desktop
+STAYED showing); now `CapturedPrimary::reassert_blanking()` re-applies the all-black
+LUT after the re-mode and after each post-resize gather sweep (the gather's relayout
+re-resets gamma ~700 ms in). Dead ends confirmed live + removed: a
+`CGDisplayRegisterReconfigurationCallback` NEVER fired (the private `applySettings`
+resets gamma without a public reconfiguration event), and a timed polling burst
+can't beat it (a gamma write DURING a reconfiguration doesn't stick). **Documented
+residual (accepted):** a ~250 ms desktop flash WHILE the re-mode is in flight —
+macOS shows the desktop during the reconfiguration and won't let gamma stick until
+it commits; the only fix is a black shield-window helper process, not worth it for
+a local-panel flash during an intentional resize. **(4) Client fingerprint audit
+record** (`event="fingerprint"`, #163) names which RDP client connected —
+`client_name`/`rdp_version`/`client_build`/`platform` from the handshake, in
+`macrdp.log` + the opt-in SIEM JSON stream; fingerprinting not auth (spoofable) but
+tells clients apart: mstsc=real Windows build+`WINDOWS`, FreeRDP=build 2600+`UNIX`,
+Thincast=18363+`UNSPECIFIED`. See the vd-arrangement + capture-primary quirk notes.)
+Earlier: **v0.8.39** (the smooth-resize release —
 polish for live client-driven resize on the **headless** path, **no change to
 the default runtime path**. Two fixes: **(1)** the headless overlay watcher
 now **polls through the reactivation's transient session flap** (1→0→1, up to

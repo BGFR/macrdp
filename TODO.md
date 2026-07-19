@@ -72,9 +72,12 @@ then delete; promote a parked item to *In flight* when work actually starts.
   VideoToolbox decodes the webcam end-to-end — 500+ frames, zero errors, real color
   `CVPixelBuffer` at 1080p (the decoded grayscale-Y dump is the user's real camera view;
   color CVPixelBuffer, luma-only PNG). Both technical unknowns now GREEN (protocol over TCP +
-  VT decode). **NEXT = Phase 3** (CoreMediaIO Camera Extension consuming the `CVPixelBuffer`s →
-  the webcam as a selectable macOS camera in Photo Booth/Zoom — the genuinely-new macOS piece +
-  app↔extension frame IPC), then **Phase 4** (UDP migration + lifecycle). Full plan +
+  VT decode). **Phase 3 SCOPED 2026-07-20 → `~/.claude/plans/camera-redirection-phase3.md`** (CoreMediaIO Camera
+  Extension: the webcam as a selectable macOS camera). BIG de-risk from the research: macrdp's Rust process
+  feeds the extension's SINK stream directly via the CoreMediaIO C client API (FFI) — no Swift hot path, no
+  per-frame IPC, zero-copy IOSurface. Entitlement is self-serviceable (no Apple grant). ~1 week, dominated
+  by signing/activation/reboot friction not algorithms; 3a (static-frame bring-up) isolates that risk first.
+  Then **Phase 4** (UDP migration — not a prereq, TCP proven). Full plan +
   the live-debugged wire lessons: `~/.claude/plans/camera-redirection-phase1.md` +
   `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].
 

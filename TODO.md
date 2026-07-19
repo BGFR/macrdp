@@ -63,29 +63,23 @@ then delete; promote a parked item to *In flight* when work actually starts.
   MS-RDPECAM instead). Full plan + the decrypted-pcap evidence:
   `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].
 
-- [ ] **FreeRDP audio smoothness — server-side render-latency estimator (from the 2026-07-18 audio
-  research).** FreeRDP has NO deep jitter buffer (plays each wave synchronously on arrival) AND an
-  active overrun dropper that silently discards PCM queued beyond ~2 wave-durations — so on a
-  video-contended TCP socket (FreeRDP/Thincast can't get the lossy-UDP audio path mstsc gets) late
-  waves glitch. The lever the research surfaced: **FreeRDP sends TWO WaveConfirms per wave, and the
-  second's timestamp includes the backend-reported render latency** (Pulse `pa_stream_get_latency`,
-  ALSA `snd_pcm_avail_delay`) — unlike mstsc's consume-time confirms, so a server-side estimator
-  CAN see real playout delay for FreeRDP-family clients and pace/trim before the client's dropper
-  discards. A new per-client-type mechanism in the vendored server's RDPSND path (mstsc-useless, so
-  gate on the fingerprint/QoE signal). Sharp, bounded win for the choppy-FreeRDP case. Client-side
-  companion (no server change): `/sound:latency:100` raises FreeRDP's overrun cap + (Pulse) requests
-  a real sink buffer. **SCOPED + Phase-1 GREEN → `~/.claude/plans/freerdp-render-latency-estimator.md`.**
-  Phase 1 (observe-only harness, new `vendor/ironrdp-rdpsnd` fork, self-gates on FreeRDP's
-  two-confirms-per-block so mstsc stays inert without a fingerprint dependency) is **BANKED on
-  branch `feat/audio-render-latency-phase1`** (NOT on main). LIVE-VERIFIED GREEN 2026-07-19 on
-  Thincast: signal tracks stress (client-queue depth 0.3ms→380ms + ship→play 4ms→15.5s under
-  `netshape.sh --loss 6 --delay 40`) and drains back after `off`; the multi-second backlog is
-  real and the current send-side drop-stale model MISSES it (backlog sits in the kernel socket
-  buffer past `write_all`). **Phase 2 (act) = pending user go** — must add a wrap-safe monotonic
-  seq + time eviction (the u8 block_no wrap trap, validated live) before feeding measured depth
-  into `dispatch_audio`'s trim. Only worth it if choppy FreeRDP/Thincast audio is hit in practice
-  (it needed a 6%-loss stress test to surface). See docs/known-quirks.md "Why mstsc audio is mostly smooth" +
-  [[project_av_choppiness_contention]] + [[project_waveconfirm_not_playback_position]].
+- [x] **FreeRDP audio smoothness — server-side render-latency estimator — DROPPED 2026-07-20
+  (built + tested, no perceptible benefit).** From the 2026-07-18 audio research: FreeRDP sends
+  TWO WaveConfirms per wave and the server can measure the client play-out depth from them (mstsc
+  sends one, so it can't). Phase 1 (observe-only harness, vendored `ironrdp-rdpsnd` fork) was GREEN
+  — the signal tracked a 6%-loss stress link (depth 0.3ms→380ms, ship→play 4ms→15.5s) and proved
+  the send-side drop-stale model MISSES a backlog living in the kernel socket buffer. Phase 2 (act:
+  drop a wave when measured depth > threshold) was built + live-tested on Thincast + the shaper and
+  **fired once the whole run** (the client's own buffering keeps the smoothed depth under threshold
+  for the common PCM/self-managing case) and **sounded identical** to the no-drop run. Only
+  FreeRDP-with-AAC has real value (its client overrun-dropper exempts AAC) — narrow, untested, not
+  what's run here (mstsc can't use it). Not worth a vendored fork + hot-path divergence for zero
+  audible benefit. **Branch + fork DELETED; main untouched (git pin intact).** The RESEARCH is the
+  durable win and is retained (docs/known-quirks.md "Why mstsc audio is mostly smooth" +
+  [[project_waveconfirm_not_playback_position]] + [[project_av_choppiness_contention]]).
+  **Don't re-attempt without a specific "FreeRDP-AAC choppy under loss" complaint; even then
+  `/sound:latency:<ms>` (client-side, zero divergence) is the first try.** Plan FINAL OUTCOME:
+  `~/.claude/plans/freerdp-render-latency-estimator.md`.
 
 - [~] **Perf: eliminate the per-capture full-frame `last_frame` memcpy — ASSESSED 2026-07-07,
   DEPRIORITIZED (don't re-propose as a win).** From the 2026-07-03 audit's one HIGH finding:

@@ -1775,12 +1775,15 @@ impl RdpServer {
                     // from its own start()/process() return values, so no sender is
                     // threaded into it. Mirrors the URBDRC OpenDeviceChannel arm.
                     crate::CameraServerMessage::OpenDeviceChannel { channel_name, version } => {
+                        // Build the per-device decode/present sink from the camera
+                        // factory (Phase 2+); None keeps Phase-1 log-and-drop.
+                        let sink = self.camera_factory.as_deref().and_then(|f| f.build_sample_sink());
                         let create_msg = {
                             let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
                                 warn!("No DRDYNVC channel, cannot open MS-RDPECAM device channel");
                                 continue;
                             };
-                            let proc = crate::RdCameraDeviceProcessor::new(channel_name, version);
+                            let proc = crate::RdCameraDeviceProcessor::new(channel_name, version, sink);
                             match drdynvc.create_channel(proc) {
                                 Ok(m) => m,
                                 Err(e) => {

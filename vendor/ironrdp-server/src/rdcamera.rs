@@ -268,11 +268,31 @@ impl ServerEventSender for RdCameraServer {
     }
 }
 
+/// A macrdp-provided sink for the decoded-camera path: it receives the negotiated
+/// media type once and then each raw sample (one complete frame). The vendored
+/// device processor just feeds it — all the platform work (Phase 2 VideoToolbox
+/// decode, Phase 3 CoreMediaIO presentation) lives on the macrdp side behind this
+/// trait, so the vendored crate stays platform-independent. Mirrors the URBDRC
+/// `device_callback` seam.
+pub trait CameraSampleSink: Send {
+    /// The media type the server started: the `CAM_MEDIA_FORMAT` byte (H264=0x01,
+    /// MJPG=0x02, NV12=0x04, …) + pixel dimensions. Called once before samples.
+    fn on_media_type(&mut self, format: u8, width: u32, height: u32);
+    /// One complete sample = one frame. For H264 this is an Annex-B access unit
+    /// with in-band SPS/PPS (per MS-RDPECAM §2.2.3.8.1).
+    fn on_sample(&mut self, data: &[u8]);
+}
+
 /// Factory for the MS-RDPECAM enumeration processor. `ServerEventSender` so the
 /// server can hand each connection's event sender to the enumerator (to request
 /// per-device channel opens), mirroring the URBDRC factory.
 pub trait RdCameraServerFactory: ServerEventSender + Send {
     fn build_processor(&self) -> RdCameraServer;
+    /// Build a per-device sample sink (Phase 2+: decode/present). `None` (default)
+    /// keeps Phase-1 behavior — negotiate + log samples, drop them.
+    fn build_sample_sink(&self) -> Option<Box<dyn CameraSampleSink>> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -308,10 +328,12 @@ pub struct RdCameraDeviceProcessor {
     sample_bytes: u64,
     first_sample_at: Option<Instant>,
     last_log_at: Option<Instant>,
+    /// Phase 2+ decode/present sink (macrdp side); `None` = Phase-1 log-and-drop.
+    sink: Option<Box<dyn CameraSampleSink>>,
 }
 
 impl RdCameraDeviceProcessor {
-    pub fn new(channel_name: String, version: u8) -> Self {
+    pub fn new(channel_name: String, version: u8, sink: Option<Box<dyn CameraSampleSink>>) -> Self {
         Self {
             channel_name,
             version,
@@ -321,6 +343,7 @@ impl RdCameraDeviceProcessor {
             sample_bytes: 0,
             first_sample_at: None,
             last_log_at: None,
+            sink,
         }
     }
 
@@ -414,6 +437,12 @@ impl DvcProcessor for RdCameraDeviceProcessor {
                     media = %d,
                     "MS-RDPECAM chose a media type — sending StartStreamsRequest"
                 );
+                // Tell the sink the negotiated format + dimensions so it can
+                // configure its decoder before the first sample.
+                if let Some(sink) = self.sink.as_mut() {
+                    let u32_at = |o: usize| u32::from_le_bytes([chosen[o], chosen[o + 1], chosen[o + 2], chosen[o + 3]]);
+                    sink.on_media_type(chosen[0], u32_at(1), u32_at(5));
+                }
                 // StartStreamsRequest body = one START_STREAM_INFO =
                 // StreamIndex(u8) + 26-byte MediaTypeDescription. NO leading count:
                 // on the wire the count is implicit (PDU length / 27) — FreeRDP's
@@ -431,9 +460,14 @@ impl DvcProcessor for RdCameraDeviceProcessor {
             msg_id::SAMPLE_RESPONSE => {
                 // Body = StreamIndex(u8) + raw frame bytes (one PDU = one frame;
                 // the DVC layer already reassembled any chunking).
-                let frame_len = body.len().saturating_sub(1);
+                let frame = body.get(1..).unwrap_or(&[]);
+                let frame_len = frame.len();
                 self.samples += 1;
                 self.sample_bytes += frame_len as u64;
+                // Hand the frame to the decode/present sink (Phase 2+).
+                if let Some(sink) = self.sink.as_mut() {
+                    sink.on_sample(frame);
+                }
                 let now = Instant::now();
                 let first = *self.first_sample_at.get_or_insert(now);
                 // Throttled ≤1/s summary at info, so it shows under the default filter.

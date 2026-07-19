@@ -49,8 +49,8 @@ pub use rdpdr::{
     SCARD_SHARE_EXCLUSIVE, SCARD_SHARE_SHARED, SCARD_UNPOWER_CARD,
 };
 pub use rdcamera::{
-    CameraServerMessage, RdCameraDeviceProcessor, RdCameraServer, RdCameraServerFactory,
-    RDCAMERA_CHANNEL_NAME,
+    CameraSampleSink, CameraServerMessage, RdCameraDeviceProcessor, RdCameraServer,
+    RdCameraServerFactory, RDCAMERA_CHANNEL_NAME,
 };
 pub use rdpeusb::{
     DeviceDescriptor, URBDRC_CHANNEL_NAME, UrbdrcServer, UrbdrcServerFactory, UrbdrcServerMessage, UsbDeviceCallback,

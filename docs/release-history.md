@@ -4,6 +4,22 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## v0.9.0 — the webcam release
+
+*(First minor-version bump since the 0.8 series began — this one earns it.)*
+
+**A webcam redirected from the client now presents as a real macOS camera.** Enable `--enable-camera-redirection` (config `ENABLE_CAMERA_REDIRECTION=1`), tick *Video capturing devices* in the client, and **"macrdp Camera"** appears in Photo Booth / Zoom / FaceTime / Teams showing the client's live webcam. As far as is known this makes macrdp the **first open-source RDP _server_ to present a client-redirected webcam as a native OS camera** — and it's the path that actually works for **mstsc**, which routes webcams over MS-RDPECAM and refuses the raw-USB reads (`0x8007001f`) the USB-redirection path would need. **Opt-in and default OFF; the default runtime path is byte-identical when off.**
+
+The pipeline, end to end: H.264 samples arrive over the MS-RDPECAM `RDCamera` DVC (plain TCP) → **VideoToolbox** decodes them to `420v` `CVPixelBuffer`s → macrdp (as a CoreMediaIO *client*) enqueues those onto the **sink stream of a CoreMediaIO Camera system extension**, IOSurface-backed so the handoff is **zero-copy** → the extension forwards them to its source stream, which is what apps see. Live-verified on real mstsc at 1080p/~30 fps with **zero dropped frames**.
+
+- **Phase 1 — MS-RDPECAM negotiation.** The full server-side state machine (enumerate → open the client-named per-device channel → ActivateDevice → StreamList → media-type negotiation picking H.264 → StartStreams → the SampleRequest↔SampleResponse pull loop), in the vendored `ironrdp-server` (divergence 19) mirroring FreeRDP's `rdpecam` server. Samples flow over TCP, so UDP is **not** a prerequisite.
+- **Phase 2 — decode.** `src/camera/decode.rs` reframes the Annex-B access units to AVCC and decodes via `VTDecompressionSession`.
+- **Phase 3 — the macOS camera.** A hand-assembled (**no Xcode**) `.systemextension` built from a plain SwiftPM target, signed + notarized and activated from the menu-bar controller ("Enable macrdp Camera…"). Setup — the one-time Apple-portal artifacts, the build command, activation, and verification — is in **[docs/camera-extension-setup.md](camera-extension-setup.md)**.
+- **Four silent CMIO failure modes** were found and are written up in that runbook, because every one of them fails with *no error at all*: the `.systemextension` filename must equal its bundle id; `CMIOExtensionClient.signingID` is literally the string `"unknown"` (so sink-producer authentication is impossible, and a rejecting hook surfaces to the producer as a bogus `-4`); **`kCMIOStreamPropertyDirection` is inverted** from its documented meaning, and starting the wrong stream *returns success* while nothing ever drains the queue; and macOS will not replace a same-`CFBundleVersion` system extension. Also: a CMIO extension's `os_log` is invisible without `sudo`.
+- Decode diagnostics (raw H.264 + PNG frame dumps to `$TMPDIR`) are now **opt-in** behind `MACRDP_CAMERA_DUMP=1`, and `--enable-camera-redirection` is documented in the CLI reference.
+
+**Caveat:** presenting the camera needs the system extension installed + activated once, which requires the signed/notarized build (the entitlement is self-serviceable — no Apple approval). Without it macrdp still negotiates and decodes; it simply has no camera to feed. Migrating the camera channel to UDP is scoped but deferred — TCP carries it fine.
+
 ## v0.8.40 — the headless-laptop release
 
 Three fixes for daily headless-laptop use (`--virtual-display` + `--capture-primary`/`--detach-primary`), plus a new which-client audit signal. **The default runtime path is unchanged; the first three are opt-in or headless-only.**

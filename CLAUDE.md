@@ -19,7 +19,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.8.40** (the headless-laptop release —
+(VPN/ZeroTier). **Latest release: v0.9.0** (the webcam release — **a webcam
+redirected from the client now presents as a REAL macOS camera**. Opt-in
+`--enable-camera-redirection` (default OFF, default runtime path byte-identical when
+off): tick "Video capturing devices" in the client and **"macrdp Camera"** appears in
+Photo Booth / Zoom / FaceTime / Teams showing the client's live webcam. As far as is
+known the **first OSS RDP *server* to present a client-redirected webcam as a native OS
+camera** — and the path that actually works for **mstsc**, which routes webcams over
+MS-RDPECAM and refuses the raw-USB reads (`0x8007001f`) the USB path needs. Pipeline:
+H.264 samples over the MS-RDPECAM `RDCamera` DVC (plain TCP — UDP is NOT a prerequisite)
+→ **VideoToolbox** decode to `420v` `CVPixelBuffer`s → macrdp as a **CoreMediaIO client**
+enqueues them onto the **sink stream of a CoreMediaIO Camera system extension**
+(IOSurface-backed ⇒ **zero-copy**) → the extension forwards to its source stream, which
+apps see. LIVE-VERIFIED on real mstsc at 1080p/~30 fps, **zero dropped frames**. The
+extension is **hand-assembled from a plain SwiftPM target — no Xcode** — signed +
+notarized, activated once from the menu-bar controller ("Enable macrdp Camera…"; the
+`system-extension.install` entitlement is self-serviceable, no Apple grant). Setup
+runbook: `docs/camera-extension-setup.md`. **FOUR silent CMIO failure modes were found
+and are documented there — read it before touching this, every one fails with NO error:**
+(1) the `.systemextension` filename MUST equal its `CFBundleIdentifier`; (2)
+`CMIOExtensionClient.signingID` is literally the string `"unknown"`, so sink-producer
+auth is impossible and a rejecting hook surfaces as a bogus `CMIODeviceStartStream -4`;
+(3) **`kCMIOStreamPropertyDirection` is INVERTED** vs the headers — pick the sink by
+NAME, since starting the wrong stream RETURNS SUCCESS while nothing ever drains; (4)
+macOS never replaces a same-`CFBundleVersion` system extension (monotonic build number
+now). Also: a CMIO extension's `os_log` needs `sudo` to read, and every extension change
+costs a reboot to test. Decode diagnostics are now opt-in behind `MACRDP_CAMERA_DUMP=1`.
+Migrating the camera channel to UDP is scoped but deferred — TCP carries it fine.)
+Earlier: **v0.8.40** (the headless-laptop release —
 three fixes for daily headless-laptop use plus a which-client audit signal, **no
 change to the default runtime path**; the first three are opt-in or headless-only.
 **(1) Opt-in `--restore-windows-on-disconnect`** (config

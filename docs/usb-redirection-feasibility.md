@@ -245,7 +245,7 @@ That contrast is the whole reason macrdp's redirection strategy is device-class-
 
 ## First open-source RDP *server* to present a redirected USB device
 
-As far as is known, macrdp is the **first (and currently only) open-source RDP server
+As far as is known, macrdp is the **first known (and, as far as is known, only working) open-source RDP server
 that receives a client-redirected USB device and presents it as a real local device** —
 i.e. it implements the **server direction** of MS-RDPEUSB (`URBDRC`) plus local device
 synthesis. This mirrors the project's earlier UDP-multitransport finding (first OSS RDP

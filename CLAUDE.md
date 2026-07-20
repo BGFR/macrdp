@@ -24,8 +24,10 @@ redirected from the client now presents as a REAL macOS camera**. Opt-in
 `--enable-camera-redirection` (default OFF, default runtime path byte-identical when
 off): tick "Video capturing devices" in the client and **"macrdp Camera"** appears in
 Photo Booth / Zoom / FaceTime / Teams showing the client's live webcam. As far as is
-known the **first OSS RDP *server* to present a client-redirected webcam as a native OS
-camera** — and the path that actually works for **mstsc**, which routes webcams over
+known the **first *known* OSS RDP *server* to present a client-redirected webcam as a native
+OS camera** (FreeRDP ships `channels/rdpecam/server/`, but that is a protocol
+endpoint — it hands raw samples to a callback and never decodes or registers an OS
+device; the first-ness is the end-to-end presentation, not speaking MS-RDPECAM) — and the path that actually works for **mstsc**, which routes webcams over
 MS-RDPECAM and refuses the raw-USB reads (`0x8007001f`) the USB path needs. Pipeline:
 H.264 samples over the MS-RDPECAM `RDCamera` DVC (plain TCP — UDP is NOT a prerequisite)
 → **VideoToolbox** decode to `420v` `CVPixelBuffer`s → macrdp as a **CoreMediaIO client**

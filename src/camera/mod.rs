@@ -49,7 +49,9 @@ const FORMAT_H264: u8 = 0x01;
 /// report average luma. These exist to debug the decode path (is the source black? is
 /// the bitstream decodable?) and are **off by default** — a camera session shouldn't
 /// litter `$TMPDIR` or pay for the per-frame luma scan in normal use.
-#[cfg(target_os = "macos")]
+///
+/// Deliberately NOT `#[cfg(target_os = "macos")]`: the raw-stream dump lives in the
+/// cross-platform `on_media_type`, so gating this on macOS breaks the Linux stub build.
 pub(crate) fn camera_dump_enabled() -> bool {
     matches!(
         std::env::var("MACRDP_CAMERA_DUMP").as_deref(),

@@ -746,6 +746,26 @@ mod macos {
                 "physical displays captured + gamma-blanked"
             );
 
+            // SECURITY: the blanked panel is NOT a lock, and while the capture
+            // is engaged the Mac CANNOT be locked at all. Apple menu → Lock
+            // Screen (and ⌃⌘Q) appear to work — no error, no feedback — but
+            // `loginwindow` cannot draw onto a display this process holds via
+            // CGDisplayCapture, so the lock never engages and the session stays
+            // live behind the black panel. Experimentally isolated 2026-07-20
+            // across ~340 samples / 3 independent signals; `caffeinate` was the
+            // obvious suspect and is exonerated (killing it changes nothing).
+            // A plain --virtual-display session is unaffected and locks fine.
+            //
+            // The failure is silent to the user standing at the machine, so we
+            // say it loudly here at least once per engage.
+            tracing::warn!(
+                "SECURITY: while --capture-primary is engaged this Mac CANNOT be \
+                 locked — Lock Screen silently does nothing, and the black panel \
+                 is gamma trickery (a crash or kill restores a live, unlocked \
+                 desktop). Treat the machine as physically unsecured until the \
+                 last client disconnects. See docs/known-quirks.md."
+            );
+
             Ok(Self {
                 virtual_id: virtual_display_id,
                 virtual_old_origin,

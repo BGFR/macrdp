@@ -82,9 +82,10 @@ then delete; promote a parked item to *In flight* when work actually starts.
   test pattern; runbook `docs/camera-extension-setup.md`). **3b + 3c BUILT 2026-07-20** — the full Phase-3 code is written + building: 3b (extension `.sink` stream +
   consume loop + Rust `CameraFeed` CMIO producer, GetCount/GetCapacity guard + CFRetain-before-enqueue) and
   3c (420v format match on both streams + NV12 test pattern; sink producer authentication —
-  signingID pre-filter + Team-ID-pinned SecCode check; lifecycle correct by construction). **The single
+  signingID pre-filter + Team-ID-pinned SecCode check; lifecycle correct by construction). **MERGED TO MAIN 2026-07-20** (merge 55d937b; opt-in, byte-identical when off; 178 tests pass). **The single
   remaining gate for ALL of Phase 3 is the activation spike** (`docs/camera-extension-setup.md`) — one run on
-  the user's Apple account + machine closes 3a/3b/3c-GREEN. BIG de-risk confirmed: the SINK feed is CoreMediaIO C client API
+  the user's Apple account + machine closes 3a/3b/3c-GREEN. Not yet released (no tag). Post-spike follow-ups:
+  env-gate the Phase-2 $TMPDIR dumps; controller deactivate-camera menu item. BIG de-risk confirmed: the SINK feed is CoreMediaIO C client API
   (FFI) — no Swift hot path, no per-frame IPC, zero-copy IOSurface. Self-serviceable entitlement (no Apple grant).
   Then **Phase 4 SCOPED 2026-07-20 → `~/.claude/plans/camera-redirection-phase4.md`** (Soft-Sync the RDCamera DVC onto the reliable UDP tunnel like `--udp-migrate-egfx`) — **LOW priority, recommend DEFER**: TCP camera is proven GREEN, and the value is partly self-cancelling (clean LAN = TCP already fine; lossy/roaming = the RTT-gate disables the UDP offer anyway). Go/no-go risk = the untested inbound-DVC Soft-Sync direction (macrdp has only ever migrated outbound EGFX). Not a prereq for anything. Full plan +
   the live-debugged wire lessons: `~/.claude/plans/camera-redirection-phase1.md` +

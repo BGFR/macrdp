@@ -15,10 +15,19 @@
 //!
 //! Sequence + gotchas confirmed against Apple's "Creating a camera extension with
 //! Core Media I/O" sample (ldenoue/cameraextension `ViewController.swift`): match the
-//! device by `kCMIODevicePropertyDeviceUID`; the **sink is stream index [1]**; and
-//! per frame **check `GetCount < GetCapacity`** then **`CFRetain` before enqueue** (a
-//! `CMSimpleQueue` stores raw pointers and does NOT retain — the extension releases
-//! on dequeue; skip the retain → use-after-free, enqueue-when-full → error).
+//! device by `kCMIODevicePropertyDeviceUID`, and per frame **check
+//! `GetCount < GetCapacity`** then **`CFRetain` before enqueue** (a `CMSimpleQueue`
+//! stores raw pointers and does NOT retain — the extension releases on dequeue; skip
+//! the retain → use-after-free, enqueue-when-full → error).
+//!
+//! **Picking the sink stream is the subtle part** (live-debugged 2026-07-20). Do NOT
+//! choose it by `kCMIOStreamPropertyDirection`: measured against our own extension the
+//! SOURCE reports direction=1 and the SINK direction=0, inverted from the header's
+//! "0 = output / 1 = input". And starting the WRONG stream fails silently —
+//! `CMIODeviceStartStream` returns success while the extension's sink handlers never
+//! fire, so nothing drains the queue and every frame is dropped as "queue full". We
+//! select by stream NAME (`*Sink*`), which is exact because macrdp owns both ends,
+//! falling back to index [1] (the extension registers source first, sink second).
 
 use std::ffi::c_void;
 use std::os::raw::c_char;
@@ -78,6 +87,20 @@ const K_CMIO_OBJECT_PROPERTY_SCOPE_GLOBAL: u32 = u32::from_be_bytes(*b"glob");
 const K_CMIO_OBJECT_PROPERTY_ELEMENT_MAIN: u32 = 0;
 const K_CMIO_DEVICE_PROPERTY_DEVICE_UID: u32 = u32::from_be_bytes(*b"uid ");
 const K_CMIO_DEVICE_PROPERTY_STREAMS: u32 = u32::from_be_bytes(*b"stm#");
+// kCMIOStreamPropertyDirection ('sdir'), logged for diagnostics only.
+//
+// DO NOT pick the sink by this value. Measured live against our own extension
+// (which registers source-then-sink): the SOURCE reports direction=1 and the SINK
+// reports direction=0 — inverted from the "0 = output / 1 = input" reading in the
+// headers. Starting the wrong stream silently "succeeds" (the producer's
+// CMIODeviceStartStream returns 0) while the extension's sink handlers never fire,
+// so nothing ever drains the queue. We select by stream NAME instead, which is
+// unambiguous because macrdp owns both ends.
+const K_CMIO_STREAM_PROPERTY_DIRECTION: u32 = u32::from_be_bytes(*b"sdir");
+/// `kCMIOObjectPropertyName` ('lnam') — the stream's localized name.
+const K_CMIO_OBJECT_PROPERTY_NAME: u32 = u32::from_be_bytes(*b"lnam");
+/// Substring identifying the extension's sink stream ("macrdp Camera.Video.Sink").
+const SINK_STREAM_NAME_MARKER: &str = "sink";
 
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
@@ -176,21 +199,46 @@ impl CameraFeed {
             let device_id = devices
                 .into_iter()
                 .find(|&d| {
-                    device_uid(d)
+                    cf_string_property(d, K_CMIO_DEVICE_PROPERTY_DEVICE_UID)
                         .map(|u| u.eq_ignore_ascii_case(MACRDP_CAMERA_DEVICE_UID))
                         .unwrap_or(false)
                 })
                 .ok_or_else(|| anyhow!("macrdp Camera device not found (extension not active?)"))?;
 
             let streams = get_object_array(device_id, K_CMIO_DEVICE_PROPERTY_STREAMS)?;
-            // The extension registers source first, sink second → sink = index [1].
             if streams.len() < 2 {
                 return Err(anyhow!(
                     "macrdp Camera exposes {} stream(s); expected a source + a sink",
                     streams.len()
                 ));
             }
-            let sink_stream_id = streams[1];
+            // Pick the sink by NAME (we own the extension, so the name is exact).
+            // Direction is logged for diagnostics only — see the const comment for
+            // why it must not be used to choose.
+            for (i, &s) in streams.iter().enumerate() {
+                tracing::info!(
+                    index = i,
+                    stream_id = s,
+                    name = ?cf_string_property(s, K_CMIO_OBJECT_PROPERTY_NAME),
+                    direction = ?stream_direction(s),
+                    "camera Phase-3b: enumerated stream"
+                );
+            }
+            let sink_stream_id = streams
+                .iter()
+                .copied()
+                .find(|&s| {
+                    cf_string_property(s, K_CMIO_OBJECT_PROPERTY_NAME)
+                        .map(|n| n.to_ascii_lowercase().contains(SINK_STREAM_NAME_MARKER))
+                        .unwrap_or(false)
+                })
+                .unwrap_or_else(|| {
+                    // The extension registers source first, sink second.
+                    tracing::warn!(
+                        "camera Phase-3b: no stream named '*Sink*' — falling back to streams[1]"
+                    );
+                    streams[1]
+                });
 
             let mut queue: CmSimpleQueueRef = ptr::null();
             let st = CMIOStreamCopyBufferQueue(
@@ -234,6 +282,7 @@ impl CameraFeed {
             // Full-queue guard (TRAP 1): enqueuing into a full CMSimpleQueue errors.
             if CMSimpleQueueGetCount(self.queue) >= CMSimpleQueueGetCapacity(self.queue) {
                 self.dropped_full += 1;
+                self.log_stats_periodically();
                 return;
             }
 
@@ -277,6 +326,22 @@ impl CameraFeed {
                 self.enqueued += 1;
             }
             CFRelease(sample); // balance our create (+1); queue holds its own retain
+            self.log_stats_periodically();
+        }
+    }
+
+    /// Log enqueue/drop counts every ~90 frames (~3 s at 30 fps) so the extension's
+    /// consumption is observable from the macrdp side (the extension's own os_log is
+    /// invisible under the CMIO role account). A low `dropped_full` means the
+    /// extension is draining the sink; a high one means it isn't.
+    fn log_stats_periodically(&self) {
+        let total = self.enqueued + self.dropped_full;
+        if total > 0 && total.is_multiple_of(90) {
+            tracing::info!(
+                enqueued = self.enqueued,
+                dropped_full = self.dropped_full,
+                "camera Phase-3b: sink feed stats (low dropped_full = extension draining)"
+            );
         }
     }
 }
@@ -334,12 +399,43 @@ unsafe fn get_object_array(object_id: CmioObjectId, selector: u32) -> Result<Vec
     Ok(ids)
 }
 
-/// Read a device's `kCMIODevicePropertyDeviceUID` as a Rust `String`.
+/// Read a stream's `kCMIOStreamPropertyDirection` (0 = output/source, 1 = input/sink).
 ///
-/// SAFETY: `device_id` must be a live CMIO device object.
-unsafe fn device_uid(device_id: CmioObjectId) -> Option<String> {
+/// SAFETY: `stream_id` must be a live CMIO stream object.
+unsafe fn stream_direction(stream_id: CmioObjectId) -> Option<u32> {
     let address = CmioObjectPropertyAddress {
-        selector: K_CMIO_DEVICE_PROPERTY_DEVICE_UID,
+        selector: K_CMIO_STREAM_PROPERTY_DIRECTION,
+        scope: K_CMIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+        element: K_CMIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+    let mut size: u32 = 0;
+    if CMIOObjectGetPropertyDataSize(stream_id, &address, 0, ptr::null(), &mut size) != 0 {
+        return None;
+    }
+    let mut dir: u32 = 0;
+    let mut used: u32 = 0;
+    if CMIOObjectGetPropertyData(
+        stream_id,
+        &address,
+        0,
+        ptr::null(),
+        size,
+        &mut used,
+        &mut dir as *mut u32 as *mut c_void,
+    ) != 0
+    {
+        return None;
+    }
+    Some(dir)
+}
+
+/// Read a CFString-valued CMIO property (device UID, stream name, …) as a `String`.
+///
+/// SAFETY: `object_id` must be a live CMIO object and `selector` a CFString property.
+unsafe fn cf_string_property(object_id: CmioObjectId, selector: u32) -> Option<String> {
+    let device_id = object_id;
+    let address = CmioObjectPropertyAddress {
+        selector,
         scope: K_CMIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
         element: K_CMIO_OBJECT_PROPERTY_ELEMENT_MAIN,
     };

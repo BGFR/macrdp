@@ -14,8 +14,10 @@
 // - 3a: device bring-up (source + test pattern) — the signing/activation spike.
 // - 3b: the sink stream + consume loop + macrdp's Rust CMIO producer.
 // - 3c: the frames are NV12 `420v` (matching VideoToolbox decode output — advertised
-//   on both streams so CMIO passes them through with no transcode), and the sink
-//   accepts frames ONLY from macrdp.app (Team-ID-pinned code-signing check).
+//   on both streams so CMIO passes them through with no transcode). Producer
+//   authentication on the sink is NOT implemented — see the security note on
+//   `authorizedToStartStream`; CMIO exposes no trustworthy client identity here
+//   (`signingID` is literally "unknown"), so this matches Apple's sample + SinkCam.
 //
 // Structure mirrors Apple's "Creating a camera extension with Core Media I/O"
 // sample (WWDC22 s10022) + Halle/SinkCam: a Provider owns one Device, the Device
@@ -28,7 +30,6 @@ import CoreMediaIO
 import CoreVideo
 import Foundation
 import IOKit.audio
-import Security
 import os.log
 
 private let kFrameRate = 30
@@ -41,14 +42,6 @@ private let kHeight: Int32 = 720
 private let kPixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
 private let logger = OSLog(subsystem: "com.clintcan.macrdp.camera", category: "extension")
 
-// Sink producer authentication (Phase 3c): only macrdp.app may feed the sink.
-// `signingID` is an OS-derived pre-filter; the authoritative check pins the Team ID
-// + identifier via a code-signing requirement (signingID alone is signer-chosen and
-// could be reused by an adversary).
-private let kProducerSigningID = "com.clintcan.macrdp"
-private let kProducerRequirement =
-    "anchor apple generic and certificate leaf[subject.OU] = \"QGLA89KHM7\" "
-    + "and identifier \"com.clintcan.macrdp\""
 
 // MARK: - Provider (one virtual device)
 
@@ -71,7 +64,11 @@ final class MacrdpCameraProviderSource: NSObject, CMIOExtensionProviderSource {
 
     // A client (a capturing app) connected/disconnected. Phase 3c validates the
     // sink client here; the source direction accepts everyone.
-    func connect(to client: CMIOExtensionClient) throws {}
+    func connect(to client: CMIOExtensionClient) throws {
+        os_log(
+            .default, log: logger, "connect: signingID=%{public}@ pid=%d",
+            client.signingID ?? "nil", client.pid)
+    }
     func disconnect(from client: CMIOExtensionClient) {}
 
     var availableProperties: Set<CMIOExtensionProperty> {
@@ -428,55 +425,36 @@ final class MacrdpCameraStreamSink: NSObject, CMIOExtensionStreamSource {
     // video into "macrdp Camera". Accept only macrdp.app's producer, and capture it
     // for the device's consume loop. This is the correct per-stream choke point (vs
     // `connect(to:)`, which is device-wide and would also gate source consumers).
+    // Capture the producer client — the device's consume loop pulls from it.
+    //
+    // SECURITY NOTE (documented limitation, matching Apple's sample + SinkCam, which
+    // both leave this an unconditional `return true`): the CMIO sink is an open
+    // injection target — any local process aware of it can feed this virtual camera.
+    // Two producer-identity checks were implemented and REMOVED because neither
+    // works from inside a CMIO extension on this macOS:
+    //   * `CMIOExtensionClient.signingID` returns the literal string "unknown" for
+    //     every client (verified live) — not the code-signing identifier — so an
+    //     equality check rejects the legitimate producer as readily as an attacker.
+    //   * `SecCodeCheckValidity` (pid → SecCode, Team-ID-pinned requirement) can't
+    //     evaluate an external process's signature inside the extension's sandbox.
+    // Rejecting here silently breaks the feed: `authorizedToStartStream` returning
+    // false means `startStream()` never runs, so the consume loop never starts and
+    // the producer's frames pile up until the sink queue drops them — with
+    // `CMIODeviceStartStream` still returning success to the producer.
+    // Revisit if CMIO ever exposes a trustworthy client identity (e.g. an audit token).
     func authorizedToStartStream(for client: CMIOExtensionClient) -> Bool {
-        guard isTrustedProducer(client) else {
-            os_log(
-                .error, log: logger,
-                "sink: REJECTED producer signingID=%{public}@ pid=%d",
-                client.signingID ?? "nil", client.pid)
-            return false
-        }
+        os_log(
+            .default, log: logger, "sink authorizedToStartStream: signingID=%{public}@ pid=%d",
+            client.signingID ?? "nil", client.pid)
         _client = client
         return true
     }
 
-    // Layered producer check: `signingID` is OS-derived (a client can't assert an
-    // arbitrary one) but is signer-chosen, so it's only a pre-filter; the
-    // authoritative gate pins the Team ID + identifier via a code-signing
-    // requirement evaluated against the client pid. If the Security API can't
-    // evaluate the process (e.g. blocked in the sandbox), fall back to the
-    // signingID match already established (documented degrade).
-    private func isTrustedProducer(_ client: CMIOExtensionClient) -> Bool {
-        guard let signingID = client.signingID, signingID == kProducerSigningID else {
-            return false
-        }
-        var code: SecCode?
-        let attrs = [kSecGuestAttributePid: NSNumber(value: client.pid)] as CFDictionary
-        let copyStatus = SecCodeCopyGuestWithAttributes(nil, attrs, [], &code)
-        guard copyStatus == errSecSuccess, let code = code else {
-            os_log(
-                .info, log: logger,
-                "sink: SecCode unavailable (status %d) — accepting on signingID", copyStatus)
-            return true
-        }
-        var requirement: SecRequirement?
-        guard
-            SecRequirementCreateWithString(kProducerRequirement as CFString, [], &requirement)
-                == errSecSuccess, let requirement = requirement
-        else {
-            return true  // couldn't build the requirement — rely on the signingID match
-        }
-        let valid = SecCodeCheckValidity(code, [], requirement)
-        if valid != errSecSuccess {
-            os_log(
-                .error, log: logger,
-                "sink: producer failed the Team-ID requirement (status %d)", valid)
-            return false
-        }
-        return true
-    }
 
     func startStream() throws {
+        os_log(
+            .default, log: logger, "sink startStream called (client=%{public}@)",
+            _client == nil ? "nil" : "set")
         guard let deviceSource = device.source as? MacrdpCameraDeviceSource,
             let client = _client
         else { return }

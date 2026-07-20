@@ -47,8 +47,12 @@
     </array>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+    <!-- CFBundleVersion is a monotonic BUILD number (not the marketing version) so
+         each rebuild is "newer" and OSSystemExtensionRequest actually REPLACES the
+         installed extension — macOS will not replace a same-CFBundleVersion system
+         extension on re-activation. Set by make-camera-extension.sh. -->
     <key>CFBundleVersion</key>
-    <string>__VERSION__</string>
+    <string>__BUILD__</string>
     <key>CFBundleShortVersionString</key>
     <string>__VERSION__</string>
     <key>LSMinimumSystemVersion</key>

@@ -75,10 +75,16 @@ EXT="$OUT_DIR/$CAMERA_ID.systemextension"
 echo "==> staging $EXT"
 rm -rf "$EXT"
 mkdir -p "$EXT/Contents/MacOS"
+# Monotonic build number (epoch seconds) so each rebuild's CFBundleVersion is
+# strictly newer → OSSystemExtensionRequest replaces the installed extension.
+# Overridable via CAMERA_EXT_BUILD for reproducible/release builds.
+BUILD="${CAMERA_EXT_BUILD:-$(date +%s)}"
 sed -e "s/__VERSION__/$VERSION/g" \
+    -e "s/__BUILD__/$BUILD/g" \
     -e "s#__CAMERA_ID__#$CAMERA_ID#g" \
     -e "s#__MACH_SVC__#$MACH_SVC#g" \
     "$PKG_DIR/camera-Info.plist" > "$EXT/Contents/Info.plist"
+echo "    CFBundleVersion (build) = $BUILD"
 cp "$BIN" "$EXT/Contents/MacOS/macrdpcamera"
 chmod +x "$EXT/Contents/MacOS/macrdpcamera"
 

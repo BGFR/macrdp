@@ -202,7 +202,7 @@ it isn't true.
 
 | Their advantage | Our status |
 |---|---|
-| **AVC444 shipped** ("pixel-perfect color", RDP 10) | **We don't have it.** `src/avc444.rs` exists (YUV444 pack + benchmarks) but is **parked and unwired** — no CLI flag. They win on color fidelity for text/fine detail. |
+| **AVC444 shipped** ("pixel-perfect color", RDP 10) | **Not wired here — but parked deliberately, not merely unfinished.** `src/avc444.rs` has spec-compliant split/combine + roundtrip tests and a vImage path; upstream `ironrdp-egfx` already exposes `send_avc444_frame`. It was parked on a *measurement*: VideoToolbox shares one hardware encoder block (two sessions measured **1.02× throughput** — effectively serial), so AVC444 costs ~2× encode wall-clock: fine at 1080p/60 (~10 ms/frame) but **doesn't fit 4K/60** (~39 ms vs a 16.6 ms budget). The plan is an opt-in `--avc444` with that caveat, resumed if colored-text quality actually bites. **Note x6nux runs on the same Apple Silicon and inherits the identical constraint** — they shipped it anyway. So: a real gap in shipped capability, not in understanding. |
 | **Lock-screen capture** (CoreGraphics fallback when the screen is locked) | **We have no equivalent.** We only *document* that input to the login window is blocked. Their session survives a locked screen in a way ours does not. |
 | **Polished GUI** — Dashboard with FPS chart, Statistics with bar charts, Console.app-style Logs, split-panel Settings | Ours is a **menu-bar controller** — functional, far less of an admin UI. Their last five commits were all UI work. |
 | **TOML config with hot reload** | We use `config.env` and mostly **require a restart** (`launchctl kickstart -k`). |
@@ -240,8 +240,13 @@ Theirs is the better *minimal* macOS screen server today (AVC444, lock-screen ca
 UI). Ours is a *remote-desktop platform* — audio, clipboard, files, USB, camera, smart cards,
 headless, and the operational hardening to leave running. Neither supersedes the other.
 
-**Two concrete things to steal:** AVC444 is already 90% built here and should be un-parked;
-and lock-screen capture is a real gap worth closing.
+**Two things worth revisiting — with eyes open:** **AVC444** is substantially built and could
+ship as an opt-in 1080p-only flag (~3 evenings), but it was parked on measured hardware limits,
+not neglect — see the row above before treating it as low-hanging fruit. **Lock-screen capture**
+looked like a gap until we tested it: the lock screen renders on the *physical* panel and macOS
+blocks synthetic input to the login window, so replicating it would yield a screen you still
+cannot type into — see the capture-primary lock quirk in [known-quirks.md](known-quirks.md).
+Neither is the free win the surface comparison suggests.
 
 ## CGKPK/RDPonMAC — the other native macOS RDP server
 

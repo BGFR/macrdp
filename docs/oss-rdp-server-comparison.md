@@ -229,7 +229,7 @@ missing on their side:
   **HTML** (0xD010) — **theirs only**. Neither implements CF_DIBV5 or CF_BITMAP. So HTML is the
   single clipboard delta, in their favour.
 - **Adaptive bitrate**, **hardware H.264 via VideoToolbox**, **HiDPI/Retina capture**, **NLA/CredSSP
-  + auto TLS**, **RFX** — present on both.
+  + auto TLS**, **RemoteFX (RFX)** — present on both. **But not NSCodec — see below.**
 
 ### Where macrdp is differentiated
 
@@ -248,6 +248,16 @@ Each of the following is **absent from their entire source tree** (whole-tree se
   RTT-aware rate control for VPN/high-latency links.
 - **Input depth** — non-US keyboard layouts auto-detected from the client, optional Ctrl→Cmd
   remapping, symbolic-hotkey workarounds, an app-switcher HUD.
+- **NSCodec legacy codec** — `nscodec` is **absent from their entire tree**; their encoder set is
+  `bitmap`/`fast_path`/`rfx`. This matters concretely: **Microsoft Remote Desktop / Windows App on
+  macOS advertises *only* NSCodec** in its legacy bitmap codec list, so without it that client
+  falls back to raw/RLE `BitmapUpdate` — bandwidth-heavy. macrdp serves Apple's own RDP client
+  better on the legacy path. (Both have H.264, which those clients do negotiate, so it bites on
+  the fallback path.) Note the provenance: macrdp **contributed this upstream** — IronRDP PR
+  **#1332, merged 2026-06-01** — where the `nscodec` module existed but was *dead code, never
+  wired up*; the contribution was the handler, encoder-codec slot, dispatch variant, selection
+  arm and server-side `CodecProperty::NsCodec` match. Their vendored `ironrdp-server-gfx` fork
+  predates or omits that merge, so it is available upstream and simply unadopted.
 - **Licensing** — Apache-2.0 vs their GPL-3.0; materially different for embedding or commercial use.
 
 ### Fair summary

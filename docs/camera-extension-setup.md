@@ -90,7 +90,7 @@ installs to `/Applications/macrdpController.app`.
 4. Check state: `systemextensionsctl list` → `activated enabled` for
    `com.clintcan.macrdp.controller.camera`.
 
-## Verify (Phases 3a + 3b + 3c GREEN, one run)
+## Verify (Phases 3a + 3b + 3c — ALL LIVE-VERIFIED GREEN 2026-07-20)
 
 1. **3a** — Open **Photo Booth** (or QuickTime → New Movie → camera dropdown, or Zoom
    video settings) → pick **macrdp Camera** → you should see the **sweeping-white-stripe
@@ -125,6 +125,51 @@ log stream --predicate 'subsystem == "com.clintcan.macrdp.camera"'
   SIP disabled — last resort only.
 - **Logs:** `log stream --predicate 'subsystem == "com.clintcan.macrdp.camera"'` for the
   extension; `log show --predicate 'process == "sysextd"'` for activation failures.
+
+## The four silent failure modes (all LIVE-DEBUGGED 2026-07-20 — read before touching this)
+
+Every one of these fails **silently** — no error, no log, and `codesign`/`CMIODeviceStartStream`
+both report success. Together they cost most of a day; none is guessable from the docs.
+
+1. **The `.systemextension` bundle filename must equal its `CFBundleIdentifier`.**
+   Otherwise `OSSystemExtensionRequest` fails with *"unable to find any matched
+   extension"* — the request never even reaches `sysextd`. (Also needs
+   `CFBundleSupportedPlatforms`; see the next section.)
+2. **`CMIOExtensionClient.signingID` is the literal string `"unknown"`** for every
+   client — it is NOT the code-signing identifier. Any auth check comparing it
+   rejects the *legitimate* producer. Worse, a rejecting `authorizedToStartStream`
+   surfaces to the producer as a bogus **`CMIODeviceStartStream` OSStatus `-4`**,
+   which reads like a wrong-stream error and sends you down the wrong path. (A
+   Team-ID-pinned `SecCode` check is also useless here — it can't evaluate an
+   external process from inside the extension sandbox.) There is currently **no
+   trustworthy way to authenticate the sink producer**; Apple's sample and SinkCam
+   both leave the hook an unconditional `return true`, and so do we.
+3. **`kCMIOStreamPropertyDirection` is INVERTED from its documented meaning.**
+   Measured against our own extension (which registers source-then-sink), the
+   **SOURCE reports `direction=1`** and the **SINK reports `direction=0`** — the
+   opposite of the header's "0 = output / 1 = input". Picking the sink by direction
+   makes the producer start the *source*, and **`CMIODeviceStartStream` returns
+   SUCCESS on the wrong stream** while the extension's sink handlers never fire — so
+   nothing drains the queue and every frame is dropped as "queue full". Select the
+   sink by **stream name** (`kCMIOObjectPropertyName` → `*Sink*`) instead.
+4. **macOS will not replace a same-`CFBundleVersion` system extension.** Re-activation
+   silently keeps the old one running. Worse, a half-swapped state **splits the source
+   and sink across two extension processes** (the old one keeps serving Photo Booth
+   while the producer feeds the new one) and nothing works until a reboot.
+   `make-camera-extension.sh` therefore stamps a **monotonic build number**.
+
+**Debugging aids that made this tractable:**
+- A CMIO extension's `os_log` is **invisible to a normal user** — it runs as the
+  `_cmiodalassistants` role account. You must use
+  `sudo log show --info --debug --predicate 'subsystem == "com.clintcan.macrdp.camera"'`.
+  Without `sudo` you get *nothing*, which looks like "the extension isn't logging".
+- Since the extension is otherwise opaque, macrdp logs **`enqueued`/`dropped_full`**
+  every ~90 frames. `dropped_full` climbing with `enqueued` frozen at the queue
+  capacity = **the extension is not draining the sink**; `dropped_full=0` with
+  `enqueued` climbing = working.
+- **Every extension code change costs a reboot to test cleanly.** Batch them.
+- Diff against a known-good CMIO extension already on the machine (OBS Virtual
+  Camera) — a `plutil -p` Info.plist diff found gotcha #1.
 
 ## Hand-assembly gotchas (RETIRED risk — LIVE-VERIFIED 2026-07-20)
 

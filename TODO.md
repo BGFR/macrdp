@@ -72,22 +72,17 @@ then delete; promote a parked item to *In flight* when work actually starts.
   VideoToolbox decodes the webcam end-to-end — 500+ frames, zero errors, real color
   `CVPixelBuffer` at 1080p (the decoded grayscale-Y dump is the user's real camera view;
   color CVPixelBuffer, luma-only PNG). Both technical unknowns now GREEN (protocol over TCP +
-  VT decode). **Phase 3 IN PROGRESS → `~/.claude/plans/camera-redirection-phase3.md`** (CoreMediaIO Camera
-  Extension: the webcam as a selectable macOS camera). **3a BUILT + VERIFIED-LOCALLY 2026-07-20**: the CMIO
-  system extension (static test pattern; `swift build`, no Xcode) + controller `OSSystemExtensionRequest`
-  activation + hand-assembled `.systemextension` packaging, all research-reconciled (child-of-app-id,
-  MachServiceName=AppGroup, unsandboxed controller w/ self-serviceable `system-extension.install`, SYSX) and
-  ad-hoc assemble/sign-verified. **Remaining for 3a-GREEN = the activation spike** (user's Apple portal +
-  entitled notarized build to `/Applications` + `systemextensionsctl developer on` + approve → Photo Booth
-  test pattern; runbook `docs/camera-extension-setup.md`). **3b + 3c BUILT 2026-07-20** — the full Phase-3 code is written + building: 3b (extension `.sink` stream +
-  consume loop + Rust `CameraFeed` CMIO producer, GetCount/GetCapacity guard + CFRetain-before-enqueue) and
-  3c (420v format match on both streams + NV12 test pattern; sink producer authentication —
-  signingID pre-filter + Team-ID-pinned SecCode check; lifecycle correct by construction). **MERGED TO MAIN 2026-07-20** (merge 55d937b; opt-in, byte-identical when off; 178 tests pass). **The single
-  remaining gate for ALL of Phase 3 is the activation spike** (`docs/camera-extension-setup.md`) — one run on
-  the user's Apple account + machine closes 3a/3b/3c-GREEN. Not yet released (no tag). Post-spike follow-ups:
-  env-gate the Phase-2 $TMPDIR dumps; controller deactivate-camera menu item. BIG de-risk confirmed: the SINK feed is CoreMediaIO C client API
-  (FFI) — no Swift hot path, no per-frame IPC, zero-copy IOSurface. Self-serviceable entitlement (no Apple grant).
-  Then **Phase 4 SCOPED 2026-07-20 → `~/.claude/plans/camera-redirection-phase4.md`** (Soft-Sync the RDCamera DVC onto the reliable UDP tunnel like `--udp-migrate-egfx`) — **LOW priority, recommend DEFER**: TCP camera is proven GREEN, and the value is partly self-cancelling (clean LAN = TCP already fine; lossy/roaming = the RTT-gate disables the UDP offer anyway). Go/no-go risk = the untested inbound-DVC Soft-Sync direction (macrdp has only ever migrated outbound EGFX). Not a prereq for anything. Full plan +
+  VT decode). **Phase 3 COMPLETE — LIVE-VERIFIED GREEN 2026-07-20**: a client webcam redirected over MS-RDPECAM now
+  presents as a **live macOS camera** (Photo Booth, ~30 fps, zero dropped frames) via a hand-assembled
+  (no-Xcode) CoreMediaIO Camera system extension — 3a activation + 3b sink feed + 3c 420v format, all green.
+  As far as is known the first OSS RDP *server* to present a client-redirected webcam as a native OS camera.
+  **Four silent CMIO failure modes were found and are documented in `docs/camera-extension-setup.md` — read
+  it before touching this**: bundle filename must == bundle id; `signingID` is literally "unknown" (so sink
+  producer auth is impossible and a rejecting hook surfaces as a bogus `-4`); `kCMIOStreamPropertyDirection`
+  is INVERTED (pick the sink by NAME — starting the wrong stream returns SUCCESS and silently never drains);
+  and macOS won't replace a same-CFBundleVersion extension (monotonic build number now). Extension `os_log`
+  needs `sudo` to read. Remaining follow-ups (non-blocking): env-gate the Phase-2 $TMPDIR dumps; a controller
+  "disable camera" menu item. **Phase 4** (UDP migration) still scoped + deferred, low priority. Full plan +
   the live-debugged wire lessons: `~/.claude/plans/camera-redirection-phase1.md` +
   `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].
 

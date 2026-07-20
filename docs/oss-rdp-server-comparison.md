@@ -223,8 +223,11 @@ missing on their side:
 - **Audio** — both have it (`macrdp-audio`, ~11 KB; ours `audio.rs` 43 KB + `aac.rs` 16 KB). Ours
   adds opt-in AAC compression and can carry audio on a lossy UDP flow; theirs is PCM-focused.
 - **Clipboard** — both have it, at comparable scale (theirs ~53 KB incl. `transfer.rs`,
-  `pasteboard.rs`, `file.rs`, `html.rs`; ours 59 KB). Both do file transfer. **They additionally
-  do HTML; we do not.**
+  `pasteboard.rs`, `file.rs`, `html.rs`; ours 59 KB). Format-by-format (both trees read
+  2026-07-20): **text** (CF_UNICODETEXT) ✅ both; **images** (CF_DIB) ✅ both — ours PNG↔DIB,
+  theirs accepting `public.png`/`tiff`/`jpeg`→DIB; **file lists** (FileGroupDescriptorW) ✅ both;
+  **HTML** (0xD010) — **theirs only**. Neither implements CF_DIBV5 or CF_BITMAP. So HTML is the
+  single clipboard delta, in their favour.
 - **Adaptive bitrate**, **hardware H.264 via VideoToolbox**, **HiDPI/Retina capture**, **NLA/CredSSP
   + auto TLS**, **RFX** — present on both.
 

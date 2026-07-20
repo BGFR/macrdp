@@ -30,12 +30,21 @@
     <string>macrdp Camera</string>
     <key>CFBundleDisplayName</key>
     <string>macrdp Camera</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
     <key>CFBundleIdentifier</key>
     <string>__CAMERA_ID__</string>
     <key>CFBundleExecutable</key>
     <string>macrdpcamera</string>
     <key>CFBundlePackageType</key>
     <string>SYSX</string>
+    <!-- Xcode always injects this; without it the OS does NOT recognize the bundle
+         as an installable macOS system extension (OSSystemExtensionRequest returns
+         extensionNotFound and it never appears in the LaunchServices registry). -->
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>MacOSX</string>
+    </array>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleVersion</key>

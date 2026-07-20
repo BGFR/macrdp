@@ -67,8 +67,11 @@ echo "==> swift build -c release --product macrdpcamera"
 BIN="$GUI_DIR/.build/release/macrdpcamera"
 [ -x "$BIN" ] || { echo "build produced no binary at $BIN" >&2; exit 1; }
 
-# 2. Assemble the .systemextension bundle.
-EXT="$OUT_DIR/macrdp-camera.systemextension"
+# 2. Assemble the .systemextension bundle. The bundle FILENAME must equal the
+#    extension's CFBundleIdentifier (<id>.systemextension) — the OSSystemExtensions
+#    bundle scan relies on it (Xcode always names it this way; a mismatched name
+#    makes activation fail with "unable to find any matched extension").
+EXT="$OUT_DIR/$CAMERA_ID.systemextension"
 echo "==> staging $EXT"
 rm -rf "$EXT"
 mkdir -p "$EXT/Contents/MacOS"

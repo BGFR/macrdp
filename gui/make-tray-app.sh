@@ -85,11 +85,13 @@ if [ "${CAMERA_EXTENSION:-0}" = "1" ]; then
     OUT_DIR="$REPO_ROOT/target" TEAM_ID="${TEAM_ID:-}" APP_GROUP="$APP_GROUP" \
         CODESIGN_IDENTITY="$IDENTITY" BUNDLE_PREFIX="$BUNDLE_PREFIX" \
         "$REPO_ROOT/packaging/make-camera-extension.sh"
-    EXT_SRC="$REPO_ROOT/target/macrdp-camera.systemextension"
+    # The extension bundle is named after its CFBundleIdentifier (required — see
+    # make-camera-extension.sh); mirror that here.
+    EXT_SRC="$REPO_ROOT/target/$BUNDLE_PREFIX.macrdp.controller.camera.systemextension"
     [ -d "$EXT_SRC" ] || { echo "extension not built at $EXT_SRC" >&2; exit 1; }
     mkdir -p "$STAGE/Contents/Library/SystemExtensions"
     cp -R "$EXT_SRC" "$STAGE/Contents/Library/SystemExtensions/"
-    echo "==> embedded macrdp-camera.systemextension"
+    echo "==> embedded $(basename "$EXT_SRC")"
     # Controller entitlements: just system-extension.install (unsandboxed, no App
     # Group — the group lives only on the extension; see macrdp-controller.entitlements).
     CTRL_ENT_ARG="--entitlements $REPO_ROOT/packaging/macrdp-controller.entitlements"

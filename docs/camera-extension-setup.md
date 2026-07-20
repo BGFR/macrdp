@@ -126,12 +126,28 @@ log stream --predicate 'subsystem == "com.clintcan.macrdp.camera"'
 - **Logs:** `log stream --predicate 'subsystem == "com.clintcan.macrdp.camera"'` for the
   extension; `log show --predicate 'process == "sysextd"'` for activation failures.
 
-## Known residual risk
+## Hand-assembly gotchas (RETIRED risk — LIVE-VERIFIED 2026-07-20)
 
-No cited public example proves a *hand-assembled* (zero-`xcodebuild`) CMIO extension
-activating — the assembly/signing is mechanically identical to what Xcode produces
-(verified structurally here), but the activation itself is the un-retired unknown.
-**If activation fails validation**, the fallback is a minimal Xcode project for *only*
-the extension bundle (the Swift source + entitlements are unchanged; only the bundle
-assembly moves to Xcode). The rest of the pipeline (Phases 1+2, the controller, the
-frame feed) is unaffected either way.
+A hand-assembled (no-`xcodebuild`) CMIO camera extension **does activate** — verified
+end-to-end on real hardware: signed → notarized → `OSSystemExtensionRequest` →
+approved → the test pattern rendered in Photo Booth, activating right alongside OBS's
+extension. The Xcode fallback was **not** needed. But two things Xcode injects
+silently are load-bearing and cost real debugging (both invisible to
+`codesign --verify`, which passes without them):
+
+1. **The bundle FILENAME must equal the `CFBundleIdentifier`** —
+   `com.clintcan.macrdp.controller.camera.systemextension`, not an arbitrary name.
+   `OSSystemExtensionRequest`'s bundle scan relies on it: a mismatched name fails with
+   **"unable to find any matched extension"** (`extensionNotFound`) — the request never
+   even reaches `sysextd`. (`make-camera-extension.sh` now names it `<id>.systemextension`.)
+2. **`CFBundleSupportedPlatforms = ["MacOSX"]` is required** in the extension
+   `Info.plist` — without it the OS doesn't treat the bundle as an installable macOS
+   system extension. (Now in `camera-Info.plist`.)
+
+Diagnosis method that worked: compare the failing bundle against a **known-good CMIO
+extension already on the machine** (OBS Virtual Camera —
+`/Applications/OBS.app/Contents/Library/SystemExtensions/*.systemextension`) — a
+`plutil -p` Info.plist diff + a bundle-tree diff surfaced both gaps. The error
+progression was the map: `extensionNotFound` (filename) → `code signature invalid`
+(not notarized — sysextd validates far stricter than `codesign`; a Developer-ID sysext
+MUST be notarized to activate with SIP on) → `needs user approval` (success).

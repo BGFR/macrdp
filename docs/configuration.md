@@ -231,6 +231,14 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           actually blank the panel on your hardware. Mutually
                           exclusive with --detach-primary. Only with
                           --virtual-display.
+                          ⚠ SECURITY: while this is engaged the Mac CANNOT BE
+                          LOCKED — Apple menu > Lock Screen silently does nothing
+                          (loginwindow can't draw onto a CGDisplayCaptured
+                          display). The black panel is gamma trickery, not a lock,
+                          and reverts to a live unlocked desktop if macrdp exits.
+                          Treat the machine as physically unsecured while a
+                          session is engaged. Experimentally confirmed; see
+                          known-quirks.md.
 --enable-udp-multitransport  EXPERIMENTAL, opt-in. Offer RDP UDP multitransport
                           (MS-RDPEMT over reliable RDPEUDP) and bind a UDP
                           listener on the same address/port as TCP. On its own,
@@ -351,6 +359,18 @@ To go *fully* headless while a client is connected, pick one:
 - **`--capture-primary`** — takes exclusive `CGDisplayCapture` of every physical display and forces the gamma LUT to map every input to black. Backlight stays on but panels render solid black. Works everywhere capture is allowed; uses only public CG symbols.
 
 Both restore the original layout when the last client disconnects, and both auto-revert on `SIGKILL` / panic (no logout required). Pick `--detach-primary` first; fall back to `--capture-primary` if your hardware doesn't honor the disable.
+
+> **⚠ Security caveat for `--capture-primary`: the Mac cannot be locked while it's engaged.**
+> Choosing Apple menu → Lock Screen (or ⌃⌘Q) appears to work but silently does nothing — the
+> Mac stays fully unlocked, so anyone with physical access can move the mouse and land in your
+> session. `CGDisplayCapture` takes exclusive ownership of the panels and `loginwindow` cannot
+> draw its lock screen onto a captured display. The blank screen is a gamma clamp, **not** a
+> security boundary — it restores to a live, unlocked desktop if macrdp exits or is killed.
+> Experimentally isolated (capture off → locks normally; killing our `caffeinate` changes
+> nothing), so it is specific to capture mode — **a plain `--virtual-display` session locks
+> fine**. To secure the Mac, disconnect (capture releases on last-client disconnect) or don't
+> use capture mode. Remote unlock is impossible regardless: macOS blocks synthetic input to the
+> login window. See [known-quirks.md](known-quirks.md).
 
 ## Examples
 

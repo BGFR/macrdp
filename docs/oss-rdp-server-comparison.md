@@ -1,8 +1,15 @@
-# What macrdp does that other open-source RDP servers don't — verified
+# macrdp vs. other open-source RDP servers
 
-This is the evidence backing every "first" claim made elsewhere in the docs. It exists so
-those claims are **citable, falsifiable, and re-verifiable** rather than folklore — and so
-we don't overclaim.
+Two things live here:
+
+- **[Part 1 — Verified firsts](#part-1--verified-firsts)** — the evidence behind every "first"
+  claim made elsewhere in the docs, so they are **citable, falsifiable, and re-verifiable**
+  rather than folklore, and so we don't overclaim.
+- **[Part 2 — Project comparisons](#part-2--project-comparisons)** — how macrdp actually stacks
+  up against the other native macOS RDP servers, written adversarially (steelmanning theirs).
+
+**They rot at different rates.** Part 1 is dated evidence about upstream *absences* and changes
+slowly. Part 2 changes whenever either project ships something — re-read it with more suspicion.
 
 **Verified 2026-07-20** by adversarial web research (106 agents; each candidate claim put
 to a 3-vote refutation panel — 25 claims → 16 confirmed, 9 refuted) plus a direct read of
@@ -12,6 +19,10 @@ FreeRDP's source. The brief was explicitly to *disprove* the claims, not confirm
 > or "only".** These are negative-existence claims over a field that was not exhaustively
 > enumerated (see [Limits](#limits-of-this-survey)). One claim we might have made was
 > already false; assume the others could become false as upstreams move.
+
+---
+
+# Part 1 — Verified firsts
 
 ## Verdicts at a glance
 
@@ -121,7 +132,61 @@ required retraction — it's recorded here so it's never made by accident.
 **They do not threaten claims 1–3:** both are display + input only. Neither implements USB,
 camera, UDP-multitransport, drive, or smart-card redirection.
 
-## 4b. Head-to-head: macrdp vs. x6nux/macrdp (the closest peer)
+→ Both projects are compared properly in **[Part 2](#part-2--project-comparisons)**.
+
+## 5. What macrdp should NOT claim
+
+- **H.264/EGFX server-side encoding is not a first** — xrdp and gnome-remote-desktop both do
+  server-side H.264.
+- **Smart-card (MS-RDPESC) server direction** and **drive redirection presented as a real
+  filesystem mount** were **not adjudicated**. They may well be unusual, but assert nothing
+  either way without a source-tree audit.
+- [Lamco's comparison page](https://lamco.ai/comparison/) is marketing-quality; the
+  verification panel rejected claims resting on it. Don't cite it in either direction.
+
+## Limits of this survey
+
+The honest boundary on claims 1–3: the survey did **not** affirmatively clear **ogon**,
+**gnome-remote-desktop**, the **Weston/wlroots** RDP backends, **NeutrinoRDP**, or other
+IronRDP-downstream servers (lamco, hypr, cosmic-ext, ARISU) for server-direction USB,
+camera, or UDP. The claims rest on FreeRDP + xrdp absence-of-evidence — strong for those two
+projects, but not an exhaustive field survey. Hence "as far as is known".
+
+Also note that one supporting line of evidence was voted down during verification: two
+claims asserting FreeRDP's merged MS-RDPECAM PR #10258 is client-only were **refuted**,
+which is precisely why claim 3 was re-grounded on a direct source read rather than an
+API-doc reading.
+
+## Re-verifying this (it will rot)
+
+These are absence claims about actively developed upstreams. To re-check:
+
+1. **USB** — does `channels/urbdrc/` have a `server/` dir, or `add_subdirectory(server)` in
+   its CMakeLists? Is [#7558](https://github.com/FreeRDP/FreeRDP/issues/7558) still open?
+2. **UDP** — does `libfreerdp/core/multitransport.c` still answer `E_ABORT` via
+   `multitransport_no_udp`? Has any RDPEUDP implementation landed in-tree?
+3. **Camera** — does `channels/rdpecam/server/camera_device_main.c` still merely
+   `IFCALLRET(context->SampleResponse, …)` with the raw payload, with no decoder and no OS
+   device registration?
+4. **Field** — have ogon / gnome-remote-desktop / the IronRDP downstreams grown any
+   server-direction redirection channel?
+
+**Part 2 rots faster than Part 1** and on a different trigger: Part 1 tracks *absences* in
+upstreams that change slowly, while Part 2 tracks two actively-developed projects. Re-check
+their READMEs and commit activity before repeating anything from it — particularly the
+"where they're ahead" table, which is the part most likely to be out of date (and the part
+we'd look worst getting wrong).
+
+Related: [features.md](features.md) (the capability list),
+[usb-redirection-feasibility.md](usb-redirection-feasibility.md),
+[rdp-udp-multitransport-feasibility.md](rdp-udp-multitransport-feasibility.md),
+[camera-extension-setup.md](camera-extension-setup.md).
+
+---
+
+# Part 2 — Project comparisons
+
+## x6nux/macrdp — the closest peer
 
 [`x6nux/macrdp`](https://github.com/x6nux/macrdp) deserves a real comparison rather than a
 footnote: it is the **same architectural lineage** (a vendored, patched `ironrdp-server` +
@@ -178,44 +243,24 @@ headless, and the operational hardening to leave running. Neither supersedes the
 **Two concrete things to steal:** AVC444 is already 90% built here and should be un-parked;
 and lock-screen capture is a real gap worth closing.
 
-## 5. What macrdp should NOT claim
+## CGKPK/RDPonMAC — the other native macOS RDP server
 
-- **H.264/EGFX server-side encoding is not a first** — xrdp and gnome-remote-desktop both do
-  server-side H.264.
-- **Smart-card (MS-RDPESC) server direction** and **drive redirection presented as a real
-  filesystem mount** were **not adjudicated**. They may well be unusual, but assert nothing
-  either way without a source-tree audit.
-- [Lamco's comparison page](https://lamco.ai/comparison/) is marketing-quality; the
-  verification panel rejected claims resting on it. Don't cite it in either direction.
+[`CGKPK/RDPonMAC`](https://github.com/CGKPK/RDPonMAC) (created 2026-04-26, Apache-2.0) is a
+genuine native macOS RDP server built on a different stack: **libxrdp + ScreenCaptureKit**,
+with `CGDisplayCreateImage` login-screen fallback, `CGEvent`/IOKit HID input injection, and
+verified service to both mstsc and sdl-freerdp. It terminates RDP itself — not a VNC bridge,
+not a proxy.
 
-## Limits of this survey
+It is **display + input only**: no audio, clipboard, or any redirection channel. Its one
+notable capability macrdp lacks is the **login-screen capture fallback** — see the
+capture-primary lock quirk in [known-quirks.md](known-quirks.md) for why that turns out to
+matter less than it sounds (a remotely-visible lock screen still cannot be typed into).
 
-The honest boundary on claims 1–3: the survey did **not** affirmatively clear **ogon**,
-**gnome-remote-desktop**, the **Weston/wlroots** RDP backends, **NeutrinoRDP**, or other
-IronRDP-downstream servers (lamco, hypr, cosmic-ext, ARISU) for server-direction USB,
-camera, or UDP. The claims rest on FreeRDP + xrdp absence-of-evidence — strong for those two
-projects, but not an exhaustive field survey. Hence "as far as is known".
+Its activity was not tracked in detail; treat the above as a snapshot, not a current status.
 
-Also note that one supporting line of evidence was voted down during verification: two
-claims asserting FreeRDP's merged MS-RDPECAM PR #10258 is client-only were **refuted**,
-which is precisely why claim 3 was re-grounded on a direct source read rather than an
-API-doc reading.
+## Scope of Part 2
 
-## Re-verifying this (it will rot)
-
-These are absence claims about actively developed upstreams. To re-check:
-
-1. **USB** — does `channels/urbdrc/` have a `server/` dir, or `add_subdirectory(server)` in
-   its CMakeLists? Is [#7558](https://github.com/FreeRDP/FreeRDP/issues/7558) still open?
-2. **UDP** — does `libfreerdp/core/multitransport.c` still answer `E_ABORT` via
-   `multitransport_no_udp`? Has any RDPEUDP implementation landed in-tree?
-3. **Camera** — does `channels/rdpecam/server/camera_device_main.c` still merely
-   `IFCALLRET(context->SampleResponse, …)` with the raw payload, with no decoder and no OS
-   device registration?
-4. **Field** — have ogon / gnome-remote-desktop / the IronRDP downstreams grown any
-   server-direction redirection channel?
-
-Related: [features.md](features.md) (the capability list),
-[usb-redirection-feasibility.md](usb-redirection-feasibility.md),
-[rdp-udp-multitransport-feasibility.md](rdp-udp-multitransport-feasibility.md),
-[camera-extension-setup.md](camera-extension-setup.md).
+Deliberately limited to the two projects that were actually examined. **No feature matrix
+against xrdp / gnome-remote-desktop / ogon appears here on purpose** — Part 1's
+[Limits](#limits-of-this-survey) records that those were never affirmatively cleared, and a
+tidy comparison grid would imply verification that does not exist.

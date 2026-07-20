@@ -259,6 +259,17 @@ Each of the following is **absent from their entire source tree** (whole-tree se
   arm and server-side `CodecProperty::NsCodec` match. Their vendored `ironrdp-server-gfx` fork
   predates or omits that merge, so it is available upstream and simply unadopted.
 - **Licensing** — Apache-2.0 vs their GPL-3.0; materially different for embedding or commercial use.
+- **Upstream contribution posture.** Both projects vendor *patched* IronRDP forks — only one feeds
+  fixes back. Measured 2026-07-20 via the GitHub API: **macrdp's author has 19 PRs to
+  Devolutions/IronRDP, 14 merged; x6nux has 0.** Merged work includes the RDPSND audio
+  keep-newest fix (**#1276**), `SuppressOutput`/`RefreshRectangle` handling (**#1319**), the
+  NSCodec encoder + selection (**#1332**), EGFX capability-decode tolerance (**#1298**), three
+  CLIPRDR fixes (**#1299/#1300/#1301**), and acceptor field surfacing (**#1373/#1397/#1359**) —
+  several of which let macrdp *delete* vendored forks entirely. This is a real difference in
+  kind, not a scoreboard: fixes landed upstream benefit every IronRDP downstream **including
+  x6nux**, and the NSCodec gap above is exactly that — sitting upstream, contributed here,
+  simply unadopted there. Re-verify with:
+  `gh api 'search/issues?q=repo:Devolutions/IronRDP+is:pr+author:<user>'`.
 
 ### Fair summary
 

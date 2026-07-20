@@ -5,16 +5,17 @@ redirected webcam (decoded by Phases 1+2) as a selectable macOS camera ("macrdp
 Camera") via a **CoreMediaIO Camera system extension**. It covers the one-time
 Apple-portal setup, the build, and activation.
 
-**Phase 3a status:** the extension + activation code + packaging are built and
-**verified to assemble/sign locally**. What remains — and what this runbook drives
-— is the **activation spike**: proving a *hand-assembled* (no-Xcode) `.systemextension`
-activates on a real machine with Developer-ID signing + provisioning profiles. Do
-this before building the real frame feed (Phase 3b).
+**Status: Phase 3 is COMPLETE and LIVE-VERIFIED (2026-07-20).** A hand-assembled
+(no-Xcode) `.systemextension` activates on real hardware, and a client webcam
+redirected over MS-RDPECAM presents as a live macOS camera in Photo Booth. Before
+changing anything here, read **"The four silent failure modes"** at the bottom — each
+one fails with no error and cost real debugging time.
 
 ## What activates what
 
 - **`macrdpController.app`** (the menu-bar app, `gui/`) embeds the extension at
-  `Contents/Library/SystemExtensions/macrdp-camera.systemextension` and activates it
+  `Contents/Library/SystemExtensions/com.clintcan.macrdp.controller.camera.systemextension`
+  (the filename MUST equal the bundle id) and activates it
   via `OSSystemExtensionRequest` (menu → **Enable macrdp Camera…**). It needs the
   `com.apple.developer.system-extension.install` entitlement + its own provisioning
   profile. It is **not** sandboxed.
@@ -100,18 +101,23 @@ installs to `/Applications/macrdpController.app`.
    should replace the test pattern** in Photo Booth. This confirms the sink feed +
    the `420v` format + the producer authentication all work end-to-end.
 
-**The producer must be the signed `macrdp.app`.** Phase 3c authenticates the sink
-producer — the extension accepts frames only from a binary signed as
-`com.clintcan.macrdp` under Team `QGLA89KHM7`. A plain unsigned `cargo build` macrdp
-feeding the sink is **rejected** (you'd see the test pattern, not the webcam, and an
-`sink: REJECTED producer` line in the extension log). Run the Developer-ID
-`macrdp.app`. Watch the extension log to see which auth path fired (and whether
-`SecCode` is available in the extension sandbox — it falls back to the `signingID`
-match if not):
+**Producer authentication is NOT enforced** — the extension accepts any client that
+starts the sink. This is a deliberate, documented limitation: CMIO exposes no
+trustworthy client identity (`signingID` is literally `"unknown"`, and `SecCode` can't
+evaluate an external process from the extension's sandbox), so Apple's own sample and
+SinkCam leave the hook an unconditional `return true` too. See failure mode #2 below —
+an auth check here silently breaks the feed.
+
+**Watching the extension requires `sudo`** (it runs as the `_cmiodalassistants` role
+account; without `sudo` you see nothing at all, which looks like "it isn't logging"):
 
 ```
-log stream --predicate 'subsystem == "com.clintcan.macrdp.camera"'
+sudo log show --last 5m --info --debug --predicate 'subsystem == "com.clintcan.macrdp.camera"' --style compact
 ```
+
+The quickest health check is actually on the macrdp side — it logs the sink feed every
+~90 frames: `dropped_full=0` with `enqueued` climbing means the extension is draining
+(working); `enqueued` frozen at the queue capacity means it is **not**.
 
 ## Dev iteration & teardown
 

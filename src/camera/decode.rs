@@ -266,11 +266,17 @@ extern "C" fn decode_output(
         // Inspect the actual decoded pixels — dump the first few frames as PNG so
         // the picture is directly visible, and report avg luma (≈16 = a black
         // source; higher/varied = a real image).
-        let dump_seq = (state.dumped_pngs < 3).then(|| {
-            state.dumped_pngs += 1;
-            state.dumped_pngs
-        });
-        let avg_luma = inspect_luma(image_buffer, dump_seq);
+        // Opt-in only (MACRDP_CAMERA_DUMP=1): the luma scan locks + walks the frame
+        // and the PNG dumps write to $TMPDIR, so skip both in normal operation.
+        let avg_luma = if super::camera_dump_enabled() {
+            let dump_seq = (state.dumped_pngs < 3).then(|| {
+                state.dumped_pngs += 1;
+                state.dumped_pngs
+            });
+            inspect_luma(image_buffer, dump_seq)
+        } else {
+            None
+        };
         tracing::info!(
             decoded = state.decoded,
             errors = state.errors,

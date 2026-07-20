@@ -11,13 +11,17 @@
 //! [`MacCamera`] is the macrdp-side factory. The MS-RDPECAM state machine —
 //! enumerator handshake, per-device channel, stream/media-type negotiation, and
 //! the SampleRequest↔SampleResponse pull loop — lives in the vendored
-//! `ironrdp-server` ([`RdCameraServer`] + `RdCameraDeviceProcessor`, divergence
-//! 19). Phase 1 receives the H.264 sample stream over TCP and *logs* it (the
-//! `MS-RDPECAM sample received (Phase-1 GREEN …)` line proves frames flow); it does
-//! **not** decode (Phase 2 — VideoToolbox), present a macOS camera (Phase 3 —
-//! CoreMediaIO Camera Extension), or migrate to UDP (Phase 4). So this module is
-//! still cross-platform (pure protocol policy) — the macOS presentation code
-//! arrives in Phase 2+ as a frame sink handed to the device processor.
+//! `ironrdp-server` ([`RdCameraServer`] + `RdCameraDeviceProcessor`, divergence 19).
+//!
+//! The full pipeline is LIVE (Phases 1–3, verified 2026-07-20): H.264 samples arrive
+//! over TCP → [`decode`] turns them into `420v` `CVPixelBuffer`s (VideoToolbox) →
+//! [`feed`] enqueues those onto the CoreMediaIO sink of the **macrdp Camera** system
+//! extension (`gui/Sources/macrdpcamera`), which presents them as a real macOS camera
+//! in Photo Booth / Zoom / FaceTime. Phase 4 (migrating the channel to UDP) is
+//! scoped but deferred — TCP carries the stream fine.
+//!
+//! This file stays the cross-platform policy layer; the macOS-specific decode and
+//! CMIO-feed code is behind `#[cfg(target_os = "macos")]` submodules.
 //!
 //! The factory carries the connection's server-event sender (`ServerEventSender`)
 //! so the enumerator can ask the event loop to open a per-device channel — exactly
@@ -39,6 +43,19 @@ mod feed;
 
 /// MS-RDPECAM `CAM_MEDIA_FORMAT` for H.264.
 const FORMAT_H264: u8 = 0x01;
+
+/// Opt-in decode diagnostics (`MACRDP_CAMERA_DUMP=1`): write the raw H.264 elementary
+/// stream (~10 MiB cap) plus the first few decoded frames as PNG to `$TMPDIR`, and
+/// report average luma. These exist to debug the decode path (is the source black? is
+/// the bitstream decodable?) and are **off by default** — a camera session shouldn't
+/// litter `$TMPDIR` or pay for the per-frame luma scan in normal use.
+#[cfg(target_os = "macos")]
+pub(crate) fn camera_dump_enabled() -> bool {
+    matches!(
+        std::env::var("MACRDP_CAMERA_DUMP").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
 
 /// Stable UID of the "macrdp Camera" virtual device — MUST match the `deviceID`
 /// UUID the CoreMediaIO extension sets (`gui/Sources/macrdpcamera/main.swift`). The
@@ -88,9 +105,9 @@ impl CameraSampleSink for CameraSink {
         self.format = format;
         self.width = width;
         self.height = height;
-        // Phase 2a: open the raw-stream dump (H.264 only — MJPG/raw would need a
-        // different container/verification).
-        if format == FORMAT_H264 {
+        // Opt-in raw-stream dump (H.264 only — MJPG/raw would need a different
+        // container/verification). Off unless MACRDP_CAMERA_DUMP=1.
+        if format == FORMAT_H264 && camera_dump_enabled() {
             let path = std::env::temp_dir().join(format!(
                 "macrdp-camera-{}-{}x{}.h264",
                 std::process::id(),
@@ -110,10 +127,10 @@ impl CameraSampleSink for CameraSink {
                 }
                 Err(e) => tracing::warn!(error = %e, "camera: could not open the H.264 dump file"),
             }
-        } else {
+        } else if camera_dump_enabled() {
             tracing::info!(
                 format = format_args!("0x{format:02x}"),
-                "camera Phase-2a: non-H.264 format — raw-stream dump skipped"
+                "camera: non-H.264 format — raw-stream dump skipped"
             );
         }
         // Phase 2b/3b (macOS): stand up the VideoToolbox decoder for H.264, and

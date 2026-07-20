@@ -138,6 +138,28 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   Drives/RDPDR). As far as is known, the first OSS RDP
                           #   *server* to present a redirected USB device. macOS-only.
                           #   See docs/usb-redirection-feasibility.md.
+--enable-camera-redirection # Opt-in (default OFF). Camera redirection (MS-RDPECAM):
+                          #   the client redirects its WEBCAM and macrdp presents it
+                          #   as a REAL macOS camera ("macrdp Camera") selectable in
+                          #   Photo Booth / Zoom / FaceTime / Teams. The client
+                          #   opts in too (mstsc: Local Resources → More → Video
+                          #   capturing devices; enable BEFORE connecting).
+                          #   Pipeline: H.264 samples over the RDCamera DVC →
+                          #   VideoToolbox decode → 420v CVPixelBuffer → CoreMediaIO
+                          #   sink (zero-copy) → a CoreMediaIO Camera SYSTEM
+                          #   EXTENSION that presents the device. LIVE-VERIFIED on
+                          #   mstsc (~30 fps, 1080p). This is how mstsc redirects a
+                          #   webcam — the raw-USB path can't (it refuses those
+                          #   bulk reads with 0x8007001f).
+                          #   REQUIRES the camera system extension to be installed +
+                          #   activated once (macrdpController.app → "Enable macrdp
+                          #   Camera…", needs the entitled/notarized build) — see
+                          #   docs/camera-extension-setup.md. Without it macrdp still
+                          #   negotiates + decodes, it just has no camera to feed.
+                          #   Debug: MACRDP_CAMERA_DUMP=1 additionally writes the raw
+                          #   H.264 elementary stream (~10 MiB cap) + the first few
+                          #   decoded frames as PNG to $TMPDIR and logs average luma
+                          #   (off by default). macOS-only.
 --no-lazy-paste           # Opt out of lazy Windows→Mac file paste (default ON).
                           #   Lazy streams bytes on Cmd-V (NSFilePresenter) with native
                           #   "Preparing to paste" progress and lower chunk parallelism;

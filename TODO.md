@@ -49,7 +49,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Deferred — scoped, not started
 
-- [ ] **Camera redirection Phases 1–4 — present the client's webcam as a macOS camera (MS-RDPECAM).**
+- [x] **Camera redirection Phases 1–3 — SHIPPED in v0.9.0 (2026-07-20). The client's webcam IS a macOS camera.**
   Phase 0 protocol gate is LANDED + LIVE-VERIFIED GREEN (v0.8.39-era, f2d54e5: vendored server
   divergence (19) `rdcamera.rs` + `camera_factory` seam + `src/camera/MacCamera` +
   `--enable-camera-redirection`; real mstsc SelectVersion v2 → DEVICE_ADDED over MS-RDPECAM —
@@ -82,7 +82,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   is INVERTED (pick the sink by NAME — starting the wrong stream returns SUCCESS and silently never drains);
   and macOS won't replace a same-CFBundleVersion extension (monotonic build number now). Extension `os_log`
   needs `sudo` to read. Remaining follow-ups (non-blocking): env-gate the Phase-2 $TMPDIR dumps; a controller
-  "disable camera" menu item. **Phase 4** (UDP migration) still scoped + deferred, low priority. Full plan +
+  "disable camera" menu item. **RELEASED as v0.9.0** (tag `efbe3d0`, published latest — the first minor bump since the 0.8 series began). Decode diagnostics are now opt-in behind `MACRDP_CAMERA_DUMP=1`; `--enable-camera-redirection` is documented in `docs/cli.md`. **Release gotcha worth remembering: the first tag failed CI** because a helper used from cross-platform code was `#[cfg(target_os = "macos")]` — a macOS-green clippy/test run cannot catch a Linux-stub break (no local Linux C toolchain). **Phase 4** (UDP migration) still scoped + deferred, low priority. Full plan +
   the live-debugged wire lessons: `~/.claude/plans/camera-redirection-phase1.md` +
   `docs/rdp-camera-redirection-feasibility.md` + [[project_camera_redirection_feasibility]].
 

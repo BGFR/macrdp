@@ -155,6 +155,32 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           build no-ops). Mass storage is verified; other device
                           classes are untested. macOS-only. See
                           [usb-redirection-feasibility.md](usb-redirection-feasibility.md).
+--enable-camera-redirection  Let the connecting client redirect its WEBCAM; macrdp
+                          presents it as a REAL macOS camera — "macrdp Camera"
+                          appears in Photo Booth / Zoom / FaceTime / Teams showing
+                          the client's live video. Off by default (and the default
+                          runtime path is byte-identical when off). **For a webcam,
+                          use this rather than --enable-usb-redirection** — mstsc
+                          routes webcams over this channel (MS-RDPECAM) and refuses
+                          the raw-USB reads the USB path would need.
+                          The client must opt in too: mstsc = Local Resources → More
+                          → "Video capturing devices", ticked BEFORE connecting.
+                          REQUIRES the "macrdp Camera" system extension to be
+                          installed + activated ONCE — it ships inside
+                          macrdpController.app; open the controller and choose
+                          "Enable macrdp Camera…", then approve it in System Settings
+                          → General → Login Items & Extensions → Camera Extensions.
+                          That needs the signed + notarized build (the entitlement is
+                          self-serviceable — no Apple approval). Without the
+                          extension macrdp still negotiates and decodes; it just has
+                          no camera to feed. Pipeline: H.264 over the RDCamera DVC →
+                          VideoToolbox decode → CoreMediaIO sink (zero-copy).
+                          For debugging, `CAMERA_DUMP=1` in config.env (env
+                          `MACRDP_CAMERA_DUMP=1`) additionally writes the raw H.264
+                          stream (~10 MiB cap) + the first few decoded frames as PNG
+                          to $TMPDIR and logs average luma; off by default.
+                          macOS-only. See
+                          [camera-extension-setup.md](camera-extension-setup.md).
 --no-mute-on-minimize     Opt out of muting audio while the client window is
                           minimized (default ON). When the client sends the
                           standard `SuppressOutput` PDU on minimize, the server

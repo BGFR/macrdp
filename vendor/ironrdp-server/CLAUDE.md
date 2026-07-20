@@ -1371,9 +1371,11 @@ AND released — #1276 landing is NOT sufficient.
     keeps its exit-code-derived accept/disconnect audit); documented as a v1
     boundary.
 
-(19) Server-direction MS-RDPECAM camera redirection — **Phase 0 protocol gate
-    only** (NOT upstreamed; added 2026-07-16; behind macrdp's
-    `--enable-camera-redirection`, opt-in). New `src/rdcamera.rs` houses
+(19) Server-direction MS-RDPECAM camera redirection — **COMPLETE; shipped in
+    macrdp v0.9.0** (NOT upstreamed; added 2026-07-16 as a Phase-0 gate, finished
+    2026-07-20; behind macrdp's `--enable-camera-redirection`, opt-in, default OFF).
+    The client's webcam is received here and presented by macrdp as a real macOS
+    camera. `src/rdcamera.rs` houses
     `RdCameraServer` (a `DvcProcessor`+`DvcServerProcessor` on the
     `RDCamera_Device_Enumerator` DVC) that advertises the MS-RDPECAM enumeration
     channel, answers the client's version negotiation, and LOGS the client's
@@ -1381,10 +1383,21 @@ AND released — #1276 landing is NOT sufficient.
     mstsc/Win11 will hand macrdp a client-redirected webcam over MS-RDPECAM — the
     channel the decrypted pcap proved the camera actually rides (NOT URBDRC/USB; see
     `docs/rdp-camera-redirection-feasibility.md` + the
-    `project_camera_redirection_feasibility` memory). It opens NO per-device channel,
-    drives NO stream, decodes NO samples, touches NO macOS code — a cheap gate before
-    the multi-week presentation work (per-device channels, media-type negotiation,
-    H.264 sample decode, a macOS CoreMediaIO Camera Extension).
+    `project_camera_redirection_feasibility` memory).
+    - **Beyond the gate (the shipped path):** on `DEVICE_ADDED_NOTIFICATION` the
+      enumerator asks the event loop to open the client-named **per-device DVC** (via
+      `ServerEvent::Camera` — the URBDRC per-device model), where
+      `RdCameraDeviceProcessor` runs the state machine: `ActivateDevice` →
+      `StreamList` → **media-type negotiation** (picks H.264 from the client's offered
+      formats) → `StartStreams` → the `SampleRequest`↔`SampleResponse` **pull loop**
+      (requests must be pipelined or the stream stalls). Decoded samples are handed
+      out through the `CameraSampleSink` trait (`on_media_type` / `on_sample`), which
+      macrdp implements in `src/camera/` (VideoToolbox decode → a CoreMediaIO Camera
+      system extension). **LIVE-VERIFIED on real mstsc at 1080p/~30 fps.**
+    - **Wire gotcha:** `StartStreamsRequest` carries the 27-byte `START_STREAM_INFO`
+      (StreamIndex + the 26-byte packed-LE `MEDIA_TYPE_DESCRIPTION`) with **NO leading
+      count byte** — the count is implicit in the PDU length. Emitting one gets
+      `InvalidMessage` (0x02) from real Windows.
     - Handshake (MS-RDPECAM 3.1/3.2): every message starts with a 2-byte
       `SHARED_MSG_HEADER` = `Version(u8)` + `MessageId(u8)`. The CLIENT speaks first
       (`SelectVersionRequest` 0x03, its max version) once the server opens the DVC, so
@@ -1401,12 +1414,14 @@ AND released — #1276 landing is NOT sufficient.
     - Wiring: `camera_factory: Option<Box<dyn RdCameraServerFactory>>` field + `new`
       param + struct init + `builder.with_camera_factory` + `.with_dynamic_channel`
       in `attach_channels` (advertised only when `Some` — byte-identical when off).
-      UNLIKE the URBDRC factory, `RdCameraServerFactory: Send` has NO
-      `ServerEventSender` supertrait and no `set_sender` — Phase 0 replies inline from
-      `process()` and never asks the event loop to open a channel. macrdp's
-      cross-platform `src/camera/mod.rs` (`MacCamera`) is the factory; no macOS code.
+      LIKE the URBDRC factory, `RdCameraServerFactory` has a `ServerEventSender`
+      supertrait + `set_sender`, so the enumerator can ask the event loop to open the
+      per-device channel; it also gains `build_sample_sink()` returning the optional
+      `CameraSampleSink`. macrdp's cross-platform `src/camera/mod.rs` (`MacCamera`) is
+      the factory; the macOS decode/present code sits behind it in `src/camera/
+      {decode,feed}.rs` + `gui/Sources/macrdpcamera`.
     Cleanly upstreamable as the server counterpart to a (nonexistent-upstream)
-    client MS-RDPECAM — but it's a gate, so hold until Phase 1 shapes the real API.
+    client MS-RDPECAM; the API has now been shaped by a working implementation.
     Reference: FreeRDP `channels/rdpecam/server/` implements this server side.
 
 (20) Client-fingerprint connect log (NOT upstreamed; added 2026-07-18; pairs with

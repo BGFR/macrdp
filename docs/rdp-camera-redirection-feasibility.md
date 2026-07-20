@@ -1,8 +1,16 @@
 # Client Camera (Webcam) Redirection on macrdp — Feasibility Notes
 
-*Research notes, 2026-07-16. Exploratory — macrdp does **not** implement camera
-redirection today, and nothing here is committed work. This is a scoping document
-for if/when it's ever pursued. Motivated by the ground-truth finding below.*
+> **STATUS: SHIPPED.** Camera redirection landed in **v0.9.0 (2026-07-20)** — a
+> client-redirected webcam now presents as a real macOS camera. This document is kept
+> as the original *research/scoping* record (written 2026-07-16, before any code) and
+> is **no longer the source of truth for how it works**. For that, see:
+> **[camera-extension-setup.md](camera-extension-setup.md)** (setup + the four silent
+> CoreMediaIO failure modes — read this before touching the camera code),
+> [features.md](features.md) (what it does), [architecture.md](architecture.md)
+> (the module map), and the vendored `ironrdp-server` divergence (19) log.
+
+*Original research notes, 2026-07-16 — exploratory, written when nothing was
+implemented. Motivated by the ground-truth finding below.*
 
 > **Why this doc exists — the webcam-over-mstsc question is finally settled.**
 > The long-running "why doesn't a redirected webcam show up over mstsc?" thread

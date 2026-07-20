@@ -50,6 +50,21 @@ src/switcher_hud.rs  App-switcher HUD IPC client (--app-switcher-hud). A bg
                   non-activating NSPanel drawing an app-icon row that
                   ScreenCaptureKit captures, so the remote sees the switcher.
                   Cross-platform stub-free (pure std on the Rust side).
+gui/Sources/macrdpcamera  The "macrdp Camera" CoreMediaIO Camera SYSTEM EXTENSION
+                  (CMIOExtension, macOS 12.3+) — a 3rd SwiftPM target, and the piece
+                  that makes camera redirection (src/camera/) visible to apps. One
+                  virtual device with a .source stream (what Photo Booth/Zoom select)
+                  and a .sink stream (what macrdp's feed.rs writes into); a consume
+                  loop forwards sink buffers onto the source, falling back to a test
+                  pattern while no producer is feeding. Both streams advertise 420v to
+                  match the decoder — CMIO does NOT transcode, so an advertised format
+                  that differs from the buffers sent renders garbage. Hand-assembled
+                  into a .systemextension bundle by packaging/make-camera-extension.sh
+                  (NO Xcode), signed + notarized, embedded in macrdpController.app and
+                  activated once via OSSystemExtensionRequest (see
+                  gui/Sources/macrdptray/CameraExtension.swift). Runs under a role
+                  account, so its os_log is invisible without sudo. Setup + the four
+                  SILENT CMIO failure modes: docs/camera-extension-setup.md.
 src/keyboard_layout.rs  Optional non-US layout translation
                   (--keyboard-layout). Resolves a name/KLID/input-source-id
                   to a macOS UCKeyboardLayout via TIS and translates
@@ -232,6 +247,30 @@ src/usb_redirect/ Generic USB redirection (MS-RDPEUSB / URBDRC), the SERVER /
                   ironrdp-server (src/rdpeusb.rs, divergence 16). VERIFIED end-to-end
                   on a real Linux FreeRDP client: a redirected flash drive mounts on
                   the Mac. See docs/usb-redirection-feasibility.md.
+src/camera/       Camera redirection (MS-RDPECAM) — presents the CLIENT's webcam as a
+  mod.rs          REAL macOS camera (--enable-camera-redirection, opt-in, default OFF,
+  decode.rs       macOS-only). SHIPPED v0.9.0; as far as is known the first OSS RDP
+  feed.rs         *server* to do this, and the path that works for mstsc (which routes
+                  webcams over MS-RDPECAM and refuses the raw-USB reads the
+                  usb_redirect path would need). mod.rs is the cross-platform policy:
+                  the MacCamera RdCameraServerFactory + the CameraSink that receives
+                  negotiated media types + H.264 samples (plus the opt-in
+                  MACRDP_CAMERA_DUMP diagnostics). decode.rs is the VideoToolbox
+                  VTDecompressionSession — Annex-B access units reframed to AVCC and
+                  decoded to 420v (NV12) CVPixelBuffers; all CoreMedia/VT FFI is
+                  quarantined there. feed.rs is the CoreMediaIO CLIENT: it finds the
+                  virtual device by kCMIODevicePropertyDeviceUID, opens the extension's
+                  SINK stream, and enqueues each decoded CVPixelBuffer wrapped in a
+                  CMSampleBuffer — IOSurface-backed, so the handoff to the extension
+                  process is ZERO-COPY. (Pick the sink by stream NAME: the direction
+                  property is INVERTED vs its docs, and starting the wrong stream
+                  returns SUCCESS while nothing ever drains — see
+                  docs/camera-extension-setup.md.) The MS-RDPECAM state machine
+                  (enumerator -> per-device channel -> ActivateDevice -> StreamList ->
+                  media-type negotiation -> StartStreams -> the SampleRequest/
+                  SampleResponse pull loop) lives in the vendored ironrdp-server
+                  (src/rdcamera.rs, divergence 19). The virtual camera itself is a
+                  separate process: gui/Sources/macrdpcamera (see the gui note above).
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
 vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in via

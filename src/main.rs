@@ -1573,6 +1573,10 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // EnvironmentVariables (which a `kickstart -k` won't even pick up).
         ("USB_PREFETCH_DEPTH", "MACRDP_USB_PREFETCH_DEPTH"),
         ("USB_STREAM_STALL_MS", "MACRDP_USB_STREAM_STALL_MS"),
+        // Camera-redirection decode diagnostics (--enable-camera-redirection): raw
+        // H.264 + PNG frame dumps to $TMPDIR. Env-only like the USB knobs above;
+        // bridged so it can be flipped in config.env when debugging the camera.
+        ("CAMERA_DUMP", "MACRDP_CAMERA_DUMP"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {

@@ -173,7 +173,7 @@ These are absence claims about actively developed upstreams. To re-check:
 
 **Part 2 rots faster than Part 1** and on a different trigger: Part 1 tracks *absences* in
 upstreams that change slowly, while Part 2 tracks two actively-developed projects. Re-check
-their READMEs and commit activity before repeating anything from it — particularly the
+their **source trees** (not their READMEs — x6nux's advertises 8 features and omits audio and clipboard, both of which they implement; a README-based comparison of this project was wrong twice) and commit activity before repeating anything from it — particularly the
 "where they're ahead" table, which is the part most likely to be out of date (and the part
 we'd look worst getting wrong).
 
@@ -198,55 +198,63 @@ it isn't true.
 **Facts (checked 2026-07-20):** created 2026-03-24, GPL-3.0, 23★/7 forks, 56 commits, last
 *code* push 2026-05-18. Ours: created 2026-05-13, Apache-2.0, 17★, actively pushed.
 
-### Where x6nux/macrdp is ahead of us — genuinely
+> **Verified against their SOURCE TREE, not their README (2026-07-20).** This matters: their
+> README advertises 8 features and **omits audio and clipboard entirely**, both of which they
+> in fact implement. An earlier version of this comparison claimed they had neither — it was
+> wrong, because it trusted the README. Read the tree.
+
+### Where x6nux/macrdp is ahead of us
 
 | Their advantage | Our status |
 |---|---|
-| **AVC444 shipped** ("pixel-perfect color", RDP 10) | **Not wired here — but parked deliberately, not merely unfinished.** `src/avc444.rs` has spec-compliant split/combine + roundtrip tests and a vImage path; upstream `ironrdp-egfx` already exposes `send_avc444_frame`. It was parked on a *measurement*: VideoToolbox shares one hardware encoder block (two sessions measured **1.02× throughput** — effectively serial), so AVC444 costs ~2× encode wall-clock: fine at 1080p/60 (~10 ms/frame) but **doesn't fit 4K/60** (~39 ms vs a 16.6 ms budget). The plan is an opt-in `--avc444` with that caveat, resumed if colored-text quality actually bites. **Note x6nux runs on the same Apple Silicon and inherits the identical constraint** — they shipped it anyway. So: a real gap in shipped capability, not in understanding. |
-| **Lock-screen capture** (CoreGraphics fallback when the screen is locked) | **We have no equivalent.** We only *document* that input to the login window is blocked. Their session survives a locked screen in a way ours does not. |
-| **Polished GUI** — Dashboard with FPS chart, Statistics with bar charts, Console.app-style Logs, split-panel Settings | Ours is a **menu-bar controller** — functional, far less of an admin UI. Their last five commits were all UI work. |
-| **TOML config with hot reload** | We use `config.env` and mostly **require a restart** (`launchctl kickstart -k`). |
-| Earlier, more stars, simpler surface to audit | We're newer and much larger. |
+| **AVC444 shipped** ("pixel-perfect color", RDP 10) — `yuv444_split.rs` (19 KB) | **Not wired here — parked deliberately, not unfinished.** `src/avc444.rs` has spec-compliant split/combine + roundtrip tests; upstream `ironrdp-egfx` already exposes `send_avc444_frame`. Parked on a *measurement*: VideoToolbox shares one hardware encoder block (two sessions ≈ **1.02× throughput**, effectively serial), so AVC444 costs ~2× encode wall-clock — fine at 1080p/60 (~10 ms/frame), **doesn't fit 4K/60** (~39 ms vs 16.6 ms). Plan is opt-in `--avc444` with that caveat. **They run on the same Apple Silicon and inherit the identical constraint** — they shipped it anyway. |
+| **openh264 software encoder** (13.8 KB) — a VideoToolbox-independent H.264 path | **We have none — VideoToolbox only.** A real gap: matters wherever hardware encode is unavailable or undesirable. |
+| **HTML clipboard format** (`html.rs`) | Ours does CF_UNICODETEXT / CF_DIB / file lists — **no HTML**. |
+| **Lock-screen capture** (CoreGraphics fallback) | We have none — but see [known-quirks.md](known-quirks.md): the lock screen renders on the *physical* panel and macOS blocks synthetic input to the login window, so copying this yields a screen you still cannot type into. Lower value than it appears. |
+| **Full Tauri GUI** — dashboard, charts, logs, settings, tray, SQLite | Ours is a menu-bar controller. Theirs is a substantially larger application. |
+| **TOML config with hot reload** | We use `config.env` and mostly need a restart. |
+| Earlier (2026-03-24 vs 2026-05-13), more stars | — |
 
-If someone's need is *"let me see and drive my Mac's screen, with the best color"*, theirs is
-a smaller, cleaner, arguably better-presented answer — and it has AVC444, which we shelved.
+### Where we're comparable — both implement it
+
+Corrections to an earlier, README-based version of this table, which wrongly claimed these were
+missing on their side:
+
+- **Audio** — both have it (`macrdp-audio`, ~11 KB; ours `audio.rs` 43 KB + `aac.rs` 16 KB). Ours
+  adds opt-in AAC compression and can carry audio on a lossy UDP flow; theirs is PCM-focused.
+- **Clipboard** — both have it, at comparable scale (theirs ~53 KB incl. `transfer.rs`,
+  `pasteboard.rs`, `file.rs`, `html.rs`; ours 59 KB). Both do file transfer. **They additionally
+  do HTML; we do not.**
+- **Adaptive bitrate**, **hardware H.264 via VideoToolbox**, **HiDPI/Retina capture**, **NLA/CredSSP
+  + auto TLS**, **RFX** — present on both.
 
 ### Where macrdp is differentiated
 
-The honest framing is that **these are different products**, not competing implementations of
-the same one. Theirs is a focused *display + input* server. Everything below is absent from
-their advertised feature set:
+Each of the following is **absent from their entire source tree** (whole-tree search for
+`rdpdr`, `urbdrc`, `rdpecam`, `smartcard`/`scard`, `rdpeudp`/`multitransport`,
+`virtual_display`/`cgvirtual` — the only `usb` hit is a UI status-bar string):
 
-- **Audio.** RDPSND PCM + opt-in AAC. Theirs advertises **no audio at all** — for daily
-  remote use that alone is decisive.
-- **Clipboard**, including **bidirectional file copy** (folder trees, lazy paste). Not advertised by theirs.
-- **Device redirection — the whole category:** USB (a redirected drive mounts in Finder, gamepads work),
-  **camera** (client webcam → a real macOS camera), **drive** (client drive as a real read-write NFS volume),
-  **smart card** (client's card usable by macOS PC/SC apps). Theirs has none.
+- **Device redirection — the whole category:** **USB** (a redirected drive mounts in Finder;
+  gamepads work), **camera** (client webcam → a real macOS camera), **drive** (client drive as a
+  real read-write NFS volume), **smart card** (client's card usable by macOS PC/SC apps).
 - **Headless operation** — `CGVirtualDisplay` virtual displays plus `--capture-primary` /
-  `--detach-primary` blanking, so the Mac serves a remote desktop without a monitor.
-- **UDP multitransport** (MS-RDPEMT/RDPEUDP) with lossy-audio and adaptive bitrate.
-- **Production hardening:** per-IP rate-limiting + escalating lockout, a structured JSON audit
+  `--detach-primary` blanking, so the Mac serves a desktop with no monitor attached.
+- **UDP multitransport** (MS-RDPEMT/RDPEUDP), including lossy-flow audio.
+- **Production hardening** — per-IP rate-limiting + escalating lockout, a structured JSON audit
   stream for SIEM, a health-check watchdog, bounded log rotation, mstsc blank-recovery, and
   RTT-aware rate control for VPN/high-latency links.
-- **Input depth:** non-US keyboard layouts auto-detected from the client, optional Ctrl→Cmd
+- **Input depth** — non-US keyboard layouts auto-detected from the client, optional Ctrl→Cmd
   remapping, symbolic-hotkey workarounds, an app-switcher HUD.
-- **Licensing:** Apache-2.0 vs their GPL-3.0 — materially different if you want to embed or
-  ship commercially.
+- **Licensing** — Apache-2.0 vs their GPL-3.0; materially different for embedding or commercial use.
 
 ### Fair summary
 
-Theirs is the better *minimal* macOS screen server today (AVC444, lock-screen capture, nicer
-UI). Ours is a *remote-desktop platform* — audio, clipboard, files, USB, camera, smart cards,
-headless, and the operational hardening to leave running. Neither supersedes the other.
-
-**Two things worth revisiting — with eyes open:** **AVC444** is substantially built and could
-ship as an opt-in 1080p-only flag (~3 evenings), but it was parked on measured hardware limits,
-not neglect — see the row above before treating it as low-hanging fruit. **Lock-screen capture**
-looked like a gap until we tested it: the lock screen renders on the *physical* panel and macOS
-blocks synthetic input to the login window, so replicating it would yield a screen you still
-cannot type into — see the capture-primary lock quirk in [known-quirks.md](known-quirks.md).
-Neither is the free win the surface comparison suggests.
+Both are genuine, actively-built macOS RDP servers sharing a lineage, and the honest gap is
+**narrower than a README comparison suggests** — they have audio, clipboard, AVC444, a software
+encoder, and a far richer GUI. The real distinction is **device redirection, headless operation,
+UDP transport, and operational hardening**: macrdp is a remote-desktop *platform*, theirs is a
+polished remote *display*. Neither supersedes the other, and for "see and drive my Mac with good
+color and a nice UI" theirs is a reasonable — arguably better-presented — choice.
 
 ## CGKPK/RDPonMAC — the other native macOS RDP server
 

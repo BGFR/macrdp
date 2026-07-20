@@ -121,6 +121,63 @@ required retraction — it's recorded here so it's never made by accident.
 **They do not threaten claims 1–3:** both are display + input only. Neither implements USB,
 camera, UDP-multitransport, drive, or smart-card redirection.
 
+## 4b. Head-to-head: macrdp vs. x6nux/macrdp (the closest peer)
+
+[`x6nux/macrdp`](https://github.com/x6nux/macrdp) deserves a real comparison rather than a
+footnote: it is the **same architectural lineage** (a vendored, patched `ironrdp-server` +
+`ironrdp-acceptor`, Rust, native macOS, VideoToolbox H.264) and it **predates this project
+by ~7 weeks**. Confusingly, it has the same name. This section is written adversarially —
+steelmanning theirs — because "we're better" is not a useful claim, and in several places
+it isn't true.
+
+**Facts (checked 2026-07-20):** created 2026-03-24, GPL-3.0, 23★/7 forks, 56 commits, last
+*code* push 2026-05-18. Ours: created 2026-05-13, Apache-2.0, 17★, actively pushed.
+
+### Where x6nux/macrdp is ahead of us — genuinely
+
+| Their advantage | Our status |
+|---|---|
+| **AVC444 shipped** ("pixel-perfect color", RDP 10) | **We don't have it.** `src/avc444.rs` exists (YUV444 pack + benchmarks) but is **parked and unwired** — no CLI flag. They win on color fidelity for text/fine detail. |
+| **Lock-screen capture** (CoreGraphics fallback when the screen is locked) | **We have no equivalent.** We only *document* that input to the login window is blocked. Their session survives a locked screen in a way ours does not. |
+| **Polished GUI** — Dashboard with FPS chart, Statistics with bar charts, Console.app-style Logs, split-panel Settings | Ours is a **menu-bar controller** — functional, far less of an admin UI. Their last five commits were all UI work. |
+| **TOML config with hot reload** | We use `config.env` and mostly **require a restart** (`launchctl kickstart -k`). |
+| Earlier, more stars, simpler surface to audit | We're newer and much larger. |
+
+If someone's need is *"let me see and drive my Mac's screen, with the best color"*, theirs is
+a smaller, cleaner, arguably better-presented answer — and it has AVC444, which we shelved.
+
+### Where macrdp is differentiated
+
+The honest framing is that **these are different products**, not competing implementations of
+the same one. Theirs is a focused *display + input* server. Everything below is absent from
+their advertised feature set:
+
+- **Audio.** RDPSND PCM + opt-in AAC. Theirs advertises **no audio at all** — for daily
+  remote use that alone is decisive.
+- **Clipboard**, including **bidirectional file copy** (folder trees, lazy paste). Not advertised by theirs.
+- **Device redirection — the whole category:** USB (a redirected drive mounts in Finder, gamepads work),
+  **camera** (client webcam → a real macOS camera), **drive** (client drive as a real read-write NFS volume),
+  **smart card** (client's card usable by macOS PC/SC apps). Theirs has none.
+- **Headless operation** — `CGVirtualDisplay` virtual displays plus `--capture-primary` /
+  `--detach-primary` blanking, so the Mac serves a remote desktop without a monitor.
+- **UDP multitransport** (MS-RDPEMT/RDPEUDP) with lossy-audio and adaptive bitrate.
+- **Production hardening:** per-IP rate-limiting + escalating lockout, a structured JSON audit
+  stream for SIEM, a health-check watchdog, bounded log rotation, mstsc blank-recovery, and
+  RTT-aware rate control for VPN/high-latency links.
+- **Input depth:** non-US keyboard layouts auto-detected from the client, optional Ctrl→Cmd
+  remapping, symbolic-hotkey workarounds, an app-switcher HUD.
+- **Licensing:** Apache-2.0 vs their GPL-3.0 — materially different if you want to embed or
+  ship commercially.
+
+### Fair summary
+
+Theirs is the better *minimal* macOS screen server today (AVC444, lock-screen capture, nicer
+UI). Ours is a *remote-desktop platform* — audio, clipboard, files, USB, camera, smart cards,
+headless, and the operational hardening to leave running. Neither supersedes the other.
+
+**Two concrete things to steal:** AVC444 is already 90% built here and should be un-parked;
+and lock-screen capture is a real gap worth closing.
+
 ## 5. What macrdp should NOT claim
 
 - **H.264/EGFX server-side encoding is not a first** — xrdp and gnome-remote-desktop both do

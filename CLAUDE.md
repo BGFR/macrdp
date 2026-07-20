@@ -12,6 +12,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - `@docs/known-quirks.md` — hard-won client/codec/audio behavioural notes
 > - `@docs/cli.md` — build/run/test commands + the full CLI flag reference
 > - `@docs/conventions.md` — conventions worth keeping when adding code
+> - `docs/oss-rdp-server-comparison.md` — the verified evidence behind the "first OSS
+>   RDP server to…" claims (and what NOT to claim). Read before repeating any of them.
 >
 > The `vendor/ironrdp-*/` forks each have their own nested `CLAUDE.md` (the
 > divergence logs) that load only when you work inside those directories.

@@ -587,14 +587,17 @@ struct Args {
     #[arg(long)]
     enable_lossy_audio: bool,
 
-    /// Don't adopt the client's requested desktop resolution. By default —
-    /// when mirroring the primary display without --width/--height/--hidpi —
+    /// Don't adopt the client's requested desktop resolution. By default
     /// macrdp reads the resolution the client asked for while connecting
     /// (e.g. mstsc full-screen on a 1920×1080 monitor) and serves the session
     /// at exactly that size, so the client presents the video 1:1 instead of
     /// rescaling it (client-side rescaling on mstsc costs typing latency and,
-    /// with --enable-h264, contributes to audio drift). Pass this to always
-    /// serve the size resolved at startup (the Mac display's native size)
+    /// with --enable-h264, contributes to audio drift). Applies when mirroring
+    /// the primary display without --width/--height/--hidpi, and on
+    /// --virtual-display (where the virtual display is re-moded to the
+    /// client's size — --width/--height are its initial size, not a pin).
+    /// Pass this to always serve the size resolved at startup (the Mac
+    /// display's native size, or the --width/--height virtual display size)
     /// and let the client scale.
     #[arg(long = "no-client-resolution", action = clap::ArgAction::SetTrue)]
     no_client_resolution: bool,
@@ -615,8 +618,9 @@ struct Args {
     /// size. Without it, an authenticated client can request up to the
     /// protocol maximum 8192x8192 — a ~256 MB BGRA framebuffer per frame.
     /// Each dimension must be in the RDP band [200, 8192]. No effect with
-    /// --no-client-resolution or an explicit --width/--height/--hidpi/
-    /// --virtual-display (those pin the size). Config: MAX_CLIENT_SIZE.
+    /// --no-client-resolution, or with an explicit --width/--height/--hidpi
+    /// on the mirror-primary path (those pin the size; --virtual-display
+    /// adopts, so the cap applies there). Config: MAX_CLIENT_SIZE.
     #[arg(long = "max-client-size", value_name = "WxH", value_parser = parse_max_client_size)]
     max_client_size: Option<(u16, u16)>,
 
@@ -2048,19 +2052,32 @@ async fn async_main() -> Result<()> {
     // client's requested resolution at connect time.
     let desktop_size = capture::SharedDesktopSize::new(width, height);
 
-    // Adopt the client's requested resolution only on the mirror-primary
-    // path with no explicit size choice: --width/--height pin a size,
-    // --hidpi pins backing pixels, and --virtual-display owns its own
-    // fixed-size display.
+    // Adopt the client's requested resolution at connect (and re-mode to
+    // match on a live resize). Two cases:
+    //   - Virtual display: --width/--height are the display's INITIAL size,
+    //     not a pin — adopt the client's request and re-mode the virtual
+    //     display to match, so a phone and a laptop each get a crisp 1:1
+    //     desktop (and their mouse coords, sent in the client's own size,
+    //     map correctly). --hidpi is inert on this path.
+    //   - Mirror-primary: adopt only when nothing pins the size
+    //     (--width/--height pin a size, --hidpi pins backing pixels).
+    // --no-client-resolution opts out in both cases — the virtual display
+    // then stays fixed at --width/--height; mirror-primary serves native.
     let auto_size = !args.no_client_resolution
-        && !args.virtual_display
-        && !args.hidpi
-        && args.width.is_none()
-        && args.height.is_none();
+        && if args.virtual_display {
+            true
+        } else {
+            !args.hidpi && args.width.is_none() && args.height.is_none()
+        };
     if auto_size {
         info!(
             "client-resolution auto-adopt enabled — the session will be served at \
-             the resolution the client requests (--no-client-resolution disables)"
+             the resolution the client requests{} (--no-client-resolution disables)",
+            if args.virtual_display {
+                ", re-moding the virtual display to match"
+            } else {
+                ""
+            }
         );
     }
 
@@ -2352,7 +2369,8 @@ async fn async_main() -> Result<()> {
         } else {
             warn!(
                 "--max-client-size has no effect: client-resolution auto-adopt is off \
-                 (--no-client-resolution or an explicit --width/--height/--hidpi/--virtual-display)"
+                 (--no-client-resolution, or an explicit --width/--height/--hidpi \
+                 without --virtual-display)"
             );
         }
     }

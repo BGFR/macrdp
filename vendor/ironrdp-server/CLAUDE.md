@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(17)/(18)/(19) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(7)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(17)/(18)/(19)/(20)/(21) below are upstreamed
 AND released — #1276 landing is NOT sufficient.
 
 (1) The original "keep newest queued waves on per-batch overflow"
@@ -1434,3 +1434,22 @@ AND released — #1276 landing is NOT sufficient.
     build + WINDOWS platform; FreeRDP family = build 2600; Windows Apps = their
     host platform. Lands in macrdp.log next to the `macrdp::audit` lines.
     Informational fingerprinting only. Additive; upstreamable with (4).
+
+(21) Mouse button PDU applies its position before the button (macrdp #166,
+    branch `fix/ios-touch-input`, @antonmos; NOT upstreamed, STRONG upstream
+    candidate — general input correctness, not macrdp-specific). A `MousePdu`
+    carrying a button flag ALSO carries x/y, but `From<MousePdu> for MouseEvent`
+    maps it to a positionless `Left/RightPressed|Released` variant and DROPS the
+    position — so a lone button PDU clicks wherever the server cursor last was.
+    New `pub(crate) fn mouse_events_from_pdu` in `handler.rs` prepends a
+    `MouseEvent::Move { x, y }` when the PDU has `LEFT_BUTTON | RIGHT_BUTTON` set;
+    both mouse dispatch arms in `server.rs` (fast-path `FastPathInputEvent::
+    MouseEvent` + slow-path `InputEvent::Mouse`) call it instead of
+    `handler.mouse(mouse.into())`. No-op for clients that move-then-click (mstsc,
+    macOS Windows App — the redundant Move has identical coords); fixes the **iOS
+    Windows App touch mode**, which sends a tap as a single button PDU with no
+    preceding move (taps otherwise land at the stale position). Sits next to the
+    wheel-decode fix (17) in the same `From<MousePdu>` area. Scoped to the regular
+    Mouse PDU; `MouseX` (the back/forward X buttons) and middle-click have the same
+    latent drop but aren't the reported bug (touch taps are left-clicks), so left
+    unaddressed. Upstream it and delete once merged.

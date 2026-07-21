@@ -4,6 +4,19 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## Unreleased (on `main`, since v0.9.0)
+
+Nothing tagged yet — this is what has landed on `main` since the v0.9.0 tag. Mostly documentation; one small functional change, and one feature deliberately parked on a branch.
+
+- **`--capture-primary` now warns, on every engage, that the Mac cannot be locked while it is engaged.** That mode blanks the physical panel by taking exclusive `CGDisplayCapture` of it, and `loginwindow` cannot draw its lock screen onto a captured display — so choosing Lock Screen (or ⌃⌘Q) silently no-ops and the machine stays unlocked behind the black panel (experimentally isolated across ~340 samples; `caffeinate` exonerated). The behaviour is unchanged — this is a **disclosure** fix, a `tracing::warn!` so an operator reading `macrdp.log` learns of it — plus the full write-up in `docs/known-quirks.md`. Someone standing at the machine still gets no feedback; the real fix is the experimental mode below.
+- **New doc: `docs/oss-rdp-server-comparison.md`** — the verified evidence behind macrdp's "first open-source RDP *server* to…" claims (presenting a client-redirected USB device, a working UDP multitransport data path, end-to-end client-webcam-as-native-camera), what **not** to claim, and an adversarial head-to-head against the closest peer (x6nux/macrdp). Read it before repeating any first-ness claim.
+
+### Experimental — `--shield-primary` (branch `experiment/shield-primary`, NOT on `main`, NOT released)
+
+A candidate fix for the `--capture-primary` can't-lock limitation, developed and validated but deliberately held off `main`. **`--shield-primary`** blanks each physical panel with an opaque black *window* (drawn by a new `macrdpshield` helper process) instead of capturing + gamma-blacking it — so **no display is captured and the Mac can still be locked** (it also eliminates the ~250 ms resize flash, for the same reason: a window survives a display reconfiguration where a gamma LUT is reset by one).
+
+Validated end-to-end against a real second-machine RDP client: the Mac locks, the **lock screen is visible** (the mode keeps the physical panel as the system main display so `loginwindow` draws the password field there), and while locked the remote session can *see* but not *control* the desktop (macOS blocks synthetic input to a locked session). **Kept experimental because of a real trade-off:** with the physical panel main, the remote desktop has no menu bar or Dock — they stay on the shielded panel — though it's usable via `Ctrl+Alt+G` to gather windows onto the visible display. Parked pending a ship decision (default vs. opt-in). Two adversarial reviews during development caught and fixed five real defects before this point: an unacknowledged IPC protocol that reported a shielded-but-visible desktop in three distinct failure cases, a hotplugged monitor never getting shielded, a helper that limped on after a `bind` failure (letting a local process squat its port), a wedgeable single-connection accept loop, and multi-second blocking on the latency-sensitive resize path.
+
 ## v0.9.0 — the webcam release
 
 *(First minor-version bump since the 0.8 series began — this one earns it.)*

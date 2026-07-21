@@ -1452,4 +1452,9 @@ AND released — #1276 landing is NOT sufficient.
     wheel-decode fix (17) in the same `From<MousePdu>` area. Scoped to the regular
     Mouse PDU; `MouseX` (the back/forward X buttons) and middle-click have the same
     latent drop but aren't the reported bug (touch taps are left-clicks), so left
-    unaddressed. Upstream it and delete once merged.
+    unaddressed. **Filed upstream as Devolutions/IronRDP#1466** (bug report, not a
+    patch — the report lays out both the non-breaking synthesize-a-Move shape and
+    the breaking position-on-button-event shape and leaves the choice to the
+    maintainer, since the same gap is reachable through `MousePdu`/`MouseXPdu`/
+    `MouseRelPdu` and a uniform fix touches the public `MouseEvent` API). Delete
+    this divergence once the upstream fix lands and the pin moves past it.

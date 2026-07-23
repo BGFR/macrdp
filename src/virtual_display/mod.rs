@@ -14,12 +14,14 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride, VirtualDisplay,
+    shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
+    PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride, VirtualDisplay,
+    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
+    ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(target_os = "macos")]
@@ -909,6 +911,675 @@ mod macos {
             }
         }
     }
+
+    /// Headless blanking via an opaque black **shield window** over each
+    /// physical panel, drawn by the `macrdpshield` helper process.
+    ///
+    /// Third headless mode alongside [`DetachedPrimary`] and
+    /// [`CapturedPrimary`]. The arrangement half is identical to
+    /// `CapturedPrimary` — vd to `(0, 0)` as system main, physicals shifted
+    /// aside, completed `ConfigureForSession` (see that type for why ForSession
+    /// is load-bearing across live re-modes and on disconnect). What differs is
+    /// how the panel is hidden:
+    ///
+    /// | | `CapturedPrimary` | `ShieldedPrimary` |
+    /// |---|---|---|
+    /// | hides the desktop with | all-black gamma LUT | an opaque black window |
+    /// | survives a live re-mode | **no** — macOS resets gamma on every display reconfiguration, so it must be re-asserted, and a write *during* the reconfiguration does not stick (irreducible ~250 ms desktop flash) | **yes** — a window is not gamma; nothing to re-assert, no flash |
+    /// | Mac can be locked | **no** — `loginwindow` cannot draw onto a display held by `CGDisplayCapture` | **yes** — no capture is taken |
+    /// | local cursor | confined off the panel by the capture | **not confined** — see below |
+    /// | crash safety | process-scoped; SIGKILL auto-reverts | helper self-exits when its parent dies |
+    ///
+    /// **Security trade-off, stated plainly.** Dropping `CGDisplayCapture` is
+    /// what makes the machine lockable again, but capture was also what kept the
+    /// local pointer off the panel. Under a shield, someone physically at the Mac
+    /// can move the pointer — which is shared global state, so it yanks the
+    /// remote user's cursor out of the virtual display. Their *clicks* are
+    /// swallowed (the shield window takes mouse events), and their keystrokes go
+    /// wherever focus already was, exactly as under capture (capture never
+    /// blocked the keyboard). Net: this mode trades "a local person can disturb
+    /// the pointer" for "the Mac can actually be locked", which is the better
+    /// posture for an unattended machine — but it is a real trade, not a
+    /// free win.
+    ///
+    /// **Fail-open by design.** If the helper cannot be reached, `install`
+    /// fails and the mode refuses to engage rather than reporting success over a
+    /// visible desktop. If the helper dies mid-session the panel becomes
+    /// visible — the same end state as a SIGKILLed `CapturedPrimary`, whose
+    /// gamma is likewise process-scoped.
+    pub struct ShieldedPrimary {
+        virtual_id: u32,
+        virtual_old_origin: (i32, i32),
+        /// Physical displays we shielded, with the pre-install origin so Drop
+        /// can put them back.
+        shielded: Vec<(u32, (i32, i32))>,
+        /// Whether `install` moved the vd to `(0,0)` as main. `false` in the
+        /// default keep-physical-main mode, in which case `Drop` has no
+        /// arrangement to restore (it only lowers the shields).
+        moved_arrangement: bool,
+        /// Physical displays whose vd-mirror `install` broke (single-panel
+        /// auto-mirror hardware). `Drop` re-mirrors them so the built-in panel
+        /// shows the desktop again between sessions. Empty on hardware where
+        /// the vd extends rather than mirrors.
+        broke_mirror: Vec<u32>,
+    }
+
+    /// Whether `--shield-primary` should keep the PHYSICAL panel as the system
+    /// main display instead of moving the vd to `(0, 0)` as main.
+    ///
+    /// This exists because making the vd main (as `CapturedPrimary` does, and as
+    /// shield originally copied) puts the lock screen where nobody can see it:
+    /// `loginwindow` draws on the main display, so on a shielded session ⌃⌘Q
+    /// locked the Mac but rendered the password field on the *headless* vd, with
+    /// the physical panel showing the live desktop (live-observed 2026-07-20).
+    /// Keeping the physical panel main puts the lock screen back on the physical
+    /// panel where it is visible (corroborated by the capture-off positive
+    /// control, which also drew the lock on the physical main display).
+    ///
+    /// The trade-off: with the vd not main, the menu bar + Dock stay on the
+    /// (shielded/black) physical panel rather than on the display the client
+    /// sees — so the remote desktop loses them. You cannot have the lock visible
+    /// AND the Dock on the vd; they are the same `(0,0)`/main bit. Default on
+    /// (lock visibility wins); `MACRDP_SHIELD_KEEP_PHYSICAL_MAIN=0` restores the
+    /// old vd-as-main behaviour for A/B comparison.
+    pub fn shield_keeps_physical_main() -> bool {
+        match std::env::var("MACRDP_SHIELD_KEEP_PHYSICAL_MAIN") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false") && !v.is_empty(),
+            Err(_) => true,
+        }
+    }
+
+    /// Re-mirror `panels` onto the vd — the undo of the `install` mirror-break
+    /// on single-panel auto-mirror hardware. One function because it MUST run
+    /// from three places with identical semantics: `Drop` (clean disconnect),
+    /// and both of `install`'s post-mirror-break failure paths (SHOW-exhaust
+    /// and a failed arrangement tx). The failure paths matter as much as Drop:
+    /// they `return Err` before `Self` exists, so Drop never runs — without an
+    /// explicit re-mirror there, the `ConfigureForAppOnly` break would persist
+    /// for the PROCESS lifetime (macrdp keeps serving after a failed install),
+    /// leaving the local user an un-mirrored, displaced, empty desktop panel.
+    /// Re-mirroring also subsumes the displace-tx's origin change — a mirrored
+    /// panel has no independent origin — so no separate restore is needed.
+    /// Best-effort by contract (callers are teardown paths): failures are
+    /// logged, and the ForAppOnly scope still self-reverts on process exit.
+    fn remirror_onto_vd(vd_id: u32, panels: &[u32]) {
+        if panels.is_empty() {
+            return;
+        }
+        let vd = CGDisplay::new(vd_id);
+        match vd.begin_configuration() {
+            Ok(config) => {
+                for id in panels {
+                    let _ = CGDisplay::new(*id).configure_display_mirror_of_display(&config, &vd);
+                }
+                if let Err(e) =
+                    vd.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+                {
+                    tracing::warn!(
+                        "re-mirror tx failed (CGError {e}); the built-in panel stays a \
+                         separate display until the next connect or process exit"
+                    );
+                } else {
+                    tracing::info!(
+                        remirrored_count = panels.len(),
+                        "restored the vd→physical mirror"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("could not begin re-mirror tx (CGError {e})"),
+        }
+    }
+
+    impl ShieldedPrimary {
+        pub fn install(virtual_display_id: u32) -> Result<Self> {
+            let vd = CGDisplay::new(virtual_display_id);
+            let vd_bounds = vd.bounds();
+            let virtual_old_origin = (
+                vd_bounds.origin.x.round() as i32,
+                vd_bounds.origin.y.round() as i32,
+            );
+            let vd_width = vd_bounds.size.width.round() as i32;
+
+            let actives = CGDisplay::active_displays()
+                .map_err(|e| anyhow!("CGGetActiveDisplayList: CGError {e}"))?;
+            let mut targets: Vec<(u32, (i32, i32))> = actives
+                .iter()
+                .copied()
+                .filter(|id| *id != virtual_display_id)
+                .map(|id| {
+                    let b = CGDisplay::new(id).bounds();
+                    (id, (b.origin.x.round() as i32, b.origin.y.round() as i32))
+                })
+                .collect();
+            if targets.is_empty() {
+                // No *active* physical display — but on single-panel hardware
+                // creating the vd makes macOS mirror the built-in INTO the vd,
+                // which drops the physical out of the active list (it reads
+                // online-but-inactive) even though it is very much still lit and
+                // showing the desktop. Without this fallback `install` fails with
+                // "no physical display to shield" and the overlay watcher's error
+                // arm only warns — so the session proceeds with the desktop fully
+                // VISIBLE, silently defeating the whole point of the mode. Fall
+                // back to CGGetOnlineDisplayList (which includes mirrored /
+                // disabled panels) and shield those, exactly as
+                // DetachedPrimary/CapturedPrimary already do. The origin is
+                // unknowable while mirrored/disabled, so use (0, 0) — Drop only
+                // repositions when it actually moved the arrangement, and the
+                // default keep-physical-main path moves nothing.
+                let online = online_displays()
+                    .map_err(|e| anyhow!("CGGetOnlineDisplayList: CGError {e}"))?;
+                let mirrored: Vec<u32> = online
+                    .into_iter()
+                    .filter(|id| *id != virtual_display_id && !actives.contains(id))
+                    .collect();
+                if !mirrored.is_empty() {
+                    tracing::warn!(
+                        mirrored_count = mirrored.len(),
+                        "no ACTIVE physical display to shield, but found \
+                         online-but-inactive panel(s) (mirrored into the virtual \
+                         display, or left disabled by a prior session) — shielding \
+                         those so the desktop is covered"
+                    );
+                    targets = mirrored.into_iter().map(|id| (id, (0, 0))).collect();
+                }
+            }
+            if targets.is_empty() {
+                return Err(anyhow!(
+                    "no physical display to shield — the virtual display is \
+                     the only online one already"
+                ));
+            }
+
+            // Break any mirror a physical shares with the vd BEFORE shielding.
+            // On single-panel hardware macOS mirrors the vd onto the built-in
+            // panel, which is fatal to a window-based blank two ways: (1) the
+            // mirror set collapses to ONE screen in `NSScreen.screens` (the vd),
+            // so the helper — which shields everything in NSScreen minus the vd —
+            // has nothing separate to cover; (2) even if it did, a mirrored
+            // panel is the SAME framebuffer as the vd, so a black window can't
+            // hide one without hiding what the client sees. Un-mirroring makes
+            // the physical its own independent display the helper can cover while
+            // the vd stays visible to the client. `ConfigureForAppOnly` keeps it
+            // process-scoped (SIGKILL/crash auto-reverts, like capture's gamma
+            // and detach's disable); `Drop` restores the mirror on a clean
+            // disconnect. A no-op on hardware where the vd extends rather than
+            // mirrors (no target reports `mirrors_display() == vd`).
+            let broke_mirror: Vec<u32> = targets
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| CGDisplay::new(*id).mirrors_display() == virtual_display_id)
+                .collect();
+            // Set when the displace-tx below succeeds; the window-gather that
+            // depends on it is deferred until install is KNOWN to succeed, so a
+            // failed install can't first sweep the user's windows onto a vd
+            // they cannot see locally.
+            let mut displaced = false;
+            if !broke_mirror.is_empty() {
+                let any = CGDisplay::new(virtual_display_id);
+                // kCGNullDirectDisplay (id 0) as the mirror master = "mirror
+                // nothing" = break the mirror.
+                let null_master = CGDisplay::new(0);
+                let unmirror = || -> Result<()> {
+                    let config = any.begin_configuration().map_err(|e| {
+                        anyhow!("CGBeginDisplayConfiguration (unmirror-tx): CGError {e}")
+                    })?;
+                    for id in &broke_mirror {
+                        CGDisplay::new(*id)
+                            .configure_display_mirror_of_display(&config, &null_master)
+                            .map_err(|e| {
+                                anyhow!(
+                                    "CGConfigureDisplayMirrorOfDisplay(break {id}): CGError {e}"
+                                )
+                            })?;
+                    }
+                    any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+                        .map_err(|e| {
+                            anyhow!("CGCompleteDisplayConfiguration (unmirror-tx): CGError {e}")
+                        })
+                };
+                unmirror().context(
+                    "could not break the vd↔physical mirror — refusing to engage \
+                     --shield-primary rather than shield a display that shares the \
+                     client's framebuffer",
+                )?;
+                tracing::info!(
+                    unmirrored_count = broke_mirror.len(),
+                    "broke the vd→physical mirror so the built-in panel is a \
+                     separate, shieldable display (reverts on disconnect / exit)"
+                );
+
+                // Displace the newly-separate physical(s) OFF the vd's origin —
+                // load-bearing on single-panel auto-mirror hardware, and the fix
+                // for "reconnect shows my windows, then a few seconds later the
+                // desktop goes blank" (2026-07-22). Breaking the mirror leaves
+                // the built-in panel a SEPARATE framebuffer that still sits at
+                // the SAME bounds as the vd (both at (0,0), 1728×1084 here). The
+                // user's app windows stay on the built-in; the client watches the
+                // vd; so once the mirror breaks the client sees an empty vd
+                // (wallpaper + its own menu bar) — the "reset to blank desktop".
+                // The window-gather (capture.rs, on the connect re-mode) is meant
+                // to sweep those windows onto the vd, but with both displays at
+                // IDENTICAL bounds "move to the vd's top-left" is also inside the
+                // physical, so macOS keeps the window there and the sweep is a
+                // no-op. Moving the physical aside (x = vd_width) gives the vd
+                // sole ownership of (0,0): the windows travel with the physical,
+                // land off the vd, and the gather then relocates them onto the vd
+                // unambiguously — exactly how the keep_physical_main=false
+                // `arrange()` path already works. ForAppOnly so a SIGKILL/crash
+                // auto-reverts (like the mirror-break itself); Drop's re-mirror
+                // resets the origin regardless, so no extra restore is needed.
+                // Only fires when a mirror was actually broken, so multi-panel
+                // hardware (physicals already at their own origins) is untouched.
+                //
+                // CAVEAT (known, accepted): pinning the vd at (0,0) makes the vd
+                // the system MAIN display, which is in tension with the
+                // keep_physical_main default (whose point is that loginwindow
+                // draws the lock screen on the physical main). On auto-mirror
+                // hardware this changes nothing in practice — the vd is already
+                // main even while idle (it is the mirror MASTER), so the
+                // physical was never main here and the lock-screen-visibility
+                // property never held on this hardware class to begin with.
+                // Lock-while-shielded on the single-panel path is UNVERIFIED;
+                // if it matters for a deployment, test ⌃⌘Q on a live shielded
+                // session before relying on it (see the shield notes in
+                // docs/known-quirks.md).
+                let displace = || -> Result<()> {
+                    let any = CGDisplay::new(virtual_display_id);
+                    let config = any.begin_configuration().map_err(|e| {
+                        anyhow!("CGBeginDisplayConfiguration (displace-tx): CGError {e}")
+                    })?;
+                    // Pin the vd at (0,0) so it owns the origin the client sees…
+                    vd.configure_display_origin(&config, 0, 0)
+                        .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
+                    // …and push each unmirrored physical to the right of it.
+                    let mut x_off = vd_width;
+                    for id in &broke_mirror {
+                        let d = CGDisplay::new(*id);
+                        d.configure_display_origin(&config, x_off, 0).map_err(|e| {
+                            anyhow!(
+                                "CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}"
+                            )
+                        })?;
+                        x_off += d.bounds().size.width.round().max(1.0) as i32;
+                    }
+                    // ConfigureForSession, NOT ForAppOnly — the #161/#162 lesson
+                    // replayed on this path, from a live re-strand (2026-07-22):
+                    // with ForAppOnly the WindowServer's session store never
+                    // learns the displaced arrangement, and a TRAILING relayout
+                    // re-derives window placement from the stale store — a
+                    // window the connect-time gather had already parked on the
+                    // vd was observed re-stranded onto the physical's region
+                    // minutes later ("chrome window is not showing"), exactly
+                    // the whack-a-mole `CapturedPrimary` hit before its
+                    // ForSession fix. Crash-safety holds by the same #162
+                    // argument: if macrdp dies, the vd vanishes and the lone
+                    // physical auto-anchors at (0,0) regardless of the store (a
+                    // single display always anchors the arrangement), and Drop's
+                    // re-mirror makes the stored origin moot on a clean
+                    // disconnect (a mirrored panel has no independent origin).
+                    any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
+                        .map_err(|e| {
+                            anyhow!("CGCompleteDisplayConfiguration (displace-tx): CGError {e}")
+                        })
+                };
+                // Non-fatal: if the displace fails the shield still covers the
+                // panel (privacy intact); the only loss is the client seeing an
+                // empty vd until a manual Ctrl+Alt+G. Don't strand the session.
+                if let Err(e) = displace() {
+                    tracing::warn!(
+                        error = %e,
+                        "could not displace the shielded physical off the vd origin — the \
+                         remote may see an empty desktop until Ctrl+Alt+G gathers windows"
+                    );
+                } else {
+                    tracing::info!(
+                        displaced_count = broke_mirror.len(),
+                        "moved the shielded physical panel(s) off the vd origin so app \
+                         windows gather onto the display the client sees"
+                    );
+                    displaced = true;
+                }
+
+                // Let the un-mirror + displace settle so the newly-separate
+                // physical appears in NSScreen.screens AND the helper finishes
+                // the shield relayout its own screen-parameters observer kicks
+                // off, before we send the explicit SHOW below — otherwise SHOW
+                // races that relayout and the helper is too busy to answer within
+                // the read timeout (observed: the 1 s timeout firing while the
+                // helper's window was already up).
+                std::thread::sleep(Duration::from_millis(600));
+            }
+
+            // Raise the shields BEFORE the arrangement change. The origin tx
+            // moves the vd to (0,0) and pushes the physicals aside, which is
+            // itself a visible relayout on the physical panel; shielding first
+            // means the user never sees it. (CapturedPrimary has the opposite
+            // order because its gamma write would be reset by the tx anyway.)
+            // Exclude the vd; the helper shields everything else it can see.
+            // Phrased as an exclude list so a monitor attached mid-session is
+            // covered too (the helper re-derives on screen-layout changes) —
+            // an include list is a snapshot and would silently miss it.
+            //
+            // Retry until the helper confirms it covered every target: right
+            // after a mirror-break the helper is relaying out its own shields
+            // from the screen-change notification and can be transiently slow to
+            // answer (read timeout) or answer before NSScreen has updated to
+            // include the newly-separate panel (a short count). Neither is a real
+            // failure; a retry a beat later succeeds. The ack (`count >= targets`)
+            // is what proves the desktop is actually covered — a display absent
+            // from NSScreen.screens (asleep/mid-wake) is skipped silently on the
+            // helper side, so without it we could report a shielded-but-visible
+            // desktop.
+            // Backoff, not a flat retry: the helper can stay busy well past a
+            // second. Observed live 2026-07-22 — a flat 4×300 ms (~5 s worst
+            // case) EXHAUSTED and the mode refused to engage, leaving the panel
+            // visible for the whole session. The helper was not wedged (a
+            // manual SHOW moments later answered instantly); it was busy
+            // relaying out across the mirror-break screen change *while*
+            // macrdp's own post-resize gather sweep was moving 10 windows
+            // through the WindowServer. So the tail is much longer than the
+            // typical case, which is what backoff is for: the common path still
+            // settles in ~300 ms, and a slow one gets ~13 s before we give up.
+            //
+            // Bounded deliberately rather than "retry until it works": this runs
+            // on a `tokio::spawn`ed watcher task, so the whole loop blocks a
+            // runtime worker (see the `crate::shield` module docs). ~13 s is the
+            // most that seems defensible against that; if it is ever exhausted
+            // again the fix is to move `install` onto a blocking thread rather
+            // than to keep widening this.
+            const SHOW_BACKOFF_MS: [u64; 6] = [300, 500, 800, 1200, 1600, 2000];
+            let need = targets.len();
+            let mut shielded_count = 0u16;
+            let mut last_err: Option<anyhow::Error> = None;
+            for (attempt, backoff) in SHOW_BACKOFF_MS
+                .iter()
+                .map(Some)
+                .chain(std::iter::once(None)) // final attempt: no trailing sleep
+                .enumerate()
+            {
+                match crate::shield::show(&[virtual_display_id]) {
+                    Ok(n) => {
+                        shielded_count = n;
+                        if usize::from(n) >= need {
+                            last_err = None;
+                            break;
+                        }
+                        last_err = Some(anyhow!(
+                            "shield helper covered only {n} of {need} display(s)"
+                        ));
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+                // Visible in the log, so a future engage failure shows how many
+                // attempts it burned rather than only the final error.
+                if let Some(e) = last_err.as_ref() {
+                    tracing::debug!(
+                        attempt = attempt + 1,
+                        error = %e,
+                        "shield SHOW not acknowledged yet — retrying"
+                    );
+                }
+                match backoff {
+                    Some(ms) => std::thread::sleep(Duration::from_millis(*ms)),
+                    None => break,
+                }
+            }
+            if usize::from(shielded_count) < need {
+                let _ = crate::shield::hide();
+                // Undo the mirror-break (which also undoes the displace) — we
+                // return before `Self` exists, so Drop will never do it, and
+                // the ForAppOnly break would otherwise outlive this failed
+                // engage for the whole process lifetime: an un-mirrored,
+                // displaced, empty panel in front of the local user.
+                remirror_onto_vd(virtual_display_id, &broke_mirror);
+                return Err(last_err
+                    .unwrap_or_else(|| anyhow!("shield show failed"))
+                    .context(
+                        "could not raise the shield windows over every physical display \
+                     — refusing to engage --shield-primary rather than leave one visible",
+                    ));
+            }
+
+            // Arrangement: whether to move the vd to (0,0) as system main.
+            //
+            // keep_physical_main = true (default): SKIP the move entirely. The
+            // physical panel stays main, so the lock screen (which loginwindow
+            // draws on main) renders on the physical panel where it is visible.
+            // The cost is that the vd is not main, so the remote desktop's menu
+            // bar + Dock stay on the physical (shielded) panel. See
+            // `shield_keeps_physical_main`.
+            //
+            // keep_physical_main = false: the old behaviour — move vd → (0,0),
+            // physicals aside. Remote gets the menu bar + Dock, but the lock
+            // screen renders on the invisible headless vd (refuted 2026-07-20).
+            let keep_physical_main = shield_keeps_physical_main();
+            if keep_physical_main {
+                tracing::info!(
+                    "--shield-primary: keeping the PHYSICAL panel as system main so a \
+                     lock screen stays visible locally (the vd is NOT moved to (0,0)). \
+                     Trade-off: the remote desktop's menu bar + Dock stay on the \
+                     shielded physical panel. Set MACRDP_SHIELD_KEEP_PHYSICAL_MAIN=0 \
+                     for the old vd-as-main behaviour."
+                );
+            } else {
+                // Origin tx: vd → (0, 0), physicals shifted aside. See
+                // `CapturedPrimary::install` for the full ConfigureForSession
+                // rationale — it is identical here and equally load-bearing.
+                //
+                // CRITICAL: from here on the shields are UP, but no `Self` exists
+                // yet — so `Drop` cannot run and there is nothing to lower them.
+                // A bare `?` on any step below would return `Err` and strand a
+                // black screen over the user's desktop for the life of the process
+                // (macrdp keeps running; the watcher just logs the failed install).
+                // So the fallible remainder runs in a closure whose `Err` we
+                // intercept to lower the shields before propagating.
+                let arrange = || -> Result<()> {
+                    let any = CGDisplay::new(virtual_display_id);
+                    let config = any.begin_configuration().map_err(|e| {
+                        anyhow!("CGBeginDisplayConfiguration (move-tx): CGError {e}")
+                    })?;
+                    vd.configure_display_origin(&config, 0, 0)
+                        .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
+                    let mut x_off = vd_width;
+                    for (id, _) in &targets {
+                        let d = CGDisplay::new(*id);
+                        if d.is_active() {
+                            d.configure_display_origin(&config, x_off, 0).map_err(|e| {
+                                anyhow!(
+                                    "CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}"
+                                )
+                            })?;
+                            x_off += d.bounds().size.width.round() as i32;
+                        }
+                    }
+                    any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
+                        .map_err(|e| {
+                            anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}")
+                        })?;
+                    Ok(())
+                };
+                if let Err(e) = arrange() {
+                    tracing::warn!(
+                        "arrangement transaction failed after the shields were raised — \
+                         lowering them so the desktop is not left blacked out"
+                    );
+                    if let Err(he) = crate::shield::hide() {
+                        // Both failed. Say so loudly: the screen is black and we
+                        // could not clear it. It will clear when macrdp exits (the
+                        // helper self-exits with its parent).
+                        tracing::error!(
+                            "could not lower the shields after a failed install: {he:#} — \
+                             the physical display will stay black until macrdp exits"
+                        );
+                    }
+                    // Same rationale as the SHOW-exhaust path above: no `Self`
+                    // yet ⇒ no Drop ⇒ the mirror-break would outlive this
+                    // failed engage. Undo it before propagating.
+                    remirror_onto_vd(virtual_display_id, &broke_mirror);
+                    return Err(e);
+                }
+
+                std::thread::sleep(TX_SETTLE);
+
+                // The tx moved the panels, so re-fit the shields to their new
+                // frames. The helper also re-fits itself on the screen-parameters
+                // notification; this is the belt to that suspenders, and is cheap
+                // because SHOW reconciles rather than stacking.
+                if let Err(e) = crate::shield::show(&[virtual_display_id]) {
+                    tracing::warn!("could not re-fit shields after the arrangement tx: {e:#}");
+                }
+            }
+
+            tracing::info!(
+                shielded_count = targets.len(),
+                "physical displays shielded with black windows"
+            );
+            tracing::info!(
+                "NOTE: --shield-primary does NOT capture the displays, so this Mac \
+                 CAN still be locked normally (unlike --capture-primary). The \
+                 trade-off is that a person at the machine can move the pointer, \
+                 which disturbs the remote cursor; their clicks are swallowed."
+            );
+
+            if displaced {
+                // The displace pushed the user's windows OFF the vd (they
+                // travelled with the physical). Now pull them back onto the vd —
+                // this is the step that actually makes the client see them.
+                // Deliberately HERE, after every fallible step: install has
+                // succeeded, so the windows can't be swept onto a vd the user
+                // ends up unable to see (a failed install re-mirrors instead).
+                // Detached + delayed so it runs after the displace has
+                // registered in the WindowServer and doesn't block this
+                // watcher-task's install. Two sweeps for the same reason
+                // capture.rs uses two: the WindowServer relayout from the
+                // displace has variable timing and can trail the first sweep.
+                // A no-op second sweep is cheap.
+                let vd_for_gather = virtual_display_id;
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(900));
+                    let first = crate::input::gather_windows_onto_display(vd_for_gather);
+                    std::thread::sleep(Duration::from_millis(1000));
+                    let second = crate::input::gather_windows_onto_display(vd_for_gather);
+                    if first > 0 || second > 0 {
+                        tracing::info!(
+                            first,
+                            second,
+                            display_id = vd_for_gather,
+                            "gathered windows onto the vd after displacing the shielded panel"
+                        );
+                    }
+                });
+            }
+
+            Ok(Self {
+                virtual_id: virtual_display_id,
+                virtual_old_origin,
+                shielded: targets,
+                moved_arrangement: !keep_physical_main,
+                broke_mirror,
+            })
+        }
+
+        /// Re-fit the shields, **fire-and-forget on a detached thread**.
+        ///
+        /// Unlike [`CapturedPrimary::reassert_blanking`] — a pair of
+        /// synchronous CG calls costing microseconds — this is a loopback round
+        /// trip to another process. The call sites in `capture.rs` run on the
+        /// latency-sensitive resize path (one of them while holding the
+        /// `VirtualDisplay` mutex, and three more from the post-gather sweep),
+        /// so doing it inline would put a multi-second worst case — a dead or
+        /// wedged helper — onto a hot path and hold that mutex across it.
+        ///
+        /// Detaching is safe precisely because this call is **not required for
+        /// correctness**: a shield window survives a display reconfiguration
+        /// (that is the entire premise of the mode), and the helper re-derives
+        /// its shields on every screen-layout change anyway. This is belt to
+        /// that suspenders, sent because the private `CGVirtualDisplay
+        /// applySettings` is known not to emit a public reconfiguration event.
+        ///
+        /// Always returns 0 (nothing to report synchronously); failures are
+        /// logged from the thread.
+        pub fn reassert_blanking(&self) -> usize {
+            let vd = self.virtual_id;
+            std::thread::spawn(move || {
+                if let Err(e) = crate::shield::show(&[vd]) {
+                    tracing::warn!("could not re-fit shields after a display change: {e:#}");
+                }
+            });
+            0
+        }
+    }
+
+    impl Drop for ShieldedPrimary {
+        fn drop(&mut self) {
+            tracing::info!(
+                shielded_count = self.shielded.len(),
+                "ShieldedPrimary::drop running — lowering shields + restoring layout"
+            );
+
+            // Lower the shields first so the panels are usable again even if
+            // the arrangement restore below fails.
+            if let Err(e) = crate::shield::hide() {
+                tracing::warn!(
+                    "could not lower the shield windows: {e:#} — they will vanish \
+                     when the helper exits with this process"
+                );
+            }
+
+            // Restore any vd→physical mirror `install` broke, so the built-in
+            // panel shows the desktop again between sessions. The un-mirror was
+            // `ConfigureForAppOnly` (process-scoped), so it only self-reverts on
+            // process EXIT — a clean disconnect keeps the process alive, so we
+            // must re-mirror explicitly here or the built-in is left a separate,
+            // empty extended desktop.
+            remirror_onto_vd(self.virtual_id, &self.broke_mirror);
+
+            // In keep-physical-main mode `install` never moved the arrangement,
+            // so there is nothing to restore — lowering the shields (and any
+            // re-mirror above) is the whole teardown.
+            if !self.moved_arrangement {
+                tracing::info!("lowered shields (no arrangement was moved)");
+                return;
+            }
+
+            let any = CGDisplay::new(self.virtual_id);
+            let config = match any.begin_configuration() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        "shields lowered but could not begin reposition-tx \
+                         (CGError {e}); layout will revert on logout"
+                    );
+                    return;
+                }
+            };
+            for (id, origin) in &self.shielded {
+                let _ = CGDisplay::new(*id).configure_display_origin(&config, origin.0, origin.1);
+            }
+            let _ = CGDisplay::new(self.virtual_id).configure_display_origin(
+                &config,
+                self.virtual_old_origin.0,
+                self.virtual_old_origin.1,
+            );
+            // ConfigureForSession — MUST match `install`, for exactly the reason
+            // spelled out in `CapturedPrimary`'s Drop (a ForAppOnly restore
+            // leaves the persisted store saying "vd is main" and the Dock
+            // sometimes follows it off-screen on disconnect).
+            if let Err(e) =
+                any.complete_configuration(&config, CGConfigureOption::ConfigureForSession)
+            {
+                tracing::warn!(
+                    "shields lowered but reposition-tx failed (CGError {e}); \
+                     layout will revert on logout"
+                );
+            } else {
+                tracing::info!(
+                    shielded_count = self.shielded.len(),
+                    "lowered shields and restored layout"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -967,6 +1638,17 @@ mod stub {
     impl CapturedPrimary {
         pub fn install(_virtual_display_id: u32) -> Result<Self> {
             Err(anyhow!("primary-display capture is macOS-only"))
+        }
+        pub fn reassert_blanking(&self) -> usize {
+            0
+        }
+    }
+
+    pub struct ShieldedPrimary;
+
+    impl ShieldedPrimary {
+        pub fn install(_virtual_display_id: u32) -> Result<Self> {
+            Err(anyhow!("primary-display shielding is macOS-only"))
         }
         pub fn reassert_blanking(&self) -> usize {
             0

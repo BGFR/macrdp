@@ -72,6 +72,61 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   per-dimension. Each dimension must be in [200,
                           #   8192]. No effect off the auto-adopt path. Config:
                           #   MAX_CLIENT_SIZE. Mirrors upstream IronRDP #1404.
+--shield-primary          # Third headless blanking mechanism, alternative to
+                          #   --detach-primary / --capture-primary (mutually
+                          #   exclusive with both; needs --virtual-display).
+                          #   Covers every physical panel with an opaque BLACK
+                          #   WINDOW drawn by the bundled macrdpshield helper
+                          #   instead of gamma-blacking a captured display.
+                          #   Two wins over --capture-primary:
+                          #     (1) the Mac CAN STILL BE LOCKED. capture-primary
+                          #         silently prevents locking (loginwindow can't
+                          #         draw onto a CGDisplayCapture'd display), so a
+                          #         capture-primary Mac is physically unsecured.
+                          #     (2) no ~250 ms desktop flash on a live client
+                          #         resize — a window survives a display
+                          #         reconfiguration, whereas macOS RESETS gamma
+                          #         on one (that flash is unfixable with gamma).
+                          #   Trade-off: without the capture the local pointer is
+                          #   NOT confined, so a person at the machine can move it
+                          #   and disturb the remote cursor. Their clicks are
+                          #   swallowed by the shield; their keystrokes go where
+                          #   focus already was (capture never blocked the
+                          #   keyboard either, so that part is unchanged).
+                          #   STATUS: the Mac locks AND the lock screen is
+                          #   visible (live-verified) — by default it keeps the
+                          #   PHYSICAL panel main so loginwindow draws the lock
+                          #   there. COST (not yet measured on a 2nd machine): the
+                          #   remote desktop then has NO menu bar / Dock (they
+                          #   stay on the shielded physical panel). MACRDP_SHIELD_
+                          #   KEEP_PHYSICAL_MAIN=0 gives the old vd-as-main
+                          #   behaviour (Dock on the vd, but lock screen invisible
+                          #   locally). See docs/known-quirks.md.
+                          #   Fail-safe, precisely: a MISSING helper binary aborts
+                          #   startup. An UNREACHABLE helper at connect time only
+                          #   warns — the session proceeds with the desktop
+                          #   visible. SHOW/HIDE are acknowledged (the helper
+                          #   replies with the count it actually covered) and the
+                          #   mode refuses to engage if that is short, so the
+                          #   failure is at least detected. If the helper dies
+                          #   mid-session the panel becomes visible and nothing
+                          #   restarts it.
+                          #   SINGLE-PANEL hardware (a MacBook with no external
+                          #   display): macOS auto-mirrors the vd onto the
+                          #   built-in panel, so on connect the mode BREAKS that
+                          #   mirror (process-scoped; auto-reverts on crash,
+                          #   restored on disconnect — and on a failed engage)
+                          #   and moves the panel aside so app windows land on
+                          #   the display the client sees. Side effects there:
+                          #   the vd becomes the system main display (lock-
+                          #   while-shielded is UNVERIFIED on this hardware),
+                          #   and when the vd is larger than the panel the Dock
+                          #   + menu bar land on the vd — so the remote gets
+                          #   them despite keep-physical-main. See the shield
+                          #   single-panel note in docs/known-quirks.md.
+                          #   Config: PRIMARY_MODE=shield.
+                          #   Env: MACRDP_SHIELD_HELPER (path override),
+                          #   MACRDP_SHIELD_PORT (default 40244). macOS-only.
 --restore-windows-on-disconnect  # Make windows follow you between the local
                           #   built-in screen and the remote virtual display
                           #   (opt-in; needs --detach-primary/--capture-primary).

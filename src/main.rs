@@ -1553,6 +1553,26 @@ fn args_from_config(path: &Path) -> Result<Args> {
         ),
         ("BLANK_RECOVERY_MIN_QOE", "MACRDP_BLANK_RECOVERY_MIN_QOE"),
         (
+            "BLANK_RECOVERY_MIN_RENDER_REPORTS",
+            "MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS",
+        ),
+        (
+            "BLANK_RECOVERY_ESTABLISHED_REPORTS",
+            "MACRDP_BLANK_RECOVERY_ESTABLISHED_REPORTS",
+        ),
+        (
+            "BLANK_RECOVERY_ESTABLISHED_MIN_QOE",
+            "MACRDP_BLANK_RECOVERY_ESTABLISHED_MIN_QOE",
+        ),
+        (
+            "BLANK_RECOVERY_ESTABLISHED_MAX_WAIT_MS",
+            "MACRDP_BLANK_RECOVERY_ESTABLISHED_MAX_WAIT_MS",
+        ),
+        (
+            "BLANK_RECOVERY_ESTABLISHED_WALL_REPORTS",
+            "MACRDP_BLANK_RECOVERY_ESTABLISHED_WALL_REPORTS",
+        ),
+        (
             "BLANK_RECOVERY_MAX_WAIT_MS",
             "MACRDP_BLANK_RECOVERY_MAX_WAIT_MS",
         ),

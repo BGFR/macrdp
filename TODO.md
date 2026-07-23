@@ -462,6 +462,32 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Parked — scoped, low priority
 
+- [x] **Headless-lock arc — LANDED on `main` 2026-07-23 (pending a release tag).** Merged this
+  session: **`--shield-primary`** opt-in lockable headless blanking (#170; single-panel engage
+  #171, @antonmos), the **`Ctrl+Alt+G` majority-area gather** (mostly-off windows now swept),
+  the **`--detach-primary` launchd-restart stopgap for #168** (#169, @antonmos-verified on
+  26.5.2), the **blank-recovery established tier** (#172, @antonmos), plus #165 vd
+  client-resolution auto-adopt and #166 iOS touch-tap fix. All adversarially security-scanned
+  clean. **To run any of it live: signed rebuild+reinstall** (installed v0.9.0 predates them —
+  build the shield helper via `gui/make-shield-helper.sh`; Team ID QGLA89KHM7). Two ship
+  decisions remain the user's: (a) cut a release for the unreleased pile; (b) whether shield
+  should ever become the default over `--capture-primary` (currently opt-in, capture unchanged).
+
+- [ ] **#168 — `--detach-primary` panel-re-enable ROOT FIX (macOS 26.x).** The stopgap (#169,
+  above) restarts the process so the CGS disable reverts, but the real fix — re-enabling the
+  panel *in-process* — is not achievable via display-config transactions on 26.5 (@antonmos
+  tried 5 tx structures; only process exit reverts the app-scoped disable). Issue #168 stays
+  **open**. No known in-process path today; revisit if a future macOS restores it or a new
+  CGS/SkyLight lever surfaces. `--shield-primary` sidesteps it entirely (no disable), so it may
+  simply be the long-term headless direction on 26.x+ rather than something to fix in detach.
+
+- [ ] **#167 — Dock invisible over RDP when a detach/capture vd is re-moded SMALLER than the
+  still-online physical panel.** The Dock strip sizes to the largest *online* display, so a vd
+  smaller than the (online-but-blanked) physical puts the Dock off the captured region. Repro'd
+  on bare `main` — PRE-EXISTING (via #155 live-resize), not a regression. Fix = `ConfigureForSession`
+  on the detach/capture disable tx, but that trades away crash-safety auto-revert → parked behind
+  a future opt-in **`--persist-detach`**. Documented in `docs/known-quirks.md`, not shippable as-is.
+
 - [ ] **Crash-report watch (post NSPasteboard-mutex fix).** The rare churn-time
   NSPasteboard use-after-free SIGSEGV was fixed 2026-07-07 via a process-global
   pasteboard mutex (`clipboard::pasteboard_guard()`, released in v0.8.29) — but it was

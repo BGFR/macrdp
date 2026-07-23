@@ -96,9 +96,11 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   STATUS: the Mac locks AND the lock screen is
                           #   visible (live-verified) — by default it keeps the
                           #   PHYSICAL panel main so loginwindow draws the lock
-                          #   there. COST (not yet measured on a 2nd machine): the
+                          #   there. COST (2nd-machine-confirmed): the
                           #   remote desktop then has NO menu bar / Dock (they
-                          #   stay on the shielded physical panel). MACRDP_SHIELD_
+                          #   stay on the shielded physical panel) — usable via
+                          #   Ctrl+Alt+G to gather windows onto the visible vd.
+                          #   MACRDP_SHIELD_
                           #   KEEP_PHYSICAL_MAIN=0 gives the old vd-as-main
                           #   behaviour (Dock on the vd, but lock screen invisible
                           #   locally). See docs/known-quirks.md.

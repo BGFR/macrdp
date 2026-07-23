@@ -21,7 +21,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.9.0** (the webcam release — **a webcam
+(VPN/ZeroTier). **Latest release: v0.9.1** (the lockable-headless release — a new
+opt-in headless blanking mode **`--shield-primary`** covers the physical panel with an
+opaque black *window* (via the `macrdpshield` helper) instead of capturing it, so unlike
+`--capture-primary` **the Mac can still be locked** and there's no ~250 ms resize flash;
+default OFF, capture/detach unchanged. Also: client-resolution auto-adopt on the
+`--virtual-display` path (#165), a blank-recovery established-session tier (#172), a
+majority-area `Ctrl+Alt+G` window-gather, and a `--detach-primary` launchd-restart stopgap
+(#169) for the macOS-26 in-process panel-re-enable bug (#168, root fix still open). See
+`docs/release-history.md` + the shield/lock notes in `@docs/known-quirks.md`.)
+Earlier: **v0.9.0** (the webcam release — **a webcam
 redirected from the client now presents as a REAL macOS camera**. Opt-in
 `--enable-camera-redirection` (default OFF, default runtime path byte-identical when
 off): tick "Video capturing devices" in the client and **"macrdp Camera"** appears in

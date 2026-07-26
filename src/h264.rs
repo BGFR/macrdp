@@ -341,6 +341,10 @@ struct ConnectionContext {
     /// One-shot guard for the "blank recovery disarmed / scaled on this link"
     /// log line (the detector check runs on every capture).
     blank_gate_logged: bool,
+    /// Copy of `BlankRecoveryParams::min_render_reports`, frozen here so
+    /// `on_qoe_metrics` (which only sees the context, not the owning `Gfx`) can
+    /// set the [`QoeEvidence::presented_clean`] latch. Not RTT-scaled.
+    min_render_reports: u64,
 }
 
 /// Tunables for ack-driven IDR recovery (EGFX-on-lossy). See
@@ -648,6 +652,24 @@ struct QoeEvidence {
     zero_streak: u64,
     nonzero_streak: u64,
     max_nonzero_streak: u64,
+    /// Durable "this connection genuinely presented at connect" latch (v0.9.2).
+    /// Set by the caller (`on_qoe_metrics`) the moment a sustained nonzero-EDR
+    /// run appears **while no recovery attempt has yet fired**, and never
+    /// cleared for the connection. When set, [`should_blank_recover`] returns
+    /// false unconditionally — the v0.9.0 one-shot-disarm behavior, restored.
+    ///
+    /// Why gate on "before any recovery attempt": QoE decode+render-time is
+    /// bidirectionally unreliable — one client class reports nonzero-while-black
+    /// (the #172 reconnect-blank client that flickers nonzero *after* a
+    /// reactivation), another reports zero-while-presenting (the client whose
+    /// working 50 s sessions #172 began false-dropping). The one signal that
+    /// separates them is *when* the nonzero run occurs: a sustained run seen
+    /// **before** any recovery proves the client painted the desktop on its own
+    /// (it is not the connect-time reconnect-blank, which is black from frame
+    /// one); a run seen **after** a reactivation may be the blank client's
+    /// post-reactivation flicker and must not disarm. So the latch requires the
+    /// former and the caller withholds it for the latter (`attempts == 0`).
+    presented_clean: bool,
 }
 
 impl QoeEvidence {
@@ -664,8 +686,10 @@ impl QoeEvidence {
     }
 
     /// Clear the live streaks after a recovery attempt so a re-fire needs a
-    /// full fresh window. `max_nonzero_streak` survives — it is a fact about
-    /// the connection, not evidence for the current window.
+    /// full fresh window. `max_nonzero_streak` and `presented_clean` survive —
+    /// they are facts about the connection, not evidence for the current
+    /// window. (`presented_clean` can never be set once an attempt has fired,
+    /// so in practice this only ever runs with it already false.)
     fn reset_streaks(&mut self) {
         self.zero_streak = 0;
         self.nonzero_streak = 0;
@@ -727,6 +751,19 @@ fn should_blank_recover(
     attempts: u32,
     p: &BlankRecoveryParams,
 ) -> bool {
+    // Durable clean-presentation latch (v0.9.2): a connection that produced a
+    // sustained nonzero-EDR run BEFORE any recovery attempt genuinely presented
+    // the desktop at connect, so it is not the reconnect-blank (which is black
+    // from frame one) — never recover it. This is the v0.9.0 one-shot disarm,
+    // restored: it fixes a client that presents fine but reports zero EDR
+    // mid-session (its short nonzero runs never reach the `established` bar, so
+    // the revocable disarm was force-dropping working 50 s sessions), WITHOUT
+    // re-breaking #172's blank client — that one produces its nonzero run only
+    // AFTER a reactivation, and the caller withholds the latch there
+    // (`attempts == 0`). See [`QoeEvidence::presented_clean`].
+    if qoe.presented_clean {
+        return false;
+    }
     // "Presenting" = the LAST `min_render_reports` reports were all nonzero.
     // Streak, not a latch: a client that goes back to reporting zero (the
     // post-reactivation relapse) re-arms the detector automatically, because a
@@ -2694,6 +2731,7 @@ impl GfxServerFactory for Gfx {
             last_blank_recovery_at: Instant::now(),
             link_rtt_ms,
             blank_gate_logged: false,
+            min_render_reports: self.blank_params.min_render_reports,
         });
         Some((
             GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
@@ -2899,6 +2937,24 @@ impl GraphicsPipelineHandler for GfxHandler {
             ctx.qoe.record(metrics.time_diff_dr);
             if metrics.time_diff_dr > 0 {
                 ctx.last_nonzero_qoe_at = Instant::now();
+            }
+            // Durable clean-presentation latch (v0.9.2): once the connection has
+            // shown a sustained nonzero-EDR run WHILE no recovery attempt has yet
+            // fired, it genuinely presented at connect — latch the detector off
+            // for the connection (v0.9.0 behavior). Gated on `attempts == 0`
+            // because a nonzero run AFTER a reactivation can be the #172 blank
+            // client's post-reactivation flicker-while-black, which must NOT
+            // disarm. `min_render_reports` is not RTT-scaled, so read it raw.
+            if !ctx.qoe.presented_clean
+                && ctx.blank_recovery_attempts == 0
+                && ctx.qoe.nonzero_streak >= ctx.min_render_reports
+            {
+                ctx.qoe.presented_clean = true;
+                debug!(
+                    nonzero_streak = ctx.qoe.nonzero_streak,
+                    "EGFX connection presented cleanly before any recovery — blank detector \
+                     latched off for this connection"
+                );
             }
             if metrics.time_diff_dr > 0 && was.nonzero_streak == 0 {
                 debug!(
@@ -3468,6 +3524,7 @@ mod tests {
             zero_streak: zero,
             nonzero_streak: nonzero,
             max_nonzero_streak: max_nonzero,
+            presented_clean: false,
         }
     }
 
@@ -3837,6 +3894,71 @@ mod tests {
             ms(0), // since_last_nonzero — irrelevant unless the established wall branch is under test
             ms(10_000),
             1,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_recovery_disarmed_by_clean_presentation() {
+        // The v0.9.2 regression fix: a connection that presented cleanly at
+        // connect (`presented_clean` latched) is NEVER recovered, no matter how
+        // large the subsequent all-zero window grows — this is the client that
+        // presents fine but reports zero EDR mid-session, whose short nonzero
+        // runs never reach the established bar. Before the latch, its working
+        // 50 s sessions were force-dropped.
+        let p = blank_params();
+        let latched = QoeEvidence {
+            zero_streak: 10_000,
+            nonzero_streak: 0,
+            // Deliberately BELOW the established bar (50): the whole point is
+            // that this client never establishes, yet must not be dropped.
+            max_nonzero_streak: 14,
+            presented_clean: true,
+        };
+        // Every other condition that would normally fire is satisfied: huge
+        // zero window, acks flowing, well past arm_delay/retry, attempts under
+        // cap, long since_connect. The latch alone holds it off.
+        assert!(!should_blank_recover(
+            latched,
+            true,
+            false,
+            ms(600_000),
+            ms(120_000),
+            ms(60_000),
+            0,
+            &p
+        ));
+        // And it survives even the established wall-clock blackout inputs.
+        assert!(!should_blank_recover(
+            latched,
+            true,
+            false,
+            ms(600_000),
+            ms(120_000),
+            ms(60_000),
+            1,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_recovery_clean_latch_does_not_shield_a_never_presented_blank() {
+        // The #172 fix is preserved: the reconnect-blank client never presents
+        // BEFORE a recovery attempt (it is black from frame one), so the caller
+        // never latches `presented_clean` for it — and with the latch clear, a
+        // full all-zero window still fires exactly as before. (Its later
+        // nonzero-while-black flicker arrives with attempts > 0, so the caller
+        // withholds the latch; that gating lives in `on_qoe_metrics`, this
+        // asserts the pure function is unchanged when the latch is absent.)
+        let p = blank_params();
+        assert!(should_blank_recover(
+            qoe(120, 0, 0), // presented_clean defaults false
+            true,
+            false,
+            ms(10_000),
+            ms(0),
+            ms(10_000),
+            0,
             &p
         ));
     }

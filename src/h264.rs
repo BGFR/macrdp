@@ -645,6 +645,15 @@ fn blank_drop_capped(consecutive_drops: u32, cap: u32) -> bool {
     cap > 0 && consecutive_drops >= cap
 }
 
+/// Whether an in-flight connection should clear the reconnect-storm drop counter
+/// (see the call site + [`blank_drop_capped`]). Only a genuinely-ESTABLISHED
+/// connection resets it — a brief blip (a few post-reactivation frames that then
+/// relapse to black) does NOT, so a brief-present-then-drop still counts toward
+/// the cap. Reset only matters when the counter is non-zero. Pure, unit-tested.
+fn storm_guard_should_reset(qoe: QoeEvidence, established_render_reports: u64, current_drops: u32) -> bool {
+    current_drops != 0 && qoe.established(established_render_reports)
+}
+
 /// Raw QoE decode+render-time counters for the blank detector — pure tallies,
 /// no policy (the thresholds live in [`BlankRecoveryParams`]).
 ///
@@ -743,18 +752,13 @@ impl QoeEvidence {
         self.nonzero_max_since_reset = 0;
     }
 
-    /// Has this connection ever presented (sustained nonzero EDR)?
-    fn ever_presented(&self, min_render_reports: u64) -> bool {
-        self.max_nonzero_streak >= min_render_reports
-    }
-
     /// Has this connection presented for a MEANINGFUL stretch — i.e. it is an
     /// established, presumed-healthy session rather than one that merely
-    /// flickered a few frames? Distinct from [`ever_presented`] (a much lower
-    /// bar) because the two gate opposite things: a few-frame blip must still
-    /// be treated as a suspicious (probably still-blank) connection and
-    /// recovered aggressively, whereas a session that genuinely showed the
-    /// desktop for seconds must tolerate a transient zero-EDR window without
+    /// flickered a few frames? A few-frame blip must still be treated as a
+    /// suspicious (probably still-blank) connection and recovered aggressively
+    /// (and does NOT clear the reconnect-storm guard — see
+    /// [`storm_guard_should_reset`]), whereas a session that genuinely showed
+    /// the desktop for seconds must tolerate a transient zero-EDR window without
     /// being dropped. See [`should_blank_recover`].
     fn established(&self, established_render_reports: u64) -> bool {
         self.max_nonzero_streak >= established_render_reports
@@ -1702,20 +1706,32 @@ impl Gfx {
             // Decision here (under ctx), action after the guard drops.
             // `qoe_reports` resets so a re-fire needs a fresh all-zero window.
             if self.blank_recovery_enabled && ctx.surface_id.is_some() {
-                // A presenting connection clears the reconnect-storm guard: the
-                // consecutive-drop counter only tracks UNBROKEN runs of
-                // blank-dropped connections (see `blank_drop_capped`).
-                // Deliberately the LOW `min_render_reports` bar (3), not the
-                // established bar (40): the guard asks "did this connection
-                // compose ANY real frames?" to distinguish it from a
-                // never-rendered blank run — even a brief render breaks the
-                // "every reconnect lands blank" pattern the cap exists for.
-                // Don't "harmonize" this up to the established threshold.
-                if ctx.qoe.ever_presented(self.blank_params.min_render_reports)
-                    && self.consecutive_blank_drops.load(Ordering::Relaxed) != 0
-                {
+                // A GENUINELY-ESTABLISHED connection clears the reconnect-storm
+                // guard: the consecutive-drop counter only tracks UNBROKEN runs
+                // of blank-dropped connections (see `blank_drop_capped`).
+                //
+                // Gate on the ESTABLISHED bar (~5 s of sustained presentation),
+                // NOT the low `min_render_reports` bar (3 frames). REVERSED
+                // 2026-07-29 from the earlier "even a brief render breaks the
+                // pattern, don't harmonize up" reasoning — a live restart-while-
+                // connected repro disproved it: the client re-lands on its stale
+                // retained surface (blank), the reactivation HALF-heals it (a
+                // ~4-frame run) and then it relapses to black and is dropped,
+                // forever. That 4-frame blip cleared `min_render_reports`, so it
+                // reset the counter on EVERY cycle → the cap never tripped and
+                // the drop→ARC-reconnect→blank→drop loop was infinite. A brief
+                // blip is NOT "escaped the blank cycle"; only a connection that
+                // SUSTAINS presentation (`established` — whether at connect or via
+                // a reactivation that actually healed) has, so only that resets
+                // the guard. A brief-present-then-drop now counts toward the cap,
+                // which trips after `max_consecutive_drops` and ends the cycle.
+                if storm_guard_should_reset(
+                    ctx.qoe,
+                    self.blank_params.established_render_reports,
+                    self.consecutive_blank_drops.load(Ordering::Relaxed),
+                ) {
                     self.consecutive_blank_drops.store(0, Ordering::Relaxed);
-                    debug!("EGFX connection presented — consecutive blank-drop counter reset");
+                    debug!("EGFX connection established — consecutive blank-drop counter reset");
                 }
                 // RTT gate (2026-07-05): on a slow link the EDR==0 signal is
                 // unreliable (a rendering ZeroTier client reports zero), so the
@@ -3808,7 +3824,7 @@ mod tests {
             (q.zero_streak, q.nonzero_streak, q.max_nonzero_streak),
             (1, 0, 2)
         );
-        assert!(!q.ever_presented(3));
+        assert!(q.max_nonzero_streak < 3);
         for _ in 0..3 {
             q.record(4);
         }
@@ -3817,7 +3833,7 @@ mod tests {
             (0, 3, 3)
         );
         assert_eq!(q.nonzero_max_since_reset, 3);
-        assert!(q.ever_presented(3));
+        assert!(q.max_nonzero_streak >= 3);
         // A recovery attempt clears the live streaks AND the window tallies;
         // only the connection-lifetime high-water mark survives.
         q.reset_streaks();
@@ -3828,7 +3844,7 @@ mod tests {
                 ..QoeEvidence::default()
             }
         );
-        assert!(q.ever_presented(3));
+        assert!(q.max_nonzero_streak >= 3);
     }
 
     #[test]
@@ -4568,6 +4584,28 @@ mod tests {
         assert!(blank_drop_capped(7, 3));
         // cap = 0 disables the guard entirely.
         assert!(!blank_drop_capped(100, 0));
+    }
+
+    #[test]
+    fn storm_guard_reset_needs_established_not_a_brief_present() {
+        // The 2026-07-29 fix: a restart-while-connected reconnect-blank half-heals
+        // under the reactivation (a few frames) then relapses + drops, forever.
+        // The counter must NOT reset on that brief blip, or the cap never trips.
+        let established = 50;
+
+        // Brief post-reactivation run (max nonzero = 4) with drops pending: this
+        // is exactly the cycle iteration — it must NOT reset (the old
+        // old `min_render_reports=3` bar wrongly did, defeating the cap).
+        assert!(qoe(0, 0, 4).max_nonzero_streak >= 3); // cleared the OLD (wrong) bar
+        assert!(!qoe(0, 0, 4).established(established)); // but not the new one
+        assert!(!storm_guard_should_reset(qoe(0, 0, 4), established, 2));
+
+        // A genuinely-established connection (sustained ~5 s) HAS escaped the
+        // blank cycle → reset.
+        assert!(storm_guard_should_reset(qoe(0, 0, established), established, 2));
+
+        // Nothing to reset when the counter is already zero.
+        assert!(!storm_guard_should_reset(qoe(0, 0, established), established, 0));
     }
 
     // ---- P2b: frame_drop_at_floor ----

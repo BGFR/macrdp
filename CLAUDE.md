@@ -21,7 +21,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.9.2** (blank-recovery clean-presentation latch — a
+(VPN/ZeroTier). **Latest release: v0.9.3** (storm-guard fix + the connection/input batch —
+a blank-recovery reliability fix plus four merged @antonmos contributions; **default runtime
+path unchanged**. Headline: the mstsc/Windows-App reconnect-blank drop loop can no longer run
+away. The reconnect-storm guard (`MAX_CONSECUTIVE_DROPS`) reset its counter whenever a
+connection presented as few as `min_render_reports` (3) frames — and a restart-while-connected
+reconnect-blank half-heals under the reactivation (a ~4-frame run) then relapses + is dropped,
+so that brief blip cleared the reset bar on EVERY cycle → the cap never tripped → infinite loop
+(live-repro'd on a Windows client over ZeroTier). Fix (`src/h264.rs`, `storm_guard_should_reset`):
+reset only on an **established** connection (~5 s sustained presentation), so a
+brief-present-then-drop counts toward the cap → trips → cycle ends (session stays up +
+close+reopen guidance). **LIVE-VERIFIED over ZeroTier**: guard tripped at 3 drops, 0 spurious
+resets, where the same path previously cycled forever; unit-tested; removed the now-dead
+`ever_presented`. The four contributions: **#174** a second client now TAKES OVER the live
+session (full-auth-gated — an unauthenticated connection can never evict a live session; a weak
+TPKT-peek gate was replaced) instead of hanging (vendored server divergence 23; upstream RFC
+Devolutions/IronRDP#1483); **#175** a blank-recovery post-attempt heal-confirmation deadline
+(`MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS`, default 8 s — complements the storm-guard fix at the
+other end of the loop); **#176** relative-mouse (`RelMove`) support + a `map_client_to_display`
+edge-clamp to the display's last pixel (`s-1`, stops the cursor walking onto the shielded panel);
+**#173** clipboard pre-connect-sync (skip the racy connect-time advertise). See
+`docs/release-history.md`.)
+Earlier: **v0.9.2** (blank-recovery clean-presentation latch — a
 point release fixing a v0.9.1 regression in the mstsc/Windows-App reconnect-blank
 auto-recovery; **default runtime path unchanged**, only the blank detector's disarm logic
 changed. v0.9.1's #172 made the disarm *revocable* (to catch a client reporting nonzero-EDR

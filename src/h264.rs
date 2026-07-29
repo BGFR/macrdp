@@ -650,7 +650,11 @@ fn blank_drop_capped(consecutive_drops: u32, cap: u32) -> bool {
 /// connection resets it — a brief blip (a few post-reactivation frames that then
 /// relapse to black) does NOT, so a brief-present-then-drop still counts toward
 /// the cap. Reset only matters when the counter is non-zero. Pure, unit-tested.
-fn storm_guard_should_reset(qoe: QoeEvidence, established_render_reports: u64, current_drops: u32) -> bool {
+fn storm_guard_should_reset(
+    qoe: QoeEvidence,
+    established_render_reports: u64,
+    current_drops: u32,
+) -> bool {
     current_drops != 0 && qoe.established(established_render_reports)
 }
 
@@ -4602,10 +4606,18 @@ mod tests {
 
         // A genuinely-established connection (sustained ~5 s) HAS escaped the
         // blank cycle → reset.
-        assert!(storm_guard_should_reset(qoe(0, 0, established), established, 2));
+        assert!(storm_guard_should_reset(
+            qoe(0, 0, established),
+            established,
+            2
+        ));
 
         // Nothing to reset when the counter is already zero.
-        assert!(!storm_guard_should_reset(qoe(0, 0, established), established, 0));
+        assert!(!storm_guard_should_reset(
+            qoe(0, 0, established),
+            established,
+            0
+        ));
     }
 
     // ---- P2b: frame_drop_at_floor ----

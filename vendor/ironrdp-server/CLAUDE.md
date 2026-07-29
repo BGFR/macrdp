@@ -1544,6 +1544,21 @@ AND released — #1276 landing is NOT sufficient.
       shares code with `run_connection` because that function is generic over
       any stream type and needs `&mut self`; this needs neither. Keep the two
       in sync by hand if the negotiation sequence changes upstream.
+      **DECISION 2026-07-29 — keep the duplication as-is; do NOT refactor it
+      into a shared negotiate core.** Unifying was assessed and is technically
+      feasible (extract a generic `negotiate<S>(ctx, framed, offer_mt: bool) ->
+      NegotiatedCandidate` that both call, with `run_connection` routing through
+      `serve_negotiated` for the finalize), but deliberately declined: this is
+      security-critical, just-landed vendored code on the auth/preemption path,
+      and the "don't refactor working hot-paths" rule applies (a big stateful
+      async fn, no unit coverage of the extraction). The RIGHT fix is
+      **upstreaming this divergence** — where the shared structure gets designed
+      properly and macrdp drops the divergence entirely; a bigger local refactor
+      would only INCREASE divergence and make that merge harder. The duplication
+      is bounded and only bites on an upstream pin bump (when the vendored server
+      is already being re-verified). If the hand-sync ever actually bites, the
+      low-risk mitigation is a drift-catching TEST (assert a candidate and a
+      normal connection negotiate equivalently), not a structural refactor.
     - **Multitransport is a normal-path-only feature for a candidate.** Both
       the UDP transport OFFER (in `run_connection`, before `attach_channels`)
       and the lossy-audio DVC (inside `attach_channels_impl`, only useful

@@ -15,6 +15,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
@@ -43,6 +44,15 @@ type Paths = Arc<Mutex<Vec<PathBuf>>>;
 /// authenticated peer that paste-pumped a multi-gig DIB at us could
 /// otherwise exhaust memory before any other check kicks in.
 const MAX_INCOMING_PAYLOAD: usize = 50 * 1024 * 1024;
+
+/// How long `on_ready`'s very first (connect-time) call defers our own
+/// Mac->client advertise, so it lands safely after the client's own
+/// FormatListResponse::Ok ack instead of racing it through the shared
+/// writer (see `MacCliprdrBackend::initial_advertise_pending`). Comfortably
+/// past any realistic ack-write latency (microseconds to low-single-digit
+/// ms, even under the write contention that provokes the race) while still
+/// being imperceptible to the user.
+const CONNECT_ADVERTISE_DELAY: Duration = Duration::from_millis(300);
 
 /// Convert PNG/TIFF bytes from NSPasteboard into a CF_DIB payload: a
 /// `BITMAPINFOHEADER` (40 bytes) followed by 32bpp BGRA pixels in
@@ -393,6 +403,7 @@ impl CliprdrBackendFactory for MacCliprdr {
             advertise_state: self.advertise_state.clone(),
             #[cfg(target_os = "macos")]
             lazy_paste: self.lazy_paste,
+            initial_advertise_pending: true,
         })
     }
 }
@@ -432,6 +443,28 @@ struct MacCliprdrBackend {
     // true (the default; --no-lazy-paste flips it). See MacCliprdr::lazy_paste.
     #[cfg(target_os = "macos")]
     lazy_paste: bool,
+    // True until the first `on_ready()` call is handled. That first call
+    // fires synchronously while the client's OWN initial (pre-connection)
+    // FormatList PDU is still being processed on the inbound dispatch path
+    // — its FormatListResponse::Ok ack is written moments later by that
+    // same caller. If we fire our own Mac->client advertise here too, it
+    // queues onto the shared ServerEvent channel that the sibling
+    // dispatch_events loop drains independently, racing the ack through
+    // ironrdp-server's shared writer mutex (see vendor/ironrdp-server
+    // SharedWriter): under any write contention (e.g. the initial
+    // full-frame video paint happening at the same moment), our advertise
+    // or the client-clipboard fetch it can crowd out may reach the wire
+    // before the client's own ack. See the clipboard preconnect-sync quirk
+    // note this fix is paired with.
+    //
+    // We DEFER (not skip) this first advertise, via a short `tokio::spawn`
+    // sleep — CONNECT_ADVERTISE_DELAY, comfortably past when the ack write
+    // completes — so it still reaches a reconnecting/second client whose
+    // Mac clipboard hasn't changed since the last advertise (the
+    // changeCount poller only fires on a CHANGE, so skipping outright would
+    // silently drop Mac->client sync for that case; caught in review on
+    // #173).
+    initial_advertise_pending: bool,
 }
 
 /// Drop runs when the RDP connection ends and ironrdp_server releases
@@ -658,6 +691,22 @@ impl CliprdrBackend for MacCliprdrBackend {
     }
 
     fn on_ready(&mut self) {
+        if self.initial_advertise_pending {
+            self.initial_advertise_pending = false;
+            debug!(
+                delay_ms = CONNECT_ADVERTISE_DELAY.as_millis() as u64,
+                "deferring connect-time pasteboard advertise past the client's own \
+                 initial FormatList ack (racing it through the shared writer would \
+                 confuse the client's still-open init handshake)"
+            );
+            let sender = self.sender.clone();
+            let file_paths = self.file_paths.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(CONNECT_ADVERTISE_DELAY).await;
+                advertise_pasteboard(&sender, &file_paths);
+            });
+            return;
+        }
         advertise_pasteboard(&self.sender, &self.file_paths);
     }
 
@@ -702,6 +751,11 @@ impl CliprdrBackend for MacCliprdrBackend {
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
+        debug!(
+            format_count = available_formats.len(),
+            format_ids = ?available_formats.iter().map(|f| f.id).collect::<Vec<_>>(),
+            "remote clipboard format list received (connect-time announce or a live copy)"
+        );
         // Remote (e.g. Windows) put something on its clipboard. Files are
         // checked first because a Finder paste of files is the richer
         // experience; image and text fall back if the remote didn't copy a
@@ -731,10 +785,14 @@ impl CliprdrBackend for MacCliprdrBackend {
         ];
         for pref in priority {
             if let Some(fmt) = available_formats.iter().find(|f| f.id == pref) {
+                debug!(format_id = ?fmt.id, "requesting remote format data");
                 self.last_requested = Some(fmt.id);
                 self.push(ClipboardMessage::SendInitiatePaste(fmt.id));
                 return;
             }
+        }
+        if !available_formats.is_empty() {
+            debug!("remote format list had none of our supported formats; nothing requested");
         }
     }
 
@@ -1324,6 +1382,119 @@ mod tests {
         let got = read_file_range(&f.0, 0, 8 * 1024 * 1024).unwrap();
         assert_eq!(got.len(), MAX_FILE_RANGE_BYTES as usize);
         assert!(got.iter().all(|&b| b == 0xAB));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn test_backend() -> (MacCliprdrBackend, mpsc::UnboundedReceiver<ServerEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let backend = MacCliprdrBackend {
+            sender: Arc::new(Mutex::new(Some(tx))),
+            last_requested: None,
+            active_backends: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            file_paths: Arc::new(Mutex::new(Vec::new())),
+            download_router: crate::file_promise::DownloadRouter::default(),
+            paste_temp_dir: Arc::new(Mutex::new(None)),
+            self_change_count: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
+            advertise_state: Arc::new(AdvertiseState::default()),
+            lazy_paste: true,
+            initial_advertise_pending: true,
+        };
+        (backend, rx)
+    }
+
+    /// The connect-time fix under test: the client's own initial FormatList
+    /// (handled by `on_remote_copy`, below) fires `on_ready` synchronously
+    /// from the same inbound-PDU handler that's about to write that
+    /// client's FormatListResponse::Ok ack. A same-tick Mac->client
+    /// advertise from `on_ready` races that ack through ironrdp-server's
+    /// shared writer. The very first `on_ready` call per connection must
+    /// therefore put nothing on the wire immediately — but (per review on
+    /// #173) it must NOT be dropped outright either, since the changeCount
+    /// poller only re-advertises on a CHANGE: a reconnecting/second client
+    /// whose Mac clipboard hasn't changed since the last advertise would
+    /// otherwise never receive it. So it must fire, just after a short
+    /// deferral past the ack race.
+    // Real (not paused) time: getting a spawned task to observe a manually
+    // advanced paused clock needs runtime-version-sensitive yield dancing,
+    // which is more fragile than it's worth for one 300 ms wait. Costs this
+    // test ~0.3 s of real wall-clock; everything else in the suite is
+    // effectively instant, so that's a non-issue.
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn on_ready_defers_the_connect_time_advertise_past_the_ack_race() {
+        let (mut backend, mut rx) = test_backend();
+
+        backend.on_ready();
+        assert!(
+            rx.try_recv().is_err(),
+            "connect-time on_ready must not put anything on the wire immediately"
+        );
+        assert!(!backend.initial_advertise_pending);
+
+        pb::write_string("on_ready_deferred_probe");
+        tokio::time::sleep(CONNECT_ADVERTISE_DELAY + Duration::from_millis(100)).await;
+
+        match rx
+            .try_recv()
+            .expect("the deferred advertise must eventually fire")
+        {
+            ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)) => {
+                assert!(formats
+                    .iter()
+                    .any(|f| f.id == ClipboardFormatId::CF_UNICODETEXT));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// Once the connect-time handshake has settled (`initial_advertise_pending`
+    /// already false — set up directly here rather than via a real first
+    /// `on_ready()` call, so this test doesn't have to interact with that
+    /// call's spawned deferred task), `on_ready` must advertise immediately,
+    /// exactly as it did before the connect-time fix.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn on_ready_advertises_immediately_once_settled() {
+        let (mut backend, mut rx) = test_backend();
+        backend.initial_advertise_pending = false;
+
+        pb::write_string("on_ready_settled_probe");
+        backend.on_ready();
+        match rx
+            .try_recv()
+            .expect("post-handshake on_ready must advertise immediately")
+        {
+            ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)) => {
+                assert!(formats
+                    .iter()
+                    .any(|f| f.id == ClipboardFormatId::CF_UNICODETEXT));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// `on_remote_copy` is what the client's connect-time FormatList
+    /// announce (its pre-connection clipboard) actually drives — unlike
+    /// `on_ready`, it must NOT be gated, since it's the mechanism that
+    /// fetches that content in the first place.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn on_remote_copy_requests_the_announced_text_format() {
+        let (mut backend, mut rx) = test_backend();
+        let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+
+        backend.on_remote_copy(&formats);
+
+        match rx.try_recv().expect("must request the announced format") {
+            ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id)) => {
+                assert_eq!(id, ClipboardFormatId::CF_UNICODETEXT);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(
+            backend.last_requested,
+            Some(ClipboardFormatId::CF_UNICODETEXT)
+        );
     }
 
     /// Disposable temp directory; removed on drop. Standalone for the same

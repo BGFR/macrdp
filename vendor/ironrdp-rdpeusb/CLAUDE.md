@@ -62,18 +62,26 @@ dropped because we live outside the IronRDP cargo workspace (mirrors
     FreeRDP (id `>= 0x4`) is unaffected. Verified live: an mstsc-redirected camera +
     audio/HID device parse and enumerate.
     **UPSTREAMED 2026-08-02 as PR #1513** (`fix(rdpeusb): accept UsbDevice == 0 in
-    AddDevice`, branch `clintcan:fix/rdpeusb-usb-device-zero`, OPEN/MERGEABLE/CI-green,
-    awaiting review). This is the LAST rdpeusb holdout — with div (1) #1418 + div (3)
-    #1420 merged and div (4) dropping on the pin bump, #1513 merging makes this whole
+    AddDevice`, branch `clintcan:fix/rdpeusb-usb-device-zero`, MERGEABLE, awaiting
+    re-review). This is the LAST rdpeusb holdout — with div (1) #1418 + div (3) #1420
+    merged and div (4) dropping on the pin bump, #1513 merging makes this whole
     `vendor/ironrdp-rdpeusb` fork **fully de-vendorable** at the next pin bump (first
-    fork to go). **The upstream form is SIMPLER than this vendored match** and is what
-    to adopt on the bump: upstream #1321 had `match { 0x0..=0x3 => Err, value => try_from }`,
-    but `InterfaceId::try_from` ALREADY enforces the valid range (`<= 0x3FFF_FFFF`,
-    includes 0; rejects the mask range), so #1513 collapses the whole thing to
-    `let usb_device = InterfaceId::try_from(src.read_u32())?;` — a net removal. This
-    vendored copy's 2-arm `0x0..=0x3F_FF_FF_FF`/`0x40_00_00_00..` match is likewise
-    redundant with `try_from`; **on the pin bump, take the upstream one-liner, don't
-    re-apply this match.** Round-trip test upstream: `add_device_accepts_usb_device_zero`.
+    fork to go). **CORRECTION (2026-08-03, mamoreau review of #1513):** my first #1513
+    cut was a "net removal" (`let usb_device = InterfaceId::try_from(src.read_u32())?;`)
+    on the theory that `try_from`'s `<= 0x3FFF_FFFF` range check made the whole match
+    redundant. **That was WRONG** — `try_from` also admits `1..=3`, which are the
+    RDPEUSB default **Device Sink / Channel Notification** interface IDs; a device
+    announced with one collides with the crate's fixed dispatch and mis-decodes later
+    completion PDUs. mamoreau CHANGES_REQUESTED "narrow to the observed `UsbDevice == 0`",
+    so the upstream form is now a match that **rejects `0x1..=0x3` and allows only `0`**
+    (+ a `add_device_rejects_reserved_default_interface` test). **THIS VENDORED COPY
+    SHARES THE FLAW** — its 2-arm `0x0..=0x3F_FF_FF_FF`/`0x40_00_00_00..` match likewise
+    accepts `1..=3`. It is a LATENT bug only (no real client sends `UsbDevice` in
+    `1..=3` — mstsc=0, FreeRDP >=0x4; USB path is experimental/opt-in/entitled-only), so
+    **deliberately NOT patched here** — the pin bump replaces div (2) with upstream's
+    narrowed form and fixes it for free. On the bump, adopt the upstream **narrowed match**
+    (reject `0x1..=0x3`), NOT a `try_from` one-liner. Round-trip + reject tests upstream:
+    `add_device_accepts_usb_device_zero` / `add_device_rejects_reserved_default_interface`.
 
 (2) **Interface-0 device-completion routing** (`src/pdu/mod.rs`,
     `UrbdrcClientPdu::decode`). Consequence of the mstsc `UsbDevice = 0` above: a

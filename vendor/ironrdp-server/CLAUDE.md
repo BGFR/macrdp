@@ -919,10 +919,14 @@ AND released — #1276 landing is NOT sufficient.
     re-auths via NLA every connection), so this only *enables the client's*
     auto-reconnect loop; a fixed per-process `logon_id`/`random_bits` is fine.
     Additive + standard RDP server behavior → cleanly upstreamable (a real RDP
-    server always sends this). **UPSTREAMED 2026-07-02 as PR #1405**
-    (`feat(server): send the Server Auto-Reconnect Cookie during logon`, branch
-    `clintcan:feat/server-auto-reconnect-cookie`, OPEN/CI-green/MERGEABLE,
-    awaiting review). The upstream port keeps the same send point + per-connection
+    server always sends this). **MERGED 2026-07-31 as PR #1405**
+    (`feat(server): send the Server Auto-Reconnect Cookie during logon`, by
+    mamoreau-devolutions). mamoreau's review asked for returning-cookie
+    validation + rotation; those were accepted as a **deferred follow-up** (the
+    phased split — send-side merged now), tracked in **issue #1508**
+    (`validate + rotate the Server Auto-Reconnect Cookie`). macrdp's vendored
+    send-only form is unaffected (single-console-session + NLA re-auth doesn't
+    need the returning-cookie validation). The upstream port keeps the same send point + per-connection
     guard but shapes the API like `credential_validator` — a builder method
     `with_auto_reconnect_cookie(Option<ServerAutoReconnect>)` + a runtime setter
     `set_auto_reconnect_cookie(Option<..>)` (vs this vendored `(logon_id,

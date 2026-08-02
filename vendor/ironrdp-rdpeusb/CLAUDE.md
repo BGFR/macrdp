@@ -39,9 +39,16 @@ dropped because we live outside the IronRDP cargo workspace (mirrors
     device data. **Verified live** with a USB-3.2 flash drive over a
     FreeRDP-with-urbdrc client: `ADD_DEVICE` fully decodes (`usb_version=Usb32`),
     no error, session stays up.
-    Upstreamable (the strict enums are a genuine interop bug against real Windows
-    USB-3 devices) — offer it alongside the server-direction `UrbdrcServer` work.
-    Keep this vendor dir until that lands AND releases.
+    **MERGED 2026-07-31 as PR #1418** (`feat(rdpeusb)!: tolerate unrecognized
+    device-reported USB capability values`, by CBenoit "LGTM!"). NB the upstream
+    form was RESHAPED at CBenoit's request from this `Other(u32)` fallback to
+    **newtype-over-`u32` + named consts** (no aliasing → exact round-trip/Eq), so
+    on the pin bump the vendored `Other(u32)` code is REPLACED by the upstream
+    newtype and macrdp call sites shift `SupportedUsbVer::Usb32`→`::USB_32`. Keep
+    this vendor dir until the pin bumps past the merge + a release (and for the
+    `usb_device == 0` extension below, which was NOT upstreamed — it conflicts with
+    merged #1321's deliberate `0x0..=0x3` reject; needs a "mstsc really sends 0"
+    argument to land separately).
 
     **Extension (2026-07-07, real mstsc): `AddDevice.usb_device == 0` accepted**
     (`src/pdu/sink.rs`). `AddDevice::decode` rejected the `UsbDevice` interface id
@@ -54,6 +61,19 @@ dropped because we live outside the IronRDP cargo workspace (mirrors
     plain-interface-id range (only the StreamId-masked high range stays invalid).
     FreeRDP (id `>= 0x4`) is unaffected. Verified live: an mstsc-redirected camera +
     audio/HID device parse and enumerate.
+    **UPSTREAMED 2026-08-02 as PR #1513** (`fix(rdpeusb): accept UsbDevice == 0 in
+    AddDevice`, branch `clintcan:fix/rdpeusb-usb-device-zero`, OPEN/MERGEABLE/CI-green,
+    awaiting review). This is the LAST rdpeusb holdout — with div (1) #1418 + div (3)
+    #1420 merged and div (4) dropping on the pin bump, #1513 merging makes this whole
+    `vendor/ironrdp-rdpeusb` fork **fully de-vendorable** at the next pin bump (first
+    fork to go). **The upstream form is SIMPLER than this vendored match** and is what
+    to adopt on the bump: upstream #1321 had `match { 0x0..=0x3 => Err, value => try_from }`,
+    but `InterfaceId::try_from` ALREADY enforces the valid range (`<= 0x3FFF_FFFF`,
+    includes 0; rejects the mask range), so #1513 collapses the whole thing to
+    `let usb_device = InterfaceId::try_from(src.read_u32())?;` — a net removal. This
+    vendored copy's 2-arm `0x0..=0x3F_FF_FF_FF`/`0x40_00_00_00..` match is likewise
+    redundant with `try_from`; **on the pin bump, take the upstream one-liner, don't
+    re-apply this match.** Round-trip test upstream: `add_device_accepts_usb_device_zero`.
 
 (2) **Interface-0 device-completion routing** (`src/pdu/mod.rs`,
     `UrbdrcClientPdu::decode`). Consequence of the mstsc `UsbDevice = 0` above: a
@@ -87,7 +107,12 @@ dropped because we live outside the IronRDP cargo workspace (mirrors
     `total_length - 9` bytes (clamped, so a header-only descriptor still decodes). The
     server's `parse_configuration` fills it from the fetched config descriptor. Verified
     live: mstsc `SelectConfiguration` succeeds (pipe handles returned) for a camera +
-    audio/HID device; FreeRDP mass storage unaffected. Upstreamable with (1)/(2).
+    audio/HID device; FreeRDP mass storage unaffected. **MERGED 2026-07-31 as PR #1420**
+    (`feat(rdpeusb)!: carry the full configuration descriptor in UsbConfigDesc`, by
+    mamoreau-devolutions). CBenoit APPROVED "just needs a rebase" (it was stacked on
+    #1418); rebased onto master — `--onto` dropped the then-merged #1418 commits,
+    replayed only #1420's own — then merged. Drop from this fork on the pin bump past
+    its release. So the whole rdpeusb pair (div 1 #1418 + div 3 #1420) is now upstream.
 
 (4) **Panic-hardening: bound wire-controlled `read_slice` lengths in the
     completion decoders** (`src/pdu/completion/mod.rs`, `src/pdu/completion/

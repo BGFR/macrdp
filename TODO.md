@@ -618,22 +618,26 @@ then delete; promote a parked item to *In flight* when work actually starts.
   multitransport, rdpdr server-direction, smartcard, acceptor KLID+MT, audio-lag/resize/dispatch,
   server ARC auto-reconnect cookie). **#1359 (rdpsnd) + #1397 (acceptor keyboard-layout on
   `AcceptorResult`) MERGED 2026-07-01; #1373 (acceptor honor-size) MERGED 2026-07-02 (`d471bd06`).**
-  **Four clintcan PRs currently OPEN (all MERGEABLE, awaiting review — reactive-only, do
-  not poll/nudge):**
+  **MERGE WAVE 2026-07-30/31 (mamoreau + CBenoit): #1453 + #1405 + #1418 + #1420 all MERGED
+  (the rebase unblocked #1420). Now ONLY ONE PR open — #1404 (idle since 07-02, now
+  CONFLICTING after the master advance) — plus tracking issue #1508. Reactive-only:**
   - [ ] **#1404** `feat(acceptor)!: clamp honored client desktop size to an operator maximum` — the
     honor-size resource-hardening CBenoit green-lit in his #1373 approval. Replaces the `bool` with
     `Option<DesktopSize>` = operator max; client request clamped per-dimension. Upstreams the
     hardened form of acceptor divergence (1).
-  - [ ] **#1405** `feat(server): send the Server Auto-Reconnect Cookie during logon` — upstreams
+  - [x] **#1405** `feat(server): send the Server Auto-Reconnect Cookie during logon` — upstreams
     vendored `ironrdp-server` divergence (13). Additive (default `None`): optional ARC_SC cookie
-    (MS-RDPBCGR 2.2.4.3) sent as a Save Session Info PDU once per connection, so a client
+    (MS-RDPBCGR 2.2.4.2) sent as a Save Session Info PDU once per connection, so a client
     auto-reconnects on an ungraceful drop (mstsc won't without it). API mirrors `credential_validator`
-    (builder `with_auto_reconnect_cookie` + setter). PR body flags the one open design point:
-    send-only, does NOT validate the returning ARC_CS cookie (offered as a follow-up).
-  - [ ] **#1418** `feat(rdpeusb)!: tolerate unrecognized device-reported USB capability values` —
-    opened 2026-07-08. Upstreams vendored `ironrdp-rdpeusb` divergence (1) (the lenient USB-caps
-    decode): fixes a real USB-3.2 device (SupportedUsbVersion `0x320`) tearing down the URBDRC
-    channel on decode. **REVIEW ADDRESSED 2026-07-10 (commit `80c7c8b9`):** CBenoit REQUIRED
+    (builder `with_auto_reconnect_cookie` + setter). **MERGED 2026-07-31 (mamoreau).** The phased
+    split was accepted — send-side merged; returning-cookie validation + rotation DEFERRED to
+    tracking issue **#1508**. (A doc-push exposed a stale-base build break — #1348 removed
+    `encode_share_data_pdu` — fixed by rebase + reintroducing the helper as the PR's own; CI green
+    before merge.)
+  - [x] **#1418** `feat(rdpeusb)!: tolerate unrecognized device-reported USB capability values` —
+    opened 2026-07-08, **MERGED 2026-07-31 (CBenoit "LGTM!").** Upstreams vendored `ironrdp-rdpeusb`
+    divergence (1) (the lenient USB-caps decode): fixes a real USB-3.2 device (SupportedUsbVersion
+    `0x320`) tearing down the URBDRC channel on decode. **REVIEW ADDRESSED 2026-07-10 (commit `80c7c8b9`):** CBenoit REQUIRED
     dropping the `Other(u32)` fallback (it can alias a named value → breaks round-trip/Eq, a pattern
     they're purging codebase-wide), so the 4 device-reported fields are now **newtype structs over
     `u32` with named associated consts** (the `http::StatusCode` shape; matches the crate's own
@@ -645,23 +649,38 @@ then delete; promote a parked item to *In flight* when work actually starts.
     non-`0x1` non-zero speed. FIXED 2026-07-16 (`04c76e7a`): compare `!= FULL_SPEED` (any non-zero) +
     a 4-case raw-decode rstest. 2026-07-17: uchouT ENDORSED merge (pinged CBenoit "can we just merge
     this?") — community review done, awaiting only CBenoit's merge click. Do NOT double-nudge.**
-    Scoped to (1) only — HELD
-    rdpeusb (2) `UsbDevice=0` (CONFLICTS with merged #1321, which deliberately rejects that range;
-    needs a "mstsc really sends 0 + capture" argument). On merge+release, most of rdpeusb divergence
-    (1) drops. **Pin-bump churn: macrdp-side call sites shift `SupportedUsbVer::Usb32`→`::USB_32`
+    Scoped to (1) only —
+    rdpeusb (2) `UsbDevice=0` is now its own PR (**#1513**, below). On merge+release, most of rdpeusb
+    divergence (1) drops. **Pin-bump churn: macrdp-side call sites shift `SupportedUsbVer::Usb32`→`::USB_32`
     consts (mechanical, only at bump).**
-  - [ ] **#1420** `feat(rdpeusb)!: carry the full configuration descriptor in UsbConfigDesc` —
+  - [x] **#1420** `feat(rdpeusb)!: carry the full configuration descriptor in UsbConfigDesc` —
     FILED 2026-07-09 (was the drafted rdpeusb div (3)). `UsbConfigDesc` gains `trailing: Vec<u8>`
     (bytes 9..wTotalLength) so `TS_URB_SELECT_CONFIGURATION` carries the full configuration
     descriptor (real Windows rejects header-only with `0x80070057`). **REVIEW ADDRESSED 2026-07-10
     (commit `2cde264f`):** added Copilot's asked-for encode-time validation — `bLength`==9-byte
     header AND `wTotalLength`==header+trailing, so a caller can't emit a descriptor whose
     `wTotalLength` disagrees with the payload (+ `inconsistent_header_fails_to_encode` test).
-    **Double-checked 2026-07-10: build/clippy-D/tests/fmt clean; amendment is purely additive
-    validation.** Only Copilot has reviewed (no human yet). Independent of #1418 (different
-    file/type); both touch `tests/rdpeusb/mod.rs` (one line) → rebase whichever merges second.
-  - [ ] **#1453** `feat(acceptor): expose client multitransport flags on AcceptorResult` — opened
-    2026-07-17. Upstreams the READ-side of vendored `ironrdp-acceptor` divergence (3): surfaces
+    **CBenoit APPROVED 2026-07-31 ("LGTM and approving; just needs a rebase").** It was stacked on
+    #1418; when that merged first #1420 went CONFLICTING → **REBASED** (`git rebase --onto
+    upstream/master` dropped the two now-merged #1418 commits, replayed only #1420's own; `mod.rs`
+    auto-resolved), force-pushed → **MERGED 2026-07-31 (mamoreau).** The rdpeusb pair (div 1 #1418 +
+    div 3 #1420) is now fully upstream.
+    (Local clippy false-alarm during verify: `unfulfilled_lint_expectations` in `ironrdp-str` — a
+    crate #1420 doesn't touch — from local rustc 1.97 vs CI's pinned 1.89; reproduces on pristine
+    master, CI unaffected.)
+  - [ ] **#1513** `fix(rdpeusb): accept UsbDevice == 0 in AddDevice` — OPENED 2026-08-02
+    (branch `clintcan:fix/rdpeusb-usb-device-zero`, MERGEABLE, CI green). Upstreams the LAST rdpeusb
+    holdout, divergence (2): real mstsc sends `UsbDevice == 0` but #1321's `0x0..=0x3 => Err`
+    special-case rejects it → every mstsc ADD_DEVICE fails to parse (FreeRDP uses >=0x4 so it hid).
+    **The elegant fix is a NET REMOVAL:** `InterfaceId::try_from` already enforces the valid range
+    (`<= 0x3FFF_FFFF`, includes 0; rejects the mask range), so the whole match collapses to
+    `let usb_device = InterfaceId::try_from(src.read_u32())?;` — simpler than upstream AND than
+    macrdp's own vendored 2-arm match (adopt the upstream one-liner on the pin bump). NOT breaking
+    (decoder accepts a previously-rejected value). Test `add_device_accepts_usb_device_zero`; 48
+    rdpeusb tests pass. **With #1418+#1420 merged + div (4) drop-on-bump, #1513 merging makes the
+    ENTIRE `vendor/ironrdp-rdpeusb` fork de-vendorable at the next pin bump (first whole fork to go).**
+  - [x] **#1453** `feat(acceptor): expose client multitransport flags on AcceptorResult` — opened
+    2026-07-17, **MERGED 2026-07-30 (mamoreau).** Upstreams the READ-side of vendored `ironrdp-acceptor` divergence (3): surfaces
     `pub multitransport_flags: gcc::MultiTransportFlags` (the client's GCC `MultiTransportChannelData`,
     MS-RDPBCGR §2.2.1.3.8, which the acceptor already parses then discards) so a UDP-capable server
     can decide whether to send a Server Initiate Multitransport Request. **Purely additive, zero
@@ -685,9 +704,17 @@ then delete; promote a parked item to *In flight* when work actually starts.
   (15 git pins + all 6 vendor forks are version-coupled; breaking `core 0.1→0.2` / `pdu 0.7→0.8` /
   `dvc 0.5→0.7` / `server 0.10→0.12`) and churns every vendored crate, so it runs as its OWN
   dedicated effort + release, never a side task.
-  **Trigger (whichever first):** (i) the small-PR wave merges — the rdpeusb pair (#1418 + #1420)
-  and #1405 (+#1415/#1404 if they land) — maximizing the harvest to
-  ~11–12 divergence deletions in ONE migration instead of two; or (ii) a **~6-week staleness cap
+  **Trigger (whichever first):** (i) the small-PR wave merges — **FIRED 2026-07-30/31:
+  #1453 + #1405 + #1418 + #1420 all MERGED; only #1404 still open (idle, now CONFLICTING).** So the
+  harvest is now ripe — a bump past these merges deletes the acceptor (2)/(3-read)
+  KLID+MT-flags, server (13) ARC-cookie, and rdpeusb (1) lenient-caps + (3)
+  full-config divergences, on top of the six already-merged ones (#1302/#1373/#1397/#1319/#1332/
+  #1335/#1341) — order ~11–12 deletions in ONE migration. NB rdpeusb (1)'s upstream form is the
+  NEWTYPE reshape, so the bump REPLACES the vendored `Other(u32)` and shifts call sites
+  `Usb32`→`USB_32`. **With rdpeusb (2) `usb_device==0` now filed as #1513, once it merges the ENTIRE
+  `vendor/ironrdp-rdpeusb` fork de-vendors on the bump (div 1/2/3 upstream + div 4 drop-on-bump) —
+  the first whole fork to go; other vendored forks (server div 16 etc.) still carry macrdp-specific
+  divergences and stay.** Or (ii) a **~6-week staleness cap
   (early Aug 2026)** — upstream is refactoring code our divergences sit on (e.g. #1407 restructured
   rdpeusb), so waiting past the cap makes the re-vendor diff hairier; bump anyway if reviews stall.
   **Precondition:** the Tier 2.4 48–72 h soak has signed off the current baseline (don't churn the
@@ -698,6 +725,15 @@ then delete; promote a parked item to *In flight* when work actually starts.
   follow-ups (a)+(b) above, plus EVALUATE upstream's new `autodetect_rtt` (builder,
   `Option<Arc<AtomicU32>>`) as a replacement for server divergence (15) RTT-cell → full gates
   (fmt/clippy/tests both OSes) → **live re-verification on real mstsc + FreeRDP** (H.264, audio,
+  <!-- SERVER DIV 16 (URBDRC) — #1394 API-FIT INVESTIGATED 2026-08-02 (see project_upstream_ironrdp_open_prs):
+  NOT a free bump deletion. #1394 landed in ironrdp-rdpeusb (sans-I/O) as UrbdrcControlServer +
+  UrbdrcDeviceServer (DvcServerProcessor + backend traits, sync request-generating). macrdp's div 16
+  is the HIGHER async layer (UsbHandle transfer API + UsbRouter completion router + ServerEvent::Urbdrc
+  integration + urbdrc_factory seam). Path to DELETE div 16: (a) upstream a small urbdrc_factory seam to
+  ironrdp-server (mirrors gfx_factory — STANDALONE PR, fileable NOW, doesn't need the bump); (b) rebuild
+  macrdp's USB server on #1394's UrbdrcDeviceServer+backend, keep only the thin async glue MOVED into
+  macrdp's own src/usb_redirect/. Pin-bump-era re-architecture, own effort. -->
+  clipboard, RDPDR, blank-recovery, USB if entitled) → ship as its own release with nothing else
   clipboard, RDPDR, blank-recovery, USB if entitled) → ship as its own release with nothing else
   in it. **Watch items:** issue #1352 (pdu spec-line split would rename macrdp's direct
   `ironrdp-pdu` dep) and egfx breaking changes. Est. 1–2 focused days + verification.

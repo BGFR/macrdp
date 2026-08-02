@@ -729,10 +729,13 @@ then delete; promote a parked item to *In flight* when work actually starts.
   NOT a free bump deletion. #1394 landed in ironrdp-rdpeusb (sans-I/O) as UrbdrcControlServer +
   UrbdrcDeviceServer (DvcServerProcessor + backend traits, sync request-generating). macrdp's div 16
   is the HIGHER async layer (UsbHandle transfer API + UsbRouter completion router + ServerEvent::Urbdrc
-  integration + urbdrc_factory seam). Path to DELETE div 16: (a) upstream a small urbdrc_factory seam to
-  ironrdp-server (mirrors gfx_factory — STANDALONE PR, fileable NOW, doesn't need the bump); (b) rebuild
-  macrdp's USB server on #1394's UrbdrcDeviceServer+backend, keep only the thin async glue MOVED into
-  macrdp's own src/usb_redirect/. Pin-bump-era re-architecture, own effort. -->
+  integration + urbdrc_factory seam). Path to DELETE div 16 is ALREADY being built upstream by uchouT
+  (do NOT file a competing PR): (a) the ironrdp-server seam = uchouT's OPEN PR #1417 (adds
+  ServerBuilder::with_usb_factory + src/urbdrc.rs + UsbDeviceHandle + per-device backend — near-exact
+  match to div 16; blocked by #1416, stale 07-15); (b) when #1417+#1394 merge + pin bump, macrdp adopts
+  upstream's with_usb_factory/UsbDeviceHandle/backend and DELETES vendor/ironrdp-server/src/rdpeusb.rs.
+  Only constructive move for us: VALIDATE #1417 from macrdp's real-URBDRC-server perspective (like the
+  #1509 validation) once it's unblocked. Track it, don't file. Pin-bump-era adoption. -->
   clipboard, RDPDR, blank-recovery, USB if entitled) → ship as its own release with nothing else
   clipboard, RDPDR, blank-recovery, USB if entitled) → ship as its own release with nothing else
   in it. **Watch items:** issue #1352 (pdu spec-line split would rename macrdp's direct

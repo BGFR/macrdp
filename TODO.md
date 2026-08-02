@@ -737,7 +737,6 @@ then delete; promote a parked item to *In flight* when work actually starts.
   Only constructive move for us: VALIDATE #1417 from macrdp's real-URBDRC-server perspective (like the
   #1509 validation) once it's unblocked. Track it, don't file. Pin-bump-era adoption. -->
   clipboard, RDPDR, blank-recovery, USB if entitled) → ship as its own release with nothing else
-  clipboard, RDPDR, blank-recovery, USB if entitled) → ship as its own release with nothing else
   in it. **Watch items:** issue #1352 (pdu spec-line split would rename macrdp's direct
   `ironrdp-pdu` dep) and egfx breaking changes. Est. 1–2 focused days + verification.
 - Upstream-ability of the remaining divergences was surveyed 2026-07-01 (don't re-survey; ranking

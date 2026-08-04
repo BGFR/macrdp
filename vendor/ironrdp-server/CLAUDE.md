@@ -1675,6 +1675,40 @@ AND released — #1276 landing is NOT sufficient.
        after an eviction. Accepted — it's a net under the real fix, not the
        mechanism itself, and the alternative (no bound at all) is worse.
 
+       **Known limitation 2 — a MULTI-HOMED auto-reconnecting client DEFEATS
+       the net (live-observed 2026-08-04 on the soak mini).** The inverse of
+       limitation 1: the cooldown keys on source IP, so a SINGLE client
+       reachable over more than one network path presents more than one IP and
+       just alternates them to dodge it — barred on IP-a, it auto-reconnects on
+       IP-b (a different key → not barred), re-takes the session, and the
+       ping-pong the whole `recently_evicted` / `EvictedByOtherConnection`
+       machinery exists to stop runs anyway. Observed with the macOS **Windows
+       App** (`client_name=MacBook-Pro`) reaching the mini over BOTH LAN
+       (192.168.0.185) AND ZeroTier (10.241.115.104): it (a) does NOT honor
+       `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION` — it auto-reconnects after
+       eviction regardless (the notice's "client-dependent" caveat, now
+       confirmed for this client), and (b) is multi-homed, so it repeatedly
+       stole the session back from an mstsc peer (192.168.0.149) across the two
+       IPs — one of which the guard WAS actively barring (`ignoring a reconnect
+       from the peer just evicted` fired correctly on that path each time; it
+       simply can't cover the other). Takeover ITSELF worked correctly
+       throughout and the server stayed a single stable process under the storm
+       — only the anti-flap NET is defeated, not preemption. No perfect
+       server-side key exists at the preempt-decision point (source IP is the
+       only per-connection-stable id there — `client_name` is spoofable /
+       non-unique, and the session/logon identity isn't known until after the
+       candidate authenticates). Practical fix is CLIENT-SIDE: fully QUIT the
+       losing client (not just disconnect) / disable its auto-reconnect / point
+       it at a single address. Possible server-side hardening, DEFERRED (do not
+       touch mid-soak): key the cooldown on the candidate's negotiated logon
+       identity instead of (or in addition to) source IP, or a global "just
+       evicted → refuse ALL new preemptions for N ms" quench that a
+       multi-homed client can't route around. Also compounds cosmetically with
+       the mstsc first-connect cert-prompt broken-pipe (`auth
+       did_not_complete [write all]` → immediate retry succeeds), which makes
+       the winning peer's OWN reconnect read as "asks for credentials, then
+       disconnects" on its first attempt before the retry lands.
+
     Covered by `src/conn_test.rs::second_client_preempts_the_live_session`
     (extended: now asserts the evicted session actually RECEIVES
     `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION`, decoding the PDU rather than

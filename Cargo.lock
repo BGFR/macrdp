@@ -1611,7 +1611,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-async"
 version = "0.8.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?rev=879ffed866c32748d30d26b54f9d667ad001c51c#879ffed866c32748d30d26b54f9d667ad001c51c"
 dependencies = [
  "bytes",
  "ironrdp-connector",

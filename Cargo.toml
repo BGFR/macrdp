@@ -132,7 +132,13 @@ ironrdp-str              = { git = "https://github.com/Devolutions/IronRDP.git",
 ironrdp-error            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp                  = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-ainput           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
-ironrdp-async            = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
+# ironrdp-async is VENDORED (same upstream rev 879ffed) for the read_by_hint
+# zero-length-PDU DoS guard (macrdp PR #1556, commit c541d09e) — an unauth pre-TLS
+# remote DoS: a single 2-byte fast-path frame spins read_by_hint at 100% CPU and
+# wedges the accept loop. See vendor/ironrdp-async/CLAUDE.md. Two-sided (also in the
+# [patch."...git"] block below) because the git-pinned ironrdp crates depend on it
+# within the IronRDP workspace. Drop when the pin bumps past #1515 + #1556.
+ironrdp-async            = { path = "vendor/ironrdp-async" }
 ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
 ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "879ffed866c32748d30d26b54f9d667ad001c51c" }
@@ -152,6 +158,7 @@ ironrdp-tokio            = { git = "https://github.com/Devolutions/IronRDP.git",
 # consumer resolves to the single vendored copy.
 [patch."https://github.com/Devolutions/IronRDP.git"]
 ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
+ironrdp-async = { path = "vendor/ironrdp-async" }
 
 [profile.release]
 lto = "thin"

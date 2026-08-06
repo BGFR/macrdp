@@ -296,8 +296,10 @@ The entitlement `com.apple.developer.usb.host-controller-interface` is **granted
   pinned `ironrdp-rdpeusb` `SupportedUsbVer` enum stopped at USB 2.0 and rejected a
   modern device's `0x320` (USB 3.2) caps, so `ironrdp-rdpeusb` is now **vendored** with
   a lenient `UsbDeviceCaps` decode (USB 3.x versions + `Other(u32)` fallbacks). Verified
-  live with a USB-3.2 flash drive (`usb_version=Usb32`). See
-  `vendor/ironrdp-rdpeusb/CLAUDE.md`.
+  live with a USB-3.2 flash drive (`usb_version=Usb32`). (The lenient decode landed
+  upstream, so the `ironrdp-rdpeusb` fork was **de-vendored at the a5d1c682 pin bump**
+  (v0.9.5) — the crate is now the plain git dep, and the server-side USB code stays in the
+  vendored `ironrdp-server`, `src/rdpeusb.rs`, divergence 16.)
 - **Phase 3.1b(2a) GO** — a server-initiated **`GET_DESCRIPTOR` control transfer**
   round-trips real device data (proven observe-only, plain `cargo build`): on
   `ADD_DEVICE` the device processor sends `RegisterRequestCallback` +

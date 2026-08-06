@@ -21,7 +21,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.9.4** (security hotfix — an UNAUTH, pre-TLS remote DoS: a single
+(VPN/ZeroTier). **Latest release: v0.9.5** (maintenance — the IronRDP dependency pin bumped
+`879ffed8` → `a5d1c682` (133 commits) and vendored divergence *shrank*; **no user-facing
+change, default runtime path functionally unchanged**. Retires TWO vendored forks — the
+**`ironrdp-rdpeusb` crate** (its lenient USB-3 caps decode landed upstream; `src/rdpeusb.rs`
+PORTED to a5d1c682's split control/device PDUs — **mstsc Xbox-controller USB redirect
+live-verified on the bumped build**, proving the mstsc-strict interop fixes survived the
+port) and **`ironrdp-async`** (the v0.9.4 DoS guard — DROPPED because a5d1c682 already
+carries upstream **#1515**'s `find_size` hardening, so the pre-auth framing DoS is now fixed
+*upstream in the pin*, not by a local vendor) — and **harvests one divergence** (QOI,
+always-Rgb, upstream #1335+#1341). Absorbs into `src/`: honor-client-desktop-size, **rdpsnd
+format selection #1359** (the crate now owns it → macrdp's `choose_audio_format` divergence
+gone), and the **egfx frame-ack signature #1345**. Net **−2 vendored forks, −1 divergence**
+(`vendor/` now holds 5 forks: acceptor/dvc/rdpdr/rdpeudp/server). VERIFIED end-to-end on
+FreeRDP (CredSSP/audit, AAC, H.264) + mstsc (USB) + the four abuse-fuzz harnesses; **soaked
+27.4 h on the Mac mini** (0 panics/0 restarts, RSS bounded avg 54 MB) alongside the
+adversarial abuse suite — see `docs/pin-bump-soak-results.md`. Landed via PR #178. Deferred
+de-drift: the honor-size server-half (divergence #9) + upstreamed-but-unreleased divergences
+#5/#6/#13 drop on a future bump.) Earlier: **v0.9.4** (security hotfix — an UNAUTH, pre-TLS remote DoS: a single
 malformed 2-byte fast-path frame (`04 00`/`00 00`) spun the vendored `ironrdp-async`
 `Framed::read_by_hint` at 100% CPU (`read_exact(0)` in a non-yielding loop) and wedged the
 acceptor's accept loop = whole-server outage; reachable before TLS/CredSSP so the auth-guard
@@ -31,8 +48,9 @@ passes). Fixed by **vendoring `ironrdp-async`** (4-file crate, two-sided `[patch
 (commit `c541d09e`), complementing upstream #1515's `find_size` hardening. NO `src/` change.
 Found by `soak_abuse3` decoder-fuzz. LIVE-VERIFIED: the 2-byte trigger ×10 → CPU 0.0% (no
 spin/pegged thread), accept loop live, guard fires (`accept_begin failed`) = clean
-per-connection rejection. Drop the vendor dir when the pin bumps past #1515+#1556. See
-`vendor/ironrdp-async/CLAUDE.md`.) Earlier: **v0.9.3** (storm-guard fix + the connection/input batch —
+per-connection rejection. The `ironrdp-async` vendor dir was DROPPED at the v0.9.5
+a5d1c682 pin bump — a5d1c682 carries #1515, so this framing DoS is now fixed upstream in
+the pin, not by a local vendor.) Earlier: **v0.9.3** (storm-guard fix + the connection/input batch —
 a blank-recovery reliability fix plus four merged @antonmos contributions; **default runtime
 path unchanged**. Headline: the mstsc/Windows-App reconnect-blank drop loop can no longer run
 away. The reconnect-storm guard (`MAX_CONSECUTIVE_DROPS`) reset its counter whenever a

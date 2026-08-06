@@ -310,19 +310,16 @@ vendor/ironrdp-rdpdr/     Local fork of ironrdp-rdpdr 0.5.0 (added 2026-06-16,
                           vendor/ironrdp-server/src/rdpdr.rs. See
                           vendor/ironrdp-rdpdr/CLAUDE.md.
 
-vendor/ironrdp-rdpeusb/   Local fork of ironrdp-rdpeusb (added 2026-07-06) for
-                          generic USB redirection (--enable-usb-redirection, opt-in,
-                          EXPERIMENTAL). The MS-RDPEUSB / URBDRC PDU layer (server
-                          UrbdrcServerPdu encode + client UrbdrcClientPdu decode incl.
-                          AddDevice + UrbCompletion, and the TS_URB set — descriptor /
-                          SelectConfiguration / bulk-or-interrupt / control-transfer).
-                          The fork's divergence is a LENIENT UsbDeviceCaps decode (USB
-                          3.x SupportedUsbVer + Other(u32) fallbacks) so a modern USB-3
-                          device's caps parse instead of erroring. The server-direction
-                          UrbdrcServer processor + the async UsbHandle transfer path
-                          that USE these PDUs live in the vendored ironrdp-server
-                          (src/rdpeusb.rs, divergence 16), NOT here. Candidate for
-                          upstream. See vendor/ironrdp-rdpeusb/CLAUDE.md.
+(vendor/ironrdp-rdpeusb/  DE-VENDORED at the a5d1c682 pin bump (v0.9.5, 2026-08-06).
+                          The lenient UsbDeviceCaps decode (USB 3.x SupportedUsbVer +
+                          Other(u32) fallbacks) landed upstream, so the MS-RDPEUSB /
+                          URBDRC PDU crate is now the plain a5d1c682 git dependency
+                          (Cargo.toml), not a fork. The server-direction USB-redirection
+                          processor + the async UsbHandle transfer path that USE those
+                          PDUs still live in the vendored ironrdp-server (src/rdpeusb.rs,
+                          divergence 16) — that IS --enable-usb-redirection; only the
+                          PDU-layer fork went away. If you're seeing this in a stale
+                          checkout, the dir isn't missing — it stopped existing.)
 
 vendor/ironrdp-rdpeudp/   NEW sans-I/O crate (added 2026-06-25) for RDP UDP
                           multitransport (--enable-udp-multitransport, feature

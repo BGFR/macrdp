@@ -66,6 +66,9 @@ const REPREEMPT_COOLDOWN: Duration = Duration::from_secs(5);
 /// previously accepted candidate. The `select!` yields one of these and does
 /// NOT mutate the probe slot — its futures still borrow it inside the select
 /// expression.
+// Short-lived select!-race enum — one is produced per loop iteration and consumed
+// immediately, so boxing the large variant would only add an accept-path allocation.
+#[allow(clippy::large_enum_variant)]
 enum PreemptRace {
     Ended(Result<()>),
     Accepted(std::io::Result<(tokio::net::TcpStream, SocketAddr)>),
@@ -134,13 +137,7 @@ pub trait ConnectionHandler: Send {
     /// hostname / raw RDP version / build number plus the General-capset
     /// platform (formatted). Informational fingerprinting — a client can
     /// claim anything. Default: no-op.
-    fn on_client_fingerprint(
-        &mut self,
-        client_name: &str,
-        rdp_version: u32,
-        client_build: u32,
-        platform: &str,
-    ) {
+    fn on_client_fingerprint(&mut self, client_name: &str, rdp_version: u32, client_build: u32, platform: &str) {
         let _ = (client_name, rdp_version, client_build, platform);
     }
 }
@@ -748,7 +745,10 @@ type AttachedGfxHandle = ();
 /// connection's own multitransport bookkeeping. A candidate that wins via
 /// preemption always runs plain TCP with no lossy-audio channel; a normal
 /// (non-racing) connection is unaffected.
-#[expect(clippy::too_many_arguments, reason = "internal helper, one call site per caller shape")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal helper, one call site per caller shape"
+)]
 fn attach_channels_impl(
     acceptor: &mut Acceptor,
     cliprdr_factory: Option<&dyn CliprdrServerFactory>,
@@ -757,7 +757,9 @@ fn attach_channels_impl(
     usb_factory: Option<&dyn crate::UrbdrcServerFactory>,
     camera_factory: Option<&dyn crate::RdCameraServerFactory>,
     #[cfg(feature = "egfx")] gfx_factory: Option<&dyn GfxServerFactory>,
-    #[cfg(feature = "multitransport")] multitransport_lossy_audio_formats: Option<Vec<ironrdp_rdpsnd::pdu::AudioFormat>>,
+    #[cfg(feature = "multitransport")] multitransport_lossy_audio_formats: Option<
+        Vec<ironrdp_rdpsnd::pdu::AudioFormat>,
+    >,
     #[cfg(feature = "multitransport")] lossy_audio_format: crate::multitransport::audio_dvc::NegotiatedAudioFormat,
     display: &Arc<Mutex<Box<dyn RdpServerDisplay>>>,
     handler: &Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
@@ -937,15 +939,31 @@ struct NegotiatedCandidate {
 /// ever sees) and takes `&NegotiationContext` instead, precisely so it can
 /// run alongside a live `&mut self` borrow. Keep the two in sync by hand if
 /// the negotiation sequence ever changes upstream.
-async fn negotiate_candidate(ctx: &NegotiationContext, stream: TcpStream, peer: SocketAddr) -> Option<NegotiatedCandidate> {
+async fn negotiate_candidate(
+    ctx: &NegotiationContext,
+    stream: TcpStream,
+    peer: SocketAddr,
+) -> Option<NegotiatedCandidate> {
     let framed = TokioFramed::new(stream);
 
     let size = ctx.display.lock().await.size().await;
     let capabilities = capabilities::capabilities(&ctx.opts, size);
     let mut acceptor = Acceptor::new(ctx.opts.security.flag(), size, capabilities, ctx.creds.clone());
-    acceptor.set_honor_client_desktop_size(ctx.honor_client_desktop_size);
-    acceptor.set_honor_client_desktop_size_max(ctx.honor_client_desktop_size_max);
+    // (vendored) Reconcile macrdp's (honor: bool, max: Option<DesktopSize>) onto the
+    // acceptor's unified Option<DesktopSize> API (upstream #1373+#1404): Some(max) =
+    // honor + clamp to max; None = don't honor. No explicit max honors up to the
+    // protocol ceiling (8192), where the clamp is a no-op.
+    acceptor.set_honor_client_desktop_size(ctx.honor_client_desktop_size.then(|| {
+        ctx.honor_client_desktop_size_max.unwrap_or(DesktopSize {
+            width: 8192,
+            height: 8192,
+        })
+    }));
 
+    #[allow(
+        clippy::let_unit_value,
+        reason = "attach_channels_impl returns () when the egfx feature is off"
+    )]
     let gfx_handle = attach_channels_impl(
         &mut acceptor,
         ctx.cliprdr_factory.as_deref(),
@@ -984,7 +1002,10 @@ async fn negotiate_candidate(ctx: &NegotiationContext, stream: TcpStream, peer: 
             // which macrdp never configures. Conservatively not eligible to
             // preempt rather than guessing at a meaning for "authenticated"
             // that doesn't apply here.
-            debug!(?peer, "candidate connection did not upgrade to TLS — not eligible to preempt");
+            debug!(
+                ?peer,
+                "candidate connection did not upgrade to TLS — not eligible to preempt"
+            );
             return None;
         }
     };
@@ -1036,7 +1057,11 @@ async fn negotiate_candidate(ctx: &NegotiationContext, stream: TcpStream, peer: 
         }
 
         if let Err(error) = auth_result {
-            debug!(?peer, ?error, "candidate CredSSP authentication failed — not preempting the live session");
+            debug!(
+                ?peer,
+                ?error,
+                "candidate CredSSP authentication failed — not preempting the live session"
+            );
             return None;
         }
     }
@@ -1050,6 +1075,9 @@ async fn negotiate_candidate(ctx: &NegotiationContext, stream: TcpStream, peer: 
 }
 
 impl RdpServer {
+    // Takes every channel factory + shared handle explicitly; RdpServerBuilder is the
+    // ergonomic construction path.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         opts: RdpServerOptions,
         handler: Box<dyn RdpServerInputHandler>,
@@ -1135,6 +1163,7 @@ impl RdpServer {
             udp_tunnel_bound: None,
             #[cfg(feature = "multitransport")]
             egfx_on_lossy_handle: None,
+            #[cfg(feature = "multitransport")]
             egfx_on_udp_handle: None,
             #[cfg(feature = "multitransport")]
             demigrate_request: None,
@@ -1298,10 +1327,7 @@ impl RdpServer {
     /// it and de-migrates EGFX back to the TCP DRDYNVC channel for the rest of the
     /// session. Reset to false on reconnect so a fresh connection retries UDP.
     #[cfg(feature = "multitransport")]
-    pub fn set_demigrate_request_handle(
-        &mut self,
-        handle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    ) {
+    pub fn set_demigrate_request_handle(&mut self, handle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
         self.demigrate_request = handle;
     }
 
@@ -1360,6 +1386,10 @@ impl RdpServer {
     }
 
     fn attach_channels(&mut self, acceptor: &mut Acceptor) {
+        #[allow(
+            clippy::let_unit_value,
+            reason = "attach_channels_impl returns () when the egfx feature is off"
+        )]
         let gfx_handle = attach_channels_impl(
             acceptor,
             self.cliprdr_factory.as_deref(),
@@ -1383,6 +1413,7 @@ impl RdpServer {
             self.gfx_handle = gfx_handle;
         }
         #[cfg(not(feature = "egfx"))]
+        #[allow(clippy::let_unit_value, reason = "gfx_handle is () when the egfx feature is off")]
         let _ = gfx_handle;
     }
 
@@ -1424,6 +1455,7 @@ impl RdpServer {
             self.gfx_handle = candidate.gfx_handle;
         }
         #[cfg(not(feature = "egfx"))]
+        #[allow(clippy::let_unit_value, reason = "gfx_handle is () when the egfx feature is off")]
         let _ = candidate.gfx_handle;
 
         let framed = self.accept_finalize(candidate.framed, candidate.acceptor).await?;
@@ -1457,8 +1489,12 @@ impl RdpServer {
         let mut acceptor = Acceptor::new(self.opts.security.flag(), size, capabilities, self.creds.clone());
         // (vendored) Let the acceptor adopt the client's requested desktop
         // size from Client Core Data before Demand Active goes out.
-        acceptor.set_honor_client_desktop_size(self.honor_client_desktop_size);
-        acceptor.set_honor_client_desktop_size_max(self.honor_client_desktop_size_max);
+        acceptor.set_honor_client_desktop_size(self.honor_client_desktop_size.then(|| {
+            self.honor_client_desktop_size_max.unwrap_or(DesktopSize {
+                width: 8192,
+                height: 8192,
+            })
+        }));
 
         // (vendored, feature=multitransport) When offering UDP multitransport:
         // (1) advertise EXTENDED_CLIENT_DATA_SUPPORTED so the client actually
@@ -1492,10 +1528,7 @@ impl RdpServer {
         #[cfg(feature = "multitransport")]
         let mt_rtt_gated = {
             let max = multitransport_offer_max_rtt_ms();
-            let rtt = self
-                .link_rtt_ms
-                .as_ref()
-                .map_or(0, |c| c.load(Ordering::Relaxed));
+            let rtt = self.link_rtt_ms.as_ref().map_or(0, |c| c.load(Ordering::Relaxed));
             let gated = max > 0 && rtt >= max && self.multitransport.is_some();
             if gated && !mt_suppressed {
                 tracing::info!(
@@ -1533,11 +1566,7 @@ impl RdpServer {
             self.multitransport_tunnel_inbound_rx = None;
         }
         #[cfg(feature = "multitransport")]
-        if let Some(provider) = self
-            .multitransport
-            .as_ref()
-            .filter(|_| !mt_suppressed && !mt_rtt_gated)
-        {
+        if let Some(provider) = self.multitransport.as_ref().filter(|_| !mt_suppressed && !mt_rtt_gated) {
             let offer = crate::multitransport::new_offer(provider.requested_protocol());
             // Register this connection's cookie so the UDP listener can bind an
             // inbound tunnel to it. Evict the previous connection's cookie first
@@ -1558,7 +1587,10 @@ impl RdpServer {
                 self.udp_tunnel_bound = Some(registry.register(offer.cookie, in_tx));
             }
             self.current_offer_cookie = Some(offer.cookie);
-            acceptor.set_advertise_extended_client_data(true);
+            // (pin bump a5d1c682) EXTENDED_CLIENT_DATA is now advertised unconditionally
+            // by the acceptor, so the old set_advertise_extended_client_data(true) call
+            // was retired from the re-vendored acceptor — the offer alone drives the
+            // multitransport negotiation now.
             acceptor.set_multitransport_offer(Some(offer));
         }
 
@@ -1686,6 +1718,9 @@ impl RdpServer {
         let mut pending: Option<(NegotiatedCandidate, SocketAddr)> = None;
 
         loop {
+            // Transient per-iteration enum unifying the two connection sources for the
+            // race below; boxing the large variants would add an allocation per accept.
+            #[allow(clippy::large_enum_variant)]
             enum Entry {
                 Fresh(TcpStream, SocketAddr),
                 Negotiated(NegotiatedCandidate, SocketAddr),
@@ -1768,12 +1803,12 @@ impl RdpServer {
                 // connection's RTT-dependent behavior (blank-recovery gating,
                 // adaptive-bitrate seeding) falls back to whatever was last
                 // observed rather than a fresh sample.
-                if let Entry::Fresh(stream, _) = &entry {
-                    if let Some(cell) = &self.link_rtt_ms {
-                        let rtt = tcp_srtt_ms(stream).unwrap_or(0);
-                        cell.store(rtt, Ordering::Relaxed);
-                        debug!(?peer, rtt_ms = rtt, "sampled TCP link RTT at accept");
-                    }
+                if let Entry::Fresh(stream, _) = &entry
+                    && let Some(cell) = &self.link_rtt_ms
+                {
+                    let rtt = tcp_srtt_ms(stream).unwrap_or(0);
+                    cell.store(rtt, Ordering::Relaxed);
+                    debug!(?peer, rtt_ms = rtt, "sampled TCP link RTT at accept");
                 }
                 let started = tokio::time::Instant::now();
 
@@ -2034,19 +2069,17 @@ impl RdpServer {
                     // still consume the stale cookie and re-raise the
                     // retired flag → zombie peer → spurious death + a
                     // 10-min offer cooldown on a healthy setup.
-                    if let Some(cookie) = self.current_offer_cookie.take() {
-                        if let Some(registry) = self.multitransport_cookies.as_ref() {
-                            registry.remove(&cookie);
-                        }
+                    if let Some(cookie) = self.current_offer_cookie.take()
+                        && let Some(registry) = self.multitransport_cookies.as_ref()
+                    {
+                        registry.remove(&cookie);
                     }
                 }
 
                 if let Some(handler) = self.connection_handler.as_ref() {
-                    let action = handler.borrow_mut().on_disconnected(
-                        peer,
-                        duration,
-                        result.as_ref().err(),
-                    );
+                    let action = handler
+                        .borrow_mut()
+                        .on_disconnected(peer, duration, result.as_ref().err());
                     if action == PostConnectionAction::Stop {
                         debug!(?peer, "Handler requested stop after disconnect");
                         break;
@@ -2231,13 +2264,12 @@ impl RdpServer {
                 // preempting client — see the variant's doc comment).
                 ServerEvent::EvictedByOtherConnection => {
                     debug!("evicting this connection — another client took the session over");
-                    let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(
-                        rdp::server_error_info::ServerSetErrorInfoPdu(
+                    let pdu =
+                        rdp::headers::ShareDataPdu::ServerSetErrorInfo(rdp::server_error_info::ServerSetErrorInfoPdu(
                             rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
                                 rdp::server_error_info::ProtocolIndependentCode::DisconnectedByOtherconnection,
                             ),
-                        ),
-                    );
+                        ));
                     // Best-effort: if the evicted peer's socket is already
                     // half-dead the write fails, which is fine — it's leaving
                     // either way, and the caller falls back to cancelling it.
@@ -2302,6 +2334,10 @@ impl RdpServer {
                         ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
                         ClipboardMessage::SendFileContentsRequest(request) => cliprdr.request_file_contents(request),
                         ClipboardMessage::SendFileContentsResponse(response) => cliprdr.submit_file_contents(response),
+                        // (pin-bump a5d1c682) upstream added this variant. macrdp drives
+                        // file copy via its own ServerEvent::ClipboardFileCopy, but the
+                        // match must cover it; same call the upstream arm makes.
+                        ClipboardMessage::SendInitiateFileCopy(files) => cliprdr.initiate_file_copy(files),
                         ClipboardMessage::Error(error) => {
                             error!(?error, "Handling clipboard event");
                             continue;
@@ -2398,7 +2434,8 @@ impl RdpServer {
                                 warn!("No DRDYNVC channel, cannot open URBDRC device channel");
                                 continue;
                             };
-                            match drdynvc.create_channel(crate::rdpeusb::UrbdrcDeviceProcessor::new(sender, device_cb)) {
+                            match drdynvc.create_channel(crate::rdpeusb::UrbdrcDeviceProcessor::new(sender, device_cb))
+                            {
                                 Ok(m) => m,
                                 Err(e) => {
                                     warn!(error = %e, "failed to create URBDRC device channel");
@@ -2528,11 +2565,19 @@ impl RdpServer {
                     if let Some(ref mut ad) = self.autodetect {
                         ad.expire_stale_probes(crate::autodetect::RTT_PROBE_MAX_AGE);
                         let request = ad.send_rtt_request();
-                        let data = encode_share_data_pdu(
-                            rdp::headers::ShareDataPdu::AutoDetectReq(request),
-                            io_channel_id,
-                            user_channel_id,
-                        )?;
+                        // (pin-bump a5d1c682) Autodetect moved out of ShareDataPdu into
+                        // rdp::autodetect and onto the MCS message channel. macrdp does
+                        // NOT use RDP network-autodetect (div-15 kernel TCP RTT replaces
+                        // it), so self.autodetect is never enabled and this is unreached;
+                        // adapt to the new PDU type so it compiles. No message channel is
+                        // plumbed here — harmless as it never runs.
+                        let pdu = rdp::autodetect::AutoDetectReqPdu::new(request);
+                        let mcs_pdu = SendDataIndication {
+                            initiator_id: user_channel_id,
+                            channel_id: io_channel_id,
+                            user_data: encode_vec(&pdu)?.into(),
+                        };
+                        let data = encode_vec(&X224(mcs_pdu))?;
                         writer.write_all(&data).await?;
                     }
                 }
@@ -3003,10 +3048,11 @@ impl RdpServer {
         // recovery. Only when EGFX is actually migrated (non-empty channel list)
         // AND the target is the lossy tunnel; the reliable tunnel never drops, so
         // the flag stays false there.
-        if egfx_tunnel_type == dvc::pdu::TUNNELTYPE_UDPFECL && !channel_ids.is_empty() {
-            if let Some(handle) = &self.egfx_on_lossy_handle {
-                handle.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+        if egfx_tunnel_type == dvc::pdu::TUNNELTYPE_UDPFECL
+            && !channel_ids.is_empty()
+            && let Some(handle) = &self.egfx_on_lossy_handle
+        {
+            handle.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         debug!("UDP tunnel bound + EGFX active — Soft-Sync gate open");
         self.send_soft_sync_request(writer, user_channel_id, egfx_tunnel_type, channel_ids)
@@ -3177,10 +3223,10 @@ impl RdpServer {
                 return;
             }
         };
-        if !replies.is_empty() {
-            if let Err(e) = self.route_dvc_over_udp(replies) {
-                warn!(error = %e, "failed to ship tunnel reply PDUs");
-            }
+        if !replies.is_empty()
+            && let Err(e) = self.route_dvc_over_udp(replies)
+        {
+            warn!(error = %e, "failed to ship tunnel reply PDUs");
         }
     }
 
@@ -3272,24 +3318,24 @@ impl RdpServer {
         // sent so the client's Multitransport Response can be matched and the
         // inbound UDP flow bound to this session. Initial accept only.
         #[cfg(feature = "multitransport")]
-        if !result.reactivation {
-            if let Some(offer) = result.multitransport_offered {
-                self.multitransport_migration = Some(crate::multitransport::MigrationState {
-                    request_id: offer.request_id,
-                    cookie: offer.cookie,
-                    protocol: offer.protocol,
-                    soft_sync_sent: false,
-                });
-                debug!(
-                    request_id = offer.request_id,
-                    protocol = ?offer.protocol,
-                    soft_sync = result
-                        .multitransport_flags
-                        .contains(ironrdp_pdu::gcc::MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP),
-                    cookie = %offer.cookie.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                    "Server Initiate Multitransport Request was sent by the acceptor"
-                );
-            }
+        if !result.reactivation
+            && let Some(offer) = result.multitransport_offered
+        {
+            self.multitransport_migration = Some(crate::multitransport::MigrationState {
+                request_id: offer.request_id,
+                cookie: offer.cookie,
+                protocol: offer.protocol,
+                soft_sync_sent: false,
+            });
+            debug!(
+                request_id = offer.request_id,
+                protocol = ?offer.protocol,
+                soft_sync = result
+                    .multitransport_flags
+                    .contains(ironrdp_pdu::gcc::MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP),
+                cookie = %offer.cookie.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "Server Initiate Multitransport Request was sent by the acceptor"
+            );
         }
 
         let mut update_codecs = UpdateEncoderCodecs::new();
@@ -3387,21 +3433,21 @@ impl RdpServer {
         // (e.g. the EGFX blank-recovery connection drop) instead of showing
         // "disconnected". Not re-sent on deactivation-reactivation resizes
         // (`auto_reconnect_sent` guard, reset per connection in run_connection).
-        if !self.auto_reconnect_sent {
-            if let Some(cookie) = self.auto_reconnect_cookie.clone() {
-                let pdu = rdp::headers::ShareDataPdu::SaveSessionInfo(rdp::session_info::SaveSessionInfoPdu {
-                    info_type: rdp::session_info::InfoType::LogonExtended,
-                    info_data: rdp::session_info::InfoData::LogonExtended(rdp::session_info::LogonInfoExtended {
-                        present_fields_flags: rdp::session_info::LogonExFlags::AUTO_RECONNECT_COOKIE,
-                        auto_reconnect: Some(cookie),
-                        errors_info: None,
-                    }),
-                });
-                let data = encode_share_data_pdu(pdu, result.io_channel_id, result.user_channel_id)?;
-                writer.write_all(&data).await.context("send auto-reconnect cookie")?;
-                self.auto_reconnect_sent = true;
-                debug!("Sent Server Auto-Reconnect Cookie (Save Session Info PDU)");
-            }
+        if !self.auto_reconnect_sent
+            && let Some(cookie) = self.auto_reconnect_cookie.clone()
+        {
+            let pdu = rdp::headers::ShareDataPdu::SaveSessionInfo(rdp::session_info::SaveSessionInfoPdu {
+                info_type: rdp::session_info::InfoType::LogonExtended,
+                info_data: rdp::session_info::InfoData::LogonExtended(rdp::session_info::LogonInfoExtended {
+                    present_fields_flags: rdp::session_info::LogonExFlags::AUTO_RECONNECT_COOKIE,
+                    auto_reconnect: Some(cookie),
+                    errors_info: None,
+                }),
+            });
+            let data = encode_share_data_pdu(pdu, result.io_channel_id, result.user_channel_id)?;
+            writer.write_all(&data).await.context("send auto-reconnect cookie")?;
+            self.auto_reconnect_sent = true;
+            debug!("Sent Server Auto-Reconnect Cookie (Save Session Info PDU)");
         }
 
         let state = self
@@ -3512,15 +3558,12 @@ impl RdpServer {
                     return Ok(true);
                 }
 
-                rdp::headers::ShareDataPdu::AutoDetectRsp(response) => {
-                    if let Some(ref mut ad) = self.autodetect {
-                        if let Some(rtt_ms) = ad.handle_response(&response) {
-                            debug!(rtt_ms, seq = response.sequence_number(), "RTT measured");
-                        } else {
-                            trace!(seq = response.sequence_number(), "Unmatched auto-detect response");
-                        }
-                    }
-                }
+                // (pin-bump a5d1c682) The auto-detect RESPONSE is no longer a
+                // ShareDataPdu variant — it rides the MCS message channel
+                // (handle_message_channel_data upstream). macrdp doesn't use RDP
+                // network-autodetect (div-15 kernel TCP RTT), so the response is never
+                // received; the arm is removed rather than re-plumbed onto the message
+                // channel.
 
                 // Client requests the server stop or resume sending display
                 // updates. mstsc sends `desktop_rect: None` on minimize and

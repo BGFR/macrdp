@@ -928,10 +928,14 @@ AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1
     (`feat(server): send the Server Auto-Reconnect Cookie during logon`, by
     mamoreau-devolutions). mamoreau's review asked for returning-cookie
     validation + rotation; those were accepted as a **deferred follow-up** (the
-    phased split — send-side merged now), tracked in **issue #1508**
-    (`validate + rotate the Server Auto-Reconnect Cookie`). macrdp's vendored
-    send-only form is unaffected (single-console-session + NLA re-auth doesn't
-    need the returning-cookie validation). The upstream port keeps the same send point + per-connection
+    phased split — send-side merged in #1405) and are **now DONE upstream: PR
+    #1509 (`validate auto-reconnect cookies`) MERGED 2026-08-02, auto-closing
+    issue #1508 as completed** — it carried macrdp's independent HMAC-MD5
+    known-answer test + the `ServerAutoReconnect` re-export + our live-mstsc
+    validation, and glamberson's two-cookie rotation grace window also landed.
+    macrdp's vendored send-only form is unaffected (single-console-session +
+    NLA re-auth doesn't need the returning-cookie validation), so the pin bump
+    can adopt upstream's full send+validate+rotate API and drop this divergence. The upstream port keeps the same send point + per-connection
     guard but shapes the API like `credential_validator` — a builder method
     `with_auto_reconnect_cookie(Option<ServerAutoReconnect>)` + a runtime setter
     `set_auto_reconnect_cookie(Option<..>)` (vs this vendored `(logon_id,
@@ -1626,11 +1630,17 @@ AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1
     Upstreamable, same shape as (22): an opt-in policy (a `ConnectionHandler`/
     builder switch: reject-new vs preempt-existing-once-authenticated), since
     a general-purpose multi-session server would want to keep the existing
-    queue-behind behavior. Filed as Devolutions/IronRDP#1476 (still the
-    TPKT-peek shape as of this writing — the auth-gating redesign is
-    macrdp-specific for now, since it needed the `Box`→`Rc` factory change
-    which isn't obviously desirable upstream). Revisit upstreaming once (22)'s
-    design has had more real-world runway.
+    queue-behind behavior. Filed as Devolutions/IronRDP#1476 — **@antonmos
+    rebuilt it (2026-08-03) to exactly this full-auth gate** (a candidate must
+    complete real negotiation + CredSSP under Hybrid before it can evict; an
+    honest per-mode table; a shared `negotiate_and_authenticate` free fn +
+    `attach_channels_impl` + `Box`→`Rc` factories — the same structure as this
+    divergence), after CBenoit independently flagged the bare TPKT-peek as
+    unsafe (matching macrdp's 07-27 finding) and that peek shape was rejected.
+    #1476 also adds the `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION` + anti-storm
+    eviction notice macrdp ships. **OPEN, awaiting CBenoit's merge decision**
+    (issue #1483 is the backing RFC). When it merges + the pin bumps, macrdp
+    de-vendors this divergence.
 
     **Eviction must tell the loser WHY, or the two clients ping-pong forever
     (2026-07-27, found in live testing of the above — the failure that made

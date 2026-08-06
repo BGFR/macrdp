@@ -621,7 +621,9 @@ then delete; promote a parked item to *In flight* when work actually starts.
   **MERGE WAVE 2026-07-30/31 (mamoreau + CBenoit): #1453 + #1405 + #1418 + #1420 all MERGED
   (the rebase unblocked #1420). Now ONLY ONE PR open — #1404 (idle since 07-02, now
   CONFLICTING after the master advance) — plus tracking issue #1508. Reactive-only:**
-  - [ ] **#1404** `feat(acceptor)!: clamp honored client desktop size to an operator maximum` — the
+  **▶ UPDATE 2026-08-02: #1404 MERGED (mamoreau) + #1508 CLOSED as completed (done via #1509, MERGED
+  08-02) → ZERO open clintcan PRs. Everything below is now merged; kept as the record.**
+  - [x] **#1404** `feat(acceptor)!: clamp honored client desktop size to an operator maximum` (**MERGED 2026-08-02, mamoreau**) — the
     honor-size resource-hardening CBenoit green-lit in his #1373 approval. Replaces the `bool` with
     `Option<DesktopSize>` = operator max; client request clamped per-dimension. Upstreams the
     hardened form of acceptor divergence (1).

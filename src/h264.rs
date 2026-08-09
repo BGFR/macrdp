@@ -540,11 +540,11 @@ struct BlankRecoveryParams {
     /// `MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS` to re-enable remap-first
     /// experimentation (e.g. against a non-mstsc QoE-reporting client).
     max_attempts: u32,
-    /// EXPERIMENTAL (`MACRDP_BLANK_RECOVERY_REACTIVATE=1`, default off): make
-    /// the FIRST recovery attempt a bare core Deactivation–Reactivation
-    /// ([`BlankAction::Reactivate`]) instead of the normal remap/drop; if it
-    /// doesn't heal, the second attempt drops. Forces `max_attempts` to ≥2 so
-    /// the fallback drop can fire.
+    /// ON by default (`MACRDP_BLANK_RECOVERY_REACTIVATE=0` reverts to the
+    /// remap/drop path): make the FIRST recovery attempt a bare core
+    /// Deactivation–Reactivation ([`BlankAction::Reactivate`]); if it doesn't
+    /// heal, the second attempt drops. Forces `max_attempts` to ≥2 so the
+    /// fallback drop can fire.
     reactivate: bool,
     /// Wall-clock fast-path for detection on a STATIC blank. A blank desktop
     /// changes little, so QoE reports trickle in slowly (~0.3/s vs ~8/s on an
@@ -608,7 +608,7 @@ enum BlankAction {
     /// and auto-reconnects with its reconnect cookie; a fresh connection
     /// renders with high probability and the detector re-checks it.
     Drop,
-    /// EXPERIMENTAL (`MACRDP_BLANK_RECOVERY_REACTIVATE=1`): trigger a bare
+    /// Gated by `MACRDP_BLANK_RECOVERY_REACTIVATE` (default on): trigger a bare
     /// core RDP **Deactivation–Reactivation** (Server Deactivate All → new
     /// Demand Active) WITHOUT touching the EGFX pipeline. Injected as a no-op
     /// `DisplayUpdate::Resize(current_size)` (see `capture.rs`), which the

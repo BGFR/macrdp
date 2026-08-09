@@ -344,10 +344,25 @@ BLANK_RECOVERY_MAX_RTT_MS=80  # stand down at/above this link RTT (0 = always ar
 AUTO_RECONNECT=1              # 0 = don't provision the auto-reconnect cookie         [MACRDP_AUTO_RECONNECT]
 ```
 
-Expert window tunables follow the same pattern (`BLANK_RECOVERY_{MIN_QOE,
-MAX_WAIT_MS,MIN_WALL_REPORTS,ARM_MS,RETRY_MS,MAX_ATTEMPTS,MAX_CONSECUTIVE_DROPS}`);
-QoE-less clients (FreeRDP) and high-RTT links are never touched. See the
-blank-recovery notes in `docs/known-quirks.md` for the full story.
+The expert window/timing tunables — same `config.env` keys, rarely needed (the
+defaults are right for almost everyone):
+
+```
+BLANK_RECOVERY_ARM_MS=3000              # skip the connect-time churn before the detector evaluates     [MACRDP_BLANK_RECOVERY_ARM_MS]
+BLANK_RECOVERY_MIN_QOE=24               # all-zero QoE reports (~3 s) to declare an ACTIVE blank         [MACRDP_BLANK_RECOVERY_MIN_QOE]
+BLANK_RECOVERY_MAX_WAIT_MS=4000         # wall-clock fast-path: declare a STATIC blank after this many ms  [MACRDP_BLANK_RECOVERY_MAX_WAIT_MS]
+BLANK_RECOVERY_MIN_WALL_REPORTS=1       # min all-zero reports the fast-path needs (skips QoE-less clients)  [MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS]
+BLANK_RECOVERY_HEAL_CONFIRM_MS=8000     # after a reactivation, wait this long for a sustained heal before the fallback drop  [MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS]
+BLANK_RECOVERY_RETRY_MS=4000            # spacing between recovery attempts                              [MACRDP_BLANK_RECOVERY_RETRY_MS]
+BLANK_RECOVERY_MAX_ATTEMPTS=1           # forced to >=2 when REACTIVATE=1 so the drop can be attempt 2   [MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS]
+BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS=3  # storm guard: stop dropping after N blank-drops with no heal between  [MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS]
+```
+
+QoE-less clients (FreeRDP) and high-RTT links are never touched. A deeper
+"established-session" tier — `BLANK_RECOVERY_{MIN_RENDER_REPORTS, ESTABLISHED_REPORTS,
+ESTABLISHED_MIN_QOE, ESTABLISHED_MAX_WAIT_MS, ESTABLISHED_WALL_REPORTS}` — tolerates the
+brief zero-EDR windows a healthy client produces mid-session; see the blank-recovery
+notes in `docs/known-quirks.md` for the full story and the tuning history.
 
 ## Headless mode
 

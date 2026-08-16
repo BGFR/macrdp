@@ -21,7 +21,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Status
 
 Functional v0 — daily-driver usable on a trusted LAN and over the internet
-(VPN/ZeroTier). **Latest release: v0.9.5** (maintenance — the IronRDP dependency pin bumped
+(VPN/ZeroTier). **Latest release: v0.9.6** (bug-fix patch — TWO things that shipped broken get
+corrected, both @antonmos. **#179**: a v0.9.5 SCROLL-DOWN REGRESSION — the pin bump moved
+`ironrdp-pdu` past its own wheel-decode fix (now proper two's-complement) but did NOT delete
+vendored divergence-17's compensation, so it DOUBLE-corrected → every downward tick inflated
+~255× (Windows App) / ~13% (mstsc), up untouched (the asymmetry = the fingerprint, macrdp
+#113 in reverse). Div-17 RETIRED (pass-through) + an end-to-end round-trip test pins the
+contract so a future pin-bump decode change fails in CI. **#180**: an UNAUTH remote DoS
+latent since v0.9.3 — a single silent TCP connection wedged the second-client-preemption
+accept loop (negotiate blocks on socket reads pre-auth; awaited unbounded → once the live
+session ended the loop hung with no `select!` left, health-watchdog-INVISIBLE like the
+v0.9.4 find_size DoS). Bounded by `CANDIDATE_NEGOTIATION_TIMEOUT` (10 s) +
+`CANDIDATE_HANDOFF_GRACE` (750 ms) + a regression test; the same PR also fixes 2 more div-23
+preemption bugs (eviction event could disconnect the WINNER → discard-stale-before-serve;
+uncapped anti-storm lockout barred the reclaim headline case → `REPREEMPT_MAX_LOCKOUT` 30 s).
+Both found by the automated reviewer on upstream #1476, confirmed in the vendored copy; CI
+green, merged #180=`3a66e46` + #179=`6eb3cb1`.) Earlier: **v0.9.5** (maintenance — the IronRDP dependency pin bumped
 `879ffed8` → `a5d1c682` (133 commits) and vendored divergence *shrank*; **no user-facing
 change, default runtime path functionally unchanged**. Retires TWO vendored forks — the
 **`ironrdp-rdpeusb` crate** (its lenient USB-3 caps decode landed upstream; `src/rdpeusb.rs`

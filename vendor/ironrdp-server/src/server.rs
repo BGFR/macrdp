@@ -2000,7 +2000,7 @@ impl RdpServer {
                                         Err(_) => {
                                             debug!(
                                                 ?peer,
-                                                "a candidate was still negotiating when the session ended —                                                  dropping it rather than stalling the accept loop; it can reconnect"
+                                                "a candidate was still negotiating when the session ended — dropping it rather than stalling the accept loop; it can reconnect"
                                             );
                                             None
                                         }

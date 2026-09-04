@@ -1,0 +1,59 @@
+name: Build macrdp ARM64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Show environment
+        run: |
+          uname -a
+          arch
+          rustc --version
+          cargo --version
+          clang --version
+          xcode-select -p
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Ad-hoc sign
+        run: codesign -s - --force target/release/macrdp
+
+      - name: Verify binary
+        run: |
+          file target/release/macrdp
+          shasum -a 256 target/release/macrdp
+          ls -lh target/release/macrdp
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/macrdp dist/
+          tar -czf macrdp-multimon-test-aarch64-apple-darwin.tar.gz -C dist macrdp
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macrdp-multimon-test-aarch64
+          path: macrdp-multimon-test-aarch64-apple-darwin.tar.gz
+          if-no-files-found: error

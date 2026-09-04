@@ -16,7 +16,7 @@ use pdu::rdp::headers::ShareControlPdu;
 use pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
 use pdu::rdp::server_license::{LicensePdu, LicensingErrorMessage};
 use pdu::{gcc, mcs, nego, rdp};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::channel_connection::ChannelConnectionSequence;
 use super::finalization::FinalizationSequence;
@@ -40,6 +40,10 @@ pub struct Acceptor {
     pub(crate) creds: Option<Credentials>,
     received_credentials: Option<Credentials>,
     received_auto_reconnect: Option<ClientAutoReconnect>,
+    // (vendored experimental) Preserve the monitor topology announced by the
+    // client in GCC Client Monitor Data so the Monitor Layout PDU can echo the
+    // actual mstsc /multimon geometry instead of hardcoding a single monitor.
+    client_monitors: Option<Vec<gcc::Monitor>>,
     reactivation: bool,
     honor_client_desktop_size: Option<DesktopSize>,
     // (vendored) Client-fingerprint identity from the GCC Client Core Data
@@ -180,6 +184,7 @@ impl Acceptor {
             creds,
             received_credentials: None,
             received_auto_reconnect: None,
+            client_monitors: None,
             reactivation: false,
             honor_client_desktop_size: None,
             client_name: String::new(),
@@ -281,6 +286,7 @@ impl Acceptor {
             creds: consumed.creds,
             received_credentials: consumed.received_credentials,
             received_auto_reconnect: consumed.received_auto_reconnect,
+            client_monitors: consumed.client_monitors,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
             client_name: consumed.client_name,
@@ -636,6 +642,24 @@ impl Sequence for Acceptor {
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
                 let client_wants_message_channel = gcc_blocks.message_channel.is_some();
+
+                // (vendored experimental) mstsc sends CS_MONITOR when /multimon
+                // (or `use multimon:i:1`) is active. IronRDP already decodes it;
+                // keep the geometry so we can send it back in MonitorLayoutPdu.
+                self.client_monitors = gcc_blocks.monitor.as_ref().and_then(|monitor_data| {
+                    (!monitor_data.monitors.is_empty()).then(|| monitor_data.monitors.clone())
+                });
+
+                if let Some(monitors) = self.client_monitors.as_ref() {
+                    info!(
+                        count = monitors.len(),
+                        monitors = ?monitors,
+                        "Client announced RDP monitor topology"
+                    );
+                } else {
+                    debug!("Client did not announce RDP monitor topology");
+                }
+
                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
                 self.multitransport_flags = gcc_blocks
                     .multi_transport_channel
@@ -995,15 +1019,30 @@ impl Sequence for Acceptor {
             }
 
             AcceptorState::MonitorLayoutSend { channels } => {
+                // (vendored experimental) Prefer the topology mstsc announced in
+                // CS_MONITOR. This is what makes selectedmonitors/use multimon
+                // visible to the server. Keep the original one-monitor layout as
+                // the compatibility fallback for ordinary clients.
+                let monitors = self.client_monitors.clone().unwrap_or_else(|| {
+                    vec![gcc::Monitor {
+                        left: 0,
+                        top: 0,
+                        right: i32::from(self.desktop_size.width),
+                        bottom: i32::from(self.desktop_size.height),
+                        flags: gcc::MonitorFlags::PRIMARY,
+                    }]
+                });
+
+                info!(
+                    count = monitors.len(),
+                    monitors = ?monitors,
+                    desktop_size = ?self.desktop_size,
+                    "Sending RDP Monitor Layout PDU"
+                );
+
                 let monitor_layout =
                     rdp::headers::ShareDataPdu::MonitorLayout(rdp::finalization_messages::MonitorLayoutPdu {
-                        monitors: vec![gcc::Monitor {
-                            left: 0,
-                            top: 0,
-                            right: i32::from(self.desktop_size.width),
-                            bottom: i32::from(self.desktop_size.height),
-                            flags: gcc::MonitorFlags::PRIMARY,
-                        }],
+                        monitors,
                     });
 
                 debug!(message = ?monitor_layout, "Send");

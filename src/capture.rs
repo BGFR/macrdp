@@ -831,11 +831,6 @@ impl CaptureDisplay {
         #[cfg(target_os = "macos")]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> =
             if let Some(bottom_id) = self.secondary_display_id {
-                if self.gfx.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "experimental multimon capture does not support EGFX/H.264 yet"
-                    ));
-                }
                 let top_id = self
                     .display_id
                     .ok_or_else(|| anyhow::anyhow!("multimon top display id missing"))?;
@@ -853,6 +848,7 @@ impl CaptureDisplay {
                         bottom_size,
                         self.cursor_scale,
                         self.warp_cursor_home,
+                        self.gfx.clone(),
                         self.keyframe_on_change,
                         self.click_signal.clone(),
                         self.flush_frames,
@@ -977,8 +973,11 @@ mod macos {
 
     /// Composite two real macOS displays into the one RDP desktop framebuffer.
     /// The top display occupies y=0..split_y-1; the bottom display occupies
-    /// y=split_y..combined_height-1. Bitmap rectangles from each child capture
-    /// are translated into that combined coordinate space.
+    /// y=split_y..combined_height-1. On the legacy path, child BitmapUpdates are
+    /// translated into that combined coordinate space. With EGFX/H.264 enabled,
+    /// the same child updates are first applied to a persistent combined BGRA
+    /// framebuffer, then that full 1920x2160-style canvas is submitted to the
+    /// existing VideoToolbox/Gfx pipeline as one RDP surface.
     pub struct MultiScreenCaptureUpdates {
         top: ScreenCaptureUpdates,
         bottom: ScreenCaptureUpdates,
@@ -986,6 +985,36 @@ mod macos {
         combined_size: DesktopSize,
         top_alive: bool,
         bottom_alive: bool,
+        /// EGFX/H.264 sink for the combined canvas. The child captures deliberately
+        /// run with `gfx=None`; this outer compositor is the only encoder producer.
+        gfx: Option<crate::h264::Gfx>,
+        keyframe_on_change: KeyframeOnChange,
+        kf_armed: bool,
+        click_signal: Option<ClickSignal>,
+        frame_interval: Duration,
+        flush_frames: u32,
+        flush_remaining: u32,
+        display_suppressed: Option<Arc<AtomicBool>>,
+        was_suppressed: bool,
+        suppressed_since: Option<Instant>,
+        first_egfx_frame_sent: bool,
+        /// Persistent combined BGRA framebuffer. Child BitmapUpdates are raw BGRA
+        /// rectangles, so applying them here is a cheap row copy and avoids asking
+        /// VideoToolbox to understand two independent display streams.
+        composite: Vec<u8>,
+        composite_stride: usize,
+        composite_dirty: bool,
+        force_keyframe_pending: bool,
+        last_submit: Option<Instant>,
+        /// The first SCK sample from each child is emitted as a full-frame bitmap,
+        /// split into strips by `split_strips`. Track row coverage so the first
+        /// H.264 frame is not submitted until BOTH displays have been completely
+        /// seeded; that makes the first EGFX IDR a clean full two-monitor desktop.
+        top_seed_rows: Vec<bool>,
+        bottom_seed_rows: Vec<bool>,
+        top_seed_remaining: usize,
+        bottom_seed_remaining: usize,
+        suppress_next_adopt: Arc<AtomicBool>,
     }
 
     impl MultiScreenCaptureUpdates {
@@ -1000,6 +1029,7 @@ mod macos {
             bottom_screen_size_pts: (f64, f64),
             cursor_scale_multiplier: f64,
             warp_cursor_home: bool,
+            gfx: Option<crate::h264::Gfx>,
             keyframe_on_change: KeyframeOnChange,
             click_signal: Option<ClickSignal>,
             flush_frames: u32,
@@ -1046,16 +1076,24 @@ mod macos {
                 warp_cursor_home,
                 None,
                 keyframe_on_change,
-                click_signal,
+                click_signal.clone(),
                 flush_frames,
-                display_suppressed,
+                display_suppressed.clone(),
                 auto_size,
                 stretch,
                 desktop_size,
                 pending_resize,
-                suppress_next_adopt,
+                suppress_next_adopt.clone(),
             )
             .await?;
+
+            let composite_stride = usize::from(combined_width)
+                .checked_mul(4)
+                .ok_or_else(|| anyhow!("multimon composite stride overflow"))?;
+            let composite_len = composite_stride
+                .checked_mul(usize::from(combined_height))
+                .ok_or_else(|| anyhow!("multimon composite framebuffer size overflow"))?;
+            let each_rows = usize::from(each_h);
 
             tracing::info!(
                 top_display_id,
@@ -1064,6 +1102,7 @@ mod macos {
                 each_h,
                 combined_w = combined_width,
                 combined_h = combined_height,
+                h264 = gfx.is_some(),
                 "started two ScreenCaptureKit streams for RDP multimon"
             );
 
@@ -1077,6 +1116,27 @@ mod macos {
                 },
                 top_alive: true,
                 bottom_alive: true,
+                gfx,
+                keyframe_on_change,
+                kf_armed: true,
+                click_signal,
+                frame_interval: Duration::from_secs_f64(1.0 / f64::from(fps.max(1))),
+                flush_frames,
+                flush_remaining: 0,
+                display_suppressed,
+                was_suppressed: false,
+                suppressed_since: None,
+                first_egfx_frame_sent: false,
+                composite: vec![0; composite_len],
+                composite_stride,
+                composite_dirty: false,
+                force_keyframe_pending: false,
+                last_submit: None,
+                top_seed_rows: vec![false; each_rows],
+                bottom_seed_rows: vec![false; each_rows],
+                top_seed_remaining: each_rows,
+                bottom_seed_remaining: each_rows,
+                suppress_next_adopt,
             })
         }
 
@@ -1094,50 +1154,378 @@ mod macos {
                 other => other,
             }
         }
+
+        fn mark_seed_rows(rows: &mut [bool], remaining: &mut usize, y: u16, h: u16) {
+            let start = usize::from(y).min(rows.len());
+            let end = start.saturating_add(usize::from(h)).min(rows.len());
+            for covered in &mut rows[start..end] {
+                if !*covered {
+                    *covered = true;
+                    *remaining = remaining.saturating_sub(1);
+                }
+            }
+        }
+
+        /// Apply one child legacy bitmap rectangle into the combined BGRA canvas.
+        /// `ScreenCaptureUpdates::rect_update` emits tightly packed BgrA32 data,
+        /// so no pixel-format conversion is needed before VideoToolbox sees it.
+        fn apply_bitmap(&mut self, bitmap: &BitmapUpdate, y_offset: u16, is_top: bool) -> bool {
+            let width = usize::from(bitmap.width.get());
+            let height = usize::from(bitmap.height.get());
+            let src_stride = bitmap.stride.get();
+            let row_bytes = match width.checked_mul(4) {
+                Some(v) => v,
+                None => return false,
+            };
+            if src_stride < row_bytes {
+                tracing::warn!(
+                    src_stride,
+                    row_bytes,
+                    "multimon child bitmap stride is smaller than its row width"
+                );
+                return false;
+            }
+
+            let dst_x = usize::from(bitmap.x);
+            let dst_y = usize::from(bitmap.y) + usize::from(y_offset);
+            let combined_w = usize::from(self.combined_size.width);
+            let combined_h = usize::from(self.combined_size.height);
+            if dst_x.saturating_add(width) > combined_w
+                || dst_y.saturating_add(height) > combined_h
+            {
+                tracing::warn!(
+                    x = bitmap.x,
+                    y = bitmap.y,
+                    y_offset,
+                    width,
+                    height,
+                    combined_w,
+                    combined_h,
+                    "multimon child bitmap falls outside the combined framebuffer"
+                );
+                return false;
+            }
+
+            let src = bitmap.data.as_ref();
+            let required_src = height
+                .saturating_sub(1)
+                .checked_mul(src_stride)
+                .and_then(|v| v.checked_add(row_bytes))
+                .unwrap_or(usize::MAX);
+            if src.len() < required_src {
+                tracing::warn!(
+                    data_len = src.len(),
+                    required_src,
+                    "multimon child bitmap data is shorter than its declared geometry"
+                );
+                return false;
+            }
+
+            for row in 0..height {
+                let src_off = row * src_stride;
+                let dst_off = (dst_y + row) * self.composite_stride + dst_x * 4;
+                self.composite[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&src[src_off..src_off + row_bytes]);
+            }
+
+            if is_top {
+                Self::mark_seed_rows(
+                    &mut self.top_seed_rows,
+                    &mut self.top_seed_remaining,
+                    bitmap.y,
+                    bitmap.height.get(),
+                );
+            } else {
+                Self::mark_seed_rows(
+                    &mut self.bottom_seed_rows,
+                    &mut self.bottom_seed_remaining,
+                    bitmap.y,
+                    bitmap.height.get(),
+                );
+            }
+            self.composite_dirty = true;
+            true
+        }
+
+        fn seed_ready(&self) -> bool {
+            self.top_seed_remaining == 0 && self.bottom_seed_remaining == 0
+        }
+
+        fn note_keyframe_change(&mut self, bitmap: &BitmapUpdate) {
+            let kfc = self.keyframe_on_change;
+            if !kfc.enabled {
+                return;
+            }
+
+            let frame_px = u64::from(self.combined_size.width)
+                * u64::from(self.combined_size.height);
+            let changed_px = u64::from(bitmap.width.get()) * u64::from(bitmap.height.get());
+            let high = if self
+                .click_signal
+                .as_ref()
+                .is_some_and(|s| s.within(kfc.click_window))
+            {
+                kfc.click_pct
+            } else {
+                kfc.change_pct
+            };
+            let low = (high / 2).max(1);
+            let is_big = frame_px > 0 && changed_px * 100 >= frame_px * high;
+            let is_quiet = frame_px == 0 || changed_px * 100 < frame_px * low;
+            if self.kf_armed && is_big {
+                self.kf_armed = false;
+                self.force_keyframe_pending = true;
+            } else if is_quiet {
+                self.kf_armed = true;
+            }
+        }
+
+        fn submit_due(&self) -> bool {
+            self.last_submit
+                .is_none_or(|last| last.elapsed() >= self.frame_interval)
+        }
+
+        /// Submit the current combined framebuffer. `arm_flush` is true for a real
+        /// changed frame and false for one of the trailing duplicate frames used to
+        /// drain mstsc's AVC presentation buffer.
+        fn submit_composite(&mut self, force_keyframe: bool, arm_flush: bool) -> bool {
+            let Some(gfx) = self.gfx.as_ref() else {
+                return false;
+            };
+            match gfx.submit_bgra(&self.composite, self.composite_stride, force_keyframe) {
+                Ok(true) => {
+                    if !self.first_egfx_frame_sent {
+                        tracing::info!(
+                            width = self.combined_size.width,
+                            height = self.combined_size.height,
+                            "first combined multimon EGFX/H.264 frame shipped"
+                        );
+                    }
+                    self.first_egfx_frame_sent = true;
+                    self.composite_dirty = false;
+                    self.force_keyframe_pending = false;
+                    self.last_submit = Some(Instant::now());
+                    if arm_flush {
+                        self.flush_remaining = self.flush_frames;
+                    }
+                    true
+                }
+                Ok(false) => false,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "multimon EGFX submit_bgra failed");
+                    false
+                }
+            }
+        }
+
+        fn timer_delay(&self) -> Option<Duration> {
+            if !self.first_egfx_frame_sent {
+                return None;
+            }
+            if self.composite_dirty {
+                return Some(match self.last_submit {
+                    Some(last) => {
+                        let elapsed = last.elapsed();
+                        if elapsed >= self.frame_interval {
+                            Duration::ZERO
+                        } else {
+                            self.frame_interval - elapsed
+                        }
+                    }
+                    None => Duration::ZERO,
+                });
+            }
+            (self.flush_remaining > 0).then_some(self.frame_interval)
+        }
+
+        fn on_timer(&mut self) {
+            if self.composite_dirty {
+                let force = self.force_keyframe_pending;
+                let _ = self.submit_composite(force, true);
+                return;
+            }
+            if self.flush_remaining > 0 {
+                self.flush_remaining -= 1;
+                let _ = self.submit_composite(false, false);
+            }
+        }
+
+        /// Apply/translate one update from a child display. `Ok(None)` means the
+        /// update was consumed by the EGFX compositor and should not also be sent
+        /// through the legacy bitmap channel.
+        fn process_child_update(
+            &mut self,
+            update: DisplayUpdate,
+            y_offset: u16,
+            is_top: bool,
+        ) -> Result<Option<DisplayUpdate>> {
+            match update {
+                DisplayUpdate::Bitmap(bitmap) => {
+                    let applied = self.apply_bitmap(&bitmap, y_offset, is_top);
+                    if applied {
+                        self.note_keyframe_change(&bitmap);
+                    }
+
+                    if applied && self.gfx.is_some() && self.seed_ready() {
+                        if !self.first_egfx_frame_sent || self.submit_due() {
+                            let force = self.force_keyframe_pending;
+                            if self.submit_composite(force, true) {
+                                return Ok(None);
+                            }
+                        }
+                        if self.first_egfx_frame_sent {
+                            return Ok(None);
+                        }
+                    }
+
+                    let mut bitmap = bitmap;
+                    bitmap.y = bitmap.y.saturating_add(y_offset);
+                    Ok(Some(DisplayUpdate::Bitmap(bitmap)))
+                }
+                DisplayUpdate::Resize(_) => Ok(Some(DisplayUpdate::Resize(self.combined_size))),
+                other => Ok(Some(other)),
+            }
+        }
     }
 
     #[async_trait::async_trait]
     impl RdpServerDisplayUpdates for MultiScreenCaptureUpdates {
         async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
             loop {
+                if let Some(gfx) = self.gfx.as_ref() {
+                    if crate::RESYNC_VIDEO.swap(false, Ordering::Relaxed) {
+                        gfx.force_keyframe();
+                        if self.first_egfx_frame_sent {
+                            self.composite_dirty = true;
+                            self.force_keyframe_pending = true;
+                        }
+                    }
+                    if let Some((w, h)) = gfx.take_reactivate_request() {
+                        self.suppress_next_adopt.store(true, Ordering::Relaxed);
+                        tracing::info!(
+                            requested_w = w,
+                            requested_h = h,
+                            combined_w = self.combined_size.width,
+                            combined_h = self.combined_size.height,
+                            "multimon EGFX requested core reactivation"
+                        );
+                        return Ok(Some(DisplayUpdate::Resize(self.combined_size)));
+                    }
+                }
+
+                if self.first_egfx_frame_sent {
+                    if let Some(flag) = self.display_suppressed.as_ref() {
+                        if flag.load(Ordering::Relaxed) {
+                            let started = *self.suppressed_since.get_or_insert_with(Instant::now);
+                            if started.elapsed() >= SUPPRESS_DEBOUNCE {
+                                self.was_suppressed = true;
+                                self.flush_remaining = 0;
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                continue;
+                            }
+                        } else {
+                            self.suppressed_since = None;
+                            if self.was_suppressed {
+                                self.was_suppressed = false;
+                                if let Some(gfx) = self.gfx.as_ref() {
+                                    gfx.demigrate_on_resume();
+                                }
+                                self.composite_dirty = true;
+                                self.force_keyframe_pending = true;
+                                tracing::debug!(
+                                    "multimon client un-suppress edge — resending combined frame as IDR"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 match (self.top_alive, self.bottom_alive) {
                     (false, false) => return Ok(None),
                     (true, false) => {
-                        let next = self.top.next_update().await?;
-                        if next.is_none() {
-                            self.top_alive = false;
+                        let timer_delay = self.timer_delay();
+                        let selected = if let Some(delay) = timer_delay {
+                            tokio::select! {
+                                r = self.top.next_update() => Some(r?),
+                                _ = tokio::time::sleep(delay) => None,
+                            }
+                        } else {
+                            Some(self.top.next_update().await?)
+                        };
+                        let Some(next) = selected else {
+                            self.on_timer();
                             continue;
+                        };
+                        match next {
+                            Some(update) => {
+                                if let Some(out) = self.process_child_update(update, 0, true)? {
+                                    return Ok(Some(out));
+                                }
+                            }
+                            None => self.top_alive = false,
                         }
-                        return Ok(next.map(|u| Self::translate(u, 0, self.combined_size)));
                     }
                     (false, true) => {
-                        let next = self.bottom.next_update().await?;
-                        if next.is_none() {
-                            self.bottom_alive = false;
+                        let timer_delay = self.timer_delay();
+                        let selected = if let Some(delay) = timer_delay {
+                            tokio::select! {
+                                r = self.bottom.next_update() => Some(r?),
+                                _ = tokio::time::sleep(delay) => None,
+                            }
+                        } else {
+                            Some(self.bottom.next_update().await?)
+                        };
+                        let Some(next) = selected else {
+                            self.on_timer();
                             continue;
+                        };
+                        match next {
+                            Some(update) => {
+                                if let Some(out) = self.process_child_update(
+                                    update,
+                                    self.split_y,
+                                    false,
+                                )? {
+                                    return Ok(Some(out));
+                                }
+                            }
+                            None => self.bottom_alive = false,
                         }
-                        return Ok(
-                            next.map(|u| Self::translate(u, self.split_y, self.combined_size))
-                        );
                     }
                     (true, true) => {
-                        let split_y = self.split_y;
-                        let combined_size = self.combined_size;
-                        let top = &mut self.top;
-                        let bottom = &mut self.bottom;
-                        tokio::select! {
-                            r = top.next_update() => {
-                                match r? {
-                                    Some(u) => return Ok(Some(Self::translate(u, 0, combined_size))),
-                                    None => self.top_alive = false,
+                        let timer_delay = self.timer_delay();
+                        let selected: Option<(bool, Option<DisplayUpdate>)> = {
+                            let top = &mut self.top;
+                            let bottom = &mut self.bottom;
+                            if let Some(delay) = timer_delay {
+                                tokio::select! {
+                                    r = top.next_update() => Some((true, r?)),
+                                    r = bottom.next_update() => Some((false, r?)),
+                                    _ = tokio::time::sleep(delay) => None,
+                                }
+                            } else {
+                                tokio::select! {
+                                    r = top.next_update() => Some((true, r?)),
+                                    r = bottom.next_update() => Some((false, r?)),
                                 }
                             }
-                            r = bottom.next_update() => {
-                                match r? {
-                                    Some(u) => return Ok(Some(Self::translate(u, split_y, combined_size))),
-                                    None => self.bottom_alive = false,
+                        };
+
+                        let Some((is_top, next)) = selected else {
+                            self.on_timer();
+                            continue;
+                        };
+                        match next {
+                            Some(update) => {
+                                let y_offset = if is_top { 0 } else { self.split_y };
+                                if let Some(out) =
+                                    self.process_child_update(update, y_offset, is_top)?
+                                {
+                                    return Ok(Some(out));
                                 }
                             }
+                            None if is_top => self.top_alive = false,
+                            None => self.bottom_alive = false,
                         }
                     }
                 }

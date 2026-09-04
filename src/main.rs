@@ -315,9 +315,8 @@ struct Args {
     /// one two-monitor RDP desktop. The configured --width/--height describe the
     /// combined RDP canvas; this first implementation splits it into two equal
     /// vertically-stacked displays (for example 1920x2160 -> 2 x 1920x1080).
-    /// Requires --virtual-display and --no-client-resolution. Legacy bitmap
-    /// transport only for now; --enable-h264 is rejected while this experiment
-    /// is active.
+    /// Requires --virtual-display and --no-client-resolution. Supports the
+    /// legacy bitmap path and experimental EGFX/H.264 composite encoding.
     #[arg(long)]
     multimon_virtual: bool,
 
@@ -328,8 +327,8 @@ struct Args {
     /// monitor at a native 1:1 size. For example 1920x2160 means: virtual
     /// 1920x1080 + physical display scaled to 1920x1080. The physical Mac panel
     /// remains the macOS system primary and stays visible locally. Requires
-    /// --virtual-display and --no-client-resolution. Legacy bitmap transport only
-    /// for now; --enable-h264 is rejected while this experiment is active.
+    /// --virtual-display and --no-client-resolution. Supports the legacy bitmap
+    /// path and experimental EGFX/H.264 composite encoding.
     #[arg(long)]
     multimon_physical_virtual: bool,
 
@@ -1947,10 +1946,10 @@ async fn async_main() -> Result<()> {
         ));
     }
     if multimon_any && args.enable_h264 {
-        return Err(anyhow!(
-            "experimental multimon capture is legacy-bitmap-only for now; \
-             remove --enable-h264"
-        ));
+        info!(
+            "experimental multimon EGFX/H.264 enabled — two display captures are \
+             composited into the combined RDP desktop before VideoToolbox encoding"
+        );
     }
     if multimon_any
         && (args.make_primary || args.detach_primary || args.capture_primary || args.shield_primary)

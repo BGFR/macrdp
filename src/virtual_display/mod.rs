@@ -286,9 +286,7 @@ mod macos {
         let y = pb.origin.y.round() as i32 - vh;
 
         let config = physical.begin_configuration().map_err(|e| {
-            anyhow!(
-                "CGBeginDisplayConfiguration (physical+virtual multimon): CGError {e}"
-            )
+            anyhow!("CGBeginDisplayConfiguration (physical+virtual multimon): CGError {e}")
         })?;
         virtual_display
             .configure_display_origin(&config, x, y)
@@ -300,9 +298,7 @@ mod macos {
         physical
             .complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
             .map_err(|e| {
-                anyhow!(
-                    "CGCompleteDisplayConfiguration (physical+virtual multimon): CGError {e}"
-                )
+                anyhow!("CGCompleteDisplayConfiguration (physical+virtual multimon): CGError {e}")
             })?;
 
         tracing::info!(

@@ -321,6 +321,18 @@ struct Args {
     #[arg(long)]
     multimon_virtual: bool,
 
+    /// EXPERIMENTAL: expose the physical Mac main display plus ONE virtual
+    /// display as a two-monitor RDP desktop. The physical display is mapped to
+    /// the RDP primary/lower monitor and is scaled into one half of the combined
+    /// --width/--height canvas; the virtual display is the upper/secondary RDP
+    /// monitor at a native 1:1 size. For example 1920x2160 means: virtual
+    /// 1920x1080 + physical display scaled to 1920x1080. The physical Mac panel
+    /// remains the macOS system primary and stays visible locally. Requires
+    /// --virtual-display and --no-client-resolution. Legacy bitmap transport only
+    /// for now; --enable-h264 is rejected while this experiment is active.
+    #[arg(long)]
+    multimon_physical_virtual: bool,
+
     /// Promote the virtual display to be the system's primary display
     /// for the duration of the run — the one with the menu bar, where
     /// new app windows open. Use this when you want to drive the
@@ -1919,26 +1931,34 @@ async fn async_main() -> Result<()> {
              virtual display to be the system's primary)"
         ));
     }
-    if args.multimon_virtual && !args.virtual_display {
-        return Err(anyhow!("--multimon-virtual requires --virtual-display"));
-    }
-    if args.multimon_virtual && !args.no_client_resolution {
+    if args.multimon_virtual && args.multimon_physical_virtual {
         return Err(anyhow!(
-            "--multimon-virtual currently requires --no-client-resolution so mstsc's \
-             single-monitor core size cannot re-mode the two-display canvas"
+            "--multimon-virtual and --multimon-physical-virtual are mutually exclusive"
         ));
     }
-    if args.multimon_virtual && args.enable_h264 {
+    let multimon_any = args.multimon_virtual || args.multimon_physical_virtual;
+    if multimon_any && !args.virtual_display {
         return Err(anyhow!(
-            "--multimon-virtual is legacy-bitmap-only in this experimental build; \
-             remove --enable-h264 for the first two-display test"
+            "multimon modes require --virtual-display"
         ));
     }
-    if args.multimon_virtual
+    if multimon_any && !args.no_client_resolution {
+        return Err(anyhow!(
+            "multimon modes currently require --no-client-resolution so mstsc's \
+             single-monitor core size cannot re-mode the combined canvas"
+        ));
+    }
+    if multimon_any && args.enable_h264 {
+        return Err(anyhow!(
+            "experimental multimon capture is legacy-bitmap-only for now; \
+             remove --enable-h264"
+        ));
+    }
+    if multimon_any
         && (args.make_primary || args.detach_primary || args.capture_primary || args.shield_primary)
     {
         return Err(anyhow!(
-            "--multimon-virtual cannot currently be combined with --make-primary, \
+            "multimon modes cannot currently be combined with --make-primary, \
              --detach-primary, --capture-primary, or --shield-primary"
         ));
     }
@@ -2147,6 +2167,38 @@ async fn async_main() -> Result<()> {
 
             virtual_display_secondary = Some(Arc::new(std::sync::Mutex::new(bottom)));
             Some(Arc::new(std::sync::Mutex::new(top)))
+        } else if args.multimon_physical_virtual {
+            if h % 2 != 0 {
+                return Err(anyhow!(
+                    "--multimon-physical-virtual currently requires an even combined --height; got {h}"
+                ));
+            }
+            let each_h = h / 2;
+            if each_h < 200 {
+                return Err(anyhow!(
+                    "--multimon-physical-virtual split height {each_h} is below the RDP minimum"
+                ));
+            }
+
+            // One real macOS virtual display backs the UPPER RDP monitor. The
+            // physical Mac main display backs the LOWER/PRIMARY RDP monitor and
+            // stays system-primary + visible locally. ScreenCaptureKit scales
+            // the physical panel into the configured RDP monitor rectangle.
+            let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(each_h), 60)
+                .context("attaching physical+virtual multimon virtual display")?;
+            virtual_display::arrange_virtual_above_physical(vd.display_id(), physical_main_id)
+                .context("arranging virtual RDP monitor above the physical main display")?;
+
+            info!(
+                virtual_display_id = vd.display_id(),
+                physical_display_id = physical_main_id,
+                each_w = w,
+                each_h,
+                combined_w = w,
+                combined_h = h,
+                "physical Mac display + one virtual display attached for RDP multimon; physical stays system primary"
+            );
+            Some(Arc::new(std::sync::Mutex::new(vd)))
         } else {
             // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
             // metadata here (capture cadence is governed by --fps); pass a
@@ -2382,12 +2434,26 @@ async fn async_main() -> Result<()> {
         (w, h, None, size)
     };
 
-    let secondary_capture_display_id: Option<u32> = virtual_display_secondary.as_ref().map(|vd| {
-        vd.lock()
-            .expect("secondary virtual display mutex poisoned")
-            .display_id()
-    });
-    let secondary_screen_size_pts: Option<(f64, f64)> =
+    let secondary_capture_display_id: Option<u32> = if args.multimon_physical_virtual {
+        Some(physical_main_id)
+    } else {
+        virtual_display_secondary.as_ref().map(|vd| {
+            vd.lock()
+                .expect("secondary virtual display mutex poisoned")
+                .display_id()
+        })
+    };
+    let secondary_screen_size_pts: Option<(f64, f64)> = if args.multimon_physical_virtual {
+        #[cfg(target_os = "macos")]
+        {
+            let b = core_graphics::display::CGDisplay::new(physical_main_id).bounds();
+            Some((b.size.width, b.size.height))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Some((0.0, 0.0))
+        }
+    } else {
         virtual_display_secondary.as_ref().map(|vd| {
             let id = vd
                 .lock()
@@ -2403,7 +2469,8 @@ async fn async_main() -> Result<()> {
                 let _ = id;
                 (0.0, 0.0)
             }
-        });
+        })
+    };
 
     // Frame rate: explicit --fps wins; otherwise 60 for H.264 (mstsc holds a
     // ~2-frame presentation buffer, so 60fps keeps typing latency low) or 15 for

@@ -1157,6 +1157,11 @@ pub struct Gfx {
     /// surface + encoder are created, so the H.264 pipeline tracks the
     /// client-resolution auto-adopt without rebuilding the factory.
     desktop_size: crate::capture::SharedDesktopSize,
+    /// True for the experimental two-monitor vertical RDP layout. The H.264
+    /// surface still spans the full combined framebuffer, but RESET_GRAPHICS must
+    /// advertise the same two TS_MONITOR_DEF rectangles as the core RDP layer or
+    /// mstsc decodes frames without presenting them.
+    multimon_vertical: bool,
     fps: u32,
     bitrate_bps: u32,
     /// Periodic keyframe (IDR) interval in seconds (from `--keyframe-interval`).
@@ -1310,6 +1315,7 @@ impl Gfx {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         desktop_size: crate::capture::SharedDesktopSize,
+        multimon_vertical: bool,
         fps: u32,
         bitrate_bps: u32,
         keyframe_secs: f32,
@@ -1516,6 +1522,7 @@ impl Gfx {
             sender: Arc::new(Mutex::new(None)),
             ctx: Arc::new(Mutex::new(None)),
             desktop_size,
+            multimon_vertical,
             fps,
             bitrate_bps,
             keyframe_secs,
@@ -2298,23 +2305,61 @@ impl Gfx {
             ctx.dims = (width, height);
             let mut server = ctx.server_handle.lock().unwrap();
             server.set_output_dimensions(width, height);
-            // Emit RESET_GRAPHICS with an explicit single-monitor layout
-            // covering the full desktop, BEFORE create_surface. The auto-reset
-            // path inside create_surface sends an EMPTY monitor array; mstsc
-            // tolerates that on the first GFX session (it falls back to the
-            // demand-active desktop region) but NOT on reconnect — with no
-            // monitor defining the graphics output region, a correctly decoded
-            // + acked surface has nowhere to composite and the screen stays
-            // blank. resize_with_monitors sets reset_graphics_sent=true so the
-            // empty-monitor reset never fires. (reconnect-blank fix 2026-05-20.)
-            let monitor = Monitor {
-                left: 0,
-                top: 0,
-                right: i32::from(width).saturating_sub(1),
-                bottom: i32::from(height).saturating_sub(1),
-                flags: MonitorFlags::PRIMARY,
+            // Emit RESET_GRAPHICS with an explicit monitor layout BEFORE
+            // create_surface. The auto-reset path inside create_surface sends an
+            // EMPTY monitor array; mstsc can decode/ack frames without presenting
+            // them when the graphics-output monitor layout disagrees with the core
+            // RDP multimon topology. resize_with_monitors sets
+            // reset_graphics_sent=true so the empty-monitor reset never fires.
+            //
+            // In multimon mode the combined H.264 surface is top-monitor pixels
+            // followed by bottom/primary-monitor pixels (1920x2160 in our test).
+            // TS_MONITOR_DEF coordinates are relative to the PRIMARY monitor, so
+            // the upper monitor uses negative Y exactly like mstsc's GCC topology:
+            //   primary:  (0,0) .. (w-1, each_h-1)
+            //   upper:    (0,-each_h) .. (w-1,-1)
+            // RESET_GRAPHICS width/height remain the bounding desktop size.
+            let monitors = if self.multimon_vertical {
+                if height % 2 != 0 {
+                    return Err(anyhow!(
+                        "EGFX multimon requires an even combined height; got {height}"
+                    ));
+                }
+                let each_h = height / 2;
+                let right = i32::from(width).saturating_sub(1);
+                let primary = Monitor {
+                    left: 0,
+                    top: 0,
+                    right,
+                    bottom: i32::from(each_h).saturating_sub(1),
+                    flags: MonitorFlags::PRIMARY,
+                };
+                let upper = Monitor {
+                    left: 0,
+                    top: -i32::from(each_h),
+                    right,
+                    bottom: -1,
+                    flags: MonitorFlags::empty(),
+                };
+                info!(
+                    combined_w = width,
+                    combined_h = height,
+                    each_h,
+                    primary = ?primary,
+                    upper = ?upper,
+                    "EGFX RESET_GRAPHICS using two-monitor topology"
+                );
+                vec![primary, upper]
+            } else {
+                vec![Monitor {
+                    left: 0,
+                    top: 0,
+                    right: i32::from(width).saturating_sub(1),
+                    bottom: i32::from(height).saturating_sub(1),
+                    flags: MonitorFlags::PRIMARY,
+                }]
             };
-            server.resize_with_monitors(width, height, vec![monitor]);
+            server.resize_with_monitors(width, height, monitors);
             // Create the surface with upstream's auto-allocated id. mstsc retains
             // EGFX surfaces by id for its whole process lifetime and no-ops a
             // CreateSurface for an id it already holds, so a reconnect to the

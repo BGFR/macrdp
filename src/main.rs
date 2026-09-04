@@ -2594,6 +2594,7 @@ async fn async_main() -> Result<()> {
     let gfx = args.enable_h264.then(|| {
         h264::Gfx::new(
             desktop_size.clone(),
+            multimon_any,
             fps,
             args.bitrate.max(1).saturating_mul(1_000_000),
             args.keyframe_interval,

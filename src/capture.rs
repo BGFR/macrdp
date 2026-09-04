@@ -1190,8 +1190,7 @@ mod macos {
             let dst_y = usize::from(bitmap.y) + usize::from(y_offset);
             let combined_w = usize::from(self.combined_size.width);
             let combined_h = usize::from(self.combined_size.height);
-            if dst_x.saturating_add(width) > combined_w
-                || dst_y.saturating_add(height) > combined_h
+            if dst_x.saturating_add(width) > combined_w || dst_y.saturating_add(height) > combined_h
             {
                 tracing::warn!(
                     x = bitmap.x,
@@ -1257,8 +1256,8 @@ mod macos {
                 return;
             }
 
-            let frame_px = u64::from(self.combined_size.width)
-                * u64::from(self.combined_size.height);
+            let frame_px =
+                u64::from(self.combined_size.width) * u64::from(self.combined_size.height);
             let changed_px = u64::from(bitmap.width.get()) * u64::from(bitmap.height.get());
             let high = if self
                 .click_signal
@@ -1481,11 +1480,9 @@ mod macos {
                         };
                         match next {
                             Some(update) => {
-                                if let Some(out) = self.process_child_update(
-                                    update,
-                                    self.split_y,
-                                    false,
-                                )? {
+                                if let Some(out) =
+                                    self.process_child_update(update, self.split_y, false)?
+                                {
                                     return Ok(Some(out));
                                 }
                             }

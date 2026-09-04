@@ -93,6 +93,35 @@ fn validate_desktop_size(width: u16, height: u16) -> Option<DesktopSize> {
     }
 }
 
+/// Derive the combined desktop canvas from a client monitor topology.
+///
+/// TS_MONITOR_DEF rectangles use inclusive right/bottom coordinates and may
+/// extend into negative space relative to the primary monitor. For example,
+/// two 1920x1080 monitors stacked vertically can be (0,0..1079) and
+/// (0,-1080..-1), yielding a 1920x2160 combined desktop.
+fn desktop_size_from_monitors(monitors: &[gcc::Monitor]) -> Option<DesktopSize> {
+    let first = monitors.first()?;
+
+    let mut min_left = i64::from(first.left);
+    let mut min_top = i64::from(first.top);
+    let mut max_right = i64::from(first.right);
+    let mut max_bottom = i64::from(first.bottom);
+
+    for monitor in &monitors[1..] {
+        min_left = min_left.min(i64::from(monitor.left));
+        min_top = min_top.min(i64::from(monitor.top));
+        max_right = max_right.max(i64::from(monitor.right));
+        max_bottom = max_bottom.max(i64::from(monitor.bottom));
+    }
+
+    let width = max_right.checked_sub(min_left)?.checked_add(1)?;
+    let height = max_bottom.checked_sub(min_top)?.checked_add(1)?;
+    let width = u16::try_from(width).ok()?;
+    let height = u16::try_from(height).ok()?;
+
+    validate_desktop_size(width, height)
+}
+
 /// Writes `size` into every Bitmap capability set in `capabilities`.
 ///
 /// The server advertises its desktop size in the Bitmap capability set of the
@@ -671,36 +700,67 @@ impl Sequence for Acceptor {
                 self.client_version = gcc_blocks.core.version.0;
                 self.client_build = gcc_blocks.core.client_build;
 
-                // Adopt the client's requested desktop size (from its Client
-                // Core Data) before Demand Active is sent, so the session is
-                // negotiated at that size without a Deactivation-Reactivation
-                // resize. The request is clamped to the operator-configured
-                // maximum first, so an untrusted client can't drive the
-                // framebuffer/encoder allocation past that ceiling. See
-                // `set_honor_client_desktop_size`.
+                // Adopt the client-requested desktop size before Demand Active.
+                // In /multimon mode mstsc's Client Core Data can describe only
+                // one monitor (for example 1920x1080) while CS_MONITOR carries
+                // the real combined topology (for example 1920x2160). Prefer
+                // the monitor-union canvas when multiple monitors are present;
+                // otherwise preserve the existing single-monitor behavior.
                 if let Some(max) = self.honor_client_desktop_size {
-                    let requested_width = gcc_blocks.core.desktop_width;
-                    let requested_height = gcc_blocks.core.desktop_height;
-                    let clamped_width = requested_width.min(max.width);
-                    let clamped_height = requested_height.min(max.height);
-                    if let Some(client_size) = validate_desktop_size(clamped_width, clamped_height) {
+                    let monitor_size = self
+                        .client_monitors
+                        .as_deref()
+                        .filter(|monitors| monitors.len() > 1)
+                        .and_then(desktop_size_from_monitors);
+
+                    let requested_size = if let Some(multimon_size) = monitor_size {
+                        info!(
+                            multimon_size = ?multimon_size,
+                            core_size = ?DesktopSize {
+                                width: gcc_blocks.core.desktop_width,
+                                height: gcc_blocks.core.desktop_height,
+                            },
+                            max = ?max,
+                            "Using combined monitor topology as RDP desktop size"
+                        );
+                        multimon_size
+                    } else {
+                        DesktopSize {
+                            width: gcc_blocks.core.desktop_width,
+                            height: gcc_blocks.core.desktop_height,
+                        }
+                    };
+
+                    // For multimon, clamping the combined canvas would make the
+                    // advertised monitor rectangles inconsistent with the desktop.
+                    // Only adopt it when it fits within the operator-configured max.
+                    let client_size = if monitor_size.is_some() {
+                        (requested_size.width <= max.width && requested_size.height <= max.height)
+                            .then_some(requested_size)
+                    } else {
+                        validate_desktop_size(
+                            requested_size.width.min(max.width),
+                            requested_size.height.min(max.height),
+                        )
+                    };
+
+                    if let Some(client_size) = client_size {
                         if client_size != self.desktop_size {
                             debug!(
-                                requested = ?DesktopSize { width: requested_width, height: requested_height },
+                                requested = ?requested_size,
                                 max = ?max,
                                 adopted = ?client_size,
                                 previous = ?self.desktop_size,
-                                "Honoring client-requested desktop size (clamped to operator maximum)"
+                                "Honoring client-requested desktop size"
                             );
                             self.desktop_size = client_size;
                             set_bitmap_desktop_size(&mut self.server_capabilities, client_size);
                         }
                     } else {
-                        debug!(
-                            requested = ?DesktopSize { width: requested_width, height: requested_height },
-                            clamped = ?DesktopSize { width: clamped_width, height: clamped_height },
+                        warn!(
+                            requested = ?requested_size,
                             max = ?max,
-                            "Client-requested desktop size is out of protocol range after clamping to the operator maximum; keeping the server-provided size"
+                            "Client-requested desktop size exceeds the configured maximum; keeping the server-provided size"
                         );
                     }
                 }

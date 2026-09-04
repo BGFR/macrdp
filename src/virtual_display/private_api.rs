@@ -40,6 +40,12 @@ use objc2_foundation::{CGSize, NSString};
 
 type CGDirectDisplayID = u32;
 
+// A process may create more than one virtual display for RDP multimon.
+// CGVirtualDisplay rejects duplicate vendor/product/serial identities, so each
+// descriptor gets a unique serial even within the same process.
+static VDISPLAY_SERIAL_SEQ: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
 /// `CGSConfigureDisplayEnabled(config, display, enabled)` — undocumented
 /// SkyLight symbol re-exported from CoreGraphics on macOS 26. Called
 /// between `CGBeginDisplayConfiguration` / `CGCompleteDisplayConfiguration`
@@ -212,12 +218,12 @@ pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Re
         let _: () = msg_send![desc, setSizeInMillimeters: CGSize { width: 600.0, height: 338.0 }];
         let _: () = msg_send![desc, setProductID: 0x6D616372u32]; // "macr"
         let _: () = msg_send![desc, setVendorID: 0x6D616372u32];
-        // Was hardcoded to 1: a second macrdp process (e.g. two concurrent
-        // installs, or dev testing alongside a running instance) registering a
-        // display with an identical vendor/product/serial triple gets its
-        // descriptor rejected by CGVirtualDisplay initWithDescriptor: outright
-        // (returns nil). Per-process id keeps concurrent instances from colliding.
-        let _: () = msg_send![desc, setSerialNum: std::process::id()];
+        // A second display in the SAME process must also have a unique serial.
+        // Mix the process id with a per-process sequence so concurrent macrdp
+        // instances and multimon siblings both avoid identity collisions.
+        let seq = VDISPLAY_SERIAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let serial = std::process::id().wrapping_mul(16).wrapping_add(seq + 1);
+        let _: () = msg_send![desc, setSerialNum: serial];
 
         // 2. CGVirtualDisplay instance from the descriptor.
         let display: *mut AnyObject = msg_send![display_class, alloc];

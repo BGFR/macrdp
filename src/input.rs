@@ -38,6 +38,7 @@ impl MacInputHandler {
     pub fn new(
         desktop_size: crate::capture::SharedDesktopSize,
         target_display_id: Option<u32>,
+        secondary_target_display_id: Option<u32>,
         click_signal: Option<crate::capture::ClickSignal>,
         keyboard_layout: Option<String>,
         keyboard_layout_klid: Option<SharedKeyboardLayout>,
@@ -45,12 +46,14 @@ impl MacInputHandler {
         #[cfg(target_os = "macos")]
         let inner = macos::Inner::new(
             target_display_id,
+            secondary_target_display_id,
             keyboard_layout.as_deref(),
             keyboard_layout_klid,
         )?;
         #[cfg(not(target_os = "macos"))]
         {
             let _ = target_display_id;
+            let _ = secondary_target_display_id;
             let _ = keyboard_layout;
             let _ = keyboard_layout_klid;
         }
@@ -609,6 +612,9 @@ mod macos {
         // --detach-primary disabling the built-in mid-flight) doesn't
         // strand events on stale coords.
         target_display_id: Option<u32>,
+        // Experimental multimon: the second real macOS virtual display. The
+        // first target is the TOP half of the RDP canvas, this one the BOTTOM.
+        secondary_target_display_id: Option<u32>,
         // TTL cache for `target_bounds`: the CoreGraphics bounds query sits
         // on the busiest input path (mouse-move fires hundreds of times/s
         // during a drag) while display geometry changes only on a rare
@@ -655,6 +661,7 @@ mod macos {
     impl Inner {
         pub fn new(
             target_display_id: Option<u32>,
+            secondary_target_display_id: Option<u32>,
             keyboard_layout: Option<&str>,
             klid_handle: Option<super::SharedKeyboardLayout>,
         ) -> Result<Self> {
@@ -713,6 +720,7 @@ mod macos {
                 middle_down: false,
                 mods: ModifierState::default(),
                 target_display_id,
+                secondary_target_display_id,
                 cached_bounds: None,
                 bounds_cached_at: Instant::now(),
                 click_left: None,
@@ -756,6 +764,23 @@ mod macos {
             self.cached_bounds = Some(bounds);
             self.bounds_cached_at = Instant::now();
             bounds
+        }
+
+        fn display_bounds(id: u32) -> (f64, f64, f64, f64) {
+            let b = CGDisplay::new(id).bounds();
+            (b.origin.x, b.origin.y, b.size.width, b.size.height)
+        }
+
+        fn multimon_union_bounds(&mut self) -> Option<(f64, f64, f64, f64)> {
+            let top_id = self.target_display_id?;
+            let bottom_id = self.secondary_target_display_id?;
+            let (tx, ty, tw, th) = Self::display_bounds(top_id);
+            let (bx, by, bw, bh) = Self::display_bounds(bottom_id);
+            let min_x = tx.min(bx);
+            let min_y = ty.min(by);
+            let max_x = (tx + tw).max(bx + bw);
+            let max_y = (ty + th).max(by + bh);
+            Some((min_x, min_y, max_x - min_x, max_y - min_y))
         }
 
         pub fn keyboard(&mut self, event: KeyboardEvent) {
@@ -1242,11 +1267,35 @@ mod macos {
         }
 
         fn move_to(&mut self, x: u16, y: u16, desktop_w: u16, desktop_h: u16, letterbox: bool) {
-            // Scale desktop coords → screen points, then translate into the
-            // target display's slot in the global coord space. The origin
-            // offset is what makes CGEventPost route events to a non-primary
-            // display (virtual or external) — the WindowServer dispatches by
-            // which display contains the global coord.
+            // Experimental two-display path: the combined RDP framebuffer is
+            // normalized top-to-bottom. Route y in the first half to the TOP
+            // macOS virtual display, and y in the second half to the BOTTOM
+            // display, translating each half into that display's live global
+            // CoreGraphics bounds.
+            if let (Some(top_id), Some(bottom_id)) =
+                (self.target_display_id, self.secondary_target_display_id)
+            {
+                let split = (desktop_h / 2).max(1);
+                let (id, local_y) = if y < split {
+                    (top_id, y)
+                } else {
+                    (bottom_id, y.saturating_sub(split))
+                };
+                let (ox, oy, sw, sh) = Self::display_bounds(id);
+                let (mx, my) = super::map_client_to_display(
+                    x,
+                    local_y,
+                    desktop_w,
+                    split,
+                    sw,
+                    sh,
+                    false,
+                );
+                self.post_move(ox + mx, oy + my);
+                return;
+            }
+
+            // Single-display path.
             let (ox, oy, sw, sh) = self.target_bounds();
             let (mx, my) =
                 super::map_client_to_display(x, y, desktop_w, desktop_h, sw, sh, letterbox);
@@ -1267,7 +1316,9 @@ mod macos {
         /// on it for some or all pointer motion — left the cursor unable to
         /// reach the screen edge at all.
         fn move_rel(&mut self, dx: i32, dy: i32) {
-            let (ox, oy, sw, sh) = self.target_bounds();
+            let (ox, oy, sw, sh) = self
+                .multimon_union_bounds()
+                .unwrap_or_else(|| self.target_bounds());
             let sx = (self.last_x + f64::from(dx)).clamp(ox, ox + sw - 1.0);
             let sy = (self.last_y + f64::from(dy)).clamp(oy, oy + sh - 1.0);
             self.post_move(sx, sy);

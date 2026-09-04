@@ -14,14 +14,14 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
-    PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    arrange_vertical_pair, shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary,
+    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
-    ShieldedPrimary, VirtualDisplay,
+    arrange_vertical_pair, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
+    PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(target_os = "macos")]
@@ -227,6 +227,48 @@ mod macos {
             self.origin_pts = (0.0, 0.0);
             Ok(true)
         }
+    }
+
+    /// Arrange two virtual displays as a vertically-stacked pair just to the
+    /// right of the physical main display. `top_id` becomes the upper monitor
+    /// and `bottom_id` the lower monitor. The physical display remains system
+    /// main at (0,0), so the local Mac stays usable while the two virtual
+    /// displays form an independent remote workspace.
+    pub fn arrange_vertical_pair(top_id: u32, bottom_id: u32) -> Result<()> {
+        let main = CGDisplay::main();
+        let mb = main.bounds();
+        let x = (mb.origin.x + mb.size.width).round() as i32;
+        let base_y = mb.origin.y.round() as i32;
+
+        let top = CGDisplay::new(top_id);
+        let bottom = CGDisplay::new(bottom_id);
+        let top_h = top.bounds().size.height.round().max(1.0) as i32;
+
+        let config = main
+            .begin_configuration()
+            .map_err(|e| anyhow!("CGBeginDisplayConfiguration (multimon pair): CGError {e}"))?;
+        bottom
+            .configure_display_origin(&config, x, base_y)
+            .map_err(|e| anyhow!("CGConfigureDisplayOrigin(bottom, {x}, {base_y}): CGError {e}"))?;
+        top.configure_display_origin(&config, x, base_y - top_h)
+            .map_err(|e| {
+                anyhow!(
+                    "CGConfigureDisplayOrigin(top, {x}, {}): CGError {e}",
+                    base_y - top_h
+                )
+            })?;
+        main.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+            .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (multimon pair): CGError {e}"))?;
+
+        tracing::info!(
+            top_display_id = top_id,
+            bottom_display_id = bottom_id,
+            x,
+            top_y = base_y - top_h,
+            bottom_y = base_y,
+            "arranged two virtual displays as a vertical multimon pair"
+        );
+        Ok(())
     }
 
     /// Promotes a virtual (or any other secondary) display to be the
@@ -1589,6 +1631,10 @@ mod stub {
     /// No detach path off macOS, so nothing ever leaves a panel stuck.
     pub fn take_detach_reenable_failed() -> bool {
         false
+    }
+
+    pub fn arrange_vertical_pair(_top_id: u32, _bottom_id: u32) -> Result<()> {
+        Err(anyhow!("virtual display arrangement is macOS-only"))
     }
 
     pub struct VirtualDisplay;

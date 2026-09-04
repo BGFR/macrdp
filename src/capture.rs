@@ -338,11 +338,17 @@ pub struct CaptureDisplay {
     /// and we only fall through to it when the caller didn't ask for
     /// anything specific.
     pub display_id: Option<u32>,
+    /// Optional second macOS display for the experimental two-monitor virtual
+    /// display path. `display_id` is the TOP RDP monitor; this id is the BOTTOM
+    /// monitor. Capture composites both into the single RDP desktop canvas.
+    pub secondary_display_id: Option<u32>,
     /// Target display's logical size in points — fed through to
     /// `CursorState` for the (currently disabled) position-polling
     /// path. Caller queries it from `CGDisplay::main()` for the
     /// primary path, or from `VirtualDisplay::size_pts()`.
     pub screen_size_pts: (f64, f64),
+    /// Logical point size of `secondary_display_id`, when multimon is active.
+    pub secondary_screen_size_pts: Option<(f64, f64)>,
     /// True when serving a `--virtual-display`. On disconnect the capture
     /// session warps the cursor back onto the primary physical display, so it
     /// isn't left stranded in the (off-panel) virtual-display coordinate region.
@@ -562,6 +568,13 @@ impl RdpServerDisplay for CaptureDisplay {
     /// surface swap without the core reactivation was tried first and was
     /// visually broken on a real client).
     fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
+        if self.secondary_display_id.is_some() {
+            tracing::debug!(
+                "client requested a live display-control resize during multimon; \
+                 ignoring because the experimental two-display geometry is pinned"
+            );
+            return;
+        }
         let resizable = self.auto_size || self.virtual_display.is_some();
         if !resizable {
             tracing::debug!(
@@ -637,6 +650,13 @@ impl CaptureDisplay {
     /// virtual display (mirror-primary).
     fn sync_virtual_display(&mut self) -> (u16, u16) {
         let (width, height) = self.desktop_size.get();
+        // In the experimental multimon path the combined RDP canvas is backed
+        // by TWO fixed-size macOS virtual displays. Never try to resize the first
+        // display to the combined height (that would collapse us back to one
+        // 1920x2160 display and reintroduce cross-monitor maximize).
+        if self.secondary_display_id.is_some() {
+            return (width, height);
+        }
         let Some(vd) = self.virtual_display.clone() else {
             return (width, height);
         };
@@ -809,28 +829,65 @@ impl CaptureDisplay {
         height: u16,
     ) -> Result<Box<dyn RdpServerDisplayUpdates>> {
         #[cfg(target_os = "macos")]
-        let inner: Box<dyn RdpServerDisplayUpdates + Send> = Box::new(
-            macos::ScreenCaptureUpdates::start(
-                width,
-                height,
-                self.fps,
-                self.display_id,
-                self.screen_size_pts,
-                self.cursor_scale,
-                self.warp_cursor_home,
-                self.gfx.clone(),
-                self.keyframe_on_change,
-                self.click_signal.clone(),
-                self.flush_frames,
-                self.display_suppressed.clone(),
-                self.auto_size,
-                self.stretch,
-                self.desktop_size.clone(),
-                self.pending_resize.clone(),
-                self.suppress_next_adopt.clone(),
+        let inner: Box<dyn RdpServerDisplayUpdates + Send> = if let Some(bottom_id) = self.secondary_display_id {
+            if self.gfx.is_some() {
+                return Err(anyhow::anyhow!(
+                    "experimental multimon capture does not support EGFX/H.264 yet"
+                ));
+            }
+            let top_id = self
+                .display_id
+                .ok_or_else(|| anyhow::anyhow!("multimon top display id missing"))?;
+            let bottom_size = self
+                .secondary_screen_size_pts
+                .ok_or_else(|| anyhow::anyhow!("multimon bottom display size missing"))?;
+            Box::new(
+                macos::MultiScreenCaptureUpdates::start(
+                    width,
+                    height,
+                    self.fps,
+                    top_id,
+                    bottom_id,
+                    self.screen_size_pts,
+                    bottom_size,
+                    self.cursor_scale,
+                    self.warp_cursor_home,
+                    self.keyframe_on_change,
+                    self.click_signal.clone(),
+                    self.flush_frames,
+                    self.display_suppressed.clone(),
+                    self.auto_size,
+                    self.stretch,
+                    self.desktop_size.clone(),
+                    self.pending_resize.clone(),
+                    self.suppress_next_adopt.clone(),
+                )
+                .await?,
             )
-            .await?,
-        );
+        } else {
+            Box::new(
+                macos::ScreenCaptureUpdates::start(
+                    width,
+                    height,
+                    self.fps,
+                    self.display_id,
+                    self.screen_size_pts,
+                    self.cursor_scale,
+                    self.warp_cursor_home,
+                    self.gfx.clone(),
+                    self.keyframe_on_change,
+                    self.click_signal.clone(),
+                    self.flush_frames,
+                    self.display_suppressed.clone(),
+                    self.auto_size,
+                    self.stretch,
+                    self.desktop_size.clone(),
+                    self.pending_resize.clone(),
+                    self.suppress_next_adopt.clone(),
+                )
+                .await?,
+            )
+        };
         #[cfg(not(target_os = "macos"))]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> =
             Box::new(stub::StubUpdates::new(width, height)?);
@@ -916,6 +973,174 @@ mod macos {
     /// trips easily; backpressure flaps under heavy local CPU/IO last
     /// tens of ms and are filtered out. 1 second is comfortably between.
     const SUPPRESS_DEBOUNCE: Duration = Duration::from_secs(1);
+
+    /// Composite two real macOS displays into the one RDP desktop framebuffer.
+    /// The top display occupies y=0..split_y-1; the bottom display occupies
+    /// y=split_y..combined_height-1. Bitmap rectangles from each child capture
+    /// are translated into that combined coordinate space.
+    pub struct MultiScreenCaptureUpdates {
+        top: ScreenCaptureUpdates,
+        bottom: ScreenCaptureUpdates,
+        split_y: u16,
+        combined_size: DesktopSize,
+        top_alive: bool,
+        bottom_alive: bool,
+    }
+
+    impl MultiScreenCaptureUpdates {
+        #[allow(clippy::too_many_arguments)]
+        pub async fn start(
+            combined_width: u16,
+            combined_height: u16,
+            fps: u32,
+            top_display_id: u32,
+            bottom_display_id: u32,
+            top_screen_size_pts: (f64, f64),
+            bottom_screen_size_pts: (f64, f64),
+            cursor_scale_multiplier: f64,
+            warp_cursor_home: bool,
+            keyframe_on_change: KeyframeOnChange,
+            click_signal: Option<ClickSignal>,
+            flush_frames: u32,
+            display_suppressed: Option<Arc<AtomicBool>>,
+            auto_size: bool,
+            stretch: bool,
+            desktop_size: SharedDesktopSize,
+            pending_resize: PendingResize,
+            suppress_next_adopt: Arc<AtomicBool>,
+        ) -> Result<Self> {
+            if combined_height % 2 != 0 {
+                return Err(anyhow!(
+                    "multimon combined height {combined_height} is not evenly splittable"
+                ));
+            }
+            let each_h = combined_height / 2;
+            let top = ScreenCaptureUpdates::start(
+                combined_width,
+                each_h,
+                fps,
+                Some(top_display_id),
+                top_screen_size_pts,
+                cursor_scale_multiplier,
+                warp_cursor_home,
+                None,
+                keyframe_on_change,
+                click_signal.clone(),
+                flush_frames,
+                display_suppressed.clone(),
+                auto_size,
+                stretch,
+                desktop_size.clone(),
+                pending_resize.clone(),
+                suppress_next_adopt.clone(),
+            )
+            .await?;
+            let bottom = ScreenCaptureUpdates::start(
+                combined_width,
+                each_h,
+                fps,
+                Some(bottom_display_id),
+                bottom_screen_size_pts,
+                cursor_scale_multiplier,
+                warp_cursor_home,
+                None,
+                keyframe_on_change,
+                click_signal,
+                flush_frames,
+                display_suppressed,
+                auto_size,
+                stretch,
+                desktop_size,
+                pending_resize,
+                suppress_next_adopt,
+            )
+            .await?;
+
+            tracing::info!(
+                top_display_id,
+                bottom_display_id,
+                each_w = combined_width,
+                each_h,
+                combined_w = combined_width,
+                combined_h = combined_height,
+                "started two ScreenCaptureKit streams for RDP multimon"
+            );
+
+            Ok(Self {
+                top,
+                bottom,
+                split_y: each_h,
+                combined_size: DesktopSize {
+                    width: combined_width,
+                    height: combined_height,
+                },
+                top_alive: true,
+                bottom_alive: true,
+            })
+        }
+
+        fn translate(
+            update: DisplayUpdate,
+            y_offset: u16,
+            combined_size: DesktopSize,
+        ) -> DisplayUpdate {
+            match update {
+                DisplayUpdate::Bitmap(mut b) => {
+                    b.y = b.y.saturating_add(y_offset);
+                    DisplayUpdate::Bitmap(b)
+                }
+                DisplayUpdate::Resize(_) => DisplayUpdate::Resize(combined_size),
+                other => other,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RdpServerDisplayUpdates for MultiScreenCaptureUpdates {
+        async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+            loop {
+                match (self.top_alive, self.bottom_alive) {
+                    (false, false) => return Ok(None),
+                    (true, false) => {
+                        let next = self.top.next_update().await?;
+                        if next.is_none() {
+                            self.top_alive = false;
+                            continue;
+                        }
+                        return Ok(next.map(|u| Self::translate(u, 0, self.combined_size)));
+                    }
+                    (false, true) => {
+                        let next = self.bottom.next_update().await?;
+                        if next.is_none() {
+                            self.bottom_alive = false;
+                            continue;
+                        }
+                        return Ok(next.map(|u| Self::translate(u, self.split_y, self.combined_size)));
+                    }
+                    (true, true) => {
+                        let split_y = self.split_y;
+                        let combined_size = self.combined_size;
+                        let top = &mut self.top;
+                        let bottom = &mut self.bottom;
+                        tokio::select! {
+                            r = top.next_update() => {
+                                match r? {
+                                    Some(u) => return Ok(Some(Self::translate(u, 0, combined_size))),
+                                    None => self.top_alive = false,
+                                }
+                            }
+                            r = bottom.next_update() => {
+                                match r? {
+                                    Some(u) => return Ok(Some(Self::translate(u, split_y, combined_size))),
+                                    None => self.bottom_alive = false,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     pub struct ScreenCaptureUpdates {
         stream: AsyncSCStream,

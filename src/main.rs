@@ -1938,9 +1938,7 @@ async fn async_main() -> Result<()> {
     }
     let multimon_any = args.multimon_virtual || args.multimon_physical_virtual;
     if multimon_any && !args.virtual_display {
-        return Err(anyhow!(
-            "multimon modes require --virtual-display"
-        ));
+        return Err(anyhow!("multimon modes require --virtual-display"));
     }
     if multimon_any && !args.no_client_resolution {
         return Err(anyhow!(

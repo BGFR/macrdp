@@ -829,65 +829,66 @@ impl CaptureDisplay {
         height: u16,
     ) -> Result<Box<dyn RdpServerDisplayUpdates>> {
         #[cfg(target_os = "macos")]
-        let inner: Box<dyn RdpServerDisplayUpdates + Send> = if let Some(bottom_id) = self.secondary_display_id {
-            if self.gfx.is_some() {
-                return Err(anyhow::anyhow!(
-                    "experimental multimon capture does not support EGFX/H.264 yet"
-                ));
-            }
-            let top_id = self
-                .display_id
-                .ok_or_else(|| anyhow::anyhow!("multimon top display id missing"))?;
-            let bottom_size = self
-                .secondary_screen_size_pts
-                .ok_or_else(|| anyhow::anyhow!("multimon bottom display size missing"))?;
-            Box::new(
-                macos::MultiScreenCaptureUpdates::start(
-                    width,
-                    height,
-                    self.fps,
-                    top_id,
-                    bottom_id,
-                    self.screen_size_pts,
-                    bottom_size,
-                    self.cursor_scale,
-                    self.warp_cursor_home,
-                    self.keyframe_on_change,
-                    self.click_signal.clone(),
-                    self.flush_frames,
-                    self.display_suppressed.clone(),
-                    self.auto_size,
-                    self.stretch,
-                    self.desktop_size.clone(),
-                    self.pending_resize.clone(),
-                    self.suppress_next_adopt.clone(),
+        let inner: Box<dyn RdpServerDisplayUpdates + Send> =
+            if let Some(bottom_id) = self.secondary_display_id {
+                if self.gfx.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "experimental multimon capture does not support EGFX/H.264 yet"
+                    ));
+                }
+                let top_id = self
+                    .display_id
+                    .ok_or_else(|| anyhow::anyhow!("multimon top display id missing"))?;
+                let bottom_size = self
+                    .secondary_screen_size_pts
+                    .ok_or_else(|| anyhow::anyhow!("multimon bottom display size missing"))?;
+                Box::new(
+                    macos::MultiScreenCaptureUpdates::start(
+                        width,
+                        height,
+                        self.fps,
+                        top_id,
+                        bottom_id,
+                        self.screen_size_pts,
+                        bottom_size,
+                        self.cursor_scale,
+                        self.warp_cursor_home,
+                        self.keyframe_on_change,
+                        self.click_signal.clone(),
+                        self.flush_frames,
+                        self.display_suppressed.clone(),
+                        self.auto_size,
+                        self.stretch,
+                        self.desktop_size.clone(),
+                        self.pending_resize.clone(),
+                        self.suppress_next_adopt.clone(),
+                    )
+                    .await?,
                 )
-                .await?,
-            )
-        } else {
-            Box::new(
-                macos::ScreenCaptureUpdates::start(
-                    width,
-                    height,
-                    self.fps,
-                    self.display_id,
-                    self.screen_size_pts,
-                    self.cursor_scale,
-                    self.warp_cursor_home,
-                    self.gfx.clone(),
-                    self.keyframe_on_change,
-                    self.click_signal.clone(),
-                    self.flush_frames,
-                    self.display_suppressed.clone(),
-                    self.auto_size,
-                    self.stretch,
-                    self.desktop_size.clone(),
-                    self.pending_resize.clone(),
-                    self.suppress_next_adopt.clone(),
+            } else {
+                Box::new(
+                    macos::ScreenCaptureUpdates::start(
+                        width,
+                        height,
+                        self.fps,
+                        self.display_id,
+                        self.screen_size_pts,
+                        self.cursor_scale,
+                        self.warp_cursor_home,
+                        self.gfx.clone(),
+                        self.keyframe_on_change,
+                        self.click_signal.clone(),
+                        self.flush_frames,
+                        self.display_suppressed.clone(),
+                        self.auto_size,
+                        self.stretch,
+                        self.desktop_size.clone(),
+                        self.pending_resize.clone(),
+                        self.suppress_next_adopt.clone(),
+                    )
+                    .await?,
                 )
-                .await?,
-            )
-        };
+            };
         #[cfg(not(target_os = "macos"))]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> =
             Box::new(stub::StubUpdates::new(width, height)?);
@@ -1115,7 +1116,9 @@ mod macos {
                             self.bottom_alive = false;
                             continue;
                         }
-                        return Ok(next.map(|u| Self::translate(u, self.split_y, self.combined_size)));
+                        return Ok(
+                            next.map(|u| Self::translate(u, self.split_y, self.combined_size))
+                        );
                     }
                     (true, true) => {
                         let split_y = self.split_y;

@@ -43,8 +43,7 @@ type CGDirectDisplayID = u32;
 // A process may create more than one virtual display for RDP multimon.
 // CGVirtualDisplay rejects duplicate vendor/product/serial identities, so each
 // descriptor gets a unique serial even within the same process.
-static VDISPLAY_SERIAL_SEQ: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static VDISPLAY_SERIAL_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// `CGSConfigureDisplayEnabled(config, display, enabled)` — undocumented
 /// SkyLight symbol re-exported from CoreGraphics on macOS 26. Called

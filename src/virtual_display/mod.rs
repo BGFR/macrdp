@@ -14,8 +14,8 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    arrange_vertical_pair, shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary,
-    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    arrange_vertical_pair, shield_keeps_physical_main, take_detach_reenable_failed,
+    CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]

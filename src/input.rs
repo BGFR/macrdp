@@ -1282,15 +1282,8 @@ mod macos {
                     (bottom_id, y.saturating_sub(split))
                 };
                 let (ox, oy, sw, sh) = Self::display_bounds(id);
-                let (mx, my) = super::map_client_to_display(
-                    x,
-                    local_y,
-                    desktop_w,
-                    split,
-                    sw,
-                    sh,
-                    false,
-                );
+                let (mx, my) =
+                    super::map_client_to_display(x, local_y, desktop_w, split, sw, sh, false);
                 self.post_move(ox + mx, oy + my);
                 return;
             }

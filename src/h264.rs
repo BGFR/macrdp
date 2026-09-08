@@ -2062,49 +2062,51 @@ impl Gfx {
             };
             if let Some(bps) = adaptive.bitrate_bps {
                 let stream_bps = per_stream_bitrate(bps);
-                if let Some(encoder) = ctx.encoder.as_ref()
-                    && let Err(e) = encoder.set_bitrate(stream_bps)
-                {
-                    trace!(
-                        error = ?e,
-                        bps = stream_bps,
-                        stream = 0,
-                        "adaptive set_bitrate failed"
-                    );
+                if let Some(encoder) = ctx.encoder.as_ref() {
+                    if let Err(e) = encoder.set_bitrate(stream_bps) {
+                        trace!(
+                            error = ?e,
+                            bps = stream_bps,
+                            stream = 0,
+                            "adaptive set_bitrate failed"
+                        );
+                    }
                 }
-                if self.multimon_vertical
-                    && let Some(encoder) = ctx.secondary_encoder.as_ref()
-                    && let Err(e) = encoder.set_bitrate(stream_bps)
-                {
-                    trace!(
-                        error = ?e,
-                        bps = stream_bps,
-                        stream = 1,
-                        "adaptive set_bitrate failed"
-                    );
+                if self.multimon_vertical {
+                    if let Some(encoder) = ctx.secondary_encoder.as_ref() {
+                        if let Err(e) = encoder.set_bitrate(stream_bps) {
+                            trace!(
+                                error = ?e,
+                                bps = stream_bps,
+                                stream = 1,
+                                "adaptive set_bitrate failed"
+                            );
+                        }
+                    }
                 }
             }
             if let Some(frames) = adaptive.keyframe_frames {
-                if let Some(encoder) = ctx.encoder.as_ref()
-                    && let Err(e) = encoder.set_keyframe_interval(frames)
-                {
-                    trace!(
-                        error = ?e,
-                        frames,
-                        stream = 0,
-                        "adaptive set_keyframe_interval failed"
-                    );
+                if let Some(encoder) = ctx.encoder.as_ref() {
+                    if let Err(e) = encoder.set_keyframe_interval(frames) {
+                        trace!(
+                            error = ?e,
+                            frames,
+                            stream = 0,
+                            "adaptive set_keyframe_interval failed"
+                        );
+                    }
                 }
-                if self.multimon_vertical
-                    && let Some(encoder) = ctx.secondary_encoder.as_ref()
-                    && let Err(e) = encoder.set_keyframe_interval(frames)
-                {
-                    trace!(
-                        error = ?e,
-                        frames,
-                        stream = 1,
-                        "adaptive set_keyframe_interval failed"
-                    );
+                if self.multimon_vertical {
+                    if let Some(encoder) = ctx.secondary_encoder.as_ref() {
+                        if let Err(e) = encoder.set_keyframe_interval(frames) {
+                            trace!(
+                                error = ?e,
+                                frames,
+                                stream = 1,
+                                "adaptive set_keyframe_interval failed"
+                            );
+                        }
+                    }
                 }
             }
 

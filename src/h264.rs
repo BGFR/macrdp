@@ -2437,7 +2437,10 @@ impl Gfx {
             }
             shipped.fetch_add(n, Ordering::Relaxed);
         }
-        debug!(stream = stream_index, "EGFX ship loop exiting (output channel closed)");
+        debug!(
+            stream = stream_index,
+            "EGFX ship loop exiting (output channel closed)"
+        );
     }
 
     /// One-time per-connection surface + encoder setup. Caller holds `ctx`.
@@ -2571,8 +2574,8 @@ impl Gfx {
         // an independent VideoToolbox session/reference chain; using one encoder
         // for two unrelated desktops would make P-frames depend on the wrong image.
         let (width, combined_height) = ctx.dims;
-        let encoders_missing = ctx.encoder.is_none()
-            || (self.multimon_vertical && ctx.secondary_encoder.is_none());
+        let encoders_missing =
+            ctx.encoder.is_none() || (self.multimon_vertical && ctx.secondary_encoder.is_none());
         if encoders_missing {
             // The configured/adaptive bitrate is a whole-desktop budget. Two equal
             // monitor streams each receive half so enabling multimon doesn't double
@@ -2590,23 +2593,13 @@ impl Gfx {
                     ));
                 }
                 let each_h = combined_height / 2;
-                let mut top_encoder = Encoder::new(
-                    width,
-                    each_h,
-                    self.fps,
-                    per_stream_bps,
-                    self.keyframe_secs,
-                )?;
+                let mut top_encoder =
+                    Encoder::new(width, each_h, self.fps, per_stream_bps, self.keyframe_secs)?;
                 let top_rx = top_encoder
                     .take_receiver()
                     .ok_or_else(|| anyhow!("EGFX: top encoder receiver already taken"))?;
-                let mut bottom_encoder = Encoder::new(
-                    width,
-                    each_h,
-                    self.fps,
-                    per_stream_bps,
-                    self.keyframe_secs,
-                )?;
+                let mut bottom_encoder =
+                    Encoder::new(width, each_h, self.fps, per_stream_bps, self.keyframe_secs)?;
                 let bottom_rx = bottom_encoder
                     .take_receiver()
                     .ok_or_else(|| anyhow!("EGFX: bottom encoder receiver already taken"))?;

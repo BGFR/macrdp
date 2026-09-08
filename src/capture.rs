@@ -976,8 +976,8 @@ mod macos {
     /// y=split_y..combined_height-1. On the legacy path, child BitmapUpdates are
     /// translated into that combined coordinate space. With EGFX/H.264 enabled,
     /// the same child updates are first applied to a persistent combined BGRA
-    /// framebuffer, then that full 1920x2160-style canvas is submitted to the
-    /// existing VideoToolbox/Gfx pipeline as one RDP surface.
+    /// backing framebuffer; `Gfx::submit_bgra` then splits that backing at
+    /// `split_y` and encodes each monitor independently into its own EGFX surface.
     pub struct MultiScreenCaptureUpdates {
         top: ScreenCaptureUpdates,
         bottom: ScreenCaptureUpdates,
@@ -985,8 +985,9 @@ mod macos {
         combined_size: DesktopSize,
         top_alive: bool,
         bottom_alive: bool,
-        /// EGFX/H.264 sink for the combined canvas. The child captures deliberately
-        /// run with `gfx=None`; this outer compositor is the only encoder producer.
+        /// EGFX/H.264 sink for the combined backing buffer. The child captures
+        /// deliberately run with `gfx=None`; this outer compositor is the only
+        /// producer, while Gfx splits the two monitor halves before encoding.
         gfx: Option<crate::h264::Gfx>,
         keyframe_on_change: KeyframeOnChange,
         kf_armed: bool,
@@ -999,8 +1000,8 @@ mod macos {
         suppressed_since: Option<Instant>,
         first_egfx_frame_sent: bool,
         /// Persistent combined BGRA framebuffer. Child BitmapUpdates are raw BGRA
-        /// rectangles, so applying them here is a cheap row copy and avoids asking
-        /// VideoToolbox to understand two independent display streams.
+        /// rectangles, so applying them here is a cheap row copy. The H.264 layer
+        /// uses the top/bottom row ranges as two independent encoder inputs.
         composite: Vec<u8>,
         composite_stride: usize,
         composite_dirty: bool,
@@ -1284,9 +1285,10 @@ mod macos {
                 .is_none_or(|last| last.elapsed() >= self.frame_interval)
         }
 
-        /// Submit the current combined framebuffer. `arm_flush` is true for a real
-        /// changed frame and false for one of the trailing duplicate frames used to
-        /// drain mstsc's AVC presentation buffer.
+        /// Submit the current combined backing framebuffer. In multimon H.264,
+        /// `Gfx::submit_bgra` splits it into the two per-monitor streams. `arm_flush`
+        /// is true for a real changed frame and false for one of the trailing
+        /// duplicate frames used to drain mstsc's AVC presentation buffer.
         fn submit_composite(&mut self, force_keyframe: bool, arm_flush: bool) -> bool {
             let Some(gfx) = self.gfx.as_ref() else {
                 return false;
@@ -1297,7 +1299,7 @@ mod macos {
                         tracing::info!(
                             width = self.combined_size.width,
                             height = self.combined_size.height,
-                            "first combined multimon EGFX/H.264 frame shipped"
+                            "first multimon EGFX/H.264 frame pair submitted"
                         );
                     }
                     self.first_egfx_frame_sent = true;
@@ -1432,7 +1434,7 @@ mod macos {
                                 self.composite_dirty = true;
                                 self.force_keyframe_pending = true;
                                 tracing::debug!(
-                                    "multimon client un-suppress edge — resending combined frame as IDR"
+                                    "multimon client un-suppress edge — resending both monitor streams as IDR"
                                 );
                             }
                         }

@@ -168,8 +168,21 @@ impl WireFormat {
 /// side) and the `GfxHandler` callbacks (protocol side) via `Arc<Mutex<>>`.
 struct ConnectionContext {
     server_handle: GfxServerHandle,
+    /// Primary/sole VideoToolbox encoder. In vertical multimon mode this is the
+    /// encoder for the TOP display (the virtual Mac display in
+    /// --multimon-physical-virtual mode).
     encoder: Option<Encoder>,
+    /// Primary/sole EGFX surface id. In vertical multimon mode this is the TOP
+    /// display surface, mapped at output origin (0, 0).
     surface_id: Option<u16>,
+    /// Second VideoToolbox encoder used only by vertical multimon. Keeping a
+    /// separate H.264 reference chain per surface is required: alternating two
+    /// unrelated desktops through one inter-frame encoder corrupts the decoder's
+    /// reference history.
+    secondary_encoder: Option<Encoder>,
+    /// Second EGFX surface used only by vertical multimon. It is mapped below
+    /// the first surface at output origin (0, each_h).
+    secondary_surface_id: Option<u16>,
     is_ready: bool,
     epoch: Instant,
     /// True once the next shipped frame must be a forced keyframe (IDR):
@@ -1157,10 +1170,10 @@ pub struct Gfx {
     /// surface + encoder are created, so the H.264 pipeline tracks the
     /// client-resolution auto-adopt without rebuilding the factory.
     desktop_size: crate::capture::SharedDesktopSize,
-    /// True for the experimental two-monitor vertical RDP layout. The H.264
-    /// surface still spans the full combined framebuffer, but RESET_GRAPHICS must
-    /// advertise the same two TS_MONITOR_DEF rectangles as the core RDP layer or
-    /// mstsc decodes frames without presenting them.
+    /// True for the experimental two-monitor vertical RDP layout. The graphics
+    /// output buffer spans the full combined desktop, but H.264 is carried on TWO
+    /// independent per-monitor surfaces/encoders. RESET_GRAPHICS still advertises
+    /// the same two TS_MONITOR_DEF rectangles as the core RDP layer.
     multimon_vertical: bool,
     fps: u32,
     bitrate_bps: u32,
@@ -1425,10 +1438,23 @@ impl Gfx {
         // remap was live-verified never to heal mstsc; ≥2 re-enables
         // remap-first). max_consecutive_drops caps the cross-connection
         // drop → reconnect → blank → drop loop on a truly-stuck client.
-        let blank_recovery_enabled = match std::env::var("MACRDP_BLANK_RECOVERY") {
+        let blank_recovery_requested = match std::env::var("MACRDP_BLANK_RECOVERY") {
             Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
             Err(_) => true,
         };
+        // The reconnect-blank detector was developed against one mapped AVC
+        // surface. In true multimon there are two independent AVC surfaces and
+        // QoE reports are interleaved across them, so the old all-zero heuristic
+        // is not a trustworthy presentation signal. More importantly, a false
+        // positive deliberately drops the connection and creates an mstsc
+        // reconnect loop. Keep recovery disabled for multimon until the detector
+        // is made surface-aware.
+        let blank_recovery_enabled = blank_recovery_requested && !multimon_vertical;
+        if blank_recovery_requested && multimon_vertical {
+            info!(
+                "EGFX blank recovery disabled for multimon — QoE recovery is not yet surface-aware"
+            );
+        }
         // These two RTT knobs allow an explicit 0 (= "disable"), unlike env_u32
         // whose zero-filter falls back to the default.
         let env_u32_zero_ok = |name: &str, default: u32| -> u32 {
@@ -1704,7 +1730,11 @@ impl Gfx {
             }
             // Lazy one-time setup on the first ready frame (creates the encoder
             // and spawns the ship thread).
-            if ctx.surface_id.is_none() || ctx.encoder.is_none() {
+            let surfaces_missing = ctx.surface_id.is_none()
+                || (self.multimon_vertical && ctx.secondary_surface_id.is_none());
+            let encoders_missing = ctx.encoder.is_none()
+                || (self.multimon_vertical && ctx.secondary_encoder.is_none());
+            if surfaces_missing || encoders_missing {
                 self.setup_locked(ctx)?;
             }
             // Blank-presentation detector (the mstsc reconnect-blank): the client
@@ -1924,9 +1954,16 @@ impl Gfx {
                 .submitted
                 .load(Ordering::Relaxed)
                 .saturating_sub(ctx.shipped.load(Ordering::Relaxed));
-            if outstanding >= u64::from(self.max_in_flight) {
+            // A multimon capture submits one encoded frame per surface, so the
+            // shared submitted/shipped counters advance by two per capture. Scale
+            // the threshold by the stream count to preserve the configured
+            // --h264-frames-in-flight depth PER MONITOR.
+            let stream_count = if self.multimon_vertical { 2 } else { 1 };
+            let pipeline_limit = u64::from(self.max_in_flight).saturating_mul(stream_count);
+            if outstanding >= pipeline_limit {
                 trace!(
                     outstanding,
+                    pipeline_limit,
                     "EGFX pipeline full; dropping capture to latest"
                 );
                 return Ok(true); // still the active path; just dropped this frame
@@ -1996,8 +2033,15 @@ impl Gfx {
             return Ok(true);
         }
 
-        // Submit to VideoToolbox (async). The ship thread delivers + ships the
-        // output; we just count the submission for the drop-to-latest throttle.
+        // Submit to VideoToolbox (async). The ship thread(s) deliver + ship the
+        // output; we just count submissions for the drop-to-latest throttle.
+        //
+        // In vertical multimon the capture layer still maintains one convenient
+        // combined BGRA backing buffer. DO NOT encode that 1920x2160-style buffer
+        // as one H.264 surface: mstsc maps/presents it incorrectly in a true
+        // multi-monitor session. Instead split it by rows here and feed two
+        // independent 1920x1080-style encoders whose outputs target two mapped
+        // EGFX surfaces.
         {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
@@ -2005,24 +2049,114 @@ impl Gfx {
             };
             // Congestion-responsive control (P1 bitrate + P2a IDR backoff): compute
             // the adjustments (mutates ctx adaptive state, may set need_keyframe)
-            // BEFORE borrowing the encoder, then apply them live. No-op unless
-            // adaptive is enabled AND EGFX is on a UDP tunnel.
+            // BEFORE borrowing the encoders, then apply them live. The CLI bitrate
+            // is a whole-desktop budget, so split it equally between the two
+            // equal-area monitors instead of silently doubling network usage.
             let adaptive = self.adaptive_bitrate_step(ctx);
-            let Some(encoder) = ctx.encoder.as_mut() else {
-                return Ok(true);
+            let per_stream_bitrate = |bps: u32| {
+                if self.multimon_vertical {
+                    (bps / 2).max(1)
+                } else {
+                    bps
+                }
             };
             if let Some(bps) = adaptive.bitrate_bps {
-                if let Err(e) = encoder.set_bitrate(bps) {
-                    trace!(error = ?e, bps, "adaptive set_bitrate failed");
+                let stream_bps = per_stream_bitrate(bps);
+                if let Some(encoder) = ctx.encoder.as_ref()
+                    && let Err(e) = encoder.set_bitrate(stream_bps)
+                {
+                    trace!(
+                        error = ?e,
+                        bps = stream_bps,
+                        stream = 0,
+                        "adaptive set_bitrate failed"
+                    );
+                }
+                if self.multimon_vertical
+                    && let Some(encoder) = ctx.secondary_encoder.as_ref()
+                    && let Err(e) = encoder.set_bitrate(stream_bps)
+                {
+                    trace!(
+                        error = ?e,
+                        bps = stream_bps,
+                        stream = 1,
+                        "adaptive set_bitrate failed"
+                    );
                 }
             }
             if let Some(frames) = adaptive.keyframe_frames {
-                if let Err(e) = encoder.set_keyframe_interval(frames) {
-                    trace!(error = ?e, frames, "adaptive set_keyframe_interval failed");
+                if let Some(encoder) = ctx.encoder.as_ref()
+                    && let Err(e) = encoder.set_keyframe_interval(frames)
+                {
+                    trace!(
+                        error = ?e,
+                        frames,
+                        stream = 0,
+                        "adaptive set_keyframe_interval failed"
+                    );
+                }
+                if self.multimon_vertical
+                    && let Some(encoder) = ctx.secondary_encoder.as_ref()
+                    && let Err(e) = encoder.set_keyframe_interval(frames)
+                {
+                    trace!(
+                        error = ?e,
+                        frames,
+                        stream = 1,
+                        "adaptive set_keyframe_interval failed"
+                    );
                 }
             }
-            encoder.encode_bgra(bgra, stride, force_keyframe)?;
-            ctx.submitted.fetch_add(1, Ordering::Relaxed);
+
+            if self.multimon_vertical {
+                let (width, combined_height) = ctx.dims;
+                if combined_height % 2 != 0 {
+                    return Err(anyhow!(
+                        "EGFX multimon combined height must be even; got {combined_height}"
+                    ));
+                }
+                let each_h = combined_height / 2;
+                let bytes_per_monitor = stride
+                    .checked_mul(usize::from(each_h))
+                    .ok_or_else(|| anyhow!("EGFX multimon stride*height overflow"))?;
+                let required = bytes_per_monitor
+                    .checked_mul(2)
+                    .ok_or_else(|| anyhow!("EGFX multimon combined buffer size overflow"))?;
+                if bgra.len() < required {
+                    return Err(anyhow!(
+                        "EGFX multimon BGRA buffer too small: have {}, need {} (stride {} * {} rows)",
+                        bgra.len(),
+                        required,
+                        stride,
+                        combined_height
+                    ));
+                }
+                // Preserve the row stride from the combined backing buffer. Each
+                // slice starts on a row boundary and contains exactly one monitor.
+                let top = &bgra[..bytes_per_monitor];
+                let bottom = &bgra[bytes_per_monitor..required];
+                let Some(top_encoder) = ctx.encoder.as_mut() else {
+                    return Ok(true);
+                };
+                top_encoder.encode_bgra(top, stride, force_keyframe)?;
+                let Some(bottom_encoder) = ctx.secondary_encoder.as_mut() else {
+                    return Ok(true);
+                };
+                bottom_encoder.encode_bgra(bottom, stride, force_keyframe)?;
+                ctx.submitted.fetch_add(2, Ordering::Relaxed);
+                trace!(
+                    width,
+                    each_h,
+                    force_keyframe,
+                    "EGFX multimon BGRA submitted to two independent VT encoders"
+                );
+            } else {
+                let Some(encoder) = ctx.encoder.as_mut() else {
+                    return Ok(true);
+                };
+                encoder.encode_bgra(bgra, stride, force_keyframe)?;
+                ctx.submitted.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(true)
     }
@@ -2280,40 +2414,48 @@ impl Gfx {
     /// capture tick. Bumps `shipped` per frame so the capture thread's
     /// drop-to-latest throttle can bound the pipeline depth. Exits when the
     /// channel closes (encoder dropped on connection teardown).
-    fn ship_loop(&self, rx: std::sync::mpsc::Receiver<EncodedFrame>, shipped: Arc<AtomicU64>) {
+    fn ship_loop(
+        &self,
+        rx: std::sync::mpsc::Receiver<EncodedFrame>,
+        shipped: Arc<AtomicU64>,
+        stream_index: u8,
+    ) {
         while let Ok(frame) = rx.recv() {
-            // Sweep up any others VT delivered alongside it (keeps order).
+            // Sweep up any others VT delivered alongside it (keeps order for
+            // this encoder/surface). The two multimon ship threads may interleave
+            // with each other, which is fine: each RDPGFX frame targets exactly
+            // one independently decoded surface.
             let mut frames = vec![frame];
             while let Ok(f) = rx.try_recv() {
                 frames.push(f);
             }
             let n = frames.len() as u64;
-            if let Err(e) = self.ship_frames(&frames) {
-                warn!(error = ?e, "EGFX ship_frames failed");
+            if let Err(e) = self.ship_frames(stream_index, &frames) {
+                warn!(error = ?e, stream = stream_index, "EGFX ship_frames failed");
             }
             shipped.fetch_add(n, Ordering::Relaxed);
         }
-        debug!("EGFX ship loop exiting (output channel closed)");
+        debug!(stream = stream_index, "EGFX ship loop exiting (output channel closed)");
     }
 
     /// One-time per-connection surface + encoder setup. Caller holds `ctx`.
     fn setup_locked(&self, ctx: &mut ConnectionContext) -> Result<()> {
         // Read the live session size once and pin it for this connection's
-        // surface + encoder + ship-side regions.
+        // graphics-output buffer + surface geometry + ship-side regions.
         let (width, height) = self.desktop_size.get();
-        if ctx.surface_id.is_none() {
+        let surfaces_missing = ctx.surface_id.is_none()
+            || (self.multimon_vertical && ctx.secondary_surface_id.is_none());
+        if surfaces_missing {
             ctx.dims = (width, height);
             let mut server = ctx.server_handle.lock().unwrap();
             server.set_output_dimensions(width, height);
             // Emit RESET_GRAPHICS with an explicit monitor layout BEFORE
-            // create_surface. The auto-reset path inside create_surface sends an
+            // CreateSurface. The auto-reset path inside create_surface sends an
             // EMPTY monitor array; mstsc can decode/ack frames without presenting
             // them when the graphics-output monitor layout disagrees with the core
             // RDP multimon topology. resize_with_monitors sets
             // reset_graphics_sent=true so the empty-monitor reset never fires.
             //
-            // In multimon mode the combined H.264 surface is top-monitor pixels
-            // followed by bottom/primary-monitor pixels (1920x2160 in our test).
             // TS_MONITOR_DEF coordinates are relative to the PRIMARY monitor, so
             // the upper monitor uses negative Y exactly like mstsc's GCC topology:
             //   primary:  (0,0) .. (w-1, each_h-1)
@@ -2360,66 +2502,162 @@ impl Gfx {
                 }]
             };
             server.resize_with_monitors(width, height, monitors);
-            // Create the surface with upstream's auto-allocated id. mstsc retains
-            // EGFX surfaces by id for its whole process lifetime and no-ops a
-            // CreateSurface for an id it already holds, so a reconnect to the
-            // same mstsc process can land on a stale surface and paint blank.
-            // A fresh per-session id (the old vendored `create_surface_with_id`)
-            // only mitigated this *unreliably* on mstsc — sometimes the desktop
-            // drew, sometimes it didn't — for the cost of a permanent upstream
-            // divergence. Since the reliable recovery is the same either way
-            // (close + reopen mstsc, which clears its surface cache), we use the
-            // stock API and document the quirk instead. See [[h264-reconnect-blank]].
-            let sid = server
-                .create_surface_with_format(width, height, PixelFormat::XRgb)
-                .ok_or_else(|| anyhow!("EGFX: create_surface failed (not ready?)"))?;
-            if !server.map_surface_to_output(sid, 0, 0) {
-                return Err(anyhow!("EGFX: map_surface_to_output failed"));
+
+            if self.multimon_vertical {
+                let each_h = height / 2;
+                // RDP monitor coordinates are primary-relative and therefore put
+                // the upper monitor at negative Y. MapSurfaceToOutput origins are
+                // unsigned coordinates in the normalized Graphics Output Buffer,
+                // whose top-left is the bounding desktop's top-left. Thus:
+                //   upper/virtual  -> output (0, 0)
+                //   lower/primary  -> output (0, each_h)
+                //
+                // The old implementation created ONE width x combined-height AVC
+                // surface here. mstsc then presented that composite on one monitor
+                // (scaled to fit) while also showing the top display separately.
+                // Two per-monitor surfaces avoid that ambiguity and give each H.264
+                // stream its own decoder state.
+                let top_sid = server
+                    .create_surface_with_format(width, each_h, PixelFormat::XRgb)
+                    .ok_or_else(|| {
+                        anyhow!("EGFX: create top multimon surface failed (not ready?)")
+                    })?;
+                if !server.map_surface_to_output(top_sid, 0, 0) {
+                    return Err(anyhow!("EGFX: map top multimon surface failed"));
+                }
+                let bottom_sid = server
+                    .create_surface_with_format(width, each_h, PixelFormat::XRgb)
+                    .ok_or_else(|| {
+                        anyhow!("EGFX: create bottom multimon surface failed (not ready?)")
+                    })?;
+                if !server.map_surface_to_output(bottom_sid, 0, u32::from(each_h)) {
+                    return Err(anyhow!("EGFX: map bottom multimon surface failed"));
+                }
+                ctx.surface_id = Some(top_sid);
+                ctx.secondary_surface_id = Some(bottom_sid);
+                info!(
+                    top_surface_id = top_sid,
+                    bottom_surface_id = bottom_sid,
+                    w = width,
+                    each_h,
+                    top_output_x = 0,
+                    top_output_y = 0,
+                    bottom_output_x = 0,
+                    bottom_output_y = each_h,
+                    "EGFX multimon surfaces created + mapped"
+                );
+            } else {
+                // Single-monitor path: preserve the existing one-surface setup.
+                let sid = server
+                    .create_surface_with_format(width, height, PixelFormat::XRgb)
+                    .ok_or_else(|| anyhow!("EGFX: create_surface failed (not ready?)"))?;
+                if !server.map_surface_to_output(sid, 0, 0) {
+                    return Err(anyhow!("EGFX: map_surface_to_output failed"));
+                }
+                ctx.surface_id = Some(sid);
+                ctx.secondary_surface_id = None;
+                info!(
+                    surface_id = sid,
+                    w = width,
+                    h = height,
+                    "EGFX surface created + mapped"
+                );
             }
-            ctx.surface_id = Some(sid);
-            info!(
-                surface_id = sid,
-                w = width,
-                h = height,
-                "EGFX surface created + mapped"
-            );
         }
-        // Encoder dims always follow the surface's creation dims, so an
-        // encoder (re)build can never disagree with an existing surface.
-        let (width, height) = ctx.dims;
-        if ctx.encoder.is_none() {
-            // Pass actual dims; VideoToolbox pads to 16-px macroblocks
-            // internally and encodes the crop in the SPS, so the client
-            // decodes back to actual dims.
-            // Start at the connection's current adaptive target, not the raw
-            // ceiling: equal to the ceiling unless the RTT seed lowered it
-            // (slow link) or the controller already adjusted it (encoder
-            // rebuild mid-connection).
-            let mut encoder = Encoder::new(
-                width,
-                height,
-                self.fps,
-                ctx.adaptive_target_bps,
-                self.keyframe_secs,
-            )?;
-            // Hand VT's output channel to a dedicated ship thread (push model),
-            // so encoded frames are sent the instant they're ready, off the
-            // capture thread. The thread exits when the encoder is dropped (on
-            // connection teardown) and its sender closes.
-            let rx = encoder
-                .take_receiver()
-                .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
-            ctx.encoder = Some(encoder);
-            // Fresh throttle counters for this connection.
-            ctx.submitted.store(0, Ordering::Relaxed);
-            ctx.shipped.store(0, Ordering::Relaxed);
-            let gfx = self.clone();
-            let shipped = ctx.shipped.clone();
-            std::thread::Builder::new()
-                .name("egfx-ship".into())
-                .spawn(move || gfx.ship_loop(rx, shipped))
-                .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
-            info!("EGFX VideoToolbox encoder initialized + ship thread started");
+
+        // Encoder dimensions follow their surfaces. In multimon each monitor gets
+        // an independent VideoToolbox session/reference chain; using one encoder
+        // for two unrelated desktops would make P-frames depend on the wrong image.
+        let (width, combined_height) = ctx.dims;
+        let encoders_missing = ctx.encoder.is_none()
+            || (self.multimon_vertical && ctx.secondary_encoder.is_none());
+        if encoders_missing {
+            // The configured/adaptive bitrate is a whole-desktop budget. Two equal
+            // monitor streams each receive half so enabling multimon doesn't double
+            // the intended network rate.
+            let per_stream_bps = if self.multimon_vertical {
+                (ctx.adaptive_target_bps / 2).max(1)
+            } else {
+                ctx.adaptive_target_bps
+            };
+
+            if self.multimon_vertical {
+                if combined_height % 2 != 0 {
+                    return Err(anyhow!(
+                        "EGFX multimon requires an even combined height; got {combined_height}"
+                    ));
+                }
+                let each_h = combined_height / 2;
+                let mut top_encoder = Encoder::new(
+                    width,
+                    each_h,
+                    self.fps,
+                    per_stream_bps,
+                    self.keyframe_secs,
+                )?;
+                let top_rx = top_encoder
+                    .take_receiver()
+                    .ok_or_else(|| anyhow!("EGFX: top encoder receiver already taken"))?;
+                let mut bottom_encoder = Encoder::new(
+                    width,
+                    each_h,
+                    self.fps,
+                    per_stream_bps,
+                    self.keyframe_secs,
+                )?;
+                let bottom_rx = bottom_encoder
+                    .take_receiver()
+                    .ok_or_else(|| anyhow!("EGFX: bottom encoder receiver already taken"))?;
+
+                // Fresh throttle counters for this connection. They count encoded
+                // frames, not capture ticks; multimon therefore advances by two.
+                ctx.submitted.store(0, Ordering::Relaxed);
+                ctx.shipped.store(0, Ordering::Relaxed);
+
+                let top_gfx = self.clone();
+                let top_shipped = ctx.shipped.clone();
+                std::thread::Builder::new()
+                    .name("egfx-ship-top".into())
+                    .spawn(move || top_gfx.ship_loop(top_rx, top_shipped, 0))
+                    .map_err(|e| anyhow!("EGFX: failed to spawn top ship thread: {e}"))?;
+                let bottom_gfx = self.clone();
+                let bottom_shipped = ctx.shipped.clone();
+                std::thread::Builder::new()
+                    .name("egfx-ship-bottom".into())
+                    .spawn(move || bottom_gfx.ship_loop(bottom_rx, bottom_shipped, 1))
+                    .map_err(|e| anyhow!("EGFX: failed to spawn bottom ship thread: {e}"))?;
+
+                ctx.encoder = Some(top_encoder);
+                ctx.secondary_encoder = Some(bottom_encoder);
+                info!(
+                    w = width,
+                    h = each_h,
+                    bitrate_per_stream_bps = per_stream_bps,
+                    "EGFX multimon VideoToolbox encoders initialized + two ship threads started"
+                );
+            } else {
+                let mut encoder = Encoder::new(
+                    width,
+                    combined_height,
+                    self.fps,
+                    per_stream_bps,
+                    self.keyframe_secs,
+                )?;
+                let rx = encoder
+                    .take_receiver()
+                    .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
+                ctx.submitted.store(0, Ordering::Relaxed);
+                ctx.shipped.store(0, Ordering::Relaxed);
+                let gfx = self.clone();
+                let shipped = ctx.shipped.clone();
+                std::thread::Builder::new()
+                    .name("egfx-ship".into())
+                    .spawn(move || gfx.ship_loop(rx, shipped, 0))
+                    .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
+                ctx.encoder = Some(encoder);
+                ctx.secondary_encoder = None;
+                info!("EGFX VideoToolbox encoder initialized + ship thread started");
+            }
         }
         // stats: publish the per-connection baseline (no-op unless --stats-endpoint).
         if let Some(s) = crate::stats::global() {
@@ -2548,7 +2786,9 @@ impl Gfx {
             // `submit_bgra` run `setup_locked` (which also rebuilds the
             // encoder and resets the throttle counters).
             ctx.encoder = None;
+            ctx.secondary_encoder = None;
             ctx.surface_id = None;
+            ctx.secondary_surface_id = None;
             ctx.need_keyframe = true;
             info!("EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size");
         }
@@ -2660,7 +2900,7 @@ impl Gfx {
         Ok(())
     }
 
-    fn ship_frames(&self, frames: &[EncodedFrame]) -> Result<()> {
+    fn ship_frames(&self, stream_index: u8, frames: &[EncodedFrame]) -> Result<()> {
         let (dvc_messages, egfx_channel_id) = {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
@@ -2679,10 +2919,33 @@ impl Gfx {
                 let ctx = guard
                     .as_mut()
                     .ok_or_else(|| anyhow!("EGFX: ctx vanished mid-submit"))?;
-                let surface_id = ctx
-                    .surface_id
-                    .ok_or_else(|| anyhow!("EGFX: no surface_id"))?;
-                let (width, height) = ctx.dims;
+                let (width, combined_height) = ctx.dims;
+                let (surface_id, height) = if self.multimon_vertical {
+                    if combined_height % 2 != 0 {
+                        return Err(anyhow!(
+                            "EGFX multimon combined height must be even; got {combined_height}"
+                        ));
+                    }
+                    let sid = match stream_index {
+                        0 => ctx.surface_id,
+                        1 => ctx.secondary_surface_id,
+                        _ => None,
+                    }
+                    .ok_or_else(|| {
+                        anyhow!("EGFX: no surface_id for multimon stream {stream_index}")
+                    })?;
+                    (sid, combined_height / 2)
+                } else {
+                    if stream_index != 0 {
+                        return Err(anyhow!(
+                            "EGFX: invalid stream {stream_index} for single-monitor session"
+                        ));
+                    }
+                    let sid = ctx
+                        .surface_id
+                        .ok_or_else(|| anyhow!("EGFX: no surface_id"))?;
+                    (sid, combined_height)
+                };
                 let epoch = ctx.epoch;
                 // Liveness for ack-driven IDR recovery: we're actively shipping.
                 ctx.last_ship_at = Instant::now();
@@ -2748,18 +3011,24 @@ impl Gfx {
                         param_sets = ps_count,
                         param_bytes = ps_bytes,
                         payload_bytes = payload.len(),
+                        stream = stream_index,
+                        surface_id,
                         "EGFX shipped keyframe (IDR)"
                     ),
                     Some(frame_id) => trace!(
                         frame_id,
                         keyframe = false,
                         payload_bytes = payload.len(),
+                        stream = stream_index,
+                        surface_id,
                         "EGFX shipped frame"
                     ),
                     None => debug!(
                         keyframe = f.is_keyframe,
                         param_sets = ps_count,
                         bytes = payload.len(),
+                        stream = stream_index,
+                        surface_id,
                         "send_avc420_frame returned None"
                     ),
                 }
@@ -2884,6 +3153,8 @@ impl GfxServerFactory for Gfx {
             server_handle: handle.clone(),
             encoder: None,
             surface_id: None,
+            secondary_encoder: None,
+            secondary_surface_id: None,
             is_ready: false,
             epoch: Instant::now(),
             need_keyframe: true,
@@ -3199,6 +3470,7 @@ impl GraphicsPipelineHandler for GfxHandler {
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             debug!(
                 surface_id = ?ctx.surface_id,
+                secondary_surface_id = ?ctx.secondary_surface_id,
                 dims = ?ctx.dims,
                 submitted = ctx.submitted.load(Ordering::Relaxed),
                 shipped = ctx.shipped.load(Ordering::Relaxed),
@@ -3206,7 +3478,9 @@ impl GraphicsPipelineHandler for GfxHandler {
             );
             ctx.is_ready = false;
             ctx.encoder = None;
+            ctx.secondary_encoder = None;
             ctx.surface_id = None;
+            ctx.secondary_surface_id = None;
             ctx.need_keyframe = true;
         } else {
             debug!("EGFX on_close: graphics channel closed (no active context)");

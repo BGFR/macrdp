@@ -1105,25 +1105,28 @@ mod macos {
             )
             .await?;
             let tertiary = if let Some(id) = tertiary_display_id {
-                Some(ScreenCaptureUpdates::start(
-                    combined_width,
-                    each_h,
-                    fps,
-                    Some(id),
-                    tertiary_screen_size_pts.expect("validated above"),
-                    cursor_scale_multiplier,
-                    warp_cursor_home,
-                    None,
-                    keyframe_on_change,
-                    click_signal.clone(),
-                    flush_frames,
-                    display_suppressed.clone(),
-                    auto_size,
-                    stretch,
-                    desktop_size,
-                    pending_resize,
-                    suppress_next_adopt.clone(),
-                ).await?)
+                Some(
+                    ScreenCaptureUpdates::start(
+                        combined_width,
+                        each_h,
+                        fps,
+                        Some(id),
+                        tertiary_screen_size_pts.expect("validated above"),
+                        cursor_scale_multiplier,
+                        warp_cursor_home,
+                        None,
+                        keyframe_on_change,
+                        click_signal.clone(),
+                        flush_frames,
+                        display_suppressed.clone(),
+                        auto_size,
+                        stretch,
+                        desktop_size,
+                        pending_resize,
+                        suppress_next_adopt.clone(),
+                    )
+                    .await?,
+                )
             } else {
                 None
             };
@@ -1201,7 +1204,12 @@ mod macos {
         /// Apply one child legacy bitmap rectangle into the combined BGRA canvas.
         /// `ScreenCaptureUpdates::rect_update` emits tightly packed BgrA32 data,
         /// so no pixel-format conversion is needed before VideoToolbox sees it.
-        fn apply_bitmap(&mut self, bitmap: &BitmapUpdate, y_offset: u16, stream_index: usize) -> bool {
+        fn apply_bitmap(
+            &mut self,
+            bitmap: &BitmapUpdate,
+            y_offset: u16,
+            stream_index: usize,
+        ) -> bool {
             let width = usize::from(bitmap.width.get());
             let height = usize::from(bitmap.height.get());
             let src_stride = bitmap.stride.get();
@@ -1262,7 +1270,10 @@ mod macos {
             let (rows, remaining) = match stream_index {
                 0 => (&mut self.top_seed_rows, &mut self.top_seed_remaining),
                 1 => (&mut self.bottom_seed_rows, &mut self.bottom_seed_remaining),
-                2 => (&mut self.tertiary_seed_rows, &mut self.tertiary_seed_remaining),
+                2 => (
+                    &mut self.tertiary_seed_rows,
+                    &mut self.tertiary_seed_remaining,
+                ),
                 _ => return false,
             };
             Self::mark_seed_rows(rows, remaining, bitmap.y, bitmap.height.get());
@@ -1503,7 +1514,9 @@ mod macos {
                         let y_offset = u16::try_from(stream_index)
                             .unwrap_or(0)
                             .saturating_mul(self.split_y);
-                        if let Some(out) = self.process_child_update(update, y_offset, stream_index)? {
+                        if let Some(out) =
+                            self.process_child_update(update, y_offset, stream_index)?
+                        {
                             return Ok(Some(out));
                         }
                     }

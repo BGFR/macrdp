@@ -1252,7 +1252,10 @@ mod pb {
             let ns = NSString::from_str(s);
             pb.setString_forType(&ns, NSPasteboardTypeString);
             if let Some(cc) = self_change_count {
-                cc.store(pb.changeCount() as i64, std::sync::atomic::Ordering::Relaxed);
+                cc.store(
+                    pb.changeCount() as i64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
     }
@@ -1292,7 +1295,10 @@ mod pb {
             let data = NSData::with_bytes(bytes);
             pb.setData_forType(Some(&data), NSPasteboardTypePNG);
             if let Some(cc) = self_change_count {
-                cc.store(pb.changeCount() as i64, std::sync::atomic::Ordering::Relaxed);
+                cc.store(
+                    pb.changeCount() as i64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
     }

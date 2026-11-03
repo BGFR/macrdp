@@ -319,21 +319,22 @@ struct Args {
     #[arg(long)]
     multimon_virtual: bool,
 
-    /// Number of separate macOS virtual monitors in --multimon-virtual mode.
-    /// Default 2 keeps the prior behavior. Use 3 for a top/middle/bottom
-    /// stack; --height must be the total height (e.g. 3240 for 3x1080).
+    /// Total number of RDP monitors in either multimon mode (2 or 3).
+    /// --multimon-virtual creates this many virtual displays;
+    /// --multimon-physical-virtual uses the physical main display plus
+    /// (count - 1) virtual displays. Default 2 preserves prior behavior.
+    /// --height must be the combined height (e.g. 3240 for 3x1080).
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(2..=3))]
     multimon_count: u8,
 
-    /// EXPERIMENTAL: expose the physical Mac main display plus ONE virtual
-    /// display as a two-monitor RDP desktop. The physical display is mapped to
-    /// the RDP primary/lower monitor and is scaled into one half of the combined
-    /// --width/--height canvas; the virtual display is the upper/secondary RDP
-    /// monitor at a native 1:1 size. For example 1920x2160 means: virtual
-    /// 1920x1080 + physical display scaled to 1920x1080. The physical Mac panel
-    /// remains the macOS system primary and stays visible locally. Requires
-    /// --virtual-display and --no-client-resolution. Supports the legacy bitmap
-    /// path and experimental EGFX/H.264 per-monitor encoding.
+    /// EXPERIMENTAL: expose the physical Mac main display plus one or two
+    /// virtual displays as a two- or three-monitor RDP desktop. The physical
+    /// display is the BOTTOM/RDP primary monitor, scaled into its RDP rectangle;
+    /// the virtual displays are stacked above it at native 1:1 size. For three
+    /// 1920x1080 monitors pass --multimon-count 3 --width 1920 --height 3240.
+    /// The physical panel remains macOS system primary and visible locally.
+    /// Requires --virtual-display and --no-client-resolution. Supports legacy
+    /// bitmap and experimental EGFX/H.264 per-monitor encoding.
     #[arg(long)]
     multimon_physical_virtual: bool,
 
@@ -1636,8 +1637,13 @@ fn args_from_config(path: &Path) -> Result<Args> {
     }
     if on("VIRTUAL_DISPLAY", false) {
         argv.push("--virtual-display".into());
-        if on("MULTIMON_VIRTUAL", false) {
-            argv.push("--multimon-virtual".into());
+        if on("MULTIMON_VIRTUAL", false) || on("MULTIMON_PHYSICAL_VIRTUAL", false) {
+            let mode_flag = if on("MULTIMON_VIRTUAL", false) {
+                "--multimon-virtual"
+            } else {
+                "--multimon-physical-virtual"
+            };
+            argv.push(mode_flag.into());
             argv.push("--multimon-count".into());
             argv.push(get("MULTIMON_COUNT", "2"));
             // Multimon uses a pinned combined canvas rather than the
@@ -1946,13 +1952,13 @@ async fn async_main() -> Result<()> {
         ));
     }
     let multimon_any = args.multimon_virtual || args.multimon_physical_virtual;
-    if args.multimon_count != 2 && !args.multimon_virtual {
-        return Err(anyhow!("--multimon-count 3 requires --multimon-virtual"));
+    if args.multimon_count != 2 && !multimon_any {
+        return Err(anyhow!(
+            "--multimon-count 3 requires --multimon-virtual or --multimon-physical-virtual"
+        ));
     }
-    let monitor_count: usize = if args.multimon_virtual {
+    let monitor_count: usize = if multimon_any {
         usize::from(args.multimon_count)
-    } else if args.multimon_physical_virtual {
-        2
     } else {
         1
     };
@@ -2197,37 +2203,53 @@ async fn async_main() -> Result<()> {
                 .map(|vd| Arc::new(std::sync::Mutex::new(vd)));
             Some(Arc::new(std::sync::Mutex::new(top)))
         } else if args.multimon_physical_virtual {
-            if h % 2 != 0 {
+            let count = u16::from(args.multimon_count);
+            if h % count != 0 {
                 return Err(anyhow!(
-                    "--multimon-physical-virtual currently requires an even combined --height; got {h}"
+                    "--multimon-physical-virtual requires combined --height divisible by {count}; got {h}"
                 ));
             }
-            let each_h = h / 2;
+            let each_h = h / count;
             if each_h < 200 {
                 return Err(anyhow!(
-                    "--multimon-physical-virtual split height {each_h} is below the RDP minimum"
+                    "--multimon-physical-virtual per-monitor height {each_h} is below the RDP minimum"
                 ));
             }
 
-            // One real macOS virtual display backs the UPPER RDP monitor. The
-            // physical Mac main display backs the LOWER/PRIMARY RDP monitor and
-            // stays system-primary + visible locally. ScreenCaptureKit scales
-            // the physical panel into the configured RDP monitor rectangle.
-            let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(each_h), 60)
-                .context("attaching physical+virtual multimon virtual display")?;
-            virtual_display::arrange_virtual_above_physical(vd.display_id(), physical_main_id)
-                .context("arranging virtual RDP monitor above the physical main display")?;
+            // Create one or two virtual displays above the physical panel.
+            // Capture order is virtual top, optionally virtual middle, physical
+            // bottom (RDP primary). The physical Mac panel stays system-primary
+            // and visible locally; SCK scales its native size to one RDP strip.
+            let mut displays = Vec::with_capacity(usize::from(count - 1));
+            for index in 0..(count - 1) {
+                displays.push(
+                    virtual_display::VirtualDisplay::new(u32::from(w), u32::from(each_h), 60)
+                        .with_context(|| {
+                            format!("attaching physical+virtual multimon virtual display {index}")
+                        })?,
+                );
+            }
+            let ids: Vec<u32> = displays.iter().map(|vd| vd.display_id()).collect();
+            virtual_display::arrange_virtuals_above_physical(&ids, physical_main_id)
+                .context("arranging virtual RDP monitors above the physical main display")?;
 
             info!(
-                virtual_display_id = vd.display_id(),
+                virtual_display_ids = ?ids,
                 physical_display_id = physical_main_id,
+                monitor_count = count,
                 each_w = w,
                 each_h,
                 combined_w = w,
                 combined_h = h,
-                "physical Mac display + one virtual display attached for RDP multimon; physical stays system primary"
+                "physical Mac display + virtual displays attached for RDP multimon; physical stays system primary"
             );
-            Some(Arc::new(std::sync::Mutex::new(vd)))
+
+            let mut displays = displays.into_iter();
+            let top = displays.next().expect("2 or 3 physical+virtual monitors");
+            virtual_display_secondary = displays
+                .next()
+                .map(|vd| Arc::new(std::sync::Mutex::new(vd)));
+            Some(Arc::new(std::sync::Mutex::new(top)))
         } else {
             // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
             // metadata here (capture cadence is governed by --fps); pass a
@@ -2463,11 +2485,20 @@ async fn async_main() -> Result<()> {
         (w, h, None, size)
     };
 
-    let tertiary_capture_display_id: Option<u32> = virtual_display_tertiary.as_ref().map(|vd| {
-        vd.lock()
-            .expect("tertiary virtual display mutex poisoned")
-            .display_id()
-    });
+    // The physical display is always the LAST RDP strip in mixed mode.
+    // In two-monitor mode it is secondary; in three-monitor mode it is
+    // tertiary, after the two virtual displays.
+    let physical_is_secondary = args.multimon_physical_virtual && args.multimon_count == 2;
+    let physical_is_tertiary = args.multimon_physical_virtual && args.multimon_count == 3;
+    let tertiary_capture_display_id: Option<u32> = if physical_is_tertiary {
+        Some(physical_main_id)
+    } else {
+        virtual_display_tertiary.as_ref().map(|vd| {
+            vd.lock()
+                .expect("tertiary virtual display mutex poisoned")
+                .display_id()
+        })
+    };
     let tertiary_screen_size_pts: Option<(f64, f64)> = tertiary_capture_display_id.map(|id| {
         #[cfg(target_os = "macos")]
         {
@@ -2480,7 +2511,7 @@ async fn async_main() -> Result<()> {
             (0.0, 0.0)
         }
     });
-    let secondary_capture_display_id: Option<u32> = if args.multimon_physical_virtual {
+    let secondary_capture_display_id: Option<u32> = if physical_is_secondary {
         Some(physical_main_id)
     } else {
         virtual_display_secondary.as_ref().map(|vd| {
@@ -2489,7 +2520,7 @@ async fn async_main() -> Result<()> {
                 .display_id()
         })
     };
-    let secondary_screen_size_pts: Option<(f64, f64)> = if args.multimon_physical_virtual {
+    let secondary_screen_size_pts: Option<(f64, f64)> = if physical_is_secondary {
         #[cfg(target_os = "macos")]
         {
             let b = core_graphics::display::CGDisplay::new(physical_main_id).bounds();
@@ -3197,6 +3228,68 @@ mod config_tests {
         assert!(args.keychain);
         // EXTRA_FLAGS is parsed as real CLI tokens.
         assert_eq!(args.fps, Some(30));
+    }
+
+    #[test]
+    fn physical_plus_two_virtual_cli_flags() {
+        let args = Args::try_parse_from([
+            "macrdp",
+            "--bind",
+            "127.0.0.1:3390",
+            "--keychain",
+            "--map-ctrl-to-cmd",
+            "--virtual-display",
+            "--multimon-physical-virtual",
+            "--multimon-count",
+            "3",
+            "--width",
+            "1920",
+            "--height",
+            "3240",
+            "--no-client-resolution",
+            "--enable-h264",
+        ])
+        .unwrap();
+        assert!(args.multimon_physical_virtual);
+        assert!(!args.multimon_virtual);
+        assert_eq!(args.multimon_count, 3);
+        assert_eq!(args.width, Some(1920));
+        assert_eq!(args.height, Some(3240));
+        assert!(args.no_client_resolution);
+        assert!(args.enable_h264);
+
+        // The existing two-monitor configuration still defaults to count 2.
+        let original = Args::try_parse_from([
+            "macrdp",
+            "--virtual-display",
+            "--multimon-physical-virtual",
+            "--width",
+            "1920",
+            "--height",
+            "2160",
+            "--no-client-resolution",
+        ])
+        .unwrap();
+        assert_eq!(original.multimon_count, 2);
+    }
+
+    #[test]
+    fn config_supports_physical_plus_two_virtual_monitors() {
+        let path = write_temp(
+            "mixed-three",
+            "VIRTUAL_DISPLAY=1\n\
+             MULTIMON_PHYSICAL_VIRTUAL=1\n\
+             MULTIMON_COUNT=3\n\
+             VD_WIDTH=1920\n\
+             VD_HEIGHT=3240\n",
+        );
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(args.multimon_physical_virtual);
+        assert!(!args.multimon_virtual);
+        assert_eq!(args.multimon_count, 3);
+        assert_eq!(args.height, Some(3240));
+        assert!(args.no_client_resolution);
     }
 
     #[test]

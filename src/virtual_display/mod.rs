@@ -14,14 +14,14 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    arrange_vertical_stack, arrange_virtual_above_physical, shield_keeps_physical_main,
+    arrange_vertical_stack, arrange_virtuals_above_physical, shield_keeps_physical_main,
     take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
     ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    arrange_vertical_stack, arrange_virtual_above_physical, take_detach_reenable_failed,
+    arrange_vertical_stack, arrange_virtuals_above_physical, take_detach_reenable_failed,
     CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
@@ -267,29 +267,38 @@ mod macos {
         Ok(())
     }
 
-    /// Arrange one virtual display directly above the physical main display,
-    /// without moving the physical display itself. This keeps the physical Mac
-    /// panel as the system primary at its existing origin while giving the RDP
-    /// client a natural vertical two-monitor geometry: virtual on top, physical
-    /// on the bottom/primary monitor.
-    pub fn arrange_virtual_above_physical(virtual_id: u32, physical_id: u32) -> Result<()> {
+    /// Arrange one or two virtual displays directly above the physical main
+    /// display, top-to-bottom, without changing the physical panel's origin.
+    /// The physical panel remains the system primary and is captured as the
+    /// final/bottom RDP monitor, even when its native size differs from the
+    /// virtual display size.
+    pub fn arrange_virtuals_above_physical(
+        virtual_ids_top_to_bottom: &[u32],
+        physical_id: u32,
+    ) -> Result<()> {
+        if !(1..=2).contains(&virtual_ids_top_to_bottom.len()) {
+            return Err(anyhow!(
+                "physical+virtual stack requires one or two virtual displays"
+            ));
+        }
         let physical = CGDisplay::new(physical_id);
         let pb = physical.bounds();
-        let virtual_display = CGDisplay::new(virtual_id);
-        let vh = virtual_display.bounds().size.height.round().max(1.0) as i32;
         let x = pb.origin.x.round() as i32;
-        let y = pb.origin.y.round() as i32 - vh;
+        let mut y = pb.origin.y.round() as i32;
 
         let config = physical.begin_configuration().map_err(|e| {
             anyhow!("CGBeginDisplayConfiguration (physical+virtual multimon): CGError {e}")
         })?;
-        virtual_display
-            .configure_display_origin(&config, x, y)
-            .map_err(|e| {
+        // Position from bottom to top so each screen touches the one below.
+        for (index, &id) in virtual_ids_top_to_bottom.iter().enumerate().rev() {
+            let vd = CGDisplay::new(id);
+            y -= vd.bounds().size.height.round().max(1.0) as i32;
+            vd.configure_display_origin(&config, x, y).map_err(|e| {
                 anyhow!(
-                    "CGConfigureDisplayOrigin(virtual, {x}, {y}) (physical+virtual multimon): CGError {e}"
+                    "CGConfigureDisplayOrigin(virtual #{index}, {x}, {y}) (physical+virtual multimon): CGError {e}"
                 )
             })?;
+        }
         physical
             .complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
             .map_err(|e| {
@@ -297,13 +306,13 @@ mod macos {
             })?;
 
         tracing::info!(
-            virtual_display_id = virtual_id,
+            virtual_display_ids = ?virtual_ids_top_to_bottom,
             physical_display_id = physical_id,
             virtual_x = x,
-            virtual_y = y,
+            top_virtual_y = y,
             physical_x = pb.origin.x,
             physical_y = pb.origin.y,
-            "arranged virtual RDP monitor above physical main display; physical remains system primary"
+            "arranged virtual RDP monitors above physical main display; physical remains system primary"
         );
         Ok(())
     }
@@ -1674,7 +1683,7 @@ mod stub {
         Err(anyhow!("virtual display arrangement is macOS-only"))
     }
 
-    pub fn arrange_virtual_above_physical(_virtual_id: u32, _physical_id: u32) -> Result<()> {
+    pub fn arrange_virtuals_above_physical(_virtual_ids: &[u32], _physical_id: u32) -> Result<()> {
         Err(anyhow!("virtual display arrangement is macOS-only"))
     }
 

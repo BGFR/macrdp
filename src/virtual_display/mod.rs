@@ -14,14 +14,14 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    arrange_vertical_pair, arrange_virtual_above_physical, shield_keeps_physical_main,
+    arrange_vertical_pair, arrange_vertical_stack, arrange_virtual_above_physical, shield_keeps_physical_main,
     take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
     ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    arrange_vertical_pair, arrange_virtual_above_physical, take_detach_reenable_failed,
+    arrange_vertical_pair, arrange_vertical_stack, arrange_virtual_above_physical, take_detach_reenable_failed,
     CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
@@ -230,46 +230,44 @@ mod macos {
         }
     }
 
-    /// Arrange two virtual displays as a vertically-stacked pair just to the
-    /// right of the physical main display. `top_id` becomes the upper monitor
-    /// and `bottom_id` the lower monitor. The physical display remains system
-    /// main at (0,0), so the local Mac stays usable while the two virtual
-    /// displays form an independent remote workspace.
-    pub fn arrange_vertical_pair(top_id: u32, bottom_id: u32) -> Result<()> {
+    /// Arrange two or three RDP virtual displays in top-to-bottom order, just
+    /// to the right of the physical primary display. The bottom virtual screen
+    /// stays at the primary display's Y origin; every preceding screen is
+    /// placed immediately above the next. The physical display never moves.
+    pub fn arrange_vertical_stack(display_ids_top_to_bottom: &[u32]) -> Result<()> {
+        if !(2..=3).contains(&display_ids_top_to_bottom.len()) {
+            return Err(anyhow!("virtual stack requires two or three displays"));
+        }
         let main = CGDisplay::main();
         let mb = main.bounds();
         let x = (mb.origin.x + mb.size.width).round() as i32;
-        let base_y = mb.origin.y.round() as i32;
-
-        let top = CGDisplay::new(top_id);
-        let bottom = CGDisplay::new(bottom_id);
-        let top_h = top.bounds().size.height.round().max(1.0) as i32;
-
+        let mut y = mb.origin.y.round() as i32;
         let config = main
             .begin_configuration()
-            .map_err(|e| anyhow!("CGBeginDisplayConfiguration (multimon pair): CGError {e}"))?;
-        bottom
-            .configure_display_origin(&config, x, base_y)
-            .map_err(|e| anyhow!("CGConfigureDisplayOrigin(bottom, {x}, {base_y}): CGError {e}"))?;
-        top.configure_display_origin(&config, x, base_y - top_h)
-            .map_err(|e| {
-                anyhow!(
-                    "CGConfigureDisplayOrigin(top, {x}, {}): CGError {e}",
-                    base_y - top_h
-                )
+            .map_err(|e| anyhow!("CGBeginDisplayConfiguration (virtual stack): CGError {e}"))?;
+        for (index, &id) in display_ids_top_to_bottom.iter().enumerate().rev() {
+            let display = CGDisplay::new(id);
+            if index != display_ids_top_to_bottom.len() - 1 {
+                y -= display.bounds().size.height.round().max(1.0) as i32;
+            }
+            display.configure_display_origin(&config, x, y).map_err(|e| {
+                anyhow!("CGConfigureDisplayOrigin(virtual #{index}, {x}, {y}): CGError {e}")
             })?;
+        }
         main.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
-            .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (multimon pair): CGError {e}"))?;
-
+            .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (virtual stack): CGError {e}"))?;
         tracing::info!(
-            top_display_id = top_id,
-            bottom_display_id = bottom_id,
+            display_ids = ?display_ids_top_to_bottom,
             x,
-            top_y = base_y - top_h,
-            bottom_y = base_y,
-            "arranged two virtual displays as a vertical multimon pair"
+            top_y = y,
+            "arranged stacked virtual RDP monitors (top to bottom)"
         );
         Ok(())
+    }
+
+    /// Compatibility helper used by existing two-monitor callers.
+    pub fn arrange_vertical_pair(top_id: u32, bottom_id: u32) -> Result<()> {
+        arrange_vertical_stack(&[top_id, bottom_id])
     }
 
     /// Arrange one virtual display directly above the physical main display,
@@ -1676,6 +1674,10 @@ mod stub {
     }
 
     pub fn arrange_vertical_pair(_top_id: u32, _bottom_id: u32) -> Result<()> {
+        Err(anyhow!("virtual display arrangement is macOS-only"))
+    }
+
+    pub fn arrange_vertical_stack(_ids: &[u32]) -> Result<()> {
         Err(anyhow!("virtual display arrangement is macOS-only"))
     }
 

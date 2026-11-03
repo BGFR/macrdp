@@ -342,6 +342,10 @@ pub struct CaptureDisplay {
     /// display path. `display_id` is the TOP RDP monitor; this id is the BOTTOM
     /// monitor. Capture composites both into the single RDP desktop canvas.
     pub secondary_display_id: Option<u32>,
+    /// Optional third macOS display backing the bottom RDP monitor when three
+    /// vertically stacked monitors are requested. The secondary then becomes
+    /// the middle display; `display_id` remains the top one.
+    pub tertiary_display_id: Option<u32>,
     /// Target display's logical size in points — fed through to
     /// `CursorState` for the (currently disabled) position-polling
     /// path. Caller queries it from `CGDisplay::main()` for the
@@ -349,6 +353,7 @@ pub struct CaptureDisplay {
     pub screen_size_pts: (f64, f64),
     /// Logical point size of `secondary_display_id`, when multimon is active.
     pub secondary_screen_size_pts: Option<(f64, f64)>,
+    pub tertiary_screen_size_pts: Option<(f64, f64)>,
     /// True when serving a `--virtual-display`. On disconnect the capture
     /// session warps the cursor back onto the primary physical display, so it
     /// isn't left stranded in the (off-panel) virtual-display coordinate region.
@@ -836,7 +841,7 @@ impl CaptureDisplay {
                     .ok_or_else(|| anyhow::anyhow!("multimon top display id missing"))?;
                 let bottom_size = self
                     .secondary_screen_size_pts
-                    .ok_or_else(|| anyhow::anyhow!("multimon bottom display size missing"))?;
+                    .ok_or_else(|| anyhow::anyhow!("multimon second display size missing"))?;
                 Box::new(
                     macos::MultiScreenCaptureUpdates::start(
                         width,
@@ -844,8 +849,10 @@ impl CaptureDisplay {
                         self.fps,
                         top_id,
                         bottom_id,
+                        self.tertiary_display_id,
                         self.screen_size_pts,
                         bottom_size,
+                        self.tertiary_screen_size_pts,
                         self.cursor_scale,
                         self.warp_cursor_home,
                         self.gfx.clone(),
@@ -981,10 +988,12 @@ mod macos {
     pub struct MultiScreenCaptureUpdates {
         top: ScreenCaptureUpdates,
         bottom: ScreenCaptureUpdates,
+        tertiary: Option<ScreenCaptureUpdates>,
         split_y: u16,
         combined_size: DesktopSize,
         top_alive: bool,
         bottom_alive: bool,
+        tertiary_alive: bool,
         /// EGFX/H.264 sink for the combined backing buffer. The child captures
         /// deliberately run with `gfx=None`; this outer compositor is the only
         /// producer, while Gfx splits the two monitor halves before encoding.
@@ -1013,8 +1022,10 @@ mod macos {
         /// seeded; that makes the first EGFX IDR a clean full two-monitor desktop.
         top_seed_rows: Vec<bool>,
         bottom_seed_rows: Vec<bool>,
+        tertiary_seed_rows: Vec<bool>,
         top_seed_remaining: usize,
         bottom_seed_remaining: usize,
+        tertiary_seed_remaining: usize,
         suppress_next_adopt: Arc<AtomicBool>,
     }
 
@@ -1026,8 +1037,10 @@ mod macos {
             fps: u32,
             top_display_id: u32,
             bottom_display_id: u32,
+            tertiary_display_id: Option<u32>,
             top_screen_size_pts: (f64, f64),
             bottom_screen_size_pts: (f64, f64),
+            tertiary_screen_size_pts: Option<(f64, f64)>,
             cursor_scale_multiplier: f64,
             warp_cursor_home: bool,
             gfx: Option<crate::h264::Gfx>,
@@ -1041,12 +1054,16 @@ mod macos {
             pending_resize: PendingResize,
             suppress_next_adopt: Arc<AtomicBool>,
         ) -> Result<Self> {
-            if combined_height % 2 != 0 {
+            let count: u16 = if tertiary_display_id.is_some() { 3 } else { 2 };
+            if combined_height % count != 0 {
                 return Err(anyhow!(
-                    "multimon combined height {combined_height} is not evenly splittable"
+                    "multimon combined height {combined_height} is not divisible by {count}"
                 ));
             }
-            let each_h = combined_height / 2;
+            if tertiary_display_id.is_some() && tertiary_screen_size_pts.is_none() {
+                return Err(anyhow!("third multimon display size is missing"));
+            }
+            let each_h = combined_height / count;
             let top = ScreenCaptureUpdates::start(
                 combined_width,
                 each_h,
@@ -1082,11 +1099,34 @@ mod macos {
                 display_suppressed.clone(),
                 auto_size,
                 stretch,
-                desktop_size,
-                pending_resize,
+                desktop_size.clone(),
+                pending_resize.clone(),
                 suppress_next_adopt.clone(),
             )
             .await?;
+            let tertiary = if let Some(id) = tertiary_display_id {
+                Some(ScreenCaptureUpdates::start(
+                    combined_width,
+                    each_h,
+                    fps,
+                    Some(id),
+                    tertiary_screen_size_pts.expect("validated above"),
+                    cursor_scale_multiplier,
+                    warp_cursor_home,
+                    None,
+                    keyframe_on_change,
+                    click_signal.clone(),
+                    flush_frames,
+                    display_suppressed.clone(),
+                    auto_size,
+                    stretch,
+                    desktop_size,
+                    pending_resize,
+                    suppress_next_adopt.clone(),
+                ).await?)
+            } else {
+                None
+            };
 
             let composite_stride = usize::from(combined_width)
                 .checked_mul(4)
@@ -1099,17 +1139,21 @@ mod macos {
             tracing::info!(
                 top_display_id,
                 bottom_display_id,
+                tertiary_display_id,
+                monitor_count = count,
                 each_w = combined_width,
                 each_h,
                 combined_w = combined_width,
                 combined_h = combined_height,
                 h264 = gfx.is_some(),
-                "started two ScreenCaptureKit streams for RDP multimon"
+                "started independent ScreenCaptureKit streams for RDP multimon"
             );
 
             Ok(Self {
                 top,
                 bottom,
+                tertiary_alive: tertiary.is_some(),
+                tertiary,
                 split_y: each_h,
                 combined_size: DesktopSize {
                     width: combined_width,
@@ -1135,8 +1179,10 @@ mod macos {
                 last_submit: None,
                 top_seed_rows: vec![false; each_rows],
                 bottom_seed_rows: vec![false; each_rows],
+                tertiary_seed_rows: vec![false; if count == 3 { each_rows } else { 0 }],
                 top_seed_remaining: each_rows,
                 bottom_seed_remaining: each_rows,
+                tertiary_seed_remaining: if count == 3 { each_rows } else { 0 },
                 suppress_next_adopt,
             })
         }
@@ -1170,7 +1216,7 @@ mod macos {
         /// Apply one child legacy bitmap rectangle into the combined BGRA canvas.
         /// `ScreenCaptureUpdates::rect_update` emits tightly packed BgrA32 data,
         /// so no pixel-format conversion is needed before VideoToolbox sees it.
-        fn apply_bitmap(&mut self, bitmap: &BitmapUpdate, y_offset: u16, is_top: bool) -> bool {
+        fn apply_bitmap(&mut self, bitmap: &BitmapUpdate, y_offset: u16, stream_index: usize) -> bool {
             let width = usize::from(bitmap.width.get());
             let height = usize::from(bitmap.height.get());
             let src_stride = bitmap.stride.get();
@@ -1228,27 +1274,21 @@ mod macos {
                     .copy_from_slice(&src[src_off..src_off + row_bytes]);
             }
 
-            if is_top {
-                Self::mark_seed_rows(
-                    &mut self.top_seed_rows,
-                    &mut self.top_seed_remaining,
-                    bitmap.y,
-                    bitmap.height.get(),
-                );
-            } else {
-                Self::mark_seed_rows(
-                    &mut self.bottom_seed_rows,
-                    &mut self.bottom_seed_remaining,
-                    bitmap.y,
-                    bitmap.height.get(),
-                );
-            }
+            let (rows, remaining) = match stream_index {
+                0 => (&mut self.top_seed_rows, &mut self.top_seed_remaining),
+                1 => (&mut self.bottom_seed_rows, &mut self.bottom_seed_remaining),
+                2 => (&mut self.tertiary_seed_rows, &mut self.tertiary_seed_remaining),
+                _ => return false,
+            };
+            Self::mark_seed_rows(rows, remaining, bitmap.y, bitmap.height.get());
             self.composite_dirty = true;
             true
         }
 
         fn seed_ready(&self) -> bool {
-            self.top_seed_remaining == 0 && self.bottom_seed_remaining == 0
+            self.top_seed_remaining == 0
+                && self.bottom_seed_remaining == 0
+                && self.tertiary_seed_remaining == 0
         }
 
         fn note_keyframe_change(&mut self, bitmap: &BitmapUpdate) {
@@ -1358,11 +1398,11 @@ mod macos {
             &mut self,
             update: DisplayUpdate,
             y_offset: u16,
-            is_top: bool,
+            stream_index: usize,
         ) -> Result<Option<DisplayUpdate>> {
             match update {
                 DisplayUpdate::Bitmap(bitmap) => {
-                    let applied = self.apply_bitmap(&bitmap, y_offset, is_top);
+                    let applied = self.apply_bitmap(&bitmap, y_offset, stream_index);
                     if applied {
                         self.note_keyframe_change(&bitmap);
                     }
@@ -1441,92 +1481,53 @@ mod macos {
                     }
                 }
 
-                match (self.top_alive, self.bottom_alive) {
-                    (false, false) => return Ok(None),
-                    (true, false) => {
-                        let timer_delay = self.timer_delay();
-                        let selected = if let Some(delay) = timer_delay {
-                            tokio::select! {
-                                r = self.top.next_update() => Some(r?),
-                                _ = tokio::time::sleep(delay) => None,
-                            }
-                        } else {
-                            Some(self.top.next_update().await?)
-                        };
-                        let Some(next) = selected else {
-                            self.on_timer();
-                            continue;
-                        };
-                        match next {
-                            Some(update) => {
-                                if let Some(out) = self.process_child_update(update, 0, true)? {
-                                    return Ok(Some(out));
-                                }
-                            }
-                            None => self.top_alive = false,
+                if !self.top_alive && !self.bottom_alive && !self.tertiary_alive {
+                    return Ok(None);
+                }
+                // Poll all active captures concurrently; an absent third stream
+                // is disabled, so the old two-monitor mode follows this same path.
+                // Only process one rectangle at a time to protect the persistent
+                // composite framebuffer and its seed-row accounting.
+                let timer_delay = self.timer_delay();
+                let delay = timer_delay.unwrap_or(Duration::ZERO);
+                // Split field borrows before select! so the async optional
+                // branch doesn't capture all of `&mut self`.
+                let top_alive = self.top_alive;
+                let second_alive = self.bottom_alive;
+                let third_alive = self.tertiary_alive;
+                let top = &mut self.top;
+                let second = &mut self.bottom;
+                let third = &mut self.tertiary;
+                let selected: Option<(usize, Option<DisplayUpdate>)> = tokio::select! {
+                    r = top.next_update(), if top_alive => Some((0, r?)),
+                    r = second.next_update(), if second_alive => Some((1, r?)),
+                    r = async {
+                        match third.as_mut() {
+                            Some(capture) => capture.next_update().await,
+                            None => std::future::pending().await,
+                        }
+                    }, if third_alive => Some((2, r?)),
+                    _ = tokio::time::sleep(delay), if timer_delay.is_some() => None,
+                };
+                let Some((stream_index, next)) = selected else {
+                    self.on_timer();
+                    continue;
+                };
+                match next {
+                    Some(update) => {
+                        let y_offset = u16::try_from(stream_index)
+                            .unwrap_or(0)
+                            .saturating_mul(self.split_y);
+                        if let Some(out) = self.process_child_update(update, y_offset, stream_index)? {
+                            return Ok(Some(out));
                         }
                     }
-                    (false, true) => {
-                        let timer_delay = self.timer_delay();
-                        let selected = if let Some(delay) = timer_delay {
-                            tokio::select! {
-                                r = self.bottom.next_update() => Some(r?),
-                                _ = tokio::time::sleep(delay) => None,
-                            }
-                        } else {
-                            Some(self.bottom.next_update().await?)
-                        };
-                        let Some(next) = selected else {
-                            self.on_timer();
-                            continue;
-                        };
-                        match next {
-                            Some(update) => {
-                                if let Some(out) =
-                                    self.process_child_update(update, self.split_y, false)?
-                                {
-                                    return Ok(Some(out));
-                                }
-                            }
-                            None => self.bottom_alive = false,
-                        }
-                    }
-                    (true, true) => {
-                        let timer_delay = self.timer_delay();
-                        let selected: Option<(bool, Option<DisplayUpdate>)> = {
-                            let top = &mut self.top;
-                            let bottom = &mut self.bottom;
-                            if let Some(delay) = timer_delay {
-                                tokio::select! {
-                                    r = top.next_update() => Some((true, r?)),
-                                    r = bottom.next_update() => Some((false, r?)),
-                                    _ = tokio::time::sleep(delay) => None,
-                                }
-                            } else {
-                                tokio::select! {
-                                    r = top.next_update() => Some((true, r?)),
-                                    r = bottom.next_update() => Some((false, r?)),
-                                }
-                            }
-                        };
-
-                        let Some((is_top, next)) = selected else {
-                            self.on_timer();
-                            continue;
-                        };
-                        match next {
-                            Some(update) => {
-                                let y_offset = if is_top { 0 } else { self.split_y };
-                                if let Some(out) =
-                                    self.process_child_update(update, y_offset, is_top)?
-                                {
-                                    return Ok(Some(out));
-                                }
-                            }
-                            None if is_top => self.top_alive = false,
-                            None => self.bottom_alive = false,
-                        }
-                    }
+                    None => match stream_index {
+                        0 => self.top_alive = false,
+                        1 => self.bottom_alive = false,
+                        2 => self.tertiary_alive = false,
+                        _ => unreachable!(),
+                    },
                 }
             }
         }

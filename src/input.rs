@@ -39,6 +39,7 @@ impl MacInputHandler {
         desktop_size: crate::capture::SharedDesktopSize,
         target_display_id: Option<u32>,
         secondary_target_display_id: Option<u32>,
+        tertiary_target_display_id: Option<u32>,
         click_signal: Option<crate::capture::ClickSignal>,
         keyboard_layout: Option<String>,
         keyboard_layout_klid: Option<SharedKeyboardLayout>,
@@ -47,6 +48,7 @@ impl MacInputHandler {
         let inner = macos::Inner::new(
             target_display_id,
             secondary_target_display_id,
+            tertiary_target_display_id,
             keyboard_layout.as_deref(),
             keyboard_layout_klid,
         )?;
@@ -54,6 +56,7 @@ impl MacInputHandler {
         {
             let _ = target_display_id;
             let _ = secondary_target_display_id;
+            let _ = tertiary_target_display_id;
             let _ = keyboard_layout;
             let _ = keyboard_layout_klid;
         }
@@ -615,6 +618,9 @@ mod macos {
         // Experimental multimon: the second real macOS virtual display. The
         // first target is the TOP half of the RDP canvas, this one the BOTTOM.
         secondary_target_display_id: Option<u32>,
+        // The lower RDP monitor when three displays are stacked (the
+        // secondary one then corresponds to the middle display).
+        tertiary_target_display_id: Option<u32>,
         // TTL cache for `target_bounds`: the CoreGraphics bounds query sits
         // on the busiest input path (mouse-move fires hundreds of times/s
         // during a drag) while display geometry changes only on a rare
@@ -662,6 +668,7 @@ mod macos {
         pub fn new(
             target_display_id: Option<u32>,
             secondary_target_display_id: Option<u32>,
+            tertiary_target_display_id: Option<u32>,
             keyboard_layout: Option<&str>,
             klid_handle: Option<super::SharedKeyboardLayout>,
         ) -> Result<Self> {
@@ -721,6 +728,7 @@ mod macos {
                 mods: ModifierState::default(),
                 target_display_id,
                 secondary_target_display_id,
+                tertiary_target_display_id,
                 cached_bounds: None,
                 bounds_cached_at: Instant::now(),
                 click_left: None,
@@ -773,13 +781,19 @@ mod macos {
 
         fn multimon_union_bounds(&mut self) -> Option<(f64, f64, f64, f64)> {
             let top_id = self.target_display_id?;
-            let bottom_id = self.secondary_target_display_id?;
-            let (tx, ty, tw, th) = Self::display_bounds(top_id);
-            let (bx, by, bw, bh) = Self::display_bounds(bottom_id);
-            let min_x = tx.min(bx);
-            let min_y = ty.min(by);
-            let max_x = (tx + tw).max(bx + bw);
-            let max_y = (ty + th).max(by + bh);
+            let second_id = self.secondary_target_display_id?;
+            let (x, y, w, h) = Self::display_bounds(top_id);
+            let mut min_x = x;
+            let mut min_y = y;
+            let mut max_x = x + w;
+            let mut max_y = y + h;
+            for id in [Some(second_id), self.tertiary_target_display_id].into_iter().flatten() {
+                let (ox, oy, ow, oh) = Self::display_bounds(id);
+                min_x = min_x.min(ox);
+                min_y = min_y.min(oy);
+                max_x = max_x.max(ox + ow);
+                max_y = max_y.max(oy + oh);
+            }
             Some((min_x, min_y, max_x - min_x, max_y - min_y))
         }
 
@@ -1267,23 +1281,27 @@ mod macos {
         }
 
         fn move_to(&mut self, x: u16, y: u16, desktop_w: u16, desktop_h: u16, letterbox: bool) {
-            // Experimental two-display path: the combined RDP framebuffer is
-            // normalized top-to-bottom. Route y in the first half to the TOP
-            // macOS virtual display, and y in the second half to the BOTTOM
-            // display, translating each half into that display's live global
-            // CoreGraphics bounds.
-            if let (Some(top_id), Some(bottom_id)) =
+            // Experimental 2/3-monitor path. Capture and EGFX lay the
+            // monitors into a normalized top-to-bottom combined canvas.
+            // Route the pointer to the corresponding macOS display and map
+            // into that display's live bounds (including its Y origin).
+            if let (Some(top_id), Some(second_id)) =
                 (self.target_display_id, self.secondary_target_display_id)
             {
-                let split = (desktop_h / 2).max(1);
-                let (id, local_y) = if y < split {
-                    (top_id, y)
-                } else {
-                    (bottom_id, y.saturating_sub(split))
+                let count: u16 = if self.tertiary_target_display_id.is_some() { 3 } else { 2 };
+                let each_h = (desktop_h / count).max(1);
+                let index = (y / each_h).min(count - 1);
+                let (id, local_y) = match index {
+                    0 => (top_id, y),
+                    1 => (second_id, y.saturating_sub(each_h)),
+                    _ => (
+                        self.tertiary_target_display_id.expect("3-monitor mode"),
+                        y.saturating_sub(each_h.saturating_mul(2)),
+                    ),
                 };
                 let (ox, oy, sw, sh) = Self::display_bounds(id);
                 let (mx, my) =
-                    super::map_client_to_display(x, local_y, desktop_w, split, sw, sh, false);
+                    super::map_client_to_display(x, local_y, desktop_w, each_h, sw, sh, false);
                 self.post_move(ox + mx, oy + my);
                 return;
             }

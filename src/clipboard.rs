@@ -610,12 +610,16 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths) -> bool {
         // Files claimed but read empty (race) — fall through to format list.
     }
 
+    // Text and image representations often coexist on the same pasteboard
+    // item (browsers, Office, rich editors). Advertise TEXT when it exists;
+    // advertising DIB alongside it causes mstsc/Windows applications to pick
+    // the bitmap and turns an ordinary copy of text into a BMP paste.
+    // A genuine image-only copy still uses CF_DIB.
     let mut formats = Vec::new();
-    if pb::has_image() {
-        formats.push(ClipboardFormat::new(ClipboardFormatId::CF_DIB));
-    }
     if pb::has_string() {
         formats.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
+    } else if pb::has_image() {
+        formats.push(ClipboardFormat::new(ClipboardFormatId::CF_DIB));
     }
     if formats.is_empty() {
         // Nothing to advertise but the sender is presumably still alive.
@@ -774,14 +778,14 @@ impl CliprdrBackend for MacCliprdrBackend {
             return;
         }
 
-        // Image/text fall-back. Prefer DIBV5 over DIB (better color), then
-        // text. Asking for one format doesn't preclude later asking for
-        // another; we only need the user's single paste action so the first
-        // match wins.
+        // A normal text copy may also expose a bitmap rendering (Office,
+        // browsers, terminals). Prefer actual Unicode text instead of
+        // requesting the bitmap and overwriting the Mac clipboard with PNG.
+        // Only fall back to image when no text format is available.
         let priority = [
+            ClipboardFormatId::CF_UNICODETEXT,
             ClipboardFormatId::CF_DIBV5,
             ClipboardFormatId::CF_DIB,
-            ClipboardFormatId::CF_UNICODETEXT,
         ];
         for pref in priority {
             if let Some(fmt) = available_formats.iter().find(|f| f.id == pref) {
@@ -924,6 +928,12 @@ impl CliprdrBackend for MacCliprdrBackend {
                             len = s.len(),
                             "writing remote clipboard text to NSPasteboard"
                         );
+                        // Stamp the pasteboard's change count WHILE holding
+                        // its lock, so the outbound poller cannot mistake our
+                        // inbound write for a fresh Mac->Windows copy.
+                        #[cfg(target_os = "macos")]
+                        pb::write_string_tracking(&s, &self.self_change_count);
+                        #[cfg(not(target_os = "macos"))]
                         pb::write_string(&s);
                     }
                     Err(e) => warn!("UTF-16 decode failed: {e}"),
@@ -936,6 +946,9 @@ impl CliprdrBackend for MacCliprdrBackend {
                             len = png.len(),
                             "writing remote clipboard image to NSPasteboard"
                         );
+                        #[cfg(target_os = "macos")]
+                        pb::write_png_tracking(&png, &self.self_change_count);
+                        #[cfg(not(target_os = "macos"))]
                         pb::write_png(&png);
                     }
                     Err(e) => warn!("DIB decode failed: {e}"),
@@ -1217,12 +1230,29 @@ mod pb {
     }
 
     pub fn write_string(s: &str) {
+        write_string_impl(s, None);
+    }
+
+    pub fn write_string_tracking(
+        s: &str,
+        self_change_count: &crate::file_promise::SelfChangeCount,
+    ) {
+        write_string_impl(s, Some(self_change_count));
+    }
+
+    fn write_string_impl(
+        s: &str,
+        self_change_count: Option<&crate::file_promise::SelfChangeCount>,
+    ) {
         let _pb_guard = super::pasteboard_guard();
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.clearContents();
             let ns = NSString::from_str(s);
             pb.setString_forType(&ns, NSPasteboardTypeString);
+            if let Some(cc) = self_change_count {
+                cc.store(pb.changeCount() as i64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
@@ -1244,12 +1274,29 @@ mod pb {
     }
 
     pub fn write_png(bytes: &[u8]) {
+        write_png_impl(bytes, None);
+    }
+
+    pub fn write_png_tracking(
+        bytes: &[u8],
+        self_change_count: &crate::file_promise::SelfChangeCount,
+    ) {
+        write_png_impl(bytes, Some(self_change_count));
+    }
+
+    fn write_png_impl(
+        bytes: &[u8],
+        self_change_count: Option<&crate::file_promise::SelfChangeCount>,
+    ) {
         let _pb_guard = super::pasteboard_guard();
         unsafe {
             let pb = NSPasteboard::generalPasteboard();
             pb.clearContents();
             let data = NSData::with_bytes(bytes);
             pb.setData_forType(Some(&data), NSPasteboardTypePNG);
+            if let Some(cc) = self_change_count {
+                cc.store(pb.changeCount() as i64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 

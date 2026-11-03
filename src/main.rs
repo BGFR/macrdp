@@ -311,14 +311,19 @@ struct Args {
     #[arg(long)]
     virtual_display: bool,
 
-    /// EXPERIMENTAL: create TWO real macOS virtual displays and expose them as
-    /// one two-monitor RDP desktop. The configured --width/--height describe the
-    /// combined RDP canvas; this first implementation splits it into two equal
-    /// vertically-stacked displays (for example 1920x2160 -> 2 x 1920x1080).
+    /// EXPERIMENTAL: create two or three real macOS virtual displays and expose
+    /// them as separate RDP monitors. The configured --width/--height describe
+    /// the combined vertical canvas, e.g. 1920x3240 = 3 x 1920x1080.
     /// Requires --virtual-display and --no-client-resolution. Supports the
     /// legacy bitmap path and experimental EGFX/H.264 per-monitor encoding.
     #[arg(long)]
     multimon_virtual: bool,
+
+    /// Number of separate macOS virtual monitors in --multimon-virtual mode.
+    /// Default 2 keeps the prior behavior. Use 3 for a top/middle/bottom
+    /// stack; --height must be the total height (e.g. 3240 for 3x1080).
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(2..=3))]
+    multimon_count: u8,
 
     /// EXPERIMENTAL: expose the physical Mac main display plus ONE virtual
     /// display as a two-monitor RDP desktop. The physical display is mapped to
@@ -1633,6 +1638,11 @@ fn args_from_config(path: &Path) -> Result<Args> {
         argv.push("--virtual-display".into());
         if on("MULTIMON_VIRTUAL", false) {
             argv.push("--multimon-virtual".into());
+            argv.push("--multimon-count".into());
+            argv.push(get("MULTIMON_COUNT", "2"));
+            // Multimon uses a pinned combined canvas rather than the
+            // single-monitor client-resolution auto-adopt path.
+            argv.push("--no-client-resolution".into());
         }
         argv.push("--width".into());
         argv.push(get("VD_WIDTH", "1920"));
@@ -1936,6 +1946,16 @@ async fn async_main() -> Result<()> {
         ));
     }
     let multimon_any = args.multimon_virtual || args.multimon_physical_virtual;
+    if args.multimon_count != 2 && !args.multimon_virtual {
+        return Err(anyhow!("--multimon-count 3 requires --multimon-virtual"));
+    }
+    let monitor_count: usize = if args.multimon_virtual {
+        usize::from(args.multimon_count)
+    } else if args.multimon_physical_virtual {
+        2
+    } else {
+        1
+    };
     if multimon_any && !args.virtual_display {
         return Err(anyhow!("multimon modes require --virtual-display"));
     }
@@ -1947,8 +1967,8 @@ async fn async_main() -> Result<()> {
     }
     if multimon_any && args.enable_h264 {
         info!(
-            "experimental multimon EGFX/H.264 enabled — combined capture backing is split into \
-             two independent VideoToolbox streams and two EGFX monitor surfaces"
+            monitor_count,
+            "experimental multimon EGFX/H.264 enabled — independent per-monitor VideoToolbox streams and EGFX surfaces"
         );
     }
     if multimon_any
@@ -2118,6 +2138,9 @@ async fn async_main() -> Result<()> {
     let mut virtual_display_secondary: Option<
         Arc<std::sync::Mutex<virtual_display::VirtualDisplay>>,
     > = None;
+    let mut virtual_display_tertiary: Option<
+        Arc<std::sync::Mutex<virtual_display::VirtualDisplay>>,
+    > = None;
     let virtual_display: Option<Arc<std::sync::Mutex<virtual_display::VirtualDisplay>>> = if args
         .virtual_display
     {
@@ -2129,40 +2152,49 @@ async fn async_main() -> Result<()> {
             .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
 
         if args.multimon_virtual {
-            if h % 2 != 0 {
+            let count = u16::from(args.multimon_count);
+            if h % count != 0 {
                 return Err(anyhow!(
-                    "--multimon-virtual currently requires an even combined --height; got {h}"
+                    "--multimon-virtual requires combined --height divisible by {count}; got {h}"
                 ));
             }
-            let each_h = h / 2;
+            let each_h = h / count;
             if each_h < 200 {
                 return Err(anyhow!(
-                    "--multimon-virtual split height {each_h} is below the RDP minimum"
+                    "--multimon-virtual per-monitor height {each_h} is below the RDP minimum"
                 ));
             }
 
-            // The first display is the TOP RDP monitor, the second is the
-            // BOTTOM/primary RDP monitor. Both are real macOS displays, so
-            // maximize/fullscreen/window tiling is naturally per-monitor.
-            let top = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(each_h), 60)
-                .context("attaching top multimon virtual display")?;
-            let bottom = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(each_h), 60)
-                .context("attaching bottom multimon virtual display")?;
-
-            virtual_display::arrange_vertical_pair(top.display_id(), bottom.display_id())
-                .context("arranging the two multimon virtual displays")?;
-
+            // Create 2 or 3 genuine macOS displays, top-to-bottom. In a
+            // three-monitor RDP session these map to client screens 3, 2, 1
+            // respectively (screen 1 is the bottom/primary monitor).
+            let mut displays = Vec::with_capacity(usize::from(count));
+            for index in 0..count {
+                displays.push(
+                    virtual_display::VirtualDisplay::new(u32::from(w), u32::from(each_h), 60)
+                        .with_context(|| format!("attaching multimon virtual display {index}"))?,
+                );
+            }
+            let ids: Vec<u32> = displays.iter().map(|vd| vd.display_id()).collect();
+            virtual_display::arrange_vertical_stack(&ids)
+                .context("arranging the stacked RDP virtual displays")?;
             info!(
-                top_display_id = top.display_id(),
-                bottom_display_id = bottom.display_id(),
+                display_ids = ?ids,
                 each_w = w,
                 each_h,
                 combined_w = w,
                 combined_h = h,
-                "two macOS virtual displays attached for RDP multimon"
+                "macOS virtual displays attached for RDP multimon"
             );
 
-            virtual_display_secondary = Some(Arc::new(std::sync::Mutex::new(bottom)));
+            let mut displays = displays.into_iter();
+            let top = displays.next().expect("2 or 3 virtual monitors");
+            virtual_display_secondary = displays
+                .next()
+                .map(|vd| Arc::new(std::sync::Mutex::new(vd)));
+            virtual_display_tertiary = displays
+                .next()
+                .map(|vd| Arc::new(std::sync::Mutex::new(vd)));
             Some(Arc::new(std::sync::Mutex::new(top)))
         } else if args.multimon_physical_virtual {
             if h % 2 != 0 {
@@ -2431,6 +2463,24 @@ async fn async_main() -> Result<()> {
         (w, h, None, size)
     };
 
+    let tertiary_capture_display_id: Option<u32> = virtual_display_tertiary.as_ref().map(|vd| {
+        vd.lock()
+            .expect("tertiary virtual display mutex poisoned")
+            .display_id()
+    });
+    let tertiary_screen_size_pts: Option<(f64, f64)> =
+        tertiary_capture_display_id.map(|id| {
+            #[cfg(target_os = "macos")]
+            {
+                let b = core_graphics::display::CGDisplay::new(id).bounds();
+                (b.size.width, b.size.height)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = id;
+                (0.0, 0.0)
+            }
+        });
     let secondary_capture_display_id: Option<u32> = if args.multimon_physical_virtual {
         Some(physical_main_id)
     } else {
@@ -2594,7 +2644,7 @@ async fn async_main() -> Result<()> {
     let gfx = args.enable_h264.then(|| {
         h264::Gfx::new(
             desktop_size.clone(),
-            multimon_any,
+            monitor_count,
             fps,
             args.bitrate.max(1).saturating_mul(1_000_000),
             args.keyframe_interval,
@@ -2636,8 +2686,10 @@ async fn async_main() -> Result<()> {
         fps,
         display_id: capture_display_id,
         secondary_display_id: secondary_capture_display_id,
+        tertiary_display_id: tertiary_capture_display_id,
         screen_size_pts,
         secondary_screen_size_pts,
+        tertiary_screen_size_pts,
         // Virtual-display sessions drive the cursor into the virtual display's
         // off-panel coordinate region; warp it back to the primary on
         // disconnect so the local Mac mouse isn't stranded.
@@ -2688,6 +2740,7 @@ async fn async_main() -> Result<()> {
         desktop_size.clone(),
         capture_display_id,
         secondary_capture_display_id,
+        tertiary_capture_display_id,
         click_signal,
         args.keyboard_layout.clone(),
         Some(keyboard_layout_klid.clone()),

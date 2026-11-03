@@ -14,15 +14,16 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    arrange_vertical_pair, arrange_vertical_stack, arrange_virtual_above_physical, shield_keeps_physical_main,
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
-    ShieldedPrimary, VirtualDisplay,
+    arrange_vertical_pair, arrange_vertical_stack, arrange_virtual_above_physical,
+    shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
+    PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    arrange_vertical_pair, arrange_vertical_stack, arrange_virtual_above_physical, take_detach_reenable_failed,
-    CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    arrange_vertical_pair, arrange_vertical_stack, arrange_virtual_above_physical,
+    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
+    ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(target_os = "macos")]
@@ -250,9 +251,11 @@ mod macos {
             if index != display_ids_top_to_bottom.len() - 1 {
                 y -= display.bounds().size.height.round().max(1.0) as i32;
             }
-            display.configure_display_origin(&config, x, y).map_err(|e| {
-                anyhow!("CGConfigureDisplayOrigin(virtual #{index}, {x}, {y}): CGError {e}")
-            })?;
+            display
+                .configure_display_origin(&config, x, y)
+                .map_err(|e| {
+                    anyhow!("CGConfigureDisplayOrigin(virtual #{index}, {x}, {y}): CGError {e}")
+                })?;
         }
         main.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
             .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (virtual stack): CGError {e}"))?;

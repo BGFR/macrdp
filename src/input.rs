@@ -787,7 +787,10 @@ mod macos {
             let mut min_y = y;
             let mut max_x = x + w;
             let mut max_y = y + h;
-            for id in [Some(second_id), self.tertiary_target_display_id].into_iter().flatten() {
+            for id in [Some(second_id), self.tertiary_target_display_id]
+                .into_iter()
+                .flatten()
+            {
                 let (ox, oy, ow, oh) = Self::display_bounds(id);
                 min_x = min_x.min(ox);
                 min_y = min_y.min(oy);
@@ -1288,7 +1291,11 @@ mod macos {
             if let (Some(top_id), Some(second_id)) =
                 (self.target_display_id, self.secondary_target_display_id)
             {
-                let count: u16 = if self.tertiary_target_display_id.is_some() { 3 } else { 2 };
+                let count: u16 = if self.tertiary_target_display_id.is_some() {
+                    3
+                } else {
+                    2
+                };
                 let each_h = (desktop_h / count).max(1);
                 let index = (y / each_h).min(count - 1);
                 let (id, local_y) = match index {

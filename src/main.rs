@@ -2468,19 +2468,18 @@ async fn async_main() -> Result<()> {
             .expect("tertiary virtual display mutex poisoned")
             .display_id()
     });
-    let tertiary_screen_size_pts: Option<(f64, f64)> =
-        tertiary_capture_display_id.map(|id| {
-            #[cfg(target_os = "macos")]
-            {
-                let b = core_graphics::display::CGDisplay::new(id).bounds();
-                (b.size.width, b.size.height)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = id;
-                (0.0, 0.0)
-            }
-        });
+    let tertiary_screen_size_pts: Option<(f64, f64)> = tertiary_capture_display_id.map(|id| {
+        #[cfg(target_os = "macos")]
+        {
+            let b = core_graphics::display::CGDisplay::new(id).bounds();
+            (b.size.width, b.size.height)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = id;
+            (0.0, 0.0)
+        }
+    });
     let secondary_capture_display_id: Option<u32> = if args.multimon_physical_virtual {
         Some(physical_main_id)
     } else {

@@ -14,16 +14,15 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    arrange_vertical_pair, arrange_vertical_stack, arrange_virtual_above_physical,
-    shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
-    PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    arrange_vertical_stack, arrange_virtual_above_physical, shield_keeps_physical_main,
+    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
+    ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    arrange_vertical_pair, arrange_vertical_stack, arrange_virtual_above_physical,
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
-    ShieldedPrimary, VirtualDisplay,
+    arrange_vertical_stack, arrange_virtual_above_physical, take_detach_reenable_failed,
+    CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(target_os = "macos")]
@@ -251,11 +250,9 @@ mod macos {
             if index != display_ids_top_to_bottom.len() - 1 {
                 y -= display.bounds().size.height.round().max(1.0) as i32;
             }
-            display
-                .configure_display_origin(&config, x, y)
-                .map_err(|e| {
-                    anyhow!("CGConfigureDisplayOrigin(virtual #{index}, {x}, {y}): CGError {e}")
-                })?;
+            display.configure_display_origin(&config, x, y).map_err(|e| {
+                anyhow!("CGConfigureDisplayOrigin(virtual #{index}, {x}, {y}): CGError {e}")
+            })?;
         }
         main.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
             .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (virtual stack): CGError {e}"))?;
@@ -266,11 +263,6 @@ mod macos {
             "arranged stacked virtual RDP monitors (top to bottom)"
         );
         Ok(())
-    }
-
-    /// Compatibility helper used by existing two-monitor callers.
-    pub fn arrange_vertical_pair(top_id: u32, bottom_id: u32) -> Result<()> {
-        arrange_vertical_stack(&[top_id, bottom_id])
     }
 
     /// Arrange one virtual display directly above the physical main display,
@@ -1674,10 +1666,6 @@ mod stub {
     /// No detach path off macOS, so nothing ever leaves a panel stuck.
     pub fn take_detach_reenable_failed() -> bool {
         false
-    }
-
-    pub fn arrange_vertical_pair(_top_id: u32, _bottom_id: u32) -> Result<()> {
-        Err(anyhow!("virtual display arrangement is macOS-only"))
     }
 
     pub fn arrange_vertical_stack(_ids: &[u32]) -> Result<()> {

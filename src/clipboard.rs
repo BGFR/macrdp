@@ -1229,6 +1229,7 @@ mod pb {
         })
     }
 
+    #[cfg(test)]
     pub fn write_string(s: &str) {
         write_string_impl(s, None);
     }
@@ -1251,10 +1252,7 @@ mod pb {
             let ns = NSString::from_str(s);
             pb.setString_forType(&ns, NSPasteboardTypeString);
             if let Some(cc) = self_change_count {
-                cc.store(
-                    pb.changeCount() as i64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                cc.store(pb.changeCount() as i64, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -1276,10 +1274,6 @@ mod pb {
         })
     }
 
-    pub fn write_png(bytes: &[u8]) {
-        write_png_impl(bytes, None);
-    }
-
     pub fn write_png_tracking(
         bytes: &[u8],
         self_change_count: &crate::file_promise::SelfChangeCount,
@@ -1298,10 +1292,7 @@ mod pb {
             let data = NSData::with_bytes(bytes);
             pb.setData_forType(Some(&data), NSPasteboardTypePNG);
             if let Some(cc) = self_change_count {
-                cc.store(
-                    pb.changeCount() as i64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                cc.store(pb.changeCount() as i64, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
